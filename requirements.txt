@@ -11,6 +11,5 @@ winrt-Windows.Devices.Enumeration==3.2.1
 winrt-Windows.Foundation==3.2.1
 winrt-Windows.Foundation.Collections==3.2.1
 winrt-Windows.Storage.Streams==3.2.1
-ahrs==0.4.0
+imufusion==1.2.11
 numpy==1.26.4
-scipy==1.17.1

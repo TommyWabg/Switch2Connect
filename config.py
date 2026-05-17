@@ -192,6 +192,7 @@ class Config:
         self.calibration_data = config.get("calibration_data", {}) or {}
         self.mag_calibration_data = config.get("mag_calibration_data", {}) or {}
         self.joycon_hold_mode = config.get("joycon_hold_mode", {}) or {}
+        self.merged_gyro_side = config.get("merged_gyro_side", {}) or {}
         
         self.simulation_mode = config.get("simulation_mode", "Xbox")
         self.open_when_startup = config.get("open_when_startup", False)
@@ -229,6 +230,7 @@ class Config:
             data['calibration_data'] = self.calibration_data
             data['mag_calibration_data'] = self.mag_calibration_data
             data['joycon_hold_mode'] = self.joycon_hold_mode
+            data['merged_gyro_side'] = self.merged_gyro_side
             
             if 'mouse' not in data:
                 data['mouse'] = {}

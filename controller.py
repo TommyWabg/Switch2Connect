@@ -11,6 +11,8 @@ import ctypes
 import time
 import threading
 import math
+import imufusion
+import numpy as np
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
 except Exception:
@@ -230,6 +232,7 @@ class Controller:
         
         self.prev_screenshot = False
         self.prev_key_c = False
+        self.last_click_event_time = 0.0
         
         self.gyro_target_vx = 0.0
         self.gyro_target_vy = 0.0
@@ -255,7 +258,16 @@ class Controller:
         self.hold_mode = "Vertical"
         
         # Sensor fusion state
-        self.orientation = None # (w, x, y, z)
+        self.ahrs = imufusion.Ahrs()
+        # Convention NWU, gain=0.1, range=2000 dps, accRejection=10 deg, magRejection=20 deg, recoveryTrigger=60000 samples
+        self.ahrs.settings = imufusion.Settings(
+            imufusion.CONVENTION_NWU,
+            0.1,
+            2000.0,
+            10.0,
+            20.0,
+            60000
+        )
         self.last_fusion_time = 0
         self.gyro_bias_integral = (0.0, 0.0, 0.0)
         self.gyro_start_time = 0
@@ -267,6 +279,7 @@ class Controller:
         self.mag_max = [-32768, -32768, -32768]
         
         self.q_world_offset = None 
+        self.gyro_moving_envelope = 0.0
         self._suspended = False
         
     @property
@@ -280,6 +293,16 @@ class Controller:
             logger.info(f"Controller {self.device.address}: Input processing SUSPENDED.")
         else:
             logger.info(f"Controller {self.device.address}: Input processing RESUMED.")
+            
+    @property
+    def orientation(self):
+        q = self.ahrs.quaternion
+        return (q.w, q.x, q.y, q.z)
+
+    @orientation.setter
+    def orientation(self, value):
+        if value is None:
+            self.ahrs.reset()
         
     def __repr__(self):
         return f"{CONTROLER_NAMES[self.controller_info.product_id]} : {self.device.address}"
@@ -631,7 +654,7 @@ class Controller:
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
 
-            if getattr(self, 'is_calibrating', False):
+            if getattr(self, 'is_calibrating', False) or getattr(self, 'is_mag_calibrating', False):
                 self.simulate_gyro_mouse(inputData, False, False, False)
             else:
                 self.simulate_mouse(inputData)
@@ -655,91 +678,92 @@ class Controller:
         self.input_report_callback = callback
 
     def _reset_orientation_from_accel(self, ax, ay, az, mx=None, my=None, mz=None):
-        local_accel = (ax, ay, az)
-        world_up = (0, 0, 1)
-        self.orientation = quaternion_from_vectors(local_accel, world_up)
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm > 0.001:
+            vx, vy, vz = ax / norm, ay / norm, az / norm
+            if 1.0 + vz > 0.0001:
+                q_raw = [1.0 + vz, vy, -vx, 0.0]
+                q_norm = math.sqrt(q_raw[0]**2 + q_raw[1]**2 + q_raw[2]**2)
+                q = [q_raw[0]/q_norm, q_raw[1]/q_norm, q_raw[2]/q_norm, 0.0]
+            else:
+                # Upside down
+                q = [0.0, 1.0, 0.0, 0.0]
+        else:
+            q = [1.0, 0.0, 0.0, 0.0]
+        
+        self.ahrs.quaternion = imufusion.Quaternion(np.array(q))
+        self.gyro_bias_integral = (0.0, 0.0, 0.0)
+        self.q_world_offset = None
+        self.gyro_moving_envelope = 0.0
         self.last_fusion_time = time.perf_counter()
 
     def _mahony_update(self, gx, gy, gz, ax, ay, az, mx, my, mz, dt):
-        if self.orientation is None:
-            self._reset_orientation_from_accel(ax, ay, az, mx, my, mz)
-            return
-
         current_mode = getattr(CONFIG, "gyro_mode", "World")
-        kp_base = getattr(CONFIG, "gyro_kp", 120.0) 
-        ki_base = 30.0 # Boosted for faster recovery from long-term drift
-        # Only use magnetometer correction in 9-axis (World) mode
-        km_base = 200.0 if current_mode == "World" else 0.0
         
-        # 1. Calculate world-space directional acceleration
+        # 1. Convert raw gyroscope and accelerometer values into standard physical units
+        # Deduct static bias and dynamic bias integral (dynamic bias is in rad/s, convert to dps)
+        # - Pro Controller uses ST standard +-2000 dps (70 mdps/LSB -> 1000/70 = 14.285714 LSB/dps)
+        # - Joy-Cons use Nintendo standard +-2000 dps (0.06103 dps/LSB -> 1/0.06103 = 16.384 LSB/dps)
+        GYRO_SCALE = 14.285714 if self.is_pro_controller() else 16.384
+        gx_dps = (gx / GYRO_SCALE) - math.degrees(self.gyro_bias_integral[0])
+        gy_dps = (gy / GYRO_SCALE) - math.degrees(self.gyro_bias_integral[1])
+        gz_dps = (gz / GYRO_SCALE) - math.degrees(self.gyro_bias_integral[2])
+        
+        # Accelerometer to g unit
+        ax_g = ax / 16384.0
+        ay_g = ay / 16384.0
+        az_g = az / 16384.0
+        
+        # 2. Perform sensor fusion using C-extension imufusion
+        gyro_arr = np.array([gx_dps, gy_dps, gz_dps], dtype=np.float64)
+        accel_arr = np.array([ax_g, ay_g, az_g], dtype=np.float64)
+        
+        # Single smooth rational formula to dynamically scale blend_factor based on movement intensity.
+        # This addresses centripetal acceleration (proportional to omega^2), which introduces a DC bias during waving.
+        # - When still (envelope=0), blend_factor = 0.0 (100% raw accelerometer, effective Gain=0.1).
+        # - For slow movements (envelope=5 dps), blend_factor = 0.95 (5% correction active, safe coordinate drift prevention).
+        # - For high velocities (envelope>=50 dps), blend_factor approaches 0.995+ (completely locking out massive centripetal noise).
+        envelope = getattr(self, 'gyro_moving_envelope', 0.0)
+        blend_factor = (envelope / 0.26) / (1.0 + (envelope / 0.26))
+        accel_blended = accel_arr * (1.0 - blend_factor) + self.ahrs.gravity * blend_factor
+        
+        if current_mode == "World" and (mx != 0 or my != 0 or mz != 0):
+            mx_cal = mx - self.mag_bias[0]
+            my_cal = my - self.mag_bias[1]
+            mz_cal = mz - self.mag_bias[2]
+            mag_arr = np.array([mx_cal, my_cal, mz_cal], dtype=np.float64)
+            self.ahrs.update(gyro_arr, accel_blended, mag_arr, float(dt))
+        else:
+            self.ahrs.update_no_magnetometer(gyro_arr, accel_blended, float(dt))
+            
+        # 3. Dynamic On-the-fly Gyro Bias Calibration (Background PI loop)
+        # Learn gyro bias only during absolute stationary states to compensate for temperature drift
         raw_mag = math.sqrt(ax*ax + ay*ay + az*az)
         G_REF = 16384.0
         accel_err_total = abs(raw_mag - G_REF)
         gyro_mag = math.sqrt(gx**2 + gy**2 + gz**2)
         
-        q = self.orientation
-        raw_world = quaternion_rotate_vector(q, (ax, ay, az))
-        h_shake = math.sqrt(raw_world[0]**2 + raw_world[1]**2)
-        v_shake_err = abs(raw_world[2] - G_REF)
-        
-        # 2. Ultimate Hybrid Order Directional Tapering
-        # G-Consistency: Trust base for overall sensor health
-        g_consistency = 1.0 / (1.0 + (accel_err_total / 4000.0)**2)
-
-        # kp (Pitch/Roll) - The Shield (Strict 1000 threshold for H-move)
-        kp_scale = 1.0 / (1.0 + (h_shake / 1000.0)**4 + (v_shake_err / 8000.0)**2 + (gyro_mag / 4000.0)**4)
-        kp = kp_base * kp_scale * g_consistency
-        
-        # km (Yaw) - The Magnet
-        km_scale = 1.0 / (1.0 + (h_shake / 8000.0)**2 + (v_shake_err / 8000.0)**2 + (gyro_mag / 10000.0)**2)
-        km = km_base * km_scale * g_consistency
-        
-        # 3. Accelerometer correction calculation
-        q_inv = (q[0], -q[1], -q[2], -q[3])
-        
-        error_accel = (0, 0, 0)
-        if kp > 0.01:
-            v_pred = quaternion_rotate_vector(q_inv, (0, 0, 1))
+        if accel_err_total < 800 and gyro_mag < 200 and getattr(self, 'gyro_moving_envelope', 0.0) < 1.0:
+            g_est = self.ahrs.gravity
+            v_pred = (g_est[0], g_est[1], g_est[2])
             v_meas = vector_normalize((ax, ay, az))
             error_accel = vector_cross(v_meas, v_pred)
-
-        # 4. Update bias integral (Strictly masked by kp_scale to prevent pollution)
-        if accel_err_total < 800 and gyro_mag < 200:
-            # Only learn bias when the current orientation reference is highly trusted
-            trust_factor = kp_scale 
+            
+            # Scale bias accumulation using dynamic tapering to prevent vibration leakage
+            q_wxyz = self.ahrs.quaternion.wxyz
+            q = (q_wxyz[0], q_wxyz[1], q_wxyz[2], q_wxyz[3])
+            raw_world = quaternion_rotate_vector(q, (ax, ay, az))
+            h_shake = math.sqrt(raw_world[0]**2 + raw_world[1]**2)
+            v_shake_err = abs(raw_world[2] - G_REF)
+            
+            kp_scale = 1.0 / (1.0 + (h_shake / 1000.0)**4 + (v_shake_err / 8000.0)**2 + (gyro_mag / 4000.0)**4)
+            ki_base = 30.0
+            
             self.gyro_bias_integral = (
-                self.gyro_bias_integral[0] + error_accel[0] * ki_base * dt * trust_factor,
-                self.gyro_bias_integral[1] + error_accel[1] * ki_base * dt * trust_factor,
-                self.gyro_bias_integral[2] + error_accel[2] * ki_base * dt * trust_factor
+                self.gyro_bias_integral[0] + error_accel[0] * ki_base * dt * kp_scale,
+                self.gyro_bias_integral[1] + error_accel[1] * ki_base * dt * kp_scale,
+                self.gyro_bias_integral[2] + error_accel[2] * ki_base * dt * kp_scale
             )
-
-        # 5. Apply Gyro and Accel correction to orientation
-        raw_to_rad = math.radians(1.0 / 16.4) 
-        gx_rad = (gx * raw_to_rad) + (kp * error_accel[0]) + self.gyro_bias_integral[0]
-        gy_rad = (gy * raw_to_rad) + (kp * error_accel[1]) + self.gyro_bias_integral[1]
-        gz_rad = (gz * raw_to_rad) + (kp * error_accel[2]) + self.gyro_bias_integral[2]
-
-        omega = (0, gx_rad, gy_rad, gz_rad)
-        q_dot = quaternion_multiply(self.orientation, omega)
-        
-        new_q = (
-            self.orientation[0] + 0.5 * q_dot[0] * dt,
-            self.orientation[1] + 0.5 * q_dot[1] * dt,
-            self.orientation[2] + 0.5 * q_dot[2] * dt,
-            self.orientation[3] + 0.5 * q_dot[3] * dt
-        )
-        q = quaternion_normalize(new_q)
-
-        # 6. Heading correction (Magnetometer nudge)
-        if km > 0.01 and (mx != 0 or my != 0 or mz != 0):
-            m_local = (mx, my, mz)
-            h = quaternion_rotate_vector(q, m_local)
-            heading_error = math.atan2(h[0], h[1]) 
-            correction_angle = -heading_error * km * dt
-            q_corr = (math.cos(correction_angle/2), 0, 0, math.sin(correction_angle/2))
-            q = quaternion_multiply(q_corr, q)
-
-        self.orientation = q
         
     def simulate_mouse(self, inputData: ControllerInputData):
         mouse_config = CONFIG.mouse_config
@@ -791,20 +815,6 @@ class Controller:
             self.jc_target_vy = 0.0
 
     def simulate_gyro_mouse(self, inputData: ControllerInputData, trigger_pressed: bool = False, zr_pressed: bool = False, zl_pressed: bool = False):
-        if not getattr(self, 'gyro_active', True):
-            # Reset all speed states to prevent drift when switching Gyro sides
-            self.gyro_target_vx = 0.0
-            self.gyro_target_vy = 0.0
-            self.current_vx = 0.0
-            self.current_vy = 0.0
-            self.interp_residual_x = 0.0
-            self.interp_residual_y = 0.0
-            self.gyro_mouse_enabled = False
-            return
-
-        activation_mode = getattr(CONFIG, "gyro_activation_mode", "Toggle")
-
-
         if getattr(self, 'is_calibrating', False):
             if time.perf_counter() < self.calibration_end_time:
                 self.calibration_samples_gyro.append(inputData.gyroscope)
@@ -849,36 +859,54 @@ class Controller:
             inputData.accelerometer = (0.0, 0.0, 0.0)
             return
 
-        bias_threshold = 5  
+        if not getattr(self, 'gyro_active', True):
+            # Reset all speed states to prevent drift when switching Gyro sides
+            self.gyro_target_vx = 0.0
+            self.gyro_target_vy = 0.0
+            self.current_vx = 0.0
+            self.current_vy = 0.0
+            self.interp_residual_x = 0.0
+            self.interp_residual_y = 0.0
+            self.gyro_mouse_enabled = False
+            return
+
+        activation_mode = getattr(CONFIG, "gyro_activation_mode", "Toggle")
+
         bx, by, bz = self.gyro_bias
-        # Ignore if bias is extremely small
-        bx = bx if abs(bx) > bias_threshold else 0.0
-        by = by if abs(by) > bias_threshold else 0.0
-        bz = bz if abs(bz) > bias_threshold else 0.0
-        
         raw_gx, raw_gy, raw_gz = inputData.gyroscope
+        ax, ay, az = inputData.accelerometer
+        
+        # Standstill Auto-Calibration: gently creep self.gyro_bias when absolutely still.
+        # This completely resolves thermal drift and sensor bias offset without manual recalibration.
+        accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
+        accel_err = abs(accel_mag - 16384.0)
+        gyro_sub_mag = math.sqrt((raw_gx - bx)**2 + (raw_gy - by)**2 + (raw_gz - bz)**2)
+        moving_env = getattr(self, 'gyro_moving_envelope', 0.0)
+        
+        if accel_err < 800 and gyro_sub_mag < 150 and moving_env < 0.15:
+            # Creep rate (alpha = 0.001) - very slow and smooth (time constant of ~4 seconds)
+            alpha = 0.001
+            self.gyro_bias = (
+                (1.0 - alpha) * self.gyro_bias[0] + alpha * raw_gx,
+                (1.0 - alpha) * self.gyro_bias[1] + alpha * raw_gy,
+                (1.0 - alpha) * self.gyro_bias[2] + alpha * raw_gz
+            )
+            bx, by, bz = self.gyro_bias
+
         gyro_x = raw_gx - bx
         gyro_y = raw_gy - by
         gyro_z = raw_gz - bz
-
-        soft_dz = 5.0  
-        def apply_soft_deadzone(val, dz):
-            if abs(val) < dz: return 0.0
-            return (val - dz) if val > 0 else (val + dz)
-
-        gyro_x = apply_soft_deadzone(gyro_x, soft_dz)
-        gyro_y = apply_soft_deadzone(gyro_y, soft_dz)
-        gyro_z = apply_soft_deadzone(gyro_z, soft_dz)
 
         inputData.gyroscope = (gyro_x, gyro_y, gyro_z)
         
         rx, ry = inputData.right_stick
 
+        ax, ay, az = inputData.accelerometer
+
         if activation_mode == "Hold":
             if trigger_pressed and not getattr(self, 'gr_was_pressed', False):
                 # Reset orientation on activation to prevent jumps
-                self.orientation = None
-                self.gyro_bias_integral = (0.0, 0.0, 0.0)
+                self._reset_orientation_from_accel(ax, ay, az)
                 self.gyro_start_time = time.perf_counter()
             self.gyro_mouse_enabled = trigger_pressed
         else:
@@ -886,10 +914,8 @@ class Controller:
                 self.gyro_mouse_enabled = not self.gyro_mouse_enabled
                 if self.gyro_mouse_enabled:
                     # Reset orientation on activation to prevent jumps
-                    self.orientation = None
-                    self.gyro_bias_integral = (0.0, 0.0, 0.0)
-                    self.gyro_start_time = time.perf_counter()
-                    self.q_world_offset = None 
+                    self._reset_orientation_from_accel(ax, ay, az)
+                    self.gyro_start_time = time.perf_counter() 
                 
         self.gr_was_pressed = trigger_pressed
 
@@ -936,6 +962,10 @@ class Controller:
                 if current_r_click and not prev_r_click: win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
                 elif not current_r_click and prev_r_click: win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
 
+                # Track click stabilization window (ONLY on press / down event)
+                if (current_l_click and not prev_l_click) or (current_r_click and not prev_r_click):
+                    self.last_click_event_time = now
+
                 self.prev_l_click = current_l_click
                 self.prev_r_click = current_r_click
 
@@ -956,16 +986,15 @@ class Controller:
                 
                 ax, ay, az = inputData.accelerometer
                 mx, my, mz = inputData.magnometer
-                # Apply mag bias
-                mx -= self.mag_bias[0]
-                my -= self.mag_bias[1]
-                mz -= self.mag_bias[2]
                 
                 self._mahony_update(gyro_x, gyro_y, gyro_z, ax, ay, az, mx, my, mz, dt)
                 
-                # Transform local gyro to world space
+                # Transform local gyro to world space (filtering out roll crosstalk)
                 # q rotates local to world
-                g_local = (gyro_x, gyro_y, gyro_z)
+                if self.is_pro_controller() or self.hold_mode == "Vertical":
+                    g_local = (gyro_x, 0.0, gyro_z)
+                else:
+                    g_local = (0.0, gyro_y, gyro_z)
                 
                 # effective orientation logic:
                 # We want Pitch/Roll to remain absolute (relative to gravity), 
@@ -1008,8 +1037,19 @@ class Controller:
                 # This mathematically eliminates the "slope effect".
                 eff_v = g_world_abs[0] * r_h[0] + g_world_abs[1] * r_h[1]
                 
-                # Apply soft deadzone (consistent with FPS mode)
-                soft_dz = 5.0
+                # Update moving intensity envelope in physical dps units using a leaky integrator (coeff=0.88)
+                gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
+                omega = math.sqrt(eff_h**2 + eff_v**2) / gyro_scale
+                self.gyro_moving_envelope = 0.88 * self.gyro_moving_envelope + 0.12 * omega
+                
+                # Dynamic Soft Deadzone: 
+                # Joy-Con has a base deadzone of 7.0 LSB when still, Pro Controller has 1.0 LSB.
+                # Calculations are in raw LSB units, while self.gyro_moving_envelope is in physical dps.
+                base_dz = 2.0 if self.is_joycon() else 1.0
+
+                # Decay deadzone to 0 quickly (at 3.0 dps) to prevent asymmetric deadzone subtraction during slow turnarounds
+                soft_dz = base_dz * (1.0 - min(1.0, self.gyro_moving_envelope / 3.0))
+                
                 eff_h_final = 0
                 if eff_h > soft_dz: eff_h_final = eff_h - soft_dz
                 elif eff_h < -soft_dz: eff_h_final = eff_h + soft_dz
@@ -1026,8 +1066,11 @@ class Controller:
                 if self.is_joycon_right() and self.hold_mode == "Horizontal":
                     v_sign = 1.0
                 
-                target_vx += eff_h_final * sensitivity * accel_factor
-                target_vy += eff_v_final * v_sign * sensitivity * accel_factor 
+                # Decoupled gyro mouse movement with 20ms click stabilization
+                # Bypasses gyro coordinate changes for 20ms after click press-down to eliminate finger shake.
+                if (now - getattr(self, "last_click_event_time", 0.0)) >= 0.02:
+                    target_vx += eff_h_final * sensitivity * accel_factor
+                    target_vy += eff_v_final * v_sign * sensitivity * accel_factor 
             elif current_mode == "Roll":
                 ax, ay, az = inputData.accelerometer
                 

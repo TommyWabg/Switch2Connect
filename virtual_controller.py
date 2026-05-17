@@ -117,6 +117,19 @@ class VirtualController:
             if addr in CONFIG.joycon_hold_mode:
                 self.hold_mode = CONFIG.joycon_hold_mode[addr]
                 logger.info(f"Loaded hold mode '{self.hold_mode}' for Joy-Con {addr}")
+        elif len(self.controllers) == 2:
+            left_mac = None
+            right_mac = None
+            for c in self.controllers:
+                if c.is_joycon_left():
+                    left_mac = c.device.address
+                elif c.is_joycon_right():
+                    right_mac = c.device.address
+            if left_mac and right_mac:
+                key = f"{left_mac}+{right_mac}"
+                if key in CONFIG.merged_gyro_side:
+                    self.active_gyro_side = CONFIG.merged_gyro_side[key]
+                    logger.info(f"Loaded merged active gyro side '{self.active_gyro_side}' for combination {key}")
         
         # Reset Gyro Mouse state to prevent leftover state after Split/Merge
         controller.gyro_mouse_enabled = False

@@ -10,7 +10,7 @@ import logging
 import asyncio
 import os
 import ctypes
-from controller import Controller
+from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
 from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS
 from virtual_controller import VirtualController
@@ -121,9 +121,46 @@ class PlayerInfoBlock:
         self.controller_label = None
         self.player_led_label = None
         self.current_vc = None
+        self.mag_btn_single = None
+        self.mag_frame_single = None
+        self.mag_btn_l = None
+        self.mag_frame_l = None
+        self.mag_btn_r = None
+        self.mag_frame_r = None
 
         self.load_pictures()
         self.init_interface()
+
+    def get_left_controller(self):
+        if self.current_vc is None: return None
+        for c in self.current_vc.controllers:
+            if c.is_joycon_left():
+                return c
+        return None
+
+    def get_right_controller(self):
+        if self.current_vc is None: return None
+        for c in self.current_vc.controllers:
+            if c.is_joycon_right():
+                return c
+        return None
+
+    def get_single_controller(self):
+        if self.current_vc is None or not self.current_vc.controllers: return None
+        return self.current_vc.controllers[0]
+
+    def _on_mag_clicked(self, controller, btn, frame):
+        if controller is None: return
+        if not getattr(controller, 'is_mag_calibrating', False):
+            controller.start_mag_calibration()
+            btn.config(text="Stop Cal", fg="white")
+            frame.config(bg="#FF8C00")
+            btn.pack(padx=2, pady=2)
+        else:
+            controller.stop_mag_calibration()
+            btn.config(text="Mag Cal", fg="white")
+            frame.config(bg=button_gray)
+            btn.pack(padx=2, pady=2)
 
     def _on_split_clicked(self):
         if self.current_vc is not None:
@@ -188,6 +225,18 @@ class PlayerInfoBlock:
     def _on_gyro_side_toggled(self, val):
         if self.current_vc is not None:
             self.current_vc.active_gyro_side = val
+            if not self.current_vc.is_single() and len(self.current_vc.controllers) == 2:
+                left_mac = None
+                right_mac = None
+                for c in self.current_vc.controllers:
+                    if c.is_joycon_left():
+                        left_mac = c.device.address
+                    elif c.is_joycon_right():
+                        right_mac = c.device.address
+                if left_mac and right_mac:
+                    key = f"{left_mac}+{right_mac}"
+                    CONFIG.merged_gyro_side[key] = val
+                    CONFIG.save_config()
             self.window.update(list(VIRTUAL_CONTROLLERS))
 
     def _update_controller_image(self):
@@ -216,11 +265,93 @@ class PlayerInfoBlock:
         self.controller_label = None
         self.player_led_label = None
 
+    async def _disconnect_merged_sequential(self, vc):
+        async with vc._disconnect_lock:
+            if not getattr(vc, 'running', False) and vc.vg_controller is None and not vc.controllers:
+                return
+                
+            vc.running = False
+            import time
+            import gc
+            current_time = time.strftime("%H:%M:%S")
+            logger.info(f"[{current_time}] Player {vc.player_number} (Merged): Starting safe sequential disconnect sequence...")
+            
+            # Wait for the update thread to finish before proceeding with handle cleanup
+            if hasattr(vc, 'update_thread') and vc.update_thread.is_alive():
+                logger.info(f"Player {vc.player_number}: Waiting for update thread to exit...")
+                vc.update_thread.join(timeout=0.5)
+                if vc.update_thread.is_alive():
+                    logger.warning(f"Player {vc.player_number}: Update thread did not exit in time!")
+            
+            if not vc.controllers and vc.vg_controller is None:
+                return
+
+            logger.info(f"Player {vc.player_number}: Cleaning up virtual device and physical connections sequentially...")
+            
+            with vc.state_lock:
+                if hasattr(vc, 'vg_controller') and vc.vg_controller is not None:
+                    logger.info(f"Player {vc.player_number}: Unregistering notifications and clearing vg_controller")
+                    try:
+                        vc.vg_controller.unregister_notification()
+                    except Exception as e:
+                        logger.debug(f"Unregister notification failed: {e}")
+                    vc.vg_controller = None
+            
+            gc.collect()
+            
+            # Disconnect each physical controller sequentially with a delay to prevent Windows BLE driver bottlenecks
+            for c in list(vc.controllers):
+                c.interp_running = False
+                if hasattr(c, 'interp_thread') and c.interp_thread.is_alive():
+                    logger.info(f"Controller {c.device.address}: Joining interpolation thread (non-blocking)...")
+                    try:
+                        await asyncio.to_thread(c.interp_thread.join, 0.5)
+                    except Exception as e:
+                        logger.warning(f"Failed to join interpolation thread: {e}")
+                        
+                if hasattr(c, 'client') and c.client and c.client.is_connected:
+                    logger.info(f"Safe Disconnect: Disconnecting {c.device.address}...")
+                    try:
+                        await c.client.stop_notify(INPUT_REPORT_UUID)
+                    except Exception:
+                        pass
+                    try:
+                        await c.client.stop_notify(COMMAND_RESPONSE_UUID)
+                    except Exception:
+                        pass
+                        
+                    try:
+                        await asyncio.wait_for(c.client.disconnect(), timeout=2.5)
+                    except Exception as e:
+                        logger.debug(f"Bluetooth disconnect error (ignored): {e}")
+                        
+                # Call the disconnect callback while c.client is still not None to completely avoid AttributeError
+                if vc.on_disconnected_callback:
+                    try:
+                        await vc.on_disconnected_callback(c)
+                    except Exception as e:
+                        logger.error(f"Error in on_disconnected_callback: {e}")
+                        
+                c.client = None
+                await asyncio.sleep(0.3)
+                
+            vc.controllers.clear()
+            logger.info(f"Player {vc.player_number} (Merged): Safe sequential disconnect complete.")
+
     def _on_close_clicked(self):
         if self.current_vc is not None:
             if hasattr(self, 'close_btn') and self.close_btn:
                 self.close_btn.config(state=tk.DISABLED)
-            self.current_vc.trigger_disconnect()
+            
+            if not self.current_vc.is_single():
+                # Merge mode close button: run the highly safe sequential disconnect
+                if self.current_vc.loop and self.current_vc.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self._disconnect_merged_sequential(self.current_vc), self.current_vc.loop)
+                else:
+                    logger.error("Event loop not found or not running for merged controller.")
+            else:
+                # Single mode: standard trigger disconnect
+                self.current_vc.trigger_disconnect()
 
     def load_pictures(self):
         self.joycon2leftandright = tk.PhotoImage(file=get_resource("images/joycon2leftandright.png"))
@@ -239,7 +370,7 @@ class PlayerInfoBlock:
         self.player_leds = {nb: tk.PhotoImage(file=get_resource(f"images/player{nb}.png")) for nb in range(1,5)}
 
     def clearControllerInfo(self):
-        for attr in ['controller_label', 'player_led_label', 'close_btn', 'split_btn', 'split_frame', 'merge_btn', 'merge_frame', 'mode_switch', 'gyro_btn_l', 'gyro_btn_r', 'gyro_frame_l', 'gyro_frame_r', 'vibrate_btn', 'vibrate_frame', 'player_row', 'battery_label', 'battery_label2']:
+        for attr in ['controller_label', 'player_led_label', 'close_btn', 'split_btn', 'split_frame', 'merge_btn', 'merge_frame', 'mode_switch', 'gyro_btn_l', 'gyro_btn_r', 'gyro_frame_l', 'gyro_frame_r', 'vibrate_btn', 'vibrate_frame', 'player_row', 'battery_label', 'battery_label2', 'mag_btn_single', 'mag_frame_single', 'mag_btn_l', 'mag_frame_l', 'mag_btn_r', 'mag_frame_r']:
             widget = getattr(self, attr, None)
             if widget is not None:
                 if attr in ['controller_label', 'player_row']: widget.pack_forget()
@@ -271,6 +402,28 @@ class PlayerInfoBlock:
             self.battery_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
             if virtualController.controllers: self.battery_label.config(image=self.get_image_for_battery_level(virtualController.controllers[0]))
             if getattr(self, 'battery_label2', None): self.battery_label2.place_forget()
+
+            if getattr(self, 'mag_frame_l', None): self.mag_frame_l.place_forget()
+            if getattr(self, 'mag_frame_r', None): self.mag_frame_r.place_forget()
+
+            c = self.get_single_controller()
+            if c is not None:
+                if not getattr(self, 'mag_btn_single', None):
+                    self.mag_frame_single = tk.Frame(self.controllers_frame, bg=button_gray)
+                    self.mag_btn_single = tk.Button(self.mag_frame_single, text="Mag Cal", font=("Arial", 8, "bold"), bd=0, relief=tk.FLAT, highlightthickness=0,
+                                                    command=lambda: self._on_mag_clicked(self.get_single_controller(), self.mag_btn_single, self.mag_frame_single))
+                    self.mag_btn_single.pack()
+                
+                if getattr(c, 'is_mag_calibrating', False):
+                    self.mag_btn_single.config(text="Stop Cal", bg=button_gray, fg="white")
+                    self.mag_frame_single.config(bg="#FF8C00")
+                else:
+                    self.mag_btn_single.config(text="Mag Cal", bg=button_gray, fg="white")
+                    self.mag_frame_single.config(bg=button_gray)
+                self.mag_btn_single.pack(padx=2, pady=2)
+                self.mag_frame_single.place(x=140, y=125)
+            else:
+                if getattr(self, 'mag_frame_single', None): self.mag_frame_single.place_forget()
         else:
             if not getattr(self, 'battery_label', None): self.battery_label = tk.Label(self.battery_frame, bg=block_color)
             if not getattr(self, 'battery_label2', None): self.battery_label2 = tk.Label(self.battery_frame, bg=block_color)
@@ -278,6 +431,46 @@ class PlayerInfoBlock:
             if len(virtualController.controllers) > 0: self.battery_label.config(image=self.get_image_for_battery_level(virtualController.controllers[0]))
             self.battery_label2.place(relx=0.6, rely=0.5, anchor=tk.CENTER)
             if len(virtualController.controllers) > 1: self.battery_label2.config(image=self.get_image_for_battery_level(virtualController.controllers[1]))
+
+            if getattr(self, 'mag_frame_single', None): self.mag_frame_single.place_forget()
+
+            lc = self.get_left_controller()
+            if lc is not None:
+                if not getattr(self, 'mag_btn_l', None):
+                    self.mag_frame_l = tk.Frame(self.controllers_frame, bg=button_gray)
+                    self.mag_btn_l = tk.Button(self.mag_frame_l, text="Mag Cal", font=("Arial", 8, "bold"), bd=0, relief=tk.FLAT, highlightthickness=0,
+                                                command=lambda: self._on_mag_clicked(self.get_left_controller(), self.mag_btn_l, self.mag_frame_l))
+                    self.mag_btn_l.pack()
+                
+                if getattr(lc, 'is_mag_calibrating', False):
+                    self.mag_btn_l.config(text="Stop Cal", bg=button_gray, fg="white")
+                    self.mag_frame_l.config(bg="#FF8C00")
+                else:
+                    self.mag_btn_l.config(text="Mag Cal", bg=button_gray, fg="white")
+                    self.mag_frame_l.config(bg=button_gray)
+                self.mag_btn_l.pack(padx=2, pady=2)
+                self.mag_frame_l.place(x=5, y=125)
+            else:
+                if getattr(self, 'mag_frame_l', None): self.mag_frame_l.place_forget()
+
+            rc = self.get_right_controller()
+            if rc is not None:
+                if not getattr(self, 'mag_btn_r', None):
+                    self.mag_frame_r = tk.Frame(self.controllers_frame, bg=button_gray)
+                    self.mag_btn_r = tk.Button(self.mag_frame_r, text="Mag Cal", font=("Arial", 8, "bold"), bd=0, relief=tk.FLAT, highlightthickness=0,
+                                                command=lambda: self._on_mag_clicked(self.get_right_controller(), self.mag_btn_r, self.mag_frame_r))
+                    self.mag_btn_r.pack()
+                
+                if getattr(rc, 'is_mag_calibrating', False):
+                    self.mag_btn_r.config(text="Stop Cal", bg=button_gray, fg="white")
+                    self.mag_frame_r.config(bg="#FF8C00")
+                else:
+                    self.mag_btn_r.config(text="Mag Cal", bg=button_gray, fg="white")
+                    self.mag_frame_r.config(bg=button_gray)
+                self.mag_btn_r.pack(padx=2, pady=2)
+                self.mag_frame_r.place(x=140, y=125)
+            else:
+                if getattr(self, 'mag_frame_r', None): self.mag_frame_r.place_forget()
 
         global pending_merge_vc_index
         if not virtualController.is_single():
@@ -358,7 +551,7 @@ class PlayerInfoBlock:
             self.player_row.pack_propagate(False)
             self.player_led_label = tk.Label(self.player_row, bg=player_number_bg_color)
             self.vibrate_frame = tk.Frame(self.player_row, bg=button_gray)
-            self.vibrate_btn = tk.Button(self.vibrate_frame, text="Vibrate", bg=button_gray, fg="white", bd=0, relief=tk.FLAT, font=("Arial", 9, "bold"), width=6, command=self._on_vibrate_clicked)
+            self.vibrate_btn = tk.Button(self.vibrate_frame, text="Ping", bg=button_gray, fg="white", bd=0, relief=tk.FLAT, font=("Arial", 9, "bold"), width=6, command=self._on_vibrate_clicked)
             self.vibrate_btn.pack(padx=2, pady=2)
         self.player_row.pack(pady=10)
         self.player_led_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
@@ -490,30 +683,32 @@ class ControllerWindow:
         self.sens_scale.set(CONFIG.gyro_sensitivity)
         self.sens_scale.grid(row=0, column=4)
 
-        self.calib_frame = tk.Frame(self.gyro_frame, bg=button_gray)
-        self.calib_frame.grid(row=0, column=5, padx=(20, 5), sticky="ew")
+        self.gyro_calib_group_frame = tk.Frame(self.gyro_frame, bg=background_color)
+        self.gyro_calib_group_frame.grid(row=0, column=5, columnspan=2, padx=(20, 5), sticky="w")
+
+        self.calib_frame = tk.Frame(self.gyro_calib_group_frame, bg=button_gray)
+        self.calib_frame.pack(side=tk.LEFT)
         self.calibrate_btn = tk.Button(self.calib_frame, text="Calibrate Gyro", command=self.on_calibrate_clicked, bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=("Arial", 12, "bold"))
         self.calibrate_btn.pack(padx=2, pady=2)
 
-        tk.Label(self.gyro_frame, text="Keep controller stationary\nbefore calibrating.", bg=background_color, fg=text_color, font=("Arial", 12, "bold"), justify=tk.LEFT).grid(row=0, column=6, padx=5, sticky="w")
-
-        self.mag_calib_frame = tk.Frame(self.gyro_frame, bg=button_gray)
-        self.mag_calib_frame.grid(row=1, column=5, padx=(20, 5), pady=(10, 0), sticky="ew")
-        self.mag_calibrate_btn = tk.Button(self.mag_calib_frame, text="Calibrate Mag", command=self.on_mag_calibrate_clicked, bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=("Arial", 12, "bold"))
-        self.mag_calibrate_btn.pack(padx=2, pady=2)
+        self.calib_hint_label = tk.Label(self.gyro_calib_group_frame, text="Keep controller stationary\nbefore calibrating.", bg=background_color, fg=text_color, font=("Arial", 12, "bold"), justify=tk.LEFT)
+        self.calib_hint_label.pack(side=tk.LEFT, padx=10)
 
         mag_hint_frame = tk.Frame(self.gyro_frame, bg=background_color)
-        mag_hint_frame.grid(row=1, column=6, padx=5, pady=(10, 0), sticky="w")
+        mag_hint_frame.grid(row=1, column=5, columnspan=2, padx=(20, 5), pady=(10, 0), sticky="w")
         
         l1 = tk.Frame(mag_hint_frame, bg=background_color)
         l1.pack(side=tk.TOP, anchor="w")
+        tk.Label(l1, text="Calibrate Mag (Mag Cal): Move controller in a", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT)
+
+        l2 = tk.Frame(mag_hint_frame, bg=background_color)
+        l2.pack(side=tk.TOP, anchor="w")
         
-        tk.Label(l1, text="Move controller in a ", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT)
-        lnk = tk.Label(l1, text="'figure 8'", bg=background_color, fg=highlight_color, font=("Arial", 12, "bold", "underline"), cursor="hand2")
+        lnk = tk.Label(l2, text="'figure 8'", bg=background_color, fg=highlight_color, font=("Arial", 12, "bold", "underline"), cursor="hand2")
         lnk.pack(side=tk.LEFT)
         lnk.bind("<Button-1>", lambda e: (logger.info(f"Opening YouTube link via webbrowser..."), webbrowser.open("https://youtu.be/J_cZnPcW-Yw?si=ID2vdzURiOph8x77&t=6")))
         
-        tk.Label(mag_hint_frame, text="pattern during calibration.", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.TOP, anchor="w")
+        tk.Label(l2, text=" pattern during calibration.", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT)
 
         tk.Label(self.gyro_frame, text="Activation:", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).grid(row=1, column=0, padx=5, pady=(10, 0), sticky="e")
         self.gyro_act_switch = ToggleSwitch(self.gyro_frame, labels=["Toggle", "Hold"], values=["Toggle", "Hold"], initial_value=CONFIG.gyro_activation_mode, command=self.update_act_setting, bg_color=background_color)
@@ -522,6 +717,7 @@ class ControllerWindow:
         self.stick_scale = tk.Scale(self.gyro_frame, from_=0, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=120, bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=15, width=15, font=("Arial", 12, "bold"), command=self.on_gyro_setting_changed)
         self.stick_scale.set(getattr(CONFIG, "stick_mouse_sensitivity", 5.0))
         self.stick_scale.grid(row=1, column=4, columnspan=1, pady=(10, 0), sticky="w")
+
 
     def update_mode_setting(self, val):
         CONFIG.gyro_mode = val
@@ -551,6 +747,8 @@ class ControllerWindow:
         except Exception as e: logger.error(f"Failed to save mouse sensitivity: {e}")
 
     def on_gyro_setting_changed(self, *args):
+        if not hasattr(self, 'sens_scale') or not hasattr(self, 'stick_scale'):
+            return
         CONFIG.gyro_sensitivity = float(self.sens_scale.get())
         CONFIG.stick_mouse_sensitivity = float(self.stick_scale.get())
         try:
@@ -571,20 +769,7 @@ class ControllerWindow:
         self.root.after(1000, lambda: self.calibrate_btn.config(text="Calibrating (1..)", fg="#ffffff", disabledforeground="#ffffff"))
         self.root.after(2000, lambda: (self.calibrate_btn.config(state=tk.NORMAL, text="Calibration Done"), self.calib_frame.config(bg=button_gray), self.calibrate_btn.pack(padx=2, pady=2)))
 
-    def on_mag_calibrate_clicked(self):
-        if not hasattr(self, 'current_controllers') or self.no_controllers: return
-        if not getattr(self, 'is_mag_calibrating_ui', False):
-            self.is_mag_calibrating_ui = True
-            for vc in self.current_controllers:
-                if vc is not None: vc.start_mag_calibration()
-            self.mag_calibrate_btn.config(text="Stop Mag Calib", fg="#ffffff")
-            self.mag_calib_frame.config(bg="#ff8c00"); self.mag_calibrate_btn.pack(padx=1, pady=2)
-        else:
-            self.is_mag_calibrating_ui = False
-            for vc in self.current_controllers:
-                if vc is not None: vc.stop_mag_calibration()
-            self.mag_calibrate_btn.config(text="Calibrate Mag", fg=text_color)
-            self.mag_calib_frame.config(bg=button_gray); self.mag_calibrate_btn.pack(padx=2, pady=2)
+
 
     def init_settings_panel(self):
         self.settings_frame = tk.Frame(self.root, bg=background_color)
@@ -723,7 +908,7 @@ class ControllerWindow:
 
     def on_quit(self):
         if getattr(self, 'is_cleaning_up', False): return
-        self.is_cleaning_up = True; set_shutting_down(True); self.root.withdraw()
+        self.is_cleaning_up = True; self.is_quitting = True; set_shutting_down(True); self.root.withdraw()
         if hasattr(self, 'tray_icon') and self.tray_icon:
             try: self.tray_icon.stop()
             except: pass
@@ -837,7 +1022,11 @@ class ControllerWindow:
         self.is_quitting = False
         def callback(vcs):
             if not getattr(self, 'is_quitting', False):
-                self.message_queue.put(vcs); self.root.event_generate(CONTROLLER_UPDATED_EVENT)
+                try:
+                    self.message_queue.put(vcs)
+                    self.root.event_generate(CONTROLLER_UPDATED_EVENT)
+                except Exception as e:
+                    logger.debug(f"Ignored Tkinter event generation error: {e}")
         self.discoverer_callback = callback
         self.root.bind(CONTROLLER_UPDATED_EVENT, lambda e: self.update(self.message_queue.get()))
         t = threading.Thread(target=start_discoverer, args=(callback, self.quit_event), daemon=True); t.start()
