@@ -111,6 +111,12 @@ class VirtualController:
     async def init_added_controller(self, controller: Controller):
         self.loop = asyncio.get_running_loop()
         await self.update_leds()
+
+        if self.is_single() and controller.is_joycon():
+            addr = controller.device.address
+            if addr in CONFIG.joycon_hold_mode:
+                self.hold_mode = CONFIG.joycon_hold_mode[addr]
+                logger.info(f"Loaded hold mode '{self.hold_mode}' for Joy-Con {addr}")
         
         # Reset Gyro Mouse state to prevent leftover state after Split/Merge
         controller.gyro_mouse_enabled = False

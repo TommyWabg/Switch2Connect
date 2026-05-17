@@ -14,8 +14,24 @@ def decodeu(data: bytes):
 def decodes(data: bytes):
     return int.from_bytes(data, byteorder='little', signed=True)
 
+_CACHED_LOCAL_MAC_VALUE = None
+
 def convert_mac_string_to_value(mac: str):
-    return int.from_bytes(bytes([int(b, 16) for b in mac.split(":")]), 'big')
+    # Handle colons, dashes, and spaces robustly and convert to integer
+    cleaned = mac.replace(":", "").replace("-", "").strip()
+    return int(cleaned, 16)
+
+def get_local_mac_value():
+    global _CACHED_LOCAL_MAC_VALUE
+    if _CACHED_LOCAL_MAC_VALUE is not None:
+        return _CACHED_LOCAL_MAC_VALUE
+    
+    import bluetooth
+    addr_info = bluetooth.read_local_bdaddr()
+    if addr_info and len(addr_info) > 0:
+        _CACHED_LOCAL_MAC_VALUE = convert_mac_string_to_value(addr_info[0])
+        return _CACHED_LOCAL_MAC_VALUE
+    raise RuntimeError("No local Bluetooth adapter found or Bluetooth is disabled.")
 
 def get_stick_xy(data: bytes):
     """Convert 3 bytes containing stick x y values into these values"""

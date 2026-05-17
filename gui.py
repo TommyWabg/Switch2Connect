@@ -176,6 +176,14 @@ class PlayerInfoBlock:
         if self.current_vc is not None:
             self.current_vc.hold_mode = val
             self._update_controller_image()
+            
+            # Save hold mode mapped by MAC address for single joycons
+            if self.current_vc.is_single() and len(self.current_vc.controllers) > 0:
+                c = self.current_vc.controllers[0]
+                if c.is_joycon():
+                    addr = c.device.address
+                    CONFIG.joycon_hold_mode[addr] = val
+                    CONFIG.save_config()
 
     def _on_gyro_side_toggled(self, val):
         if self.current_vc is not None:
@@ -302,7 +310,7 @@ class PlayerInfoBlock:
             self.gyro_btn_r.pack(padx=2, pady=2)
             for b in [self.gyro_btn_l, self.gyro_btn_r]: b.config(bg=button_gray, fg="#FFFFFF")
         else:
-            if getattr(self, 'split_btn', None): self.split_btn.place_forget()
+            if getattr(self, 'split_frame', None): self.split_frame.place_forget()
             if getattr(self, 'gyro_btn_l', None):
                 self.gyro_frame_l.place_forget()
                 self.gyro_frame_r.place_forget()
@@ -728,12 +736,18 @@ class ControllerWindow:
                             if hasattr(vc, 'vg_controller') and vc.vg_controller:
                                 try: vc.vg_controller.unregister_notification()
                                 except: pass
-                            for c in vc.controllers:
-                                if c.client and c.client.is_connected: await c.disconnect(); await asyncio.sleep(0.3)
+                            for c in vc.controllers[:]:
+                                if c.client and c.client.is_connected: 
+                                    await c.disconnect()
+                                    await asyncio.sleep(0.3)
                         await asyncio.sleep(3.5)
+                    
                     fut = asyncio.run_coroutine_threadsafe(disconnect(), vcs[0].loop)
-                    try: fut.result(timeout=5.5)
-                    except: pass
+                    try:
+                        # Increased timeout protection to 20 seconds to ensure clean sequential shutdown for 3+ controllers
+                        fut.result(timeout=20.0)
+                    except:
+                        pass
             except: pass
             finally: self.root.after(0, lambda: (self.root.destroy(), os._exit(0)))
         threading.Thread(target=cleanup, daemon=True).start()

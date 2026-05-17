@@ -74,38 +74,49 @@ buttons:
 c_mapping: None
 calibration_data:
   E0:EF:BF:81:06:9F:
-  - 5.92
-  - -13.96
-  - -0.256
+  - 6.069767441860465
+  - -14.046511627906977
+  - -0.13953488372093023
   E0:EF:BF:EF:CC:BD:
-  - 2.576
-  - -11.808
-  - 9.624
+  - 2.558139534883721
+  - -10.914728682170542
+  - 9.744186046511627
   E0:EF:BF:F0:0E:17:
-  - -2.2635658914728682
-  - 1.054263565891473
-  - 3.9224806201550386
+  - -2.37984496124031
+  - -0.4883720930232558
+  - 2.751937984496124
 combine_joycons: true
 controller_mode: Xbox
 deadzone: 50
 gl_mapping: PSTPAD_L
 gr_mapping: PSTPAD_R
 gyro_activation_mode: Hold
-gyro_bias:
-- 5.689655172413793
-- -13.310344827586206
-- -0.4482758620689655
 gyro_bias_l:
-- -2.2635658914728682
-- 1.054263565891473
-- 3.9224806201550386
+- -2.37984496124031
+- -0.4883720930232558
+- 2.751937984496124
 gyro_bias_r:
-- 2.576
-- -11.808
-- 9.624
+- 6.069767441860465
+- -14.046511627906977
+- -0.13953488372093023
 gyro_mode: World
 gyro_sensitivity: 4.0
-mag_calibration_data: {}
+joycon_hold_mode:
+  E0:EF:BF:EF:CC:BD: Vertical
+  E0:EF:BF:F0:0E:17: Vertical
+mag_calibration_data:
+  E0:EF:BF:81:06:9F:
+  - 174.0
+  - 155.0
+  - 2.0
+  E0:EF:BF:EF:CC:BD:
+  - -239.5
+  - 5.5
+  - -474.0
+  E0:EF:BF:F0:0E:17:
+  - -0.5
+  - -0.5
+  - -0.5
 mouse:
   buttons:
     left_joycon:
@@ -128,3 +139,4 @@ stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
+theme_mode: Dark

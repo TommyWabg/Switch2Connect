@@ -191,6 +191,7 @@ class Config:
         # MAC address -> Calibration data mapping dictionary
         self.calibration_data = config.get("calibration_data", {}) or {}
         self.mag_calibration_data = config.get("mag_calibration_data", {}) or {}
+        self.joycon_hold_mode = config.get("joycon_hold_mode", {}) or {}
         
         self.simulation_mode = config.get("simulation_mode", "Xbox")
         self.open_when_startup = config.get("open_when_startup", False)
@@ -227,6 +228,7 @@ class Config:
             data['stick_r_bias'] = self.stick_r_bias
             data['calibration_data'] = self.calibration_data
             data['mag_calibration_data'] = self.mag_calibration_data
+            data['joycon_hold_mode'] = self.joycon_hold_mode
             
             if 'mouse' not in data:
                 data['mouse'] = {}

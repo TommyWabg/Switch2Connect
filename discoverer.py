@@ -54,8 +54,40 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
         UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
     
     try:
-        host_mac_value = convert_mac_string_to_value(bluetooth.read_local_bdaddr()[0])
+        host_mac_value = None
         connected_mac_addresses: list[str] = []
+        
+        # Robust retry loop to wait for Windows Bluetooth service and BLE stack to initialize (critical for startup)
+        bluetooth_initialized = False
+        retries = 15
+        for attempt in range(retries):
+            if quit_event.is_set():
+                logger.info("Quit event set during Bluetooth initialization. Aborting discovery.")
+                with DISCOVERY_LOCK:
+                    _CURRENTLY_DISCOVERING = False
+                return
+            
+            try:
+                from utils import get_local_mac_value
+                host_mac_value = get_local_mac_value()
+                
+                # Test scanner initialization to verify WinRT stack is ready
+                scanner = BleakScanner()
+                
+                bluetooth_initialized = True
+                logger.info(f"Bluetooth adapter and stack initialized successfully. Host MAC: {host_mac_value}")
+                break
+            except Exception as e:
+                logger.warning(f"Waiting for Bluetooth adapter/stack initialization (attempt {attempt + 1}/{retries}): {e}")
+                await asyncio.sleep(2.0)
+
+        if not bluetooth_initialized:
+            logger.error("Bluetooth adapter/stack failed to initialize after multiple attempts. Discovery aborted.")
+            with DISCOVERY_LOCK:
+                _CURRENTLY_DISCOVERING = False
+            return
+
+        lock = asyncio.Lock()
 
         async def disconnected_controller(controller: Controller):
             logger.info(f"Controller disconected {controller.client.address}")
@@ -63,9 +95,10 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             if controller.client.address in connected_mac_addresses:
                 connected_mac_addresses.remove(controller.client.address)
                 
-            for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
-                if vc is not None and await vc.remove_controller(controller):
-                    VIRTUAL_CONTROLLERS[i] = None
+            async with lock:
+                for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
+                    if vc is not None and await vc.remove_controller(controller):
+                        VIRTUAL_CONTROLLERS[i] = None
             
             if IS_SHUTTING_DOWN or _IS_SUSPENDING:
                 return
@@ -78,7 +111,6 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             await update_all_player_leds()
 
         DISCONNECT_CALLBACK = disconnected_controller
-        lock = asyncio.Lock()
 
         async def add_controller(device: BLEDevice, paired: bool):
             try:
@@ -90,8 +122,7 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     logger.info(f"Paired successfully to {device.address}")
 
                 virtual_controller = None
-                await lock.acquire()
-                try:
+                async with lock:
                     if CONFIG.combine_joycons and not controller.side_buttons_pressed:
                         if controller.is_joycon_left():
                             virtual_controller = next(filter(lambda vc: vc is not None and vc.is_single_joycon_right(), VIRTUAL_CONTROLLERS), None)
@@ -102,15 +133,8 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                         slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
                         virtual_controller = VirtualController(slot_index + 1, disconnected_controller)
                         VIRTUAL_CONTROLLERS[slot_index] = virtual_controller
-                    else:
-                        # Re-using or replacing: Ensure old one is fully disconnected if it exists
-                        # (Especially important if we kept it alive during sleep)
-                        if isinstance(virtual_controller, VirtualController):
-                             await virtual_controller.disconnect(is_suspending=False)
                     
                     virtual_controller.add_controller(controller)
-                finally:
-                    lock.release()
                 
                 await virtual_controller.init_added_controller(controller)
                 

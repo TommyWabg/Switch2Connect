@@ -536,7 +536,8 @@ class Controller:
         return StickCalibrationData(calibration_data_1), StickCalibrationData(calibration_data_2)
 
     async def pair(self):
-        mac_value = convert_mac_string_to_value(bluetooth.read_local_bdaddr()[0])
+        from utils import get_local_mac_value
+        mac_value = get_local_mac_value()
         await self.write_command(COMMAND_PAIR, SUBCOMMAND_PAIR_SET_MAC,b"\x00\x02" +  mac_value.to_bytes(6, 'little') + mac_value.to_bytes(6, 'little'))
         ltk1 = bytes([0x00, 0xea, 0xbd, 0x47, 0x13, 0x89, 0x35, 0x42, 0xc6, 0x79, 0xee, 0x07, 0xf2, 0x53, 0x2c, 0x6c, 0x31])
         await self.write_command(COMMAND_PAIR, SUBCOMMAND_PAIR_LTK1, ltk1)
