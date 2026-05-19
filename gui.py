@@ -645,25 +645,38 @@ class ControllerWindow:
         self.power_listener = PowerListener(self.handle_power_event)
 
     def check_driver_installation(self):
-        if getattr(CONFIG, 'driver_installed', False):
-            return
-            
-        import winreg
+        import subprocess
+        
         driver_exists = False
         try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
-            winreg.CloseKey(key)
-            driver_exists = True
-        except FileNotFoundError:
-            pass
+            result = subprocess.run(
+                ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            if result.returncode == 0 and "Instance ID:" in result.stdout:
+                driver_exists = True
+        except Exception as e:
+            logger.error(f"Error checking driver installation via pnputil: {e}")
+            import winreg
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
+                winreg.CloseKey(key)
+                driver_exists = True
+            except FileNotFoundError:
+                pass
             
         if driver_exists:
-            CONFIG.driver_installed = True
-            CONFIG.save_config()
+            if not getattr(CONFIG, 'driver_installed', False):
+                CONFIG.driver_installed = True
+                CONFIG.save_config()
             return
             
+        CONFIG.driver_installed = False
+        CONFIG.save_config()
+        
         from tkinter import messagebox
-        import subprocess
         import sys
         import os
         
@@ -701,14 +714,25 @@ class ControllerWindow:
                         else:
                             progress_win.destroy()
                             
-                            import winreg
                             driver_installed_ok = False
                             try:
-                                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
-                                winreg.CloseKey(key)
-                                driver_installed_ok = True
-                            except FileNotFoundError:
-                                pass
+                                res = subprocess.run(
+                                    ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
+                                    capture_output=True,
+                                    text=True,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                                )
+                                if res.returncode == 0 and "Instance ID:" in res.stdout:
+                                    driver_installed_ok = True
+                            except Exception:
+                                # Fallback to registry check
+                                import winreg
+                                try:
+                                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
+                                    winreg.CloseKey(key)
+                                    driver_installed_ok = True
+                                except FileNotFoundError:
+                                    pass
                                 
                             if driver_installed_ok:
                                 CONFIG.driver_installed = True
@@ -725,6 +749,7 @@ class ControllerWindow:
                     messagebox.showerror("Error", f"Failed to start the installer: {e}")
             else:
                 messagebox.showerror("Error", "Could not find install.bat. Please verify the integrity of the application files.")
+
 
     def init_interface(self):
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Switch 2 Controllers')
