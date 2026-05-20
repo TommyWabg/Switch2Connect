@@ -1,1 +1,1 @@
-start python gui.py
+start python src/gui.py

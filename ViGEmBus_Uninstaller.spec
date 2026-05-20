@@ -1,21 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
-
-datas = [('resources', 'resources'), ('config.yaml', 'resources')]
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('vgamepad')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('imufusion')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['src/gui.py'],
-    pathex=['.'],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    ['src/uninstall_vigembus.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -31,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='gui',
+    name='ViGEmBus_Uninstaller',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -44,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='resources/images/icon.ico',
+    icon=['resources\\images\\icon.ico'],
 )

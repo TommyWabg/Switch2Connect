@@ -78,33 +78,34 @@ calibration_data:
   - -16.25
   - 0.12837837837837837
   E0:EF:BF:EF:CC:BD:
-  - 2.1607717041800645
-  - -10.620578778135048
-  - 8.70096463022508
+  - 2.0316455696202533
+  - -10.629746835443038
+  - 8.33860759493671
   E0:EF:BF:F0:0E:17:
-  - -2.0643776824034337
-  - -0.24034334763948498
-  - 3.7467811158798283
+  - -2.040625
+  - -0.35625
+  - 4.16875
 combine_joycons: true
 controller_mode: Xbox
 deadzone: 50
+driver_installed: true
 gl_mapping: PSTPAD_L
 gr_mapping: PSTPAD_R
 gyro_activation_mode: Hold
 gyro_bias_l:
-- -2.0643776824034337
-- -0.24034334763948498
-- 3.7467811158798283
+- -2.040625
+- -0.35625
+- 4.16875
 gyro_bias_r:
-- 5.952702702702703
-- -16.25
-- 0.12837837837837837
+- 2.0316455696202533
+- -10.629746835443038
+- 8.33860759493671
 gyro_click_stabilize_duration: 0.02
 gyro_click_stabilizer: true
 gyro_mode: World
 gyro_sensitivity: 3.0
 joycon_hold_mode:
-  E0:EF:BF:EF:CC:BD: Vertical
+  E0:EF:BF:EF:CC:BD: Horizontal
   E0:EF:BF:F0:0E:17: Vertical
 mag_calibration_data:
   AA:BB:CC:DD:EE:FF:
@@ -116,9 +117,9 @@ mag_calibration_data:
   - 98.0
   - 6.0
   E0:EF:BF:EF:CC:BD:
-  - -243.5
-  - 1.0
-  - -377.0
+  - -267.5
+  - 11.5
+  - -407.0
   E0:EF:BF:F0:0E:17:
   - -126.5
   - 253.0
