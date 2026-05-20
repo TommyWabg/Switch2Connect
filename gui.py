@@ -655,7 +655,7 @@ class ControllerWindow:
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
             )
-            if result.returncode == 0 and "Instance ID:" in result.stdout:
+            if result.returncode == 0 and "root\\winuhid" in result.stdout.lower():
                 driver_exists = True
         except Exception as e:
             logger.error(f"Error checking driver installation via pnputil: {e}")
@@ -677,8 +677,6 @@ class ControllerWindow:
         CONFIG.save_config()
         
         from tkinter import messagebox
-        import sys
-        import os
         
         answer = messagebox.askyesno(
             "Install Virtual Controller Driver",
@@ -686,69 +684,215 @@ class ControllerWindow:
         )
         
         if answer:
-            base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-            install_bat = os.path.join(base_path, "install.bat")
-            if os.path.exists(install_bat):
-                try:
-                    progress_win = tk.Toplevel(self.root)
-                    progress_win.title("Driver Installation")
-                    progress_win.geometry("450x130+150+150")
-                    progress_win.resizable(False, False)
-                    progress_win.config(bg="#1E1E1E")
-                    progress_win.transient(self.root)
-                    progress_win.grab_set()
-                    
-                    label = tk.Label(
-                        progress_win,
-                        text="Installing WinUHid Driver...\nPlease authorize the UAC prompt if asked.",
-                        fg="white", bg="#1E1E1E",
-                        font=("Arial", 11, "bold")
-                    )
-                    label.pack(pady=40)
-                    
-                    proc = subprocess.Popen(f'"{install_bat}"', shell=True)
-                    
-                    def check_process():
-                        if proc.poll() is None:
-                            progress_win.after(500, check_process)
-                        else:
-                            progress_win.destroy()
+            self.run_driver_install()
+
+    def run_driver_install(self):
+        import subprocess
+        import sys
+        import os
+        from tkinter import messagebox
+        
+        # Stop discoverer before installation
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+            
+        # Run emergency cleanup to close all virtual controller handles immediately
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        install_bat = os.path.join(base_path, "install.bat")
+        if os.path.exists(install_bat):
+            try:
+                progress_win = tk.Toplevel(self.root)
+                progress_win.title("Driver Installation")
+                progress_win.geometry("450x130+150+150")
+                progress_win.resizable(False, False)
+                progress_win.config(bg="#1E1E1E")
+                progress_win.transient(self.root)
+                progress_win.grab_set()
+                
+                label = tk.Label(
+                    progress_win,
+                    text="Installing WinUHid Driver...\nPlease authorize the UAC prompt if asked.",
+                    fg="white", bg="#1E1E1E",
+                    font=("Arial", 11, "bold")
+                )
+                label.pack(pady=40)
+                
+                proc = subprocess.Popen(f'"{install_bat}"', shell=True)
+                
+                def check_process():
+                    if proc.poll() is None:
+                        progress_win.after(500, check_process)
+                    else:
+                        progress_win.grab_release()
+                        progress_win.destroy()
                             
-                            driver_installed_ok = False
-                            try:
-                                res = subprocess.run(
-                                    ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
-                                    capture_output=True,
-                                    text=True,
-                                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                                )
-                                if res.returncode == 0 and "Instance ID:" in res.stdout:
-                                    driver_installed_ok = True
-                            except Exception:
-                                # Fallback to registry check
-                                import winreg
-                                try:
-                                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
-                                    winreg.CloseKey(key)
-                                    driver_installed_ok = True
-                                except FileNotFoundError:
-                                    pass
-                                
-                            if driver_installed_ok:
-                                CONFIG.driver_installed = True
-                                CONFIG.save_config()
-                            else:
-                                messagebox.showerror(
-                                    "Error",
-                                    "Driver installation was not completed or failed.\nSome emulator functions may not work."
-                                )
-                                
-                    progress_win.after(500, check_process)
-                    self.root.wait_window(progress_win)
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to start the installer: {e}")
-            else:
-                messagebox.showerror("Error", "Could not find install.bat. Please verify the integrity of the application files.")
+                progress_win.after(500, check_process)
+                self.root.wait_window(progress_win)
+                
+                # Now that progress_win is destroyed, its event grab is released
+                driver_installed_ok = False
+                try:
+                    res = subprocess.run(
+                        ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
+                        capture_output=True,
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                    )
+                    if res.returncode == 0 and "root\\winuhid" in res.stdout.lower():
+                        driver_installed_ok = True
+                except Exception:
+                    # Fallback to registry check
+                    import winreg
+                    try:
+                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
+                        winreg.CloseKey(key)
+                        driver_installed_ok = True
+                    except FileNotFoundError:
+                        pass
+                    
+                if driver_installed_ok:
+                    CONFIG.driver_installed = True
+                    CONFIG.save_config()
+                    messagebox.showinfo("Success", "WinUHid driver installed successfully.")
+                else:
+                    messagebox.showerror(
+                        "Error",
+                        "Driver installation was not completed or failed.\nSome emulator functions may not work."
+                    )
+                self.update_driver_button()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start the installer: {e}")
+        else:
+            messagebox.showerror("Error", "Could not find install.bat. Please verify the integrity of the application files.")
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
+
+    def run_driver_uninstall(self):
+        import subprocess
+        import sys
+        import os
+        from tkinter import messagebox
+        
+        # Stop discoverer before uninstallation
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+            
+        # Run emergency cleanup to close all virtual controller handles immediately
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        uninstall_bat = os.path.join(base_path, "uninstall.bat")
+        if os.path.exists(uninstall_bat):
+            try:
+                progress_win = tk.Toplevel(self.root)
+                progress_win.title("Driver Uninstallation")
+                progress_win.geometry("450x130+150+150")
+                progress_win.resizable(False, False)
+                progress_win.config(bg="#1E1E1E")
+                progress_win.transient(self.root)
+                progress_win.grab_set()
+                
+                label = tk.Label(
+                    progress_win,
+                    text="Uninstalling WinUHid Driver...\nPlease authorize the UAC prompt if asked.",
+                    fg="white", bg="#1E1E1E",
+                    font=("Arial", 11, "bold")
+                )
+                label.pack(pady=40)
+                
+                proc = subprocess.Popen(f'"{uninstall_bat}"', shell=True)
+                
+                def check_process():
+                    if proc.poll() is None:
+                        progress_win.after(500, check_process)
+                    else:
+                        progress_win.grab_release()
+                        progress_win.destroy()
+                            
+                progress_win.after(500, check_process)
+                self.root.wait_window(progress_win)
+                
+                # Now that progress_win is destroyed, its event grab is released
+                driver_removed_ok = True
+                try:
+                    res = subprocess.run(
+                        ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
+                        capture_output=True,
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                    )
+                    if res.returncode == 0 and "root\\winuhid" in res.stdout.lower():
+                        driver_removed_ok = False
+                except Exception:
+                    # Fallback to registry check
+                    import winreg
+                    try:
+                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
+                        winreg.CloseKey(key)
+                        driver_removed_ok = False
+                    except FileNotFoundError:
+                        pass
+                    
+                if driver_removed_ok:
+                    CONFIG.driver_installed = False
+                    CONFIG.save_config()
+                    messagebox.showinfo("Success", "WinUHid driver uninstalled successfully.")
+                else:
+                    messagebox.showerror(
+                        "Error",
+                        "Driver uninstallation failed or was cancelled."
+                    )
+                self.update_driver_button()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start the uninstaller: {e}")
+        else:
+            messagebox.showerror("Error", "Could not find uninstall.bat. Please verify the integrity of the application files.")
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
+
+    def stop_discoverer_thread(self):
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            logger.info("Stopping discoverer thread...")
+            self.quit_event.set()
+            self.discoverer_thread.join(timeout=5.0)
+            self.discoverer_thread = None
+
+    def start_discoverer_thread(self):
+        self.stop_discoverer_thread()
+        self.quit_event.clear()
+        
+        def run():
+            from discoverer import start_discoverer
+            start_discoverer(self.discoverer_callback, self.quit_event)
+            
+        logger.info("Starting discoverer thread...")
+        self.discoverer_thread = threading.Thread(target=run, daemon=True)
+        self.discoverer_thread.start()
+
+    def on_driver_btn_clicked(self):
+        if getattr(CONFIG, 'driver_installed', False):
+            from tkinter import messagebox
+            if messagebox.askyesno("Uninstall Driver", "Are you sure you want to uninstall the WinUHid driver?\n(Requires administrator privileges.)"):
+                self.run_driver_uninstall()
+        else:
+            self.run_driver_install()
+
+    def update_driver_button(self):
+        if not hasattr(self, 'driver_btn') or not self.driver_btn:
+            return
+        installed = getattr(CONFIG, 'driver_installed', False)
+        text = "Uninstall WinUHid Driver" if installed else "Install WinUHid Driver"
+        self.driver_btn.config(text=text)
 
 
     def init_interface(self):
@@ -842,6 +986,13 @@ class ControllerWindow:
         # New centralized button row above Gyro Settings
         self.top_btn_frame = tk.Frame(self.root, bg=background_color)
         self.top_btn_frame.pack(side=tk.BOTTOM, pady=(0, 5))
+
+        # Driver Install/Uninstall Button
+        self.driver_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
+        self.driver_frame.pack(side=tk.LEFT, padx=5)
+        self.driver_btn = tk.Button(self.driver_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=("Arial", 10, "bold"), command=self.on_driver_btn_clicked)
+        self.driver_btn.pack(padx=2, pady=2)
+        self.update_driver_button()
 
         # Startup Button
         self.startup_frame = tk.Frame(self.top_btn_frame, bg=highlight_color if CONFIG.open_when_startup else button_gray)
@@ -1289,8 +1440,7 @@ class ControllerWindow:
                         return
                         
                     logger.info("Restarting discovery loop...")
-                    from discoverer import start_discoverer
-                    start_discoverer(self.discoverer_callback, self.quit_event)
+                    self.start_discoverer_thread()
                 except Exception as e:
                     logger.error(f"Restart failed: {e}")
                 finally:
@@ -1309,7 +1459,7 @@ class ControllerWindow:
                     logger.debug(f"Ignored Tkinter event generation error: {e}")
         self.discoverer_callback = callback
         self.root.bind(CONTROLLER_UPDATED_EVENT, lambda e: self.update(self.message_queue.get()))
-        t = threading.Thread(target=start_discoverer, args=(callback, self.quit_event), daemon=True); t.start()
+        self.start_discoverer_thread()
         
         self.power_listener.start()
         

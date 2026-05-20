@@ -1,2 +1,2 @@
-python -m PyInstaller --onefile --windowed --clean --add-data "resources;resources" --add-data "config.yaml;resources" --collect-all vgamepad --collect-all imufusion --hidden-import imufusion --name "Switch2Controllers" --icon="resources/images/icon.ico" gui.py
+python -m PyInstaller --onefile --windowed --clean --add-binary "WinUHid.dll;." --add-binary "WinUHidDevs.dll;." --add-data "resources;resources" --add-data "config.yaml;resources" --add-data "WinUHid-main;WinUHid-main" --add-data "install_driver.ps1;." --add-data "install.bat;." --add-data "uninstall_driver.ps1;." --add-data "uninstall.bat;." --collect-all vgamepad --collect-all imufusion --hidden-import imufusion --name "Switch2Controllers" --icon="resources/images/icon.ico" gui.py
 pause

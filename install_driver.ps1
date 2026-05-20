@@ -31,10 +31,13 @@ $drivers = pnputil /enum-drivers
 $oldInfs = @()
 $currentInf = ""
 foreach ($line in $drivers) {
-    if ($line -match "Published Name:\s+(oem\d+\.inf)") {
-        $currentInf = $Matches[1]
+    if ($line -match "^\s*$") {
+        $currentInf = ""
     }
-    if ($line -match "Original Name:\s+winuhiddriver\.inf") {
+    elseif ($line -match "oem\d+\.inf") {
+        $currentInf = $Matches[0]
+    }
+    elseif ($line -match "winuhiddriver\.inf") {
         if ($currentInf) {
             $oldInfs += $currentInf
         }
