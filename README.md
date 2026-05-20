@@ -29,6 +29,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Interactive Controller Identification:** Added a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Added rumble feedback (including a connection confirmation rumble) and mapped the Capture button to native Windows screenshots (`Win + PrtScn`).
 * **One-Click Disconnect:** Added a convenient 'X' button to the top right of each connected controller's UI block. You can now manually disconnect specific controllers directly from the interface without needing to power them off physically.
+* **Dedicated UI Driver Controls:** Added an **Install/Uninstall WinUHid Driver** button to the left of the "Run At Startup" button.
 * **Run at Startup:** Added a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
 * **Hide to system tray:** Added the ability to minimize the application to the Windows system tray.
