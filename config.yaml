@@ -85,6 +85,7 @@ calibration_data:
   - -2.040625
   - -0.35625
   - 4.16875
+capt_mapping: Default
 combine_joycons: true
 controller_mode: Xbox
 deadzone: 50
@@ -104,6 +105,7 @@ gyro_click_stabilize_duration: 0.02
 gyro_click_stabilizer: true
 gyro_mode: World
 gyro_sensitivity: 3.0
+home_mapping: Default
 joycon_hold_mode:
   E0:EF:BF:EF:CC:BD: Horizontal
   E0:EF:BF:F0:0E:17: Vertical
@@ -140,9 +142,11 @@ mouse:
   scroll_sensitivity: 2
   sensitivity: 5.0
 open_when_startup: false
-simulation_mode: PS4
+simulation_mode: PS5
+sll_mapping: Default
 slr_mapping: PSTPAD_R
 srl_mapping: PSTPAD_L
+srr_mapping: Default
 stabilized_gyro: true
 start_minimized: false
 steam_roll_compensation: true
