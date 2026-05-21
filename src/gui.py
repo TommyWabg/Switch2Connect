@@ -916,7 +916,7 @@ class ControllerWindow:
         except: pass
         self.root.title("Switch2 Controllers")
         self.root.geometry("1000x580+50+50")
-        self.root.minsize(1040, 760)
+        self.root.minsize(1040, 800)
         self.root.config(bg=background_color, padx=10, pady=10)
         
         # Set title bar color to match background
@@ -1220,9 +1220,18 @@ class ControllerWindow:
         self.mouse_sens_scale = tk.Scale(row_mouse, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=120, bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=15, width=15, font=("Arial", 12, "bold"), command=self.update_mouse_sensitivity)
         self.mouse_sens_scale.set(CONFIG.mouse_config.sensitivity); self.mouse_sens_scale.pack(side=tk.LEFT)
 
+        row_shared = tk.Frame(self.settings_frame, bg=background_color); row_shared.pack(side=tk.TOP, fill=tk.X, pady=5)
+        tk.Label(row_shared, text="Shared Buttons:", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(10, 5))
+        for key, label in [("home", "Home:"), ("capt", "Capture:"), ("c", "Chat:")]:
+            tk.Label(row_shared, text=label, bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(5, 2))
+            combo = ttk.Combobox(row_shared, values=BACK_BUTTON_OPTIONS, font=("Arial", 12, "bold"), state="readonly", width=10)
+            combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=2)
+            combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
+            setattr(self, f"{key}_combo", combo)
+
         row_pro = tk.Frame(self.settings_frame, bg=background_color); row_pro.pack(side=tk.TOP, fill=tk.X, pady=5)
         tk.Label(row_pro, text="Pro Controller Buttons:", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(10, 5))
-        for key, label in [("gl", "GL:"), ("gr", "GR:"), ("c", "Chat (Joy-con/Pro):")]:
+        for key, label in [("gl", "GL:"), ("gr", "GR:")]:
             tk.Label(row_pro, text=label, bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(5, 2))
             combo = ttk.Combobox(row_pro, values=BACK_BUTTON_OPTIONS, font=("Arial", 12, "bold"), state="readonly", width=10)
             combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=2)
@@ -1231,12 +1240,12 @@ class ControllerWindow:
 
         row_jc = tk.Frame(self.settings_frame, bg=background_color); row_jc.pack(side=tk.TOP, fill=tk.X, pady=5)
         tk.Label(row_jc, text="Joy-con Rail Buttons:", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(10, 5))
-        tk.Label(row_jc, text="Left SR:", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(5, 2))
-        self.srl_combo = ttk.Combobox(row_jc, values=BACK_BUTTON_OPTIONS, font=("Arial", 12, "bold"), state="readonly", width=10)
-        self.srl_combo.set(CONFIG.srl_mapping); self.srl_combo.pack(side=tk.LEFT, padx=2); self.srl_combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
-        tk.Label(row_jc, text="Right SL:", bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(15, 2))
-        self.slr_combo = ttk.Combobox(row_jc, values=BACK_BUTTON_OPTIONS, font=("Arial", 12, "bold"), state="readonly", width=10)
-        self.slr_combo.set(CONFIG.slr_mapping); self.slr_combo.pack(side=tk.LEFT, padx=2); self.slr_combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
+        for key, label in [("sll", "Left SL:"), ("srl", "Left SR:"), ("slr", "Right SL:"), ("srr", "Right SR:")]:
+            tk.Label(row_jc, text=label, bg=background_color, fg=text_color, font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=(5, 2))
+            combo = ttk.Combobox(row_jc, values=BACK_BUTTON_OPTIONS, font=("Arial", 12, "bold"), state="readonly", width=10)
+            combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=2)
+            combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
+            setattr(self, f"{key}_combo", combo)
 
     def update_sim_mode_setting(self, val):
         CONFIG.simulation_mode = val
@@ -1271,15 +1280,19 @@ class ControllerWindow:
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
     def on_setting_changed(self, event=None):
+        CONFIG.home_mapping = self.home_combo.get()
+        CONFIG.capt_mapping = self.capt_combo.get()
         CONFIG.gl_mapping = self.gl_combo.get()
         CONFIG.gr_mapping = self.gr_combo.get()
         CONFIG.c_mapping = self.c_combo.get()
-        CONFIG.slr_mapping = self.slr_combo.get()
+        CONFIG.sll_mapping = self.sll_combo.get()
         CONFIG.srl_mapping = self.srl_combo.get()
+        CONFIG.slr_mapping = self.slr_combo.get()
+        CONFIG.srr_mapping = self.srr_combo.get()
         try:
             with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
             data['abxy_mode'] = CONFIG.abxy_mode  
-            for k in ['gl_mapping','gr_mapping','c_mapping','slr_mapping','srl_mapping']: data[k] = getattr(CONFIG, k)
+            for k in ['home_mapping','capt_mapping','gl_mapping','gr_mapping','c_mapping','sll_mapping','srl_mapping','slr_mapping','srr_mapping']: data[k] = getattr(CONFIG, k)
             with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)
         except Exception as e: logger.error(f"Failed to save settings: {e}")
         self.root.focus_set()

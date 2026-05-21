@@ -706,6 +706,7 @@ class Controller:
                 "GL": bool(inputData.buttons & 0x02000000),
                 "GR": bool(inputData.buttons & 0x01000000),
                 "C":  bool(inputData.buttons & 0x00004000),
+                "HOME": bool(inputData.buttons & 0x00001000),
                 "CAPT": bool(inputData.buttons & 0x00002000),
                 "SL_L": bool(inputData.buttons & 0x00200000),
                 "SR_L": bool(inputData.buttons & 0x00100000),
@@ -713,33 +714,39 @@ class Controller:
                 "SR_R": bool(inputData.buttons & 0x00000010)
             }
 
-            inputData.buttons &= ~(0x03306030)
+            inputData.buttons &= ~(0x03307030)
 
             trigger_gyro = False
-            trigger_screenshot = btn_states["CAPT"]
+            trigger_screenshot = False
             trigger_key_c = False
 
             mapping_pairs = [
-                (btn_states["GL"], getattr(CONFIG, "gl_mapping", "None"), 0x02000000),
-                (btn_states["GR"], getattr(CONFIG, "gr_mapping", "None"), 0x01000000),
-                (btn_states["C"],  getattr(CONFIG, "c_mapping", "None"), 0x00004000),
-                (btn_states["SL_L"], getattr(CONFIG, "sll_mapping", "None"), 0x00200000),
-                (btn_states["SR_L"], getattr(CONFIG, "srl_mapping", "None"), 0x00100000),
-                (btn_states["SL_R"], getattr(CONFIG, "slr_mapping", "None"), 0x00000020),
-                (btn_states["SR_R"], getattr(CONFIG, "srr_mapping", "None"), 0x00000010)
+                # (is_pressed, action, original_bit, default_action)
+                # default_action: what to do when action == "Default". None = pass through original_bit.
+                (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None),
+                (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None),
+                (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home"),
+                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture"), 0x00002000, "Capture"),
+                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, None),
+                (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None),
+                (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None),
+                (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None),
+                (btn_states["SR_R"], getattr(CONFIG, "srr_mapping",  "Default"), 0x00000010, None),
             ]
 
             trigger_calibration = False
-            for is_pressed, action, original_bit in mapping_pairs:
+            for is_pressed, action, original_bit, default_action in mapping_pairs:
+                resolved = default_action if action == "Default" else action
                 if is_pressed:
-                    if action == "Gyro": trigger_gyro = True
-                    elif action == "CAPT": trigger_screenshot = True
-                    elif action == "C": trigger_key_c = True
-                    elif action == "Calibration": trigger_calibration = True
-                    elif action == "None":
+                    if resolved == "Gyro": trigger_gyro = True
+                    elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
+                    elif resolved == "Capture": trigger_screenshot = True
+                    elif resolved == "Chat": trigger_key_c = True
+                    elif resolved == "Calibration": trigger_calibration = True
+                    elif resolved is None:
                         inputData.buttons |= original_bit
-                    elif action in SWITCH_BUTTONS:
-                        inputData.buttons |= SWITCH_BUTTONS[action]
+                    elif resolved in SWITCH_BUTTONS:
+                        inputData.buttons |= SWITCH_BUTTONS[resolved]
 
             if trigger_calibration and not getattr(self, 'prev_calibration', False):
                 self._handle_calibration_button_pressed()

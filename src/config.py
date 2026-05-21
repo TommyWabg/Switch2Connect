@@ -38,7 +38,7 @@ SWITCH_BUTTONS = {
 }
 
 BACK_BUTTON_OPTIONS = [
-    "None", "Gyro", "Calibration", "CAPT", "C", "PSTPAD_L", "PSTPAD_R", 
+    "Default", "Gyro", "Calibration", "Home", "Capture", "Chat", "PSTPAD_L", "PSTPAD_R", 
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT"
 ]
@@ -180,13 +180,16 @@ class Config:
         self.procon_config = ButtonConfig(btns.get("procon", {}))
 
         self.mouse_config = MouseConfig(config.get("mouse", {}))
-        self.gl_mapping = config.get("gl_mapping", "None")
+        self.gl_mapping = config.get("gl_mapping", "Default")
         self.gr_mapping = config.get("gr_mapping", "Gyro")
-        self.c_mapping = config.get("c_mapping", "None")
+        self.c_mapping = config.get("c_mapping", "Default")
         self.slr_mapping = config.get("slr_mapping", "Gyro")
-        self.srl_mapping = config.get("srl_mapping", "None")
-        self.sll_mapping = config.get("sll_mapping", "None")
-        self.srr_mapping = config.get("srr_mapping", "None")
+        self.srl_mapping = config.get("srl_mapping", "Default")
+        self.sll_mapping = config.get("sll_mapping", "Default")
+        self.srr_mapping = config.get("srr_mapping", "Default")
+        self.home_mapping = config.get("home_mapping", "Default")
+        _capt = config.get("capt_mapping", "Capture")
+        self.capt_mapping = "Capture" if _capt in ("None", "CAPT", "Default") else _capt
         self.abxy_mode = config.get("abxy_mode", "Xbox") 
         
         self.gyro_mode = config.get("gyro_mode", "World")
@@ -242,6 +245,10 @@ class Config:
             data['c_mapping'] = self.c_mapping
             data['slr_mapping'] = self.slr_mapping
             data['srl_mapping'] = self.srl_mapping
+            data['sll_mapping'] = self.sll_mapping
+            data['srr_mapping'] = self.srr_mapping
+            data['home_mapping'] = self.home_mapping
+            data['capt_mapping'] = self.capt_mapping
             
             data['gyro_mode'] = self.gyro_mode
             data['gyro_sensitivity'] = self.gyro_sensitivity
