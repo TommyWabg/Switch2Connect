@@ -8,6 +8,6 @@ if %errorLevel% == 0 (
     exit /b
 ) else (
     echo Requesting Administrator privileges...
-    powershell -Command "Start-Process -FilePath '%0' -Verb RunAs -Wait"
+    powershell -Command "Start-Process -FilePath '%~0' -Verb RunAs -Wait"
     exit /b
 )

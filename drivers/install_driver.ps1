@@ -11,18 +11,50 @@ if ((Split-Path $ScriptDir -Leaf) -eq "drivers") {
 }
 
 # Paths
-$DriverDir = Join-Path $RootDir "external\WinUHid-main\WinUHid Driver\build\Release\x64\WinUHid Driver"
-$InfPath = [System.IO.Path]::GetFullPath((Join-Path $DriverDir "WinUHidDriver.inf"))
-$CertPath = [System.IO.Path]::GetFullPath((Join-Path $RootDir "external\WinUHid-main\WinUHid Driver\build\Release\x64\WinUHidDriver.cer"))
+$DriverDir = ""
+$InfPath = ""
+$CertPath = ""
+
+# Define possible search paths
+$SearchPaths = @(
+    $ScriptDir,
+    (Join-Path $RootDir "WinUHid-main\WinUHid Driver\build\Release\x64\WinUHid Driver"),
+    (Join-Path $RootDir "external\WinUHid-main\WinUHid Driver\build\Release\x64\WinUHid Driver")
+)
+
+# Find the first path containing WinUHidDriver.inf
+foreach ($path in $SearchPaths) {
+    $tempInf = Join-Path $path "WinUHidDriver.inf"
+    if (Test-Path $tempInf) {
+        $DriverDir = $path
+        $InfPath = [System.IO.Path]::GetFullPath($tempInf)
+        break
+    }
+}
+
+# Certificate path resolution: check next to inf or parent of inf
+if ($DriverDir) {
+    $tempCert = Join-Path $DriverDir "WinUHidDriver.cer"
+    if (Test-Path $tempCert) {
+        $CertPath = [System.IO.Path]::GetFullPath($tempCert)
+    } else {
+        # Try parent folder of DriverDir (for release build layout)
+        $parent = Split-Path -Parent $DriverDir
+        $tempCert = Join-Path $parent "WinUHidDriver.cer"
+        if (Test-Path $tempCert) {
+            $CertPath = [System.IO.Path]::GetFullPath($tempCert)
+        }
+    }
+}
 
 # Check if files exist
-if (-not (Test-Path $InfPath)) {
-    Write-Host "Error: Driver INF not found at $InfPath" -ForegroundColor Red
-    Exit
+if (-not $InfPath -or -not (Test-Path $InfPath)) {
+    Write-Host "Error: Driver INF not found!" -ForegroundColor Red
+    Exit 1
 }
-if (-not (Test-Path $CertPath)) {
-    Write-Host "Error: Driver Certificate not found at $CertPath" -ForegroundColor Red
-    Exit
+if (-not $CertPath -or -not (Test-Path $CertPath)) {
+    Write-Host "Error: Driver Certificate not found!" -ForegroundColor Red
+    Exit 1
 }
 
 # 1. Clean up existing WinUHid devices
