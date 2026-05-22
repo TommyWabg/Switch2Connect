@@ -1,4 +1,8 @@
 abxy_mode: Switch
+auto_disconnect_days: 0
+auto_disconnect_enabled: false
+auto_disconnect_hours: 0
+auto_disconnect_minutes: 0
 buttons:
   dual_joycons:
     A: A
@@ -85,13 +89,12 @@ calibration_data:
   - -2.040625
   - -0.35625
   - 4.16875
-capt_mapping: Default
+capt_mapping: Capture
 combine_joycons: true
 controller_mode: Xbox
 deadzone: 50
-driver_installed: true
-gl_mapping: PSTPAD_L
-gr_mapping: PSTPAD_R
+gl_mapping: PS_L_Touch
+gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
 gyro_bias_l:
 - -2.040625
@@ -107,7 +110,7 @@ gyro_mode: World
 gyro_sensitivity: 3.0
 home_mapping: Default
 joycon_hold_mode:
-  E0:EF:BF:EF:CC:BD: Horizontal
+  E0:EF:BF:EF:CC:BD: Vertical
   E0:EF:BF:F0:0E:17: Vertical
 mag_calibration_data:
   AA:BB:CC:DD:EE:FF:
@@ -144,8 +147,8 @@ mouse:
 open_when_startup: false
 simulation_mode: PS5
 sll_mapping: Default
-slr_mapping: PSTPAD_R
-srl_mapping: PSTPAD_L
+slr_mapping: PS_R_Touch
+srl_mapping: PS_L_Touch
 srr_mapping: Default
 stabilized_gyro: true
 start_minimized: false
@@ -155,4 +158,7 @@ stick_r_bias:
 - 0.0
 - 0.0
 theme_mode: Dark
+vibration_strength: 5
 virtual_gyro_soft_deadzone: 2.0
+window_height: 1020
+window_width: 1240

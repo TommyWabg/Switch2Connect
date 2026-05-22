@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('external/WinUHid-main', 'external/WinUHid-main'), ('drivers/install_driver.ps1', 'drivers'), ('drivers/install.bat', 'drivers'), ('drivers/uninstall_driver.ps1', 'drivers'), ('drivers/uninstall.bat', 'drivers')]
+datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/install_driver.ps1', 'drivers'), ('drivers/install.bat', 'drivers'), ('drivers/uninstall_driver.ps1', 'drivers'), ('drivers/uninstall.bat', 'drivers'), ('drivers/uninstall_vigembus.ps1', 'drivers'), ('drivers/uninstall_vigembus.bat', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHid Driver/WinUHidDriver.inf', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHid Driver/WinUHidDriver.dll', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHid Driver/winuhiddriver.cat', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHidDriver.cer', 'drivers')]
 binaries = [('drivers/WinUHid.dll', 'drivers'), ('drivers/WinUHidDevs.dll', 'drivers')]
 hiddenimports = ['imufusion']
 tmp_ret = collect_all('vgamepad')
