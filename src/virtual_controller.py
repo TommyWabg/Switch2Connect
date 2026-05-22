@@ -37,6 +37,7 @@ class VirtualController:
         self.loop = None
         self.touch_tracking_id = 0
         self.was_touching = False
+        self.touch_start_time = 0.0
         
         self.hold_mode = "Horizontal"
         self.active_gyro_side = "Right"
@@ -87,11 +88,14 @@ class VirtualController:
             logger.info("Switched to virtual Xbox 360 controller via WinUHid")
 
         self.vg_controller.register_notification(callback_function=self.vibration_callback)
+        self.was_touching = False
+        self.touch_start_time = 0.0
 
     def set_mode(self, new_mode):
         if self.mode != new_mode:
-            self.mode = new_mode
-            self._setup_vg_controller()
+            with self.state_lock:
+                self.mode = new_mode
+                self._setup_vg_controller()
             if self.loop and self.loop.is_running():
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
@@ -359,6 +363,9 @@ class VirtualController:
         
         report.ButtonHome = 1 if (buttons & SWITCH_BUTTONS.get("HOME", 0)) else 0
 
+        if mode == "PS5":
+            report.ButtonMute = 1 if (buttons & 0x10000000) else 0
+
         # 2. D-pad (Hat)
         up = bool(buttons & SWITCH_BUTTONS["UP"])
         down = bool(buttons & SWITCH_BUTTONS["DOWN"])
@@ -377,31 +384,40 @@ class VirtualController:
 
         # 3. Touchpad
         capt = bool(buttons & SWITCH_BUTTONS.get("CAPT", 0))
-        tpad_l = bool(buttons & SWITCH_BUTTONS.get("PSTPAD_L", 0))
-        tpad_r = bool(buttons & SWITCH_BUTTONS.get("PSTPAD_R", 0))
+        tpad_l = bool(buttons & SWITCH_BUTTONS.get("PS_L_Touch", 0))
+        tpad_r = bool(buttons & SWITCH_BUTTONS.get("PS_R_Touch", 0))
+        tpad_c = bool(buttons & SWITCH_BUTTONS.get("PS_C_Click", 0))
 
+        # PS_C_Click is center click (no touch coordinates), while PS_L_Touch and PS_R_Touch only send coordinates (no click)
         is_touching = capt or tpad_l or tpad_r
-        report.ButtonTouchpad = 1 if is_touching else 0
 
         touch_x = 0
         touch_y = 0
         if is_touching:
             if tpad_l:
-                touch_x = 480
+                touch_x = 100
                 touch_y = 512
             elif tpad_r:
-                touch_x = 1440
+                touch_x = 1800
                 touch_y = 512
             else:
                 touch_x = 960
                 touch_y = 512
 
-        if mode == "PS4":
-            if vgamepad._winuhid_devs:
-                vgamepad._winuhid_devs.WinUHidPS4SetTouchState(ctypes.byref(report), 0, is_touching, touch_x, touch_y)
+        # Set mechanical click button (CAPT and PS_C_Click trigger click)
+        report.ButtonTouchpad = 1 if (capt or tpad_c) else 0
+
+        is_new_touch = False
+        if is_touching:
+            if not self.was_touching:
+                is_new_touch = True
+
+            # Update touch coordinates with correct tracking ID/ContactSeq logic
+            self._set_touch_state(report, 0, True, touch_x, touch_y, mode, is_new_touch)
         else:
-            if vgamepad._winuhid_devs:
-                vgamepad._winuhid_devs.WinUHidPS5SetTouchState(ctypes.byref(report), 0, is_touching, touch_x, touch_y)
+            self._set_touch_state(report, 0, False, 0, 0, mode, is_new_touch=False)
+
+        self.was_touching = is_touching
 
         # 4. Triggers
         report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
@@ -485,6 +501,39 @@ class VirtualController:
         report.AccelX = clamp_short(self.last_ax)
         report.AccelY = clamp_short(self.last_ay)
         report.AccelZ = clamp_short(self.last_az)
+
+    def _set_touch_state(self, report, touch_index, touch_down, touch_x, touch_y, mode, is_new_touch=False):
+        if mode == "PS4":
+            tp = report.TouchReports[0].TouchPoints[touch_index]
+            if touch_down:
+                if is_new_touch:
+                    tp.ContactSeq = (tp.ContactSeq + 1) & 0x7F
+                else:
+                    tp.ContactSeq = tp.ContactSeq & 0x7F
+            else:
+                tp.ContactSeq = tp.ContactSeq | 0x80
+                
+            tp.XLowPart = touch_x & 0xFF
+            tp.XHighPart = (touch_x >> 8) & 0xF
+            tp.YLowPart = touch_y & 0xF
+            tp.YHighPart = (touch_y >> 4) & 0xFF
+            report.TouchReportCount = 1
+            report.TouchReports[0].Timestamp = (report.TouchReports[0].Timestamp + 1) & 0xFF
+        else:  # PS5
+            tp = report.TouchReport.TouchPoints[touch_index]
+            if touch_down:
+                if is_new_touch:
+                    tp.ContactSeq = (tp.ContactSeq + 1) & 0x7F
+                else:
+                    tp.ContactSeq = tp.ContactSeq & 0x7F
+            else:
+                tp.ContactSeq = tp.ContactSeq | 0x80
+                
+            tp.XLowPart = touch_x & 0xFF
+            tp.XHighPart = (touch_x >> 8) & 0xF
+            tp.YLowPart = touch_y & 0xF
+            tp.YHighPart = (touch_y >> 4) & 0xFF
+            report.TouchReport.Timestamp = (report.TouchReport.Timestamp + 1) & 0xFF
 
     def update_as_xbox(self, inputData: ControllerInputData, buttons: int, controller: Controller, buttonsConfig: ButtonConfig):
         with self.state_lock:
@@ -624,6 +673,8 @@ class VirtualController:
                     if vgamepad._winuhid_devs:
                         vgamepad._winuhid_devs.WinUHidPS5InitializeInputReport(ctypes.byref(self.vg_controller.report))
             logger.info(f"Player {self.player_number}: Virtual inputs reset to neutral.")
+            self.was_touching = False
+            self.touch_start_time = 0.0
 
     def force_close(self):
         """Synchronously and forcefully close the virtual device handle."""

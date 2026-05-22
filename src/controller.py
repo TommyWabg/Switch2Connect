@@ -214,6 +214,7 @@ class Controller:
         self.left_stick_calibration: StickCalibrationData = None
         self.right_stick_calibration: StickCalibrationData = None
         self.previous_mouse_state: MouseState = None
+        self.connected_at = None
 
         self.side_buttons_pressed = False
         self.response_future = None
@@ -550,6 +551,8 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to trigger haptic feedback: {e}")
 
+        self.connected_at = time.time()
+
     @classmethod
     async def create_from_device(cls, device: BLEDevice):
         controller = cls(device)
@@ -611,7 +614,26 @@ class Controller:
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData()):
-        motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes() + vibration.get_bytes() + vibration2.get_bytes() + vibration3.get_bytes()
+        strength = getattr(CONFIG, "vibration_strength", 5)
+        scale_factor = strength / 5.0
+
+        def scale_and_clamp(v: VibrationData) -> VibrationData:
+            scaled_lf = min(1023, max(0, int(v.lf_amp * scale_factor)))
+            scaled_hf = min(1023, max(0, int(v.hf_amp * scale_factor)))
+            return VibrationData(
+                lf_freq=v.lf_freq,
+                lf_en_tone=v.lf_en_tone,
+                lf_amp=scaled_lf,
+                hf_freq=v.hf_freq,
+                hf_en_tone=v.hf_en_tone,
+                hf_amp=scaled_hf
+            )
+
+        v1 = scale_and_clamp(vibration)
+        v2 = scale_and_clamp(vibration2)
+        v3 = scale_and_clamp(vibration3)
+
+        motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes() + v1.get_bytes() + v2.get_bytes() + v3.get_bytes()
         if self.is_joycon_left():
             await self.client.write_gatt_char(VIBRATION_WRITE_JOYCON_L_UUID, (b'\x00' + motor_vibrations))
         elif self.is_joycon_right():
@@ -719,6 +741,8 @@ class Controller:
             trigger_gyro = False
             trigger_screenshot = False
             trigger_key_c = False
+            trigger_game_bar = False
+            trigger_hdr_toggle = False
 
             mapping_pairs = [
                 # (is_pressed, action, original_bit, default_action)
@@ -727,7 +751,7 @@ class Controller:
                 (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None),
                 (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home"),
                 (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture"), 0x00002000, "Capture"),
-                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, None),
+                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Mute"),
                 (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None),
                 (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None),
                 (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None),
@@ -742,7 +766,10 @@ class Controller:
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
                     elif resolved == "Capture": trigger_screenshot = True
                     elif resolved == "Chat": trigger_key_c = True
+                    elif resolved == "Mute": inputData.buttons |= 0x10000000
                     elif resolved == "Calibration": trigger_calibration = True
+                    elif resolved == "Game Bar": trigger_game_bar = True
+                    elif resolved == "HDR Toggle": trigger_hdr_toggle = True
                     elif resolved is None:
                         inputData.buttons |= original_bit
                     elif resolved in SWITCH_BUTTONS:
@@ -822,6 +849,22 @@ class Controller:
             elif not trigger_key_c and getattr(self, 'prev_key_c', False):
                 win32api.keybd_event(0x43, 0, win32con.KEYEVENTF_KEYUP, 0)
             self.prev_key_c = trigger_key_c
+
+            if trigger_game_bar and not getattr(self, 'prev_game_bar', False):
+                win32api.keybd_event(0x5B, 0, 0, 0) # Win down
+                win32api.keybd_event(0x47, 0, 0, 0) # G down
+                win32api.keybd_event(0x47, 0, win32con.KEYEVENTF_KEYUP, 0) # G up
+                win32api.keybd_event(0x5B, 0, win32con.KEYEVENTF_KEYUP, 0) # Win up
+            self.prev_game_bar = trigger_game_bar
+
+            if trigger_hdr_toggle and not getattr(self, 'prev_hdr_toggle', False):
+                win32api.keybd_event(0x5B, 0, 0, 0) # Win down
+                win32api.keybd_event(0x12, 0, 0, 0) # Alt down
+                win32api.keybd_event(0x42, 0, 0, 0) # B down
+                win32api.keybd_event(0x42, 0, win32con.KEYEVENTF_KEYUP, 0) # B up
+                win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0) # Alt up
+                win32api.keybd_event(0x5B, 0, win32con.KEYEVENTF_KEYUP, 0) # Win up
+            self.prev_hdr_toggle = trigger_hdr_toggle
 
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True

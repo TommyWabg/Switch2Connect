@@ -13,8 +13,11 @@ try:
     
     if not os.path.exists(winuhid_path):
         # Try WinUHid-main build directory
-        winuhid_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
-        winuhid_devs_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
+        winuhid_path = os.path.join(get_app_root(), "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
+        winuhid_devs_path = os.path.join(get_app_root(), "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
+        if not os.path.exists(winuhid_path):
+            winuhid_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHid.dll")
+            winuhid_devs_path = os.path.join(get_app_root(), "external", "WinUHid-main", "build", "Release", "x64", "WinUHidDevs.dll")
 
     # Load WinUHid.dll first
     _winuhid = ctypes.CDLL(winuhid_path)

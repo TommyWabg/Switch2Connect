@@ -9,7 +9,8 @@ import asyncio
 import logging
 import bluetooth
 import yaml
-from utils import to_hex, convert_mac_string_to_value, decodeu
+from utils import to_hex, convert_mac_string_to_value, decodeu, show_notification
+import time
 from controller import Controller, ControllerInputData, NINTENDO_VENDOR_ID, CONTROLER_NAMES, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
 from virtual_controller import VirtualController
 from config import CONFIG
@@ -25,6 +26,40 @@ IS_SHUTTING_DOWN = False
 DISCOVERY_LOCK = threading.Lock()
 _CURRENTLY_DISCOVERING = False
 _IS_SUSPENDING = False
+
+async def auto_disconnect_checker(quit_event):
+    logger.info("Auto disconnect checker task started.")
+    while not quit_event.is_set():
+        try:
+            await asyncio.sleep(1.0)
+            if not getattr(CONFIG, "auto_disconnect_enabled", False):
+                continue
+            
+            days = getattr(CONFIG, "auto_disconnect_days", 0)
+            hours = getattr(CONFIG, "auto_disconnect_hours", 0)
+            minutes = getattr(CONFIG, "auto_disconnect_minutes", 0)
+            
+            timeout = (days * 86400) + (hours * 3600) + (minutes * 60)
+            if timeout <= 0:
+                continue
+                
+            now = time.time()
+            from discoverer import VIRTUAL_CONTROLLERS
+            
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc is not None and getattr(vc, 'running', False):
+                    should_disconnect = False
+                    for c in vc.controllers:
+                        connected_at = getattr(c, 'connected_at', None)
+                        if connected_at is not None and (now - connected_at) >= timeout:
+                            should_disconnect = True
+                            break
+                    if should_disconnect:
+                        logger.info(f"Auto Disconnect: Player {vc.player_number} connection duration exceeded limit. Disconnecting...")
+                        vc.trigger_disconnect()
+                        show_notification("Auto Disconnect", f"Player {vc.player_number} has been auto-disconnected after reaching the set time limit.")
+        except Exception as e:
+            logger.error(f"Error in auto_disconnect_checker: {e}")
 
 async def run_discovery(update_controllers_threadsafe, quit_event):
     global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, DISCONNECT_CALLBACK, _CURRENTLY_DISCOVERING
@@ -88,6 +123,9 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             return
 
         lock = asyncio.Lock()
+        
+        # Start auto disconnect checker task
+        checker_task = asyncio.create_task(auto_disconnect_checker(quit_event))
 
         async def disconnected_controller(controller: Controller):
             logger.info(f"Controller disconected {controller.client.address}")

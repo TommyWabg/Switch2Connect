@@ -33,12 +33,13 @@ SWITCH_BUTTONS = {
     "ZL":    0x00800000,
     "GR":    0x01000000,
     "GL":    0x02000000,
-    "PSTPAD_L": 0x04000000,
-    "PSTPAD_R": 0x08000000,
+    "PS_L_Touch": 0x04000000,
+    "PS_R_Touch": 0x08000000,
+    "PS_C_Click": 0x20000000,
 }
 
 BACK_BUTTON_OPTIONS = [
-    "Default", "Gyro", "Calibration", "Home", "Capture", "Chat", "PSTPAD_L", "PSTPAD_R", 
+    "Default", "Gyro", "Calibration", "Home", "Capture", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT"
 ]
@@ -219,6 +220,13 @@ class Config:
         else:
             self.virtual_gyro_soft_deadzone = float(val)
         self.driver_installed = config.get("driver_installed", False)
+        self.window_width = config.get("window_width", None)
+        self.window_height = config.get("window_height", None)
+        self.auto_disconnect_enabled = config.get("auto_disconnect_enabled", False)
+        self.auto_disconnect_days = int(config.get("auto_disconnect_days", 0))
+        self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
+        self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
+        self.vibration_strength = int(config.get("vibration_strength", 5))
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
         
@@ -232,6 +240,13 @@ class Config:
                     data = yaml.safe_load(f) or {}
             
             data['driver_installed'] = self.driver_installed
+            data['window_width'] = self.window_width
+            data['window_height'] = self.window_height
+            data['auto_disconnect_enabled'] = self.auto_disconnect_enabled
+            data['auto_disconnect_days'] = self.auto_disconnect_days
+            data['auto_disconnect_hours'] = self.auto_disconnect_hours
+            data['auto_disconnect_minutes'] = self.auto_disconnect_minutes
+            data['vibration_strength'] = self.vibration_strength
             
             data['simulation_mode'] = self.simulation_mode
             data['open_when_startup'] = self.open_when_startup
