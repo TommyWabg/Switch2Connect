@@ -35,6 +35,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Hide to system tray:** Added the ability to minimize the application to the Windows system tray.
 * **Auto Disconnect Timer:** Implemented a customizable idle disconnect feature. Through the Auto Disconnect panel, users can set a specific countdown timer (Days/Hours/Minutes) that automatically severs the connection to physical and virtual controllers to preserve battery life.
 * **Customizable Vibration Strength:** Introduced a new `Vibration Strength` slider in the settings panel (ranging from 0 to 10), allowing users to dynamically scale the intensity of the controller's haptic feedback.
+* **Rumble Frequency Slider:** You can now customize the vibration/rumble frequency directly from the settings panel.
 * **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
 
 ## System Requirements
