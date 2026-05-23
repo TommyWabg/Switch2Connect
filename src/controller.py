@@ -617,14 +617,25 @@ class Controller:
         strength = getattr(CONFIG, "vibration_strength", 5)
         scale_factor = strength / 5.0
 
+        freq_setting = getattr(CONFIG, "vibration_frequency", 10)
+        freq_factor = (freq_setting - 1) / 9.0
+
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             scaled_lf = min(1023, max(0, int(v.lf_amp * scale_factor)))
             scaled_hf = min(1023, max(0, int(v.hf_amp * scale_factor)))
+            
+            # The previous level 3 frequency was 0.5 * original_freq + 0.5.
+            # We set this as the new minimum frequency (level 1).
+            new_min_lf = 0.5 * v.lf_freq + 0.5
+            new_min_hf = 0.5 * v.hf_freq + 0.5
+            
+            scaled_lf_freq = min(511, max(1, int(new_min_lf + (v.lf_freq - new_min_lf) * freq_factor)))
+            scaled_hf_freq = min(511, max(1, int(new_min_hf + (v.hf_freq - new_min_hf) * freq_factor)))
             return VibrationData(
-                lf_freq=v.lf_freq,
+                lf_freq=scaled_lf_freq,
                 lf_en_tone=v.lf_en_tone,
                 lf_amp=scaled_lf,
-                hf_freq=v.hf_freq,
+                hf_freq=scaled_hf_freq,
                 hf_en_tone=v.hf_en_tone,
                 hf_amp=scaled_hf
             )

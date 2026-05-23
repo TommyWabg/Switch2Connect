@@ -21,6 +21,79 @@ from pystray import MenuItem as item
 from PIL import Image, ImageTk
 import win32gui
 import win32con
+from ctypes import wintypes
+
+class SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", ctypes.c_ulong),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIconOrMonitor", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+# Explicitly set types for Win32 API to ensure compatibility
+ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
+
+ctypes.windll.kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
+
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+WAIT_TIMEOUT = 0x00000102
+WAIT_OBJECT_0 = 0x00000000
+
+def check_driver_registry():
+    import winreg
+    for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver",
+                0,
+                sam
+            )
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    return False
+
+def check_driver_pnputil():
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        )
+        if result.returncode == 0 and "root\\winuhid" in result.stdout.lower():
+            return True
+    except Exception as e:
+        logger.error(f"Error checking driver installation via pnputil: {e}")
+    return False
+
+def is_driver_installed():
+    return check_driver_registry() or check_driver_pnputil()
 
 logger = logging.getLogger(__name__)
 
@@ -684,29 +757,7 @@ class ControllerWindow:
         if getattr(CONFIG, 'driver_installed', False):
             return
 
-        import subprocess
-        
-        driver_exists = False
-        try:
-            result = subprocess.run(
-                ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-            )
-            if result.returncode == 0 and "root\\winuhid" in result.stdout.lower():
-                driver_exists = True
-        except Exception as e:
-            logger.error(f"Error checking driver installation via pnputil: {e}")
-            import winreg
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
-                winreg.CloseKey(key)
-                driver_exists = True
-            except FileNotFoundError:
-                pass
-            
-        if driver_exists:
+        if is_driver_installed():
             # 如果檢查結果是已安裝，自動記錄到yaml裡
             CONFIG.driver_installed = True
             CONFIG.save_config()
@@ -723,7 +774,6 @@ class ControllerWindow:
             self.run_driver_install(show_success_msg=False)
 
     def run_driver_install(self, show_success_msg=True):
-        import subprocess
         import sys
         import os
         from tkinter import messagebox
@@ -738,8 +788,8 @@ class ControllerWindow:
         from discoverer import emergency_cleanup
         emergency_cleanup()
 
-        install_bat = get_driver_path("install.bat")
-        if os.path.exists(install_bat):
+        install_ps1 = get_driver_path("install_driver.ps1")
+        if os.path.exists(install_ps1):
             try:
                 progress_win = tk.Toplevel(self.root)
                 progress_win.title("Driver Installation")
@@ -757,39 +807,52 @@ class ControllerWindow:
                 )
                 label.pack(pady=int(40 * scaling_factor))
                 
-                proc = subprocess.Popen(f'"{install_bat}"', shell=True)
+                # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
+                info = SHELLEXECUTEINFOW()
+                info.cbSize = ctypes.sizeof(info)
+                info.fMask = SEE_MASK_NOCLOSEPROCESS
+                info.hwnd = None
+                info.lpVerb = "runas"
+                info.lpFile = "powershell.exe"
+                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{install_ps1}"'
+                info.lpDirectory = None
+                info.nShow = 1  # SW_SHOWNORMAL
                 
+                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
+                if not launched:
+                    # User cancelled the UAC prompt or it failed
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    messagebox.showerror("Error", "Driver installation was cancelled or failed to start (UAC prompt declined).")
+                    if discoverer_was_running:
+                        self.start_discoverer_thread()
+                    return
+
+                hProcess = info.hProcess
+                proc_exit_code = [0]
+
                 def check_process():
-                    if proc.poll() is None:
-                        progress_win.after(500, check_process)
+                    if hProcess:
+                        res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                        if res == WAIT_TIMEOUT:
+                            progress_win.after(200, check_process)
+                        else:
+                            exit_code = wintypes.DWORD()
+                            ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                            ctypes.windll.kernel32.CloseHandle(hProcess)
+                            proc_exit_code[0] = exit_code.value
+                            progress_win.grab_release()
+                            progress_win.destroy()
                     else:
                         progress_win.grab_release()
                         progress_win.destroy()
                             
-                progress_win.after(500, check_process)
+                progress_win.after(200, check_process)
                 self.root.wait_window(progress_win)
                 
-                # Now that progress_win is destroyed, its event grab is released
-                driver_installed_ok = False
-                try:
-                    res = subprocess.run(
-                        ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
-                        capture_output=True,
-                        text=True,
-                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                    )
-                    if res.returncode == 0 and "root\\winuhid" in res.stdout.lower():
-                        driver_installed_ok = True
-                except Exception:
-                    # Fallback to registry check
-                    import winreg
-                    try:
-                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
-                        winreg.CloseKey(key)
-                        driver_installed_ok = True
-                    except FileNotFoundError:
-                        pass
-                    
+                logger.info(f"Driver installer process exited with code: {proc_exit_code[0]}")
+                
+                driver_installed_ok = is_driver_installed()
                 if driver_installed_ok:
                     CONFIG.driver_installed = True
                     CONFIG.save_config()
@@ -804,13 +867,12 @@ class ControllerWindow:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to start the installer: {e}")
         else:
-            messagebox.showerror("Error", "Could not find install.bat. Please verify the integrity of the application files.")
+            messagebox.showerror("Error", "Could not find install_driver.ps1. Please verify the integrity of the application files.")
 
         if discoverer_was_running:
             self.start_discoverer_thread()
 
     def run_driver_uninstall(self):
-        import subprocess
         import sys
         import os
         from tkinter import messagebox
@@ -825,8 +887,8 @@ class ControllerWindow:
         from discoverer import emergency_cleanup
         emergency_cleanup()
 
-        uninstall_bat = get_driver_path("uninstall.bat")
-        if os.path.exists(uninstall_bat):
+        uninstall_ps1 = get_driver_path("uninstall_driver.ps1")
+        if os.path.exists(uninstall_ps1):
             try:
                 progress_win = tk.Toplevel(self.root)
                 progress_win.title("Driver Uninstallation")
@@ -844,39 +906,53 @@ class ControllerWindow:
                 )
                 label.pack(pady=int(40 * scaling_factor))
                 
-                proc = subprocess.Popen(f'"{uninstall_bat}"', shell=True)
+                # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
+                info = SHELLEXECUTEINFOW()
+                info.cbSize = ctypes.sizeof(info)
+                info.fMask = SEE_MASK_NOCLOSEPROCESS
+                info.hwnd = None
+                info.lpVerb = "runas"
+                info.lpFile = "powershell.exe"
+                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"'
+                info.lpDirectory = None
+                info.nShow = 1  # SW_SHOWNORMAL
                 
+                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
+                if not launched:
+                    # User cancelled the UAC prompt or it failed
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    messagebox.showerror("Error", "Driver uninstallation was cancelled or failed to start (UAC prompt declined).")
+                    if discoverer_was_running:
+                        self.start_discoverer_thread()
+                    return
+
+                hProcess = info.hProcess
+                proc_exit_code = [0]
+
                 def check_process():
-                    if proc.poll() is None:
-                        progress_win.after(500, check_process)
+                    if hProcess:
+                        res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                        if res == WAIT_TIMEOUT:
+                            progress_win.after(200, check_process)
+                        else:
+                            exit_code = wintypes.DWORD()
+                            ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                            ctypes.windll.kernel32.CloseHandle(hProcess)
+                            proc_exit_code[0] = exit_code.value
+                            progress_win.grab_release()
+                            progress_win.destroy()
                     else:
                         progress_win.grab_release()
                         progress_win.destroy()
                             
-                progress_win.after(500, check_process)
+                progress_win.after(200, check_process)
                 self.root.wait_window(progress_win)
                 
-                # Now that progress_win is destroyed, its event grab is released
-                driver_removed_ok = True
-                try:
-                    res = subprocess.run(
-                        ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
-                        capture_output=True,
-                        text=True,
-                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                    )
-                    if res.returncode == 0 and "root\\winuhid" in res.stdout.lower():
-                        driver_removed_ok = False
-                except Exception:
-                    # Fallback to registry check
-                    import winreg
-                    try:
-                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver")
-                        winreg.CloseKey(key)
-                        driver_removed_ok = False
-                    except FileNotFoundError:
-                        pass
-                    
+                logger.info(f"Driver uninstaller process exited with code: {proc_exit_code[0]}")
+                
+                # Now that progress_win is destroyed, check if it was removed
+                driver_removed_ok = not is_driver_installed()
                 if driver_removed_ok:
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
@@ -890,7 +966,7 @@ class ControllerWindow:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to start the uninstaller: {e}")
         else:
-            messagebox.showerror("Error", "Could not find uninstall.bat. Please verify the integrity of the application files.")
+            messagebox.showerror("Error", "Could not find uninstall_driver.ps1. Please verify the integrity of the application files.")
 
         if discoverer_was_running:
             self.start_discoverer_thread()
@@ -970,7 +1046,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering size)
         default_w = 1240
-        default_h = 1020
+        default_h = 1080
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
@@ -1413,10 +1489,16 @@ class ControllerWindow:
         tk.Label(row_global, text="Layout:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         self.layout_switch = ToggleSwitch(row_global, ["Xbox", "Switch"], ["Xbox", "Switch"], CONFIG.abxy_mode, self.update_layout_setting, background_color)
         self.layout_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
-        tk.Label(row_global, text="Vibration:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
-        self.vibration_strength_scale = tk.Scale(row_global, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_strength)
+
+        row_vibration = tk.Frame(self.settings_frame, bg=background_color); row_vibration.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
+        tk.Label(row_vibration, text="Vibration:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        self.vibration_strength_scale = tk.Scale(row_vibration, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_strength)
         self.vibration_strength_scale.set(getattr(CONFIG, "vibration_strength", 5))
         self.vibration_strength_scale.pack(side=tk.LEFT)
+        tk.Label(row_vibration, text="Frequency:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        self.vibration_frequency_scale = tk.Scale(row_vibration, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_frequency)
+        self.vibration_frequency_scale.set(getattr(CONFIG, "vibration_frequency", 10))
+        self.vibration_frequency_scale.pack(side=tk.LEFT)
 
         row_mouse = tk.Frame(self.settings_frame, bg=background_color); row_mouse.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_mouse, text="Joy-con Mouse:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
@@ -1470,6 +1552,13 @@ class ControllerWindow:
             CONFIG.save_config()
         except Exception as e:
             logger.error(f"Failed to save vibration strength setting: {e}")
+
+    def update_vibration_frequency(self, val):
+        try:
+            CONFIG.vibration_frequency = int(float(val))
+            CONFIG.save_config()
+        except Exception as e:
+            logger.error(f"Failed to save vibration frequency setting: {e}")
 
     def update_startup_setting(self, val):
         CONFIG.open_when_startup = val

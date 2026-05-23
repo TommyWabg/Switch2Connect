@@ -227,6 +227,7 @@ class Config:
         self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
         self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
         self.vibration_strength = int(config.get("vibration_strength", 5))
+        self.vibration_frequency = int(config.get("vibration_frequency", 10))
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
         
@@ -247,6 +248,7 @@ class Config:
             data['auto_disconnect_hours'] = self.auto_disconnect_hours
             data['auto_disconnect_minutes'] = self.auto_disconnect_minutes
             data['vibration_strength'] = self.vibration_strength
+            data['vibration_frequency'] = self.vibration_frequency
             
             data['simulation_mode'] = self.simulation_mode
             data['open_when_startup'] = self.open_when_startup
