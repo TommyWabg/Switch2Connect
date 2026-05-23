@@ -50,12 +50,19 @@ if (Test-Path $registryPath) {
     Remove-Item -Path $registryPath -Recurse -Force
 }
 
-# 5. Reset config.yaml files in the workspace
+# 5. Reset config.yaml files in the workspace and user profile AppData
 Write-Host "Resetting driver_installed flags in config.yaml files..." -ForegroundColor Yellow
 Get-ChildItem -Path $RootDir -Filter "config.yaml" -Recurse | ForEach-Object {
     $content = Get-Content $_.FullName
     $content = $content -replace "driver_installed:\s*true", "driver_installed: false"
     $content | Set-Content $_.FullName
+}
+$AppDataConfig = Join-Path $env:APPDATA "Switch2Controllers\config.yaml"
+if (Test-Path $AppDataConfig) {
+    Write-Host "Resetting driver_installed flag in user AppData config..." -ForegroundColor Yellow
+    $content = Get-Content $AppDataConfig
+    $content = $content -replace "driver_installed:\s*true", "driver_installed: false"
+    $content | Set-Content $AppDataConfig
 }
 
 Write-Host "Uninstallation complete!" -ForegroundColor Green
