@@ -93,6 +93,7 @@ capt_mapping: Capture
 combine_joycons: true
 controller_mode: Xbox
 deadzone: 50
+driver_installed: false
 gl_mapping: PS_L_Touch
 gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
@@ -158,7 +159,8 @@ stick_r_bias:
 - 0.0
 - 0.0
 theme_mode: Dark
+vibration_frequency: 5
 vibration_strength: 5
 virtual_gyro_soft_deadzone: 2.0
-window_height: 1020
+window_height: 1080
 window_width: 1240
