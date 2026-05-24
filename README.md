@@ -20,22 +20,19 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
   * **Adjustable Soft Deadzone Slider:** Added a slider for adjusting soft deadzone value for passthrough gyro data. (Soft deadzone subtracts the active deadzone value from the input magnitude. Output begins smoothly from `0.0` right at the threshold boundary, eliminating step-jump discontinuities.)
 * **Gyro Calibration:** **Calibrate Gyro** button for calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
-* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_R`, `SR_R`, `SL_L`, `SR_L`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad L/R touch and center click, calibration trigger, open Windows Game Bar, HDR toggle, or standard buttons.
+* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_R`, `SR_L` and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, or standard buttons.
 * **Joy-con Mouse Toggle:** A new dedicated switch in the GUI to enable or disable the Joy-con mouse mode. This prevents accidental cursor movement during gameplay.
 * **Dynamic Split & Merge System:** The new **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Added V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
 * **Per-Joy-Con V/H Mode Persistence:** The application now records and remembers whether each single Joy-Con is held vertically or horizontally. Layout preferences (Vertical or Horizontal) are dynamically mapped to each controller's Bluetooth MAC address and saved in `config.yaml`.
 * **Dual-Controller Gyro Selection (L/R Gyro):** When using a pair of Joy-cons as a single virtual controller, you can now manually select which Joy-con (Left or Right) provides the motion data. This allows for greater flexibility, letting you choose your preferred hand for gyro aiming or motion controls.
-* **Interactive Controller Identification:** Added a dedicated **Ping** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
+* **Interactive Controller Identification:** Added a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Added rumble feedback (including a connection confirmation rumble) and mapped the Capture button to native Windows screenshots (`Win + PrtScn`).
 * **One-Click Disconnect:** Added a convenient 'X' button to the top right of each connected controller's UI block. You can now manually disconnect specific controllers directly from the interface without needing to power them off physically.
 * **Dedicated UI Driver Controls:** Added an **Install/Uninstall WinUHid Driver** button to the left of the "Run At Startup" button.
 * **Run at Startup:** Added a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
 * **Hide to system tray:** Added the ability to minimize the application to the Windows system tray.
-* **Auto Disconnect Timer:** Implemented a customizable idle disconnect feature. Through the Auto Disconnect panel, users can set a specific countdown timer (Days/Hours/Minutes) that automatically severs the connection to physical and virtual controllers to preserve battery life.
-* **Customizable Vibration Strength:** Introduced a new `Vibration Strength` slider in the settings panel (ranging from 0 to 10), allowing users to dynamically scale the intensity of the controller's haptic feedback.
-* **Rumble Frequency Slider:** You can now customize the vibration/rumble frequency directly from the settings panel.
 * **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
 
 ## System Requirements

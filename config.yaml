@@ -3,147 +3,30 @@ auto_disconnect_days: 0
 auto_disconnect_enabled: false
 auto_disconnect_hours: 0
 auto_disconnect_minutes: 0
-buttons:
-  dual_joycons:
-    A: A
-    B: B
-    C: null
-    CAPT: null
-    DOWN: DOWN
-    HOME: GUIDE
-    L: LB
-    LEFT: LEFT
-    L_STK: L_STK
-    MINUS: BACK
-    PLUS: START
-    R: RB
-    RIGHT: RIGHT
-    R_STK: R_STK
-    SL_L: SL_L
-    SL_R: SL_R
-    SR_L: SR_L
-    SR_R: SR_R
-    UP: UP
-    X: X
-    Y: Y
-    ZL: LT
-    ZR: RT
-  procon:
-    A: A
-    B: B
-    C: null
-    CAPT: null
-    DOWN: DOWN
-    GL: null
-    GR: Gyro Mouse
-    HOME: GUIDE
-    L: LB
-    LEFT: LEFT
-    L_STK: L_STK
-    MINUS: BACK
-    PLUS: START
-    R: RB
-    RIGHT: RIGHT
-    R_STK: R_STK
-    UP: UP
-    X: X
-    Y: Y
-    ZL: LT
-    ZR: RT
-  single_joycon_l:
-    CAPT: START
-    DOWN: B
-    L: LT
-    LEFT: A
-    L_STK: L_STK
-    MINUS: BACK
-    RIGHT: Y
-    SL_L: LB
-    SR_L: RB
-    UP: X
-    ZL: RT
-  single_joycon_r:
-    A: A
-    B: X
-    C: BACK
-    HOME: GUIDE
-    PLUS: START
-    R: LT
-    R_STK: L_STK
-    SL_R: LB
-    SR_R: RB
-    X: B
-    Y: Y
-    ZR: RT
 c_mapping: Calibration
-calibration_data:
-  E0:EF:BF:81:06:9F:
-  - 5.952702702702703
-  - -16.25
-  - 0.12837837837837837
-  E0:EF:BF:EF:CC:BD:
-  - 2.0316455696202533
-  - -10.629746835443038
-  - 8.33860759493671
-  E0:EF:BF:F0:0E:17:
-  - -2.040625
-  - -0.35625
-  - 4.16875
+calibration_data: {}
 capt_mapping: Capture
-combine_joycons: true
-controller_mode: Xbox
-deadzone: 50
 driver_installed: false
+driver_type: WinUHid
 gl_mapping: PS_L_Touch
 gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
 gyro_bias_l:
-- -2.040625
-- -0.35625
-- 4.16875
+- 0.0
+- 0.0
+- 0.0
 gyro_bias_r:
-- 2.0316455696202533
-- -10.629746835443038
-- 8.33860759493671
-gyro_click_stabilize_duration: 0.02
-gyro_click_stabilizer: true
+- 0.0
+- 0.0
+- 0.0
 gyro_mode: World
 gyro_sensitivity: 3.0
 home_mapping: Default
-joycon_hold_mode:
-  E0:EF:BF:EF:CC:BD: Vertical
-  E0:EF:BF:F0:0E:17: Vertical
-mag_calibration_data:
-  AA:BB:CC:DD:EE:FF:
-  - -0.5
-  - -0.5
-  - -0.5
-  E0:EF:BF:81:06:9F:
-  - 170.5
-  - 98.0
-  - 6.0
-  E0:EF:BF:EF:CC:BD:
-  - -267.5
-  - 11.5
-  - -407.0
-  E0:EF:BF:F0:0E:17:
-  - -126.5
-  - 253.0
-  - -220.5
-merged_gyro_side:
-  E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
+joycon_hold_mode: {}
+mag_calibration_data: {}
+merged_gyro_side: {}
 mouse:
-  buttons:
-    left_joycon:
-      left_button: L
-      middle_button: L_STK
-      right_button: ZL
-    right_joycon:
-      left_button: R
-      middle_button: R_STK
-      right_button: ZR
-  enabled: true
-  scroll_sensitivity: 2
+  enabled: false
   sensitivity: 5.0
 open_when_startup: false
 simulation_mode: PS5
@@ -153,14 +36,14 @@ srl_mapping: PS_L_Touch
 srr_mapping: Default
 stabilized_gyro: true
 start_minimized: false
-steam_roll_compensation: true
+steam_roll_compensation: false
 stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
-theme_mode: Dark
-vibration_frequency: 5
+vibration_frequency: 10
 vibration_strength: 5
+vigembus_installed: false
 virtual_gyro_soft_deadzone: 2.0
 window_height: 1080
 window_width: 1240
