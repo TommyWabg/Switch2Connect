@@ -95,6 +95,97 @@ def check_driver_pnputil():
 def is_driver_installed():
     return check_driver_registry() or check_driver_pnputil()
 
+def check_vigembus_registry():
+    import winreg
+    for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services\ViGEmBus",
+                0,
+                sam
+            )
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+            
+    # Also check uninstall keys
+    paths = [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    ]
+    for path in paths:
+        for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, sam)
+                info = winreg.QueryInfoKey(key)
+                for i in range(info[0]):
+                    try:
+                        subkey_name = winreg.EnumKey(key, i)
+                        if subkey_name == "{966606F3-2745-49E9-BF15-5C3EAA4E9077}":
+                            winreg.CloseKey(key)
+                            return True
+                        subkey = winreg.OpenKey(key, subkey_name)
+                        try:
+                            val, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                            if "vigem" in str(val).lower() or "virtual gamepad emulation" in str(val).lower():
+                                winreg.CloseKey(subkey)
+                                winreg.CloseKey(key)
+                                return True
+                        except:
+                            pass
+                        winreg.CloseKey(subkey)
+                    except:
+                        pass
+                winreg.CloseKey(key)
+            except:
+                pass
+    return False
+
+def check_vigembus_pnputil():
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pnputil", "/enum-devices", "/deviceid", "Root\\ViGEmBus"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        )
+        if result.returncode == 0 and "root\\vigembus" in result.stdout.lower():
+            return True
+            
+        result = subprocess.run(
+            ["pnputil", "/enum-devices", "/deviceid", "Nefarius\\ViGEmBus\\Gen1"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        )
+        if result.returncode == 0 and "vigembus" in result.stdout.lower():
+            return True
+    except Exception as e:
+        logger.error(f"Error checking ViGEmBus installation via pnputil enum-devices: {e}")
+
+    try:
+        result = subprocess.run(
+            ["pnputil", "/enum-drivers"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        )
+        if result.returncode == 0:
+            if "vigembus" in result.stdout.lower() or "nefarius" in result.stdout.lower():
+                return True
+    except Exception as e:
+        logger.error(f"Error checking ViGEmBus installation via pnputil enum-drivers: {e}")
+        
+    return False
+
+def is_vigembus_installed():
+    return check_vigembus_registry() or check_vigembus_pnputil()
+
 logger = logging.getLogger(__name__)
 
 scaling_factor = 1.2
@@ -202,6 +293,39 @@ class ToggleSwitch(tk.Frame):
         except ValueError:
             pass
 
+    def update_options(self, labels, values, current_value):
+        # Destroy all old buttons and frames
+        for btn, frame in self.buttons:
+            try:
+                btn.destroy()
+            except:
+                pass
+            try:
+                frame.destroy()
+            except:
+                pass
+        self.buttons.clear()
+        
+        self.labels = labels
+        self.values = values
+        
+        for i, label in enumerate(labels):
+            # Create a wrapper frame to simulate the border/outline
+            frame = tk.Frame(self, bg=self.bg_color)
+            frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+            
+            btn = tk.Button(frame, text=label, width=8, font=scale_font(("Arial", 12, "bold")),
+                            bd=0, relief=tk.FLAT, highlightthickness=0,
+                            command=lambda idx=i: self._on_click(idx))
+            btn.pack(padx=0, pady=0) # Base state: no padding
+            self.buttons.append((btn, frame))
+            
+        try:
+            self.current_index = values.index(current_value)
+        except ValueError:
+            self.current_index = 0
+        self._update_ui()
+
 class PlayerInfoBlock:
     def __init__(self, parent, window):
         self.parent = parent
@@ -283,13 +407,13 @@ class PlayerInfoBlock:
             vib = VibrationData(lf_amp=800, hf_amp=800)
             off = VibrationData(lf_amp=0, hf_amp=0)
             for controller in self.current_vc.controllers:
-                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib), self.current_vc.loop)
+                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, ignore_freq_scaling=True), self.current_vc.loop)
                 self.parent.after(100, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, ignore_freq_scaling=True), loop))
                 self.parent.after(200, lambda c=controller, loop=self.current_vc.loop, v=vib: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(v), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, ignore_freq_scaling=True), loop))
                 self.parent.after(300, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, ignore_freq_scaling=True), loop))
             
             # Brief UI feedback (consistent size)
             if getattr(self, 'vibrate_frame', None):
@@ -383,6 +507,13 @@ class PlayerInfoBlock:
                         vc.vg_controller.unregister_notification()
                     except Exception as e:
                         logger.debug(f"Unregister notification failed: {e}")
+                    if hasattr(vc.vg_controller, 'cmp_func'):
+                        vc.vg_controller.cmp_func = None
+                    if hasattr(vc.vg_controller, 'close'):
+                        try:
+                            vc.vg_controller.close()
+                        except Exception:
+                            pass
                     vc.vg_controller = None
             
             gc.collect()
@@ -752,7 +883,55 @@ class ControllerWindow:
         self.last_width = CONFIG.window_width
         self.last_height = CONFIG.window_height
 
+    def check_vigembus_installation(self):
+        installed = is_vigembus_installed()
+        if not installed:
+            CONFIG.vigembus_installed = False
+            CONFIG.save_config()
+            
+            from tkinter import messagebox
+            import webbrowser
+            
+            answer = messagebox.askyesno(
+                "Install ViGEmBus Driver",
+                "ViGEmBus driver is not installed on your system.\n\nDo you want to open the download page to install it?\n(https://github.com/nefarius/ViGEmBus/releases)"
+            )
+            
+            if answer:
+                webbrowser.open("https://github.com/nefarius/ViGEmBus/releases")
+            return False
+
+        # If installed, test if the driver is actually functioning (accessible to Python via VBus connection)
+        try:
+            from virtual_controller import get_vigem
+            test_vigem = get_vigem()
+            # Test instantiating the bus (will throw Exception if service is not started/active)
+            bus = test_vigem.win.virtual_gamepad.VBus()
+            del bus
+            CONFIG.vigembus_installed = True
+            CONFIG.save_config()
+            return True
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "ViGEmBus Connection Error",
+                f"ViGEmBus driver was detected in the system registry, but it failed to initialize ({e}).\n\n"
+                "Please restart your computer to apply the installation, or reinstall the driver if the issue persists."
+            )
+            CONFIG.driver_type = "WinUHid"
+            CONFIG.vigembus_installed = False
+            CONFIG.save_config()
+            if hasattr(self, 'driver_switch'):
+                self.driver_switch.set_value("WinUHid")
+            self.update_driver_button()
+            return False
+
     def check_driver_installation(self):
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if driver_type == "ViGEmBus":
+            self.check_vigembus_installation()
+            return
+
         # 如果yaml裡有已安裝的紀錄：開啟app時不再檢查是否有安裝，無條件開啟app
         if getattr(CONFIG, 'driver_installed', False):
             return
@@ -990,19 +1169,132 @@ class ControllerWindow:
         self.discoverer_thread = threading.Thread(target=run, daemon=True)
         self.discoverer_thread.start()
 
-    def on_driver_btn_clicked(self):
-        if getattr(CONFIG, 'driver_installed', False):
-            from tkinter import messagebox
-            if messagebox.askyesno("Uninstall Driver", "Are you sure you want to uninstall the WinUHid driver?\n(Requires administrator privileges.)"):
-                self.run_driver_uninstall()
+    def run_vigembus_uninstall(self):
+        import sys
+        import os
+        from tkinter import messagebox
+        
+        # Stop discoverer before uninstallation
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+            
+        # Run emergency cleanup to close all virtual controller handles immediately
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        uninstall_ps1 = get_driver_path("uninstall_vigembus.ps1")
+        if os.path.exists(uninstall_ps1):
+            try:
+                progress_win = tk.Toplevel(self.root)
+                progress_win.title("ViGEmBus Uninstallation")
+                progress_win.geometry(f"{int(450 * scaling_factor)}x{int(130 * scaling_factor)}+150+150")
+                progress_win.resizable(False, False)
+                progress_win.config(bg="#1E1E1E")
+                progress_win.transient(self.root)
+                progress_win.grab_set()
+                
+                label = tk.Label(
+                    progress_win,
+                    text="Uninstalling ViGEmBus Driver...\nPlease authorize the UAC prompt if asked.",
+                    fg="white", bg="#1E1E1E",
+                    font=scale_font(("Arial", 11, "bold"))
+                )
+                label.pack(pady=int(40 * scaling_factor))
+                
+                # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
+                info = SHELLEXECUTEINFOW()
+                info.cbSize = ctypes.sizeof(info)
+                info.fMask = SEE_MASK_NOCLOSEPROCESS
+                info.hwnd = None
+                info.lpVerb = "runas"
+                info.lpFile = "powershell.exe"
+                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"'
+                info.lpDirectory = None
+                info.nShow = 1  # SW_SHOWNORMAL
+                
+                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
+                if not launched:
+                    # User cancelled the UAC prompt or it failed
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    messagebox.showerror("Error", "ViGEmBus uninstallation was cancelled or failed to start (UAC prompt declined).")
+                    if discoverer_was_running:
+                        self.start_discoverer_thread()
+                    return
+
+                hProcess = info.hProcess
+                proc_exit_code = [0]
+
+                def check_process():
+                    if hProcess:
+                        res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                        if res == WAIT_TIMEOUT:
+                            progress_win.after(200, check_process)
+                        else:
+                            exit_code = wintypes.DWORD()
+                            ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                            ctypes.windll.kernel32.CloseHandle(hProcess)
+                            proc_exit_code[0] = exit_code.value
+                            progress_win.grab_release()
+                            progress_win.destroy()
+                    else:
+                        progress_win.grab_release()
+                        progress_win.destroy()
+                            
+                progress_win.after(200, check_process)
+                self.root.wait_window(progress_win)
+                
+                logger.info(f"ViGEmBus uninstaller process exited with code: {proc_exit_code[0]}")
+                
+                driver_removed_ok = (proc_exit_code[0] == 0)
+                if driver_removed_ok:
+                    CONFIG.vigembus_installed = False
+                    CONFIG.save_config()
+                    messagebox.showinfo("Success", "ViGEmBus driver uninstalled successfully. A system reboot is highly recommended.")
+                else:
+                    messagebox.showerror(
+                        "Error",
+                        "ViGEmBus uninstallation failed or was cancelled."
+                    )
+                self.update_driver_button()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start the uninstaller: {e}")
         else:
-            self.run_driver_install()
+            messagebox.showerror("Error", "Could not find uninstall_vigembus.ps1. Please verify the integrity of the application files.")
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
+
+    def on_driver_btn_clicked(self):
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if driver_type == "ViGEmBus":
+            if getattr(CONFIG, 'vigembus_installed', False):
+                from tkinter import messagebox
+                if messagebox.askyesno("Uninstall Driver", "Are you sure you want to uninstall the ViGEmBus driver?\n(Requires administrator privileges.)"):
+                    self.run_vigembus_uninstall()
+            else:
+                import webbrowser
+                webbrowser.open("https://github.com/nefarius/ViGEmBus/releases")
+        else:
+            if getattr(CONFIG, 'driver_installed', False):
+                from tkinter import messagebox
+                if messagebox.askyesno("Uninstall Driver", "Are you sure you want to uninstall the WinUHid driver?\n(Requires administrator privileges.)"):
+                    self.run_driver_uninstall()
+            else:
+                self.run_driver_install()
 
     def update_driver_button(self):
         if not hasattr(self, 'driver_btn') or not self.driver_btn:
             return
-        installed = getattr(CONFIG, 'driver_installed', False)
-        text = "Uninstall WinUHid Driver" if installed else "Install WinUHid Driver"
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if driver_type == "ViGEmBus":
+            installed = getattr(CONFIG, 'vigembus_installed', False)
+            text = "Uninstall ViGEmBus Driver" if installed else "Download ViGEmBus Driver"
+        else:
+            installed = getattr(CONFIG, 'driver_installed', False)
+            text = "Uninstall WinUHid Driver" if installed else "Install WinUHid Driver"
         self.driver_btn.config(text=text)
 
 
@@ -1483,9 +1775,25 @@ class ControllerWindow:
         self.settings_frame = tk.Frame(self.root, bg=background_color)
         self.settings_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         row_global = tk.Frame(self.settings_frame, bg=background_color); row_global.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_global, text="Emu Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.sim_mode_switch = ToggleSwitch(row_global, ["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], getattr(CONFIG, "simulation_mode", "Xbox"), self.update_sim_mode_setting, background_color)
+        
+        # Driver Switch
+        tk.Label(row_global, text="Driver:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        self.driver_switch = ToggleSwitch(row_global, ["WinUHid", "ViGEmBus"], ["WinUHid", "ViGEmBus"], getattr(CONFIG, "driver_type", "WinUHid"), self.update_driver_type_setting, background_color)
+        self.driver_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        
+        # Emu Mode
+        tk.Label(row_global, text="Emu Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        
+        initial_driver = getattr(CONFIG, "driver_type", "WinUHid")
+        if initial_driver == "ViGEmBus":
+            sim_options = ["Xbox", "PS4"]
+        else:
+            sim_options = ["Xbox", "PS4", "PS5"]
+            
+        self.sim_mode_switch = ToggleSwitch(row_global, sim_options, sim_options, getattr(CONFIG, "simulation_mode", "Xbox"), self.update_sim_mode_setting, background_color)
         self.sim_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        
+        # Layout
         tk.Label(row_global, text="Layout:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         self.layout_switch = ToggleSwitch(row_global, ["Xbox", "Switch"], ["Xbox", "Switch"], CONFIG.abxy_mode, self.update_layout_setting, background_color)
         self.layout_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
@@ -1534,6 +1842,74 @@ class ControllerWindow:
             combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
             combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
             setattr(self, f"{key}_combo", combo)
+
+    def update_driver_type_setting(self, val):
+        old_driver = getattr(CONFIG, "driver_type", "WinUHid")
+        if old_driver == val:
+            return
+            
+        CONFIG.driver_type = val
+        CONFIG.save_config()
+        
+        # Check driver installation
+        if val == "ViGEmBus":
+            if not self.check_vigembus_installation():
+                # Revert to WinUHid options in GUI
+                self.sim_mode_switch.update_options(["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], CONFIG.simulation_mode)
+                return
+        else:
+            self.check_driver_installation()
+            
+        self.update_driver_button()
+        
+        # Fallback simulation mode from PS5 to PS4 under ViGEmBus
+        if val == "ViGEmBus" and CONFIG.simulation_mode == "PS5":
+            CONFIG.simulation_mode = "PS4"
+            
+        # Update sim mode switch options and set value
+        if val == "ViGEmBus":
+            self.sim_mode_switch.update_options(["Xbox", "PS4"], ["Xbox", "PS4"], CONFIG.simulation_mode)
+        else:
+            self.sim_mode_switch.update_options(["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], CONFIG.simulation_mode)
+            
+        CONFIG.save_config()
+        
+        # Apply the driver change to all running virtual controllers immediately
+        if hasattr(self, 'current_controllers'):
+            # Pass 1: Cleanly close all running virtual controllers
+            for vc in self.current_controllers:
+                if vc is not None:
+                    with vc.state_lock:
+                        if hasattr(vc, 'vg_controller') and vc.vg_controller is not None:
+                            try:
+                                vc.vg_controller.unregister_notification()
+                            except Exception:
+                                pass
+                            if hasattr(vc.vg_controller, 'cmp_func'):
+                                vc.vg_controller.cmp_func = None
+                            if hasattr(vc.vg_controller, 'close'):
+                                try:
+                                    vc.vg_controller.close()
+                                except Exception:
+                                    pass
+                            vc.vg_controller = None
+            
+            # Wait for PnP subsystem to settle
+            import gc
+            gc.collect()
+            import time
+            time.sleep(0.5)
+            
+            # Pass 2: Recreate them under the new driver/mode sequentially
+            for i, vc in enumerate(self.current_controllers):
+                if vc is not None:
+                    if i > 0:
+                        time.sleep(0.2)
+                    with vc.state_lock:
+                        vc.mode = CONFIG.simulation_mode
+                        vc._setup_vg_controller()
+                    if vc.loop and vc.loop.is_running():
+                        asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
 
     def update_sim_mode_setting(self, val):
         CONFIG.simulation_mode = val
@@ -1600,6 +1976,16 @@ class ControllerWindow:
             self.main_frame = tk.Frame(self.root, bg=background_color); self.main_frame.pack(pady=(10, 5), fill=tk.Y)
             self.players_info = None
         self.current_controllers = controllers_info
+        
+        # Check if the driver type has been changed/fallback under the hood
+        active_driver = getattr(CONFIG, "driver_type", "WinUHid")
+        if hasattr(self, 'driver_switch') and self.driver_switch.values[self.driver_switch.current_index] != active_driver:
+            self.driver_switch.set_value(active_driver)
+            self.update_driver_button()
+            if active_driver == "ViGEmBus":
+                self.sim_mode_switch.update_options(["Xbox", "PS4"], ["Xbox", "PS4"], CONFIG.simulation_mode)
+            else:
+                self.sim_mode_switch.update_options(["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], CONFIG.simulation_mode)
         # A slot is only "connected" if the VirtualController exists AND has physical controllers
         any_connected = any(c is not None and len(getattr(c, 'controllers', [])) > 0 for c in controllers_info)
         self.no_controllers = not any_connected

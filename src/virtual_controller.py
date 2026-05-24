@@ -1,4 +1,22 @@
-import winuhid_client as vgamepad
+import winuhid_client as winuhid
+from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
+import threading
+
+_vigem_import_lock = threading.Lock()
+_vigem_module = None
+
+def get_vigem():
+    global _vigem_module
+    with _vigem_import_lock:
+        if _vigem_module is not None:
+            return _vigem_module
+        import sys
+        for mod in list(sys.modules.keys()):
+            if mod == 'vgamepad' or mod.startswith('vgamepad.'):
+                sys.modules.pop(mod, None)
+        import vgamepad as vigem
+        _vigem_module = vigem
+        return _vigem_module
 import asyncio
 import threading
 import ctypes
@@ -37,12 +55,15 @@ class VirtualController:
         self.loop = None
         self.touch_tracking_id = 0
         self.was_touching = False
+        self.was_touching_0 = False
+        self.was_touching_1 = False
         self.touch_start_time = 0.0
         
         self.hold_mode = "Horizontal"
         self.active_gyro_side = "Right"
         
         self.mode = getattr(CONFIG, "simulation_mode", "Xbox")
+        self.driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         self._setup_vg_controller()
         
         self.state_lock = threading.Lock()
@@ -57,38 +78,79 @@ class VirtualController:
                 self.vg_controller.unregister_notification()
             except Exception:
                 pass
-            try:
-                self.vg_controller.close()
-            except Exception:
-                pass
+            if hasattr(self.vg_controller, 'cmp_func'):
+                self.vg_controller.cmp_func = None
+            if hasattr(self.vg_controller, 'close'):
+                try:
+                    self.vg_controller.close()
+                except Exception:
+                    pass
             self.vg_controller = None
+            
+            # Force cleanup of the old target
+            gc.collect()
+            import time
+            time.sleep(0.5)
 
-        if self.mode == "PS4":
-            self.vg_controller = vgamepad.VDS4Gamepad()
-            self.report = self.vg_controller.report
-            self.report.LeftStickX = 128
-            self.report.LeftStickY = 128
-            self.report.RightStickX = 128
-            self.report.RightStickY = 128
-            self.report.BatteryLevel = 0xAF
-            self.report.BatteryLevelSpecial = 0x08
-            logger.info("Switched to virtual PS4 controller via WinUHid")
-        elif self.mode == "PS5":
-            self.vg_controller = vgamepad.VDS5Gamepad()
-            self.report = self.vg_controller.report
-            self.report.LeftStickX = 128
-            self.report.LeftStickY = 128
-            self.report.RightStickX = 128
-            self.report.RightStickY = 128
-            self.report.BatteryPercent = 10
-            self.report.BatteryState = 2
-            logger.info("Switched to virtual PS5 controller via WinUHid")
-        else:
-            self.vg_controller = vgamepad.VX360Gamepad()
-            logger.info("Switched to virtual Xbox 360 controller via WinUHid")
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+
+        if driver_type == "ViGEmBus":
+            try:
+                vigem = get_vigem()
+                if self.mode == "PS4":
+                    self.vg_controller = vigem.VDS4Gamepad()
+                    self.report_ex = DS4_REPORT_EX()
+                    self.report_ex.Report.bThumbLX = 128
+                    self.report_ex.Report.bThumbLY = 128
+                    self.report_ex.Report.bThumbRX = 128
+                    self.report_ex.Report.bThumbRY = 128
+                    self.report_ex.Report.bBatteryLvl = 0xAF
+                    self.report_ex.Report.bBatteryLvlSpecial = 0x08
+                    self.ds4_timestamp = 0
+                    logger.info("Switched to virtual PS4 controller via ViGEmBus")
+                else:
+                    self.vg_controller = vigem.VX360Gamepad()
+                    logger.info("Switched to virtual Xbox 360 controller via ViGEmBus")
+                self.driver_type = "ViGEmBus"
+            except Exception as e:
+                logger.error(f"ViGEmBus initialization failed: {e}. Falling back to WinUHid.")
+                CONFIG.driver_type = "WinUHid"
+                CONFIG.vigembus_installed = False
+                CONFIG.save_config()
+                driver_type = "WinUHid"
+
+        if driver_type == "WinUHid":
+            if self.mode == "PS4":
+                self.vg_controller = winuhid.VDS4Gamepad()
+                self.report = self.vg_controller.report
+                self.report.LeftStickX = 128
+                self.report.LeftStickY = 128
+                self.report.RightStickX = 128
+                self.report.RightStickY = 128
+                self.report.BatteryLevel = 0xAF
+                self.report.BatteryLevelSpecial = 0x08
+                logger.info("Switched to virtual PS4 controller via WinUHid")
+            elif self.mode == "PS5":
+                self.vg_controller = winuhid.VDS5Gamepad()
+                self.report = self.vg_controller.report
+                self.report.LeftStickX = 128
+                self.report.LeftStickY = 128
+                self.report.RightStickX = 128
+                self.report.RightStickY = 128
+                self.report.BatteryPercent = 10
+                self.report.BatteryState = 2
+                logger.info("Switched to virtual PS5 controller via WinUHid")
+            else:
+                self.vg_controller = winuhid.VX360Gamepad()
+                logger.info("Switched to virtual Xbox 360 controller via WinUHid")
+            self.driver_type = "WinUHid"
 
         self.vg_controller.register_notification(callback_function=self.vibration_callback)
+        self.previous_buttons_left = 0x00000000
+        self.previous_buttons_right = 0x00000000
         self.was_touching = False
+        self.was_touching_0 = False
+        self.was_touching_1 = False
         self.touch_start_time = 0.0
 
     def set_mode(self, new_mode):
@@ -301,7 +363,7 @@ class VirtualController:
                             if current_buttons & SWITCH_BUTTONS["B"]: new_btns |= SWITCH_BUTTONS["Y"]
                             if current_buttons & SWITCH_BUTTONS["Y"]: new_btns |= SWITCH_BUTTONS["X"]
 
-                        if current_buttons & SWITCH_BUTTONS["SL_R"]: new_btns |= SWITCH_BUTTONS["R"]
+                        if current_buttons & SWITCH_BUTTONS["SL_R"]: new_btns |= SWITCH_BUTTONS["ZL"]
                         if current_buttons & SWITCH_BUTTONS["SR_R"]: new_btns |= SWITCH_BUTTONS["ZR"]
                         if current_buttons & SWITCH_BUTTONS["PLUS"]: new_btns |= SWITCH_BUTTONS["PLUS"]
                         if current_buttons & SWITCH_BUTTONS["R_STK"]: new_btns |= SWITCH_BUTTONS["L_STK"]
@@ -335,7 +397,147 @@ class VirtualController:
             self._update_as_ps4_locked(inputData, buttons, controller)
 
     def _update_as_ps4_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
-        self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS4")
+        driver_type = self.driver_type
+        if driver_type == "ViGEmBus":
+            report = self.report_ex.Report
+            
+            ds4_buttons = 0
+            if buttons & SWITCH_BUTTONS["Y"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SQUARE
+            if buttons & SWITCH_BUTTONS["X"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_TRIANGLE
+            if buttons & SWITCH_BUTTONS["B"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_CROSS
+            if buttons & SWITCH_BUTTONS["A"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_CIRCLE
+            if buttons & SWITCH_BUTTONS["L"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SHOULDER_LEFT
+            if buttons & SWITCH_BUTTONS["R"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SHOULDER_RIGHT
+            if buttons & SWITCH_BUTTONS["ZL"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_TRIGGER_LEFT
+            if buttons & SWITCH_BUTTONS["ZR"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_TRIGGER_RIGHT
+            if buttons & SWITCH_BUTTONS["MINUS"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_SHARE
+            if buttons & SWITCH_BUTTONS["PLUS"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_OPTIONS
+            if buttons & SWITCH_BUTTONS["L_STK"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_THUMB_LEFT
+            if buttons & SWITCH_BUTTONS["R_STK"]: ds4_buttons |= DS4_BUTTONS.DS4_BUTTON_THUMB_RIGHT
+
+            up = bool(buttons & SWITCH_BUTTONS["UP"])
+            down = bool(buttons & SWITCH_BUTTONS["DOWN"])
+            left = bool(buttons & SWITCH_BUTTONS["LEFT"])
+            right = bool(buttons & SWITCH_BUTTONS["RIGHT"])
+            report.wButtons = ds4_buttons | get_ds4_dpad(up, down, left, right)
+
+            report.bSpecial = 0
+            if buttons & SWITCH_BUTTONS.get("HOME", 0): 
+                report.bSpecial |= DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_PS
+
+            capt = bool(buttons & SWITCH_BUTTONS.get("CAPT", 0))
+            tpad_l = bool(buttons & SWITCH_BUTTONS.get("PS_L_Touch", 0))
+            tpad_r = bool(buttons & SWITCH_BUTTONS.get("PS_R_Touch", 0))
+            tpad_c = bool(buttons & SWITCH_BUTTONS.get("PS_C_Click", 0))
+
+            is_touching = capt or tpad_l or tpad_r or tpad_c
+
+            if is_touching:
+                report.bSpecial |= DS4_SPECIAL_BUTTONS.DS4_SPECIAL_BUTTON_TOUCHPAD
+                if not getattr(self, 'was_touching', False):
+                    self.touch_tracking_id = (getattr(self, 'touch_tracking_id', 0) + 1) & 0x7F
+                report.sCurrentTouch.bIsUpTrackingNum1 = self.touch_tracking_id
+
+                if tpad_l:
+                    report.sCurrentTouch.bTouchData1[0] = 0xE0
+                    report.sCurrentTouch.bTouchData1[1] = 0x71
+                    report.sCurrentTouch.bTouchData1[2] = 0x1D
+                elif tpad_r:
+                    report.sCurrentTouch.bTouchData1[0] = 0xA0
+                    report.sCurrentTouch.bTouchData1[1] = 0x75
+                    report.sCurrentTouch.bTouchData1[2] = 0x1D
+                else:
+                    report.sCurrentTouch.bTouchData1[0] = 0xC0
+                    report.sCurrentTouch.bTouchData1[1] = 0x73
+                    report.sCurrentTouch.bTouchData1[2] = 0x1D
+            else:
+                report.sCurrentTouch.bIsUpTrackingNum1 = 0x80 | getattr(self, 'touch_tracking_id', 0)
+
+            self.was_touching = is_touching
+            report.sCurrentTouch.bIsUpTrackingNum2 = 0x80
+
+            report.bTriggerL = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+            report.bTriggerR = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+
+            # Joystick routing
+            if not hasattr(self, 'last_lx'):
+                self.last_lx = 128; self.last_ly = 128
+                self.last_rx = 128; self.last_ry = 128
+                self.last_gx = 0; self.last_gy = 0; self.last_gz = 0
+                self.last_ax = 0; self.last_ay = 0; self.last_az = 0
+
+            if len(self.controllers) == 1:
+                if controller.is_joycon_right():
+                    if self.hold_mode == "Vertical":
+                        self.last_rx = int(max(0, min(255, round(inputData.right_stick[0] * 127.5 + 128))))
+                        self.last_ry = int(max(0, min(255, round(-inputData.right_stick[1] * 127.5 + 128))))
+                        self.last_lx = 128
+                        self.last_ly = 128
+                    else:
+                        self.last_lx = float_to_byte(inputData.right_stick[0])
+                        self.last_ly = float_to_byte(-inputData.right_stick[1])
+                else:
+                    self.last_lx = float_to_byte(inputData.left_stick[0])
+                    self.last_ly = float_to_byte(-inputData.left_stick[1])
+                    self.last_rx = float_to_byte(inputData.right_stick[0])
+                    self.last_ry = float_to_byte(-inputData.right_stick[1])
+                
+                if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
+                    if controller.is_joycon_right():
+                        self.last_gx = inputData.gyroscope[1]
+                        self.last_gy = inputData.gyroscope[2]
+                        self.last_gz = -inputData.gyroscope[0]
+                        self.last_ax = -inputData.accelerometer[1]
+                        self.last_ay = inputData.accelerometer[2]
+                        self.last_az = inputData.accelerometer[0]
+                    else:
+                        self.last_gx = -inputData.gyroscope[1]
+                        self.last_gy = inputData.gyroscope[2]
+                        self.last_gz = inputData.gyroscope[0]
+                        self.last_ax = -inputData.accelerometer[1]
+                        self.last_ay = inputData.accelerometer[2]
+                        self.last_az = -inputData.accelerometer[0]
+                else:
+                    self.last_gx = inputData.gyroscope[0]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = -inputData.gyroscope[1]
+                    self.last_ax = inputData.accelerometer[0]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = -inputData.accelerometer[1]
+            else:
+                if controller.is_joycon_left():
+                    self.last_lx = float_to_byte(inputData.left_stick[0])
+                    self.last_ly = float_to_byte(-inputData.left_stick[1])
+                elif controller.is_joycon_right():
+                    self.last_rx = float_to_byte(inputData.right_stick[0])
+                    self.last_ry = float_to_byte(-inputData.right_stick[1])
+                    
+                if getattr(controller, 'gyro_active', False):
+                    self.last_gx = inputData.gyroscope[0]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = -inputData.gyroscope[1]
+                    self.last_ax = inputData.accelerometer[0]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = -inputData.accelerometer[1]
+
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
+                self.last_lx = int(max(0, min(255, round(steer * 127.5 + 128))))
+
+            report.bThumbLX = self.last_lx
+            report.bThumbLY = self.last_ly
+            report.bThumbRX = self.last_rx
+            report.bThumbRY = self.last_ry
+
+            def clamp_short(val): return max(-32768, min(32767, int(val)))
+            report.wGyroX = clamp_short(self.last_gx)
+            report.wGyroY = clamp_short(self.last_gy)
+            report.wGyroZ = clamp_short(self.last_gz)
+            report.wAccelX = clamp_short(self.last_ax)
+            report.wAccelY = clamp_short(self.last_ay)
+            report.wAccelZ = clamp_short(self.last_az)
+        else:
+            self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS4")
 
     def update_as_ps5(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         with self.state_lock:
@@ -376,11 +578,11 @@ class VirtualController:
         hat_y = -1 if up else (1 if down else 0)
         
         if mode == "PS4":
-            if vgamepad._winuhid_devs:
-                vgamepad._winuhid_devs.WinUHidPS4SetHatState(ctypes.byref(report), hat_x, hat_y)
+            if winuhid._winuhid_devs:
+                winuhid._winuhid_devs.WinUHidPS4SetHatState(ctypes.byref(report), hat_x, hat_y)
         else:
-            if vgamepad._winuhid_devs:
-                vgamepad._winuhid_devs.WinUHidPS5SetHatState(ctypes.byref(report), hat_x, hat_y)
+            if winuhid._winuhid_devs:
+                winuhid._winuhid_devs.WinUHidPS5SetHatState(ctypes.byref(report), hat_x, hat_y)
 
         # 3. Touchpad
         capt = bool(buttons & SWITCH_BUTTONS.get("CAPT", 0))
@@ -388,36 +590,29 @@ class VirtualController:
         tpad_r = bool(buttons & SWITCH_BUTTONS.get("PS_R_Touch", 0))
         tpad_c = bool(buttons & SWITCH_BUTTONS.get("PS_C_Click", 0))
 
-        # PS_C_Click is center click (no touch coordinates), while PS_L_Touch and PS_R_Touch only send coordinates (no click)
-        is_touching = capt or tpad_l or tpad_r
-
-        touch_x = 0
-        touch_y = 0
-        if is_touching:
-            if tpad_l:
-                touch_x = 100
-                touch_y = 512
-            elif tpad_r:
-                touch_x = 1800
-                touch_y = 512
-            else:
-                touch_x = 960
-                touch_y = 512
-
         # Set mechanical click button (CAPT and PS_C_Click trigger click)
         report.ButtonTouchpad = 1 if (capt or tpad_c) else 0
 
-        is_new_touch = False
-        if is_touching:
-            if not self.was_touching:
-                is_new_touch = True
+        # Touch Point 0: Left touch or Center touch (CAPT)
+        touch_0_down = tpad_l or capt
+        touch_0_x = 100 if tpad_l else 960
+        touch_0_y = 512
 
-            # Update touch coordinates with correct tracking ID/ContactSeq logic
-            self._set_touch_state(report, 0, True, touch_x, touch_y, mode, is_new_touch)
-        else:
-            self._set_touch_state(report, 0, False, 0, 0, mode, is_new_touch=False)
+        # Touch Point 1: Right touch
+        touch_1_down = tpad_r
+        touch_1_x = 1800
+        touch_1_y = 512
 
-        self.was_touching = is_touching
+        is_new_touch_0 = touch_0_down and not self.was_touching_0
+        is_new_touch_1 = touch_1_down and not self.was_touching_1
+
+        # Set touch states for both points
+        self._set_touch_state(report, 0, touch_0_down, touch_0_x, touch_0_y, mode, is_new_touch_0)
+        self._set_touch_state(report, 1, touch_1_down, touch_1_x, touch_1_y, mode, is_new_touch_1)
+
+        self.was_touching_0 = touch_0_down
+        self.was_touching_1 = touch_1_down
+        self.was_touching = touch_0_down or touch_1_down
 
         # 4. Triggers
         report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
@@ -448,7 +643,7 @@ class VirtualController:
             
             if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
                 if controller.is_joycon_right():
-                    self.last_gx = -inputData.gyroscope[1]
+                    self.last_gx = inputData.gyroscope[1]
                     self.last_gy = inputData.gyroscope[2]
                     self.last_gz = -inputData.gyroscope[0]
                     self.last_ax = -inputData.accelerometer[1]
@@ -602,11 +797,18 @@ class VirtualController:
                 self.last_xb_lx = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
 
             # Phase 3: Final Reporting
-            self.vg_controller.set_buttons(xb_btns)
-            self.vg_controller.left_trigger(lt)
-            self.vg_controller.right_trigger(rt)
-            self.vg_controller.left_joystick_float(self.last_xb_lx, self.last_xb_ly)
-            self.vg_controller.right_joystick_float(self.last_xb_rx, self.last_xb_ry)
+            if self.driver_type == "ViGEmBus":
+                self.vg_controller.report.wButtons = xb_btns
+                self.vg_controller.left_trigger(lt)
+                self.vg_controller.right_trigger(rt)
+                self.vg_controller.left_joystick_float(self.last_xb_lx, -self.last_xb_ly)
+                self.vg_controller.right_joystick_float(self.last_xb_rx, -self.last_xb_ry)
+            else:
+                self.vg_controller.set_buttons(xb_btns)
+                self.vg_controller.left_trigger(lt)
+                self.vg_controller.right_trigger(rt)
+                self.vg_controller.left_joystick_float(self.last_xb_lx, self.last_xb_ly)
+                self.vg_controller.right_joystick_float(self.last_xb_rx, self.last_xb_ry)
 
     def is_single(self): 
         return len(self.controllers) == 1
@@ -654,8 +856,28 @@ class VirtualController:
             with self.state_lock:
                 if not hasattr(self, 'vg_controller') or self.vg_controller is None:
                     continue
+                
+                driver_type = self.driver_type
+                if driver_type == "ViGEmBus" and self.mode == "PS4":
+                    ticks = int(dt * 187500)
+                    self.ds4_timestamp = (getattr(self, 'ds4_timestamp', 0) + ticks) & 0xFFFF
                     
-                self.vg_controller.update()
+                    self.report_ex.Report.wTimestamp = self.ds4_timestamp
+                    self.report_ex.Report.bTouchPacketsN = 1
+                    self.touch_packet_counter = (getattr(self, 'touch_packet_counter', 0) + 1) & 0xFF
+                    self.report_ex.Report.sCurrentTouch.bPacketCounter = self.touch_packet_counter
+            
+                    try:
+                        import vgamepad.win.vigem_client as vcli
+                        vcli.vigem_target_ds4_update_ex_ptr.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(DS4_REPORT_EX)]
+                        busp = self.vg_controller.vbus.get_busp()
+                        devicep = self.vg_controller._devicep
+                        vcli.vigem_target_ds4_update_ex_ptr(busp, devicep, ctypes.byref(self.report_ex))
+                    except Exception as e:
+                        logger.error(f"Failed to update DS4 ex via ViGEmBus: {e}")
+                        self.vg_controller.update()
+                else:
+                    self.vg_controller.update()
         
         logger.info(f"Player {self.player_number}: Update loop thread finished.")
                 
@@ -663,17 +885,35 @@ class VirtualController:
         """Reset all virtual inputs to neutral/released state."""
         with self.state_lock:
             if self.vg_controller is not None:
-                if self.mode == "Xbox":
-                    if vgamepad._winuhid_devs:
-                        vgamepad._winuhid_devs.WinUHidXOneInitializeInputReport(ctypes.byref(self.vg_controller.report))
-                elif self.mode == "PS4":
-                    if vgamepad._winuhid_devs:
-                        vgamepad._winuhid_devs.WinUHidPS4InitializeInputReport(ctypes.byref(self.vg_controller.report))
-                elif self.mode == "PS5":
-                    if vgamepad._winuhid_devs:
-                        vgamepad._winuhid_devs.WinUHidPS5InitializeInputReport(ctypes.byref(self.vg_controller.report))
+                driver_type = self.driver_type
+                if driver_type == "WinUHid":
+                    if self.mode == "Xbox":
+                        if winuhid._winuhid_devs:
+                            winuhid._winuhid_devs.WinUHidXOneInitializeInputReport(ctypes.byref(self.vg_controller.report))
+                    elif self.mode == "PS4":
+                        if winuhid._winuhid_devs:
+                            winuhid._winuhid_devs.WinUHidPS4InitializeInputReport(ctypes.byref(self.vg_controller.report))
+                    elif self.mode == "PS5":
+                        if winuhid._winuhid_devs:
+                            winuhid._winuhid_devs.WinUHidPS5InitializeInputReport(ctypes.byref(self.vg_controller.report))
+                else: # ViGEmBus
+                    vigem = get_vigem()
+                    if self.mode == "Xbox":
+                        self.vg_controller.report = vigem.XUSB_REPORT()
+                    else: # PS4
+                        self.report_ex = DS4_REPORT_EX()
+                        self.report_ex.Report.bThumbLX = 128
+                        self.report_ex.Report.bThumbLY = 128
+                        self.report_ex.Report.bThumbRX = 128
+                        self.report_ex.Report.bThumbRY = 128
+                        self.report_ex.Report.bBatteryLvl = 0xAF
+                        self.report_ex.Report.bBatteryLvlSpecial = 0x08
             logger.info(f"Player {self.player_number}: Virtual inputs reset to neutral.")
+            self.previous_buttons_left = 0x00000000
+            self.previous_buttons_right = 0x00000000
             self.was_touching = False
+            self.was_touching_0 = False
+            self.was_touching_1 = False
             self.touch_start_time = 0.0
 
     def force_close(self):
@@ -694,10 +934,13 @@ class VirtualController:
                     self.vg_controller.unregister_notification()
                 except Exception as e:
                     logger.debug(f"Unregister notification failed: {e}")
-                try:
-                    self.vg_controller.close()
-                except Exception as e:
-                    logger.debug(f"Close failed: {e}")
+                if hasattr(self.vg_controller, 'cmp_func'):
+                    self.vg_controller.cmp_func = None
+                if hasattr(self.vg_controller, 'close'):
+                    try:
+                        self.vg_controller.close()
+                    except Exception as e:
+                        logger.debug(f"Close failed: {e}")
                 
                 # Explicitly clear the reference while holding the lock
                 self.vg_controller = None
@@ -735,10 +978,13 @@ class VirtualController:
                         self.vg_controller.unregister_notification()
                     except Exception as e:
                         logger.debug(f"Unregister notification failed: {e}")
-                    try:
-                        self.vg_controller.close()
-                    except Exception as e:
-                        logger.debug(f"Close failed: {e}")
+                    if hasattr(self.vg_controller, 'cmp_func'):
+                        self.vg_controller.cmp_func = None
+                    if hasattr(self.vg_controller, 'close'):
+                        try:
+                            self.vg_controller.close()
+                        except Exception as e:
+                            logger.debug(f"Close failed: {e}")
                     self.vg_controller = None
             
             # Explicitly trigger GC to help release driver handles
@@ -785,10 +1031,13 @@ class VirtualController:
                     self.vg_controller.unregister_notification()
                 except Exception:
                     pass
-                try:
-                    self.vg_controller.close()
-                except Exception:
-                    pass
+                if hasattr(self.vg_controller, 'cmp_func'):
+                    self.vg_controller.cmp_func = None
+                if hasattr(self.vg_controller, 'close'):
+                    try:
+                        self.vg_controller.close()
+                    except Exception:
+                        pass
                 self.vg_controller = None
                 
             return True 
@@ -797,8 +1046,54 @@ class VirtualController:
                 await self.init_added_controller(self.controllers[0])
             return False
 
-def reset_vigem_bus():
+def reset_vigem_bus(force=False):
     """
-    WinUHid migration: this is now a no-op as WinUHid does not use a ViGEm bus.
+    Force-reset the global ViGEm bus handle used by vgamepad.
+    This is critical for preventing BSOD (0x10D) during sleep/wake cycles.
     """
-    logger.info("reset_vigem_bus called (no-op for WinUHid)")
+    if not force and getattr(CONFIG, "driver_type", "WinUHid") != "ViGEmBus":
+        logger.info("reset_vigem_bus called (no-op for WinUHid)")
+        return
+        
+    try:
+        get_vigem()
+    except Exception as e:
+        logger.error(f"Cannot reset ViGEm bus: {e}")
+        return
+        
+    import vgamepad.win.virtual_gamepad as vvg
+    import gc
+    
+    logger.info("Resetting ViGEm bus handle for power state transition.")
+    try:
+        # 1. Clear the global singleton reference
+        if hasattr(vvg, 'VBUS'):
+            old_bus = vvg.VBUS
+            vvg.VBUS = None
+            # Explicitly delete to encourage immediate cleanup
+            if old_bus:
+                try:
+                    # Access private members to force disconnect if __del__ hasn't run yet
+                    import vgamepad.win.vigem_client as vcli
+                    if hasattr(old_bus, '_busp') and old_bus._busp:
+                        logger.debug("Manually disconnecting stale ViGEm bus.")
+                        vcli.vigem_disconnect(old_bus._busp)
+                        vcli.vigem_free(old_bus._busp)
+                        old_bus._busp = None
+                except:
+                    pass
+                del old_bus
+        
+        # 2. Collect garbage to ensure VBus.__del__ runs and driver handles are closed
+        gc.collect()
+        
+        # 3. Create a fresh VBus instance for the next use cycle
+        # We only do this if we are not currently suspending
+        from discoverer import _IS_SUSPENDING
+        if not _IS_SUSPENDING:
+            vvg.VBUS = vvg.VBus()
+            logger.info("New ViGEm bus handle initialized.")
+        else:
+            logger.info("ViGEm bus cleared for suspend. Will re-init on wake.")
+    except Exception as e:
+        logger.error(f"Error resetting ViGEm bus: {e}")

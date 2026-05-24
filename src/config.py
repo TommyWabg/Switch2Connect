@@ -154,13 +154,59 @@ class Config:
         else:
             base_dir = get_app_root()
         
-        self.config_file_path = os.path.join(base_dir, 'config.yaml')
+        local_config = os.path.join(base_dir, 'config.yaml')
         
-        if not os.path.exists(self.config_file_path):
-            bundled_config = get_resource("config.yaml")
-            if os.path.exists(bundled_config):
-                import shutil
-                shutil.copy(bundled_config, self.config_file_path)
+        def is_dir_writable(path):
+            try:
+                test_file = os.path.join(path, '.write_test')
+                with open(test_file, 'w') as f:
+                    f.write('test')
+                os.remove(test_file)
+                return True
+            except Exception:
+                return False
+
+        def is_file_writable(filepath):
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, 'r+'):
+                        return True
+                except Exception:
+                    return False
+            else:
+                return is_dir_writable(os.path.dirname(filepath))
+
+        use_appdata = False
+        base_dir_lower = base_dir.lower()
+        if "program files" in base_dir_lower or "windows\\system32" in base_dir_lower:
+            use_appdata = True
+        elif not is_file_writable(local_config):
+            use_appdata = True
+
+        if use_appdata:
+            appdata_dir = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'Switch2Controllers')
+            os.makedirs(appdata_dir, exist_ok=True)
+            self.config_file_path = os.path.join(appdata_dir, 'config.yaml')
+            
+            if not os.path.exists(self.config_file_path):
+                if os.path.exists(local_config):
+                    try:
+                        import shutil
+                        shutil.copy(local_config, self.config_file_path)
+                    except Exception as e:
+                        logger.error(f"Failed to copy local config to AppData: {e}")
+                else:
+                    bundled_config = get_resource("config.yaml")
+                    if os.path.exists(bundled_config):
+                        import shutil
+                        shutil.copy(bundled_config, self.config_file_path)
+        else:
+            self.config_file_path = local_config
+            if not os.path.exists(self.config_file_path):
+                bundled_config = get_resource("config.yaml")
+                if os.path.exists(bundled_config):
+                    import shutil
+                    shutil.copy(bundled_config, self.config_file_path)
 
         config = {}
         try:
@@ -220,6 +266,8 @@ class Config:
         else:
             self.virtual_gyro_soft_deadzone = float(val)
         self.driver_installed = config.get("driver_installed", False)
+        self.driver_type = config.get("driver_type", "WinUHid")
+        self.vigembus_installed = config.get("vigembus_installed", False)
         self.window_width = config.get("window_width", None)
         self.window_height = config.get("window_height", None)
         self.auto_disconnect_enabled = config.get("auto_disconnect_enabled", False)
@@ -241,6 +289,8 @@ class Config:
                     data = yaml.safe_load(f) or {}
             
             data['driver_installed'] = self.driver_installed
+            data['driver_type'] = self.driver_type
+            data['vigembus_installed'] = self.vigembus_installed
             data['window_width'] = self.window_width
             data['window_height'] = self.window_height
             data['auto_disconnect_enabled'] = self.auto_disconnect_enabled

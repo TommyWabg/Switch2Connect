@@ -537,16 +537,16 @@ class Controller:
             sharp_click = VibrationData(hf_freq=0x1e2, hf_amp=0x300, lf_amp=0x030)
             stop_vibration = VibrationData() 
 
-            await self.set_vibration(bass_thump)
+            await self.set_vibration(bass_thump, ignore_freq_scaling=True)
             await asyncio.sleep(0.2) 
             
-            await self.set_vibration(stop_vibration)
+            await self.set_vibration(stop_vibration, ignore_freq_scaling=True)
             await asyncio.sleep(0.01) 
             
-            await self.set_vibration(sharp_click)
+            await self.set_vibration(sharp_click, ignore_freq_scaling=True)
             await asyncio.sleep(1) 
             
-            await self.set_vibration(stop_vibration)
+            await self.set_vibration(stop_vibration, ignore_freq_scaling=True)
             logger.info("Connection haptic feedback triggered.")
         except Exception as e:
             logger.warning(f"Failed to trigger haptic feedback: {e}")
@@ -613,24 +613,67 @@ class Controller:
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_INIT, feature_flags.to_bytes().ljust(4, b'\0'))
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
-    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData()):
+    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False):
         strength = getattr(CONFIG, "vibration_strength", 5)
-        scale_factor = strength / 5.0
+        
+        is_pro = self.is_pro_controller()
+        if ignore_freq_scaling:
+            scale_factor = 1.0
+            lf_scale_factor = 1.0
+            hf_scale_factor = 1.0
+        elif is_pro:
+            scale_factor = strength / 5.0
+            lf_scale_factor = scale_factor
+            hf_scale_factor = scale_factor
+        else:
+            # For Joy-con: S=0 -> 0.0, S=5 -> (lf=0.8, hf=0.64), S=10 -> (lf=0.96, hf=1.12)
+            # Piecewise linear interpolation for smooth steps
+            if strength <= 5:
+                lf_scale_factor = strength * 0.16
+                hf_scale_factor = strength * 0.128
+            else:
+                lf_scale_factor = 0.8 + (strength - 5) * 0.032
+                hf_scale_factor = 0.64 + (strength - 5) * 0.096
 
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
-        freq_factor = (freq_setting - 1) / 9.0
+        if ignore_freq_scaling:
+            freq_factor = 1.0
+        else:
+            freq_factor = (freq_setting - 1) / 27.0
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
-            scaled_lf = min(1023, max(0, int(v.lf_amp * scale_factor)))
-            scaled_hf = min(1023, max(0, int(v.hf_amp * scale_factor)))
+            if ignore_freq_scaling:
+                scaled_lf_freq = v.lf_freq
+                scaled_hf_freq = v.hf_freq
+                hf_amp_factor = 1.0 if is_pro else 0.6
+            else:
+                F_limit = 240
+                
+                # Low frequency scaling
+                if v.lf_freq > F_limit:
+                    scaled_lf_freq = F_limit + (v.lf_freq - F_limit) * freq_factor
+                else:
+                    scaled_lf_freq = v.lf_freq
+                    
+                # High frequency scaling and amplitude reduction factor
+                if v.hf_freq > F_limit:
+                    scaled_hf_freq = F_limit + (v.hf_freq - F_limit) * freq_factor
+                    if is_pro:
+                        hf_amp_factor = 3.0 ** -(((10 - freq_setting) / 9.0) ** 1.2)
+                    else:
+                        # For Joy-con: Max high frequency vibration factor is 0.6.
+                        # Min vibration (at setting 1) is 0.8 * max (0.6) = 0.48.
+                        hf_amp_factor = 0.6 * (0.8 ** (((10 - freq_setting) / 9.0) ** 1.2))
+                else:
+                    scaled_hf_freq = v.hf_freq
+                    hf_amp_factor = 1.0 if is_pro else 0.6
+
+            scaled_lf_freq = min(511, max(1, int(scaled_lf_freq)))
+            scaled_hf_freq = min(511, max(1, int(scaled_hf_freq)))
             
-            # The previous level 3 frequency was 0.5 * original_freq + 0.5.
-            # We set this as the new minimum frequency (level 1).
-            new_min_lf = 0.5 * v.lf_freq + 0.5
-            new_min_hf = 0.5 * v.hf_freq + 0.5
+            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_scale_factor * 1.3)))
+            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_scale_factor * hf_amp_factor)))
             
-            scaled_lf_freq = min(511, max(1, int(new_min_lf + (v.lf_freq - new_min_lf) * freq_factor)))
-            scaled_hf_freq = min(511, max(1, int(new_min_hf + (v.hf_freq - new_min_hf) * freq_factor)))
             return VibrationData(
                 lf_freq=scaled_lf_freq,
                 lf_en_tone=v.lf_en_tone,
@@ -713,6 +756,13 @@ class Controller:
             self.battery_voltage = inputData.battery_voltage
             self.last_accel = inputData.accelerometer
 
+            is_left = self.is_joycon_left()
+            is_right = self.is_joycon_right()
+            is_pro = self.is_pro_controller()
+
+            # Filter out virtual button bits and garbage bits from physical reports (retaining only valid physical bits <= 0x03FFFFFF)
+            inputData.buttons &= 0x03FFFFFF
+
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False):
                 bx, by, bz = self.gyro_bias
@@ -736,15 +786,15 @@ class Controller:
                 self._mahony_update(gyro_x, gyro_y, gyro_z, ax, ay, az, mx, my, mz, dt)
 
             btn_states = {
-                "GL": bool(inputData.buttons & 0x02000000),
-                "GR": bool(inputData.buttons & 0x01000000),
+                "GL": bool(inputData.buttons & 0x02000000) if is_pro else False,
+                "GR": bool(inputData.buttons & 0x01000000) if is_pro else False,
                 "C":  bool(inputData.buttons & 0x00004000),
                 "HOME": bool(inputData.buttons & 0x00001000),
                 "CAPT": bool(inputData.buttons & 0x00002000),
-                "SL_L": bool(inputData.buttons & 0x00200000),
-                "SR_L": bool(inputData.buttons & 0x00100000),
-                "SL_R": bool(inputData.buttons & 0x00000020),
-                "SR_R": bool(inputData.buttons & 0x00000010)
+                "SL_L": bool(inputData.buttons & 0x00200000) if is_left else False,
+                "SR_L": bool(inputData.buttons & 0x00100000) if is_left else False,
+                "SL_R": bool(inputData.buttons & 0x00000020) if is_right else False,
+                "SR_R": bool(inputData.buttons & 0x00000010) if is_right else False
             }
 
             inputData.buttons &= ~(0x03307030)
@@ -943,14 +993,9 @@ class Controller:
                         ax_comp, ay_comp, az_comp = quaternion_rotate_vector(q_roll, (ax, ay, az))
                         
                         # Overwrite gyroscope with mapped decoupled values
-                        if self.is_joycon_right():
-                            gx_comp = 0.0
-                            gy_comp = decoupled_pitch
-                            gz_comp = decoupled_yaw
-                        else:
-                            gx_comp = 0.0
-                            gy_comp = -decoupled_pitch
-                            gz_comp = decoupled_yaw
+                        gx_comp = 0.0
+                        gy_comp = -decoupled_pitch
+                        gz_comp = decoupled_yaw
                     else:
                         # Vertical / Pro Controller mode: Roll is around Y-axis (in X-Z plane)
                         roll_rad = math.atan2(gx_g, -gz_g)
