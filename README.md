@@ -6,6 +6,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 
 * **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
 * **Low Latency Bluetooth Mode:** The application now forces Windows Bluetooth LE into `ThroughputOptimized` mode upon connection. This drastically drops the connection interval, massively reducing native Bluetooth input delay across the board.
+* **Dual Driver Architecture (WinUHid & ViGEmBus):** Introduced a flexible dual-driver backend, allowing users to toggle between the built-in `WinUHid` driver and the industry-standard `ViGEmBus` virtual gamepad emulator directly from the Settings panel.
 * **Dynamic Emu Mode Toggle:** You can now instantly switch between Xbox One, PS4 (DualShock 4), and PS5 (DualSense) emulation modes directly from the settings panel. This allows you to choose the best protocol for your specific game or platform without restarting the app.
 * **Native Motion Support (PS4/PS5 Mode):** Switching to PS4 or PS5 mode enables native motion sensor reporting via the DS4 or DualSense protocol. This provides enhanced compatibility for Steam Input and games that support native DualShock 4 or DualSense gyro features.
 * **On-the-Fly Layout Switching:** No more multiple executables! Instantly toggle between **Nintendo Layout** (matching physical labels) and **Xbox Layout** (standard PC positioning) directly from the UI.
@@ -29,7 +30,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Interactive Controller Identification:** Added a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Added rumble feedback (including a connection confirmation rumble) and mapped the Capture button to native Windows screenshots (`Win + PrtScn`).
 * **One-Click Disconnect:** Added a convenient 'X' button to the top right of each connected controller's UI block. You can now manually disconnect specific controllers directly from the interface without needing to power them off physically.
-* **Dedicated UI Driver Controls:** Added an **Install/Uninstall WinUHid Driver** button to the left of the "Run At Startup" button.
+* **Dedicated UI Driver Controls:** Added **Install/Uninstall WinUHid Driver** and **Download/Uninstall ViGEmBus Driver** buttons to the left of the "Run At Startup" button.
 * **Run at Startup:** Added a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
 * **Hide to system tray:** Added the ability to minimize the application to the Windows system tray.
@@ -47,7 +48,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 
 1. Download the `.exe` from the **[Releases](https://github.com/TommyWabg/switch2-controllers-windows10-gyro/releases)** page.
 2. Launch the app. If the driver is not installed, a dialog will ask to install the WinUHid driver. Click **Yes** and approve the administrator UAC prompt.
-3. Once the installation completes, the setup window will close automatically and the main application will launch.
+3. Once the installation completes, the setup window will close automatically, and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
 5. Use the settings panel at the bottom of the app to configure your preferred controller layout (Xbox / PS4 / PS5), gyro sensitivity, and custom button mappings.
 
@@ -57,7 +58,7 @@ Because this app emulates both Xbox One and PS4/PS5 controllers, Steam Input mig
 1. Go to **Steam** > **Settings** > **Controller** > **Show Advanced Settings**.
 2. Make sure "**Enable Steam Input for Xbox controllers**" is turned **ON**.
 3. Make sure "PlayStation Controller Support" is set to **Enabled**. (**NOT** Enabled in Games w/o Supports)
-4. Now theSwitch_2_Controllers app will handle the layout switching for you!
+4. Now the Switch_2_Controllers app will handle the layout switching for you!
 
 ## Gyro Calibration Guide
 
