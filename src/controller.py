@@ -628,28 +628,13 @@ class Controller:
             # High Frequency mapping based on 0.6.6: default (S=5) behaves like 0.6.6 strength=5 (factor = 1.0)
             target_hf_scale = (strength / 5.0) * 1.0
 
-            # High Frequency amplitude reduction factor:
-            # - Pro: F=10 -> 1.0, F=5 -> 0.5, F=1 -> 0.8
-            # - Joy-con: F=10 -> 0.4, F=5 -> 0.5, F=1 -> 0.8
-            # Interpolated piecewise linearly:
-            if is_pro:
-                if freq_setting <= 5:
-                    hf_amp_factor = 0.8 - 0.075 * (freq_setting - 1)
-                else:
-                    hf_amp_factor = 0.5 + 0.1 * (freq_setting - 5)
-            else:
-                if freq_setting <= 5:
-                    hf_amp_factor = 0.8 - 0.075 * (freq_setting - 1)
-                else:
-                    hf_amp_factor = 0.5 - 0.02 * (freq_setting - 5)
-
             # Apply limits from 0.7.1 to prevent physical hardware limitations from being exceeded
             if is_pro:
                 lf_multiplier = min(2.6, target_lf_mult) # 2.6 = 2.0 * 1.3
-                hf_multiplier = min(2.0, target_hf_scale) * hf_amp_factor
+                hf_multiplier = min(2.0, target_hf_scale)
             else:
                 lf_multiplier = min(1.248, target_lf_mult) # 1.248 = 0.96 * 1.3
-                hf_multiplier = min(1.12, target_hf_scale) * hf_amp_factor
+                hf_multiplier = min(1.12, target_hf_scale)
 
         # LF frequency is constant (freq_factor_lf = 1.0) so frequency slider has no effect
         freq_factor_lf = 1.0
@@ -662,21 +647,74 @@ class Controller:
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             if ignore_freq_scaling:
-                scaled_lf_freq = v.lf_freq
-                scaled_hf_freq = v.hf_freq
+                scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
+                scaled_hf_freq = min(511, max(1, int(v.hf_freq)))
+                lf_mask = 1.0
+                hf_mask = 1.0
             else:
                 # Frequency scaling formula based on 0.6.6
                 new_min_lf = 0.5 * v.lf_freq + 0.5
-                scaled_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
+                temp_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
 
                 new_min_hf = 0.5 * v.hf_freq + 0.5
-                scaled_hf_freq = new_min_hf + (v.hf_freq - new_min_hf) * freq_factor_hf
+                temp_hf_freq = new_min_hf + (v.hf_freq - new_min_hf) * freq_factor_hf
 
-            scaled_lf_freq = min(511, max(1, int(scaled_lf_freq)))
-            scaled_hf_freq = min(511, max(1, int(scaled_hf_freq)))
-            
-            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier)))
-            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier)))
+                # Clamped actual output frequencies
+                scaled_lf_freq = min(511, max(1, int(temp_lf_freq)))
+                scaled_hf_freq = min(511, max(1, int(temp_hf_freq)))
+
+                # LF (large motor thumps) is not targeted for high-frequency small motor simulation masking
+                lf_mask = 1.0
+
+                # Determine if the target is mid-high frequency simulating small motor (using original frequency v.hf_freq)
+                if v.hf_freq > 0:
+                    # Calculate the dynamic range limits of the high-frequency channel
+                    # Upper limit (for max hf_freq = 511) when slider is at maximum F=10 (non-stretching):
+                    freq_factor_hf_at_10 = 4.0 / 9.0 if is_pro else 28.0 / 81.0
+                    max_hf_freq = min(511, max(1, int(256.0 + 255.0 * freq_factor_hf_at_10)))
+                    # Lower limit is the current output low frequency (scaled_lf_freq)
+                    min_hf_freq = scaled_lf_freq
+
+                    denom = max(1.0, max_hf_freq - min_hf_freq)
+                    hf_mapped = 1.0 + ((scaled_hf_freq - min_hf_freq) / denom) * 9.0
+                    hf_mapped = min(10.0, max(1.0, hf_mapped))
+
+                    # Calculate base mask values at Strength=5 (F=1 -> 0.7, F=5 -> 0.3, F=10 -> 0.7 for Pro; F=1 -> 0.6, F=5 -> 0.3, F=10 -> 0.2 for Joy-Con)
+                    if is_pro:
+                        if hf_mapped <= 5.0:
+                            mask_at_5 = 0.7 - 0.1 * (hf_mapped - 1.0)
+                        else:
+                            mask_at_5 = 0.3 + 0.08 * (hf_mapped - 5.0)
+                    else:
+                        if hf_mapped <= 5.0:
+                            mask_at_5 = 0.6 - 0.075 * (hf_mapped - 1.0)
+                        else:
+                            mask_at_5 = 0.3 - 0.02 * (hf_mapped - 5.0)
+
+                    # Calculate target mask values at Strength=10 (F=1 -> 1.0, F=5 -> 0.4, F=10 -> 1.0 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
+                    if is_pro:
+                        if hf_mapped <= 5.0:
+                            mask_at_10 = 1.0 - 0.15 * (hf_mapped - 1.0)
+                        else:
+                            mask_at_10 = 0.4 + 0.12 * (hf_mapped - 5.0)
+                    else:
+                        if hf_mapped <= 5.0:
+                            mask_at_10 = 0.8 - 0.1 * (hf_mapped - 1.0)
+                        else:
+                            mask_at_10 = 0.4 + 0.0 * (hf_mapped - 5.0)
+
+                    # Linearly interpolate mask between Strength=5 and Strength=10 curves
+                    if strength >= 5:
+                        t = (strength - 5.0) / 5.0
+                        t = min(1.0, max(0.0, t))
+                        hf_mask = mask_at_5 + (mask_at_10 - mask_at_5) * t
+                    else:
+                        hf_mask = mask_at_5
+                else:
+                    hf_mask = 1.0
+
+            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier * lf_mask)))
+            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier * hf_mask)))
             
             return VibrationData(
                 lf_freq=scaled_lf_freq,
