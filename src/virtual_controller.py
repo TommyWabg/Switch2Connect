@@ -187,8 +187,7 @@ class VirtualController:
 
         stop_event = self.next_vibration_event
         async def send_vibration_task():
-            for _ in range(500):
-                if stop_event.is_set(): break
+            while not stop_event.is_set():
                 tasks = [c.set_vibration(vibrationData) for c in self.controllers]
                 await asyncio.gather(*tasks)
                 await asyncio.sleep(0.02)

@@ -445,11 +445,6 @@ class VDS5Gamepad:
             logger.error("WinUHidDevs DLL not loaded")
 
     def _rumble_handler(self, context, left_motor, right_motor):
-        try:
-            with open("rumble.log", "a") as f:
-                f.write(f"PS5 Rumble: left={left_motor}, right={right_motor}\n")
-        except Exception:
-            pass
         if self.notification_callback:
             self.notification_callback(None, None, left_motor, right_motor, 0, None)
 
