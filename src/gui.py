@@ -919,6 +919,7 @@ class ControllerWindow:
                 "Please restart your computer to apply the installation, or reinstall the driver if the issue persists."
             )
             CONFIG.driver_type = "WinUHid"
+            CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             CONFIG.vigembus_installed = False
             CONFIG.save_config()
             if hasattr(self, 'driver_switch'):
@@ -1786,11 +1787,11 @@ class ControllerWindow:
         
         initial_driver = getattr(CONFIG, "driver_type", "WinUHid")
         if initial_driver == "ViGEmBus":
-            sim_options = ["Xbox", "PS4"]
+            sim_options = ["Xbox360", "PS4"]
         else:
-            sim_options = ["Xbox", "PS4", "PS5"]
+            sim_options = ["Xbox One", "PS4", "PS5"]
             
-        self.sim_mode_switch = ToggleSwitch(row_global, sim_options, sim_options, getattr(CONFIG, "simulation_mode", "Xbox"), self.update_sim_mode_setting, background_color)
+        self.sim_mode_switch = ToggleSwitch(row_global, sim_options, sim_options, getattr(CONFIG, "simulation_mode", "Xbox One"), self.update_sim_mode_setting, background_color)
         self.sim_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Layout
@@ -1855,22 +1856,24 @@ class ControllerWindow:
         if val == "ViGEmBus":
             if not self.check_vigembus_installation():
                 # Revert to WinUHid options in GUI
-                self.sim_mode_switch.update_options(["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], CONFIG.simulation_mode)
+                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
                 return
         else:
             self.check_driver_installation()
             
         self.update_driver_button()
         
-        # Fallback simulation mode from PS5 to PS4 under ViGEmBus
-        if val == "ViGEmBus" and CONFIG.simulation_mode == "PS5":
-            CONFIG.simulation_mode = "PS4"
+        # Load the remembered simulation mode for the target driver
+        if val == "ViGEmBus":
+            CONFIG.simulation_mode = CONFIG.vigembus_sim_mode
+        else:
+            CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             
         # Update sim mode switch options and set value
         if val == "ViGEmBus":
-            self.sim_mode_switch.update_options(["Xbox", "PS4"], ["Xbox", "PS4"], CONFIG.simulation_mode)
+            self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
         else:
-            self.sim_mode_switch.update_options(["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], CONFIG.simulation_mode)
+            self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
             
         CONFIG.save_config()
         
@@ -1910,9 +1913,14 @@ class ControllerWindow:
                         vc._setup_vg_controller()
                     if vc.loop and vc.loop.is_running():
                         asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
-
+ 
     def update_sim_mode_setting(self, val):
         CONFIG.simulation_mode = val
+        if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus":
+            CONFIG.vigembus_sim_mode = val
+        else:
+            CONFIG.winuhid_sim_mode = val
+            
         if hasattr(self, 'current_controllers'):
             for vc in self.current_controllers:
                 if vc is not None: vc.set_mode(val)
@@ -1980,12 +1988,18 @@ class ControllerWindow:
         # Check if the driver type has been changed/fallback under the hood
         active_driver = getattr(CONFIG, "driver_type", "WinUHid")
         if hasattr(self, 'driver_switch') and self.driver_switch.values[self.driver_switch.current_index] != active_driver:
+            if active_driver == "ViGEmBus":
+                CONFIG.simulation_mode = CONFIG.vigembus_sim_mode
+            else:
+                CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
+            CONFIG.save_config()
+            
             self.driver_switch.set_value(active_driver)
             self.update_driver_button()
             if active_driver == "ViGEmBus":
-                self.sim_mode_switch.update_options(["Xbox", "PS4"], ["Xbox", "PS4"], CONFIG.simulation_mode)
+                self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
             else:
-                self.sim_mode_switch.update_options(["Xbox", "PS4", "PS5"], ["Xbox", "PS4", "PS5"], CONFIG.simulation_mode)
+                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
         # A slot is only "connected" if the VirtualController exists AND has physical controllers
         any_connected = any(c is not None and len(getattr(c, 'controllers', [])) > 0 for c in controllers_info)
         self.no_controllers = not any_connected
@@ -2176,6 +2190,15 @@ class ControllerWindow:
 
             threading.Thread(target=restart, daemon=True).start()
 
+    def start_battery_refresh_timer(self):
+        if not getattr(self, 'is_quitting', False):
+            if hasattr(self, 'current_controllers') and self.current_controllers:
+                try:
+                    self.update(self.current_controllers)
+                except Exception as e:
+                    logger.debug(f"Failed to refresh battery indicators: {e}")
+            self.root.after(300000, self.start_battery_refresh_timer) # 5 minutes
+
     def start(self):
         self.is_quitting = False
         def callback(vcs):
@@ -2195,6 +2218,9 @@ class ControllerWindow:
             self.hide_to_tray()
         else:
             self.root.deiconify()
+            
+        # Start battery refresh timer (5 minutes)
+        self.root.after(300000, self.start_battery_refresh_timer)
             
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 

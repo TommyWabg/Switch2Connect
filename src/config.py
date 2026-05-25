@@ -255,7 +255,6 @@ class Config:
         self.joycon_hold_mode = config.get("joycon_hold_mode", {}) or {}
         self.merged_gyro_side = config.get("merged_gyro_side", {}) or {}
         
-        self.simulation_mode = config.get("simulation_mode", "Xbox")
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
         self.stabilized_gyro = config.get("stabilized_gyro", False)
@@ -267,6 +266,38 @@ class Config:
             self.virtual_gyro_soft_deadzone = float(val)
         self.driver_installed = config.get("driver_installed", False)
         self.driver_type = config.get("driver_type", "WinUHid")
+        
+        self.simulation_mode = config.get("simulation_mode", "Xbox One")
+        if self.simulation_mode == "Xbox":
+            if self.driver_type == "ViGEmBus":
+                self.simulation_mode = "Xbox360"
+            else:
+                self.simulation_mode = "Xbox One"
+
+        self.vigembus_sim_mode = config.get("vigembus_sim_mode", None)
+        self.winuhid_sim_mode = config.get("winuhid_sim_mode", None)
+        
+        if self.vigembus_sim_mode == "Xbox":
+            self.vigembus_sim_mode = "Xbox360"
+        if self.winuhid_sim_mode == "Xbox":
+            self.winuhid_sim_mode = "Xbox One"
+        
+        if self.vigembus_sim_mode is None:
+            if self.driver_type == "ViGEmBus":
+                self.vigembus_sim_mode = self.simulation_mode if self.simulation_mode in ["Xbox360", "PS4"] else "Xbox360"
+            else:
+                self.vigembus_sim_mode = "Xbox360"
+        if self.winuhid_sim_mode is None:
+            if self.driver_type == "WinUHid":
+                self.winuhid_sim_mode = self.simulation_mode if self.simulation_mode in ["Xbox One", "PS4", "PS5"] else "PS5"
+            else:
+                self.winuhid_sim_mode = "PS5"
+
+        if self.driver_type == "ViGEmBus":
+            self.simulation_mode = self.vigembus_sim_mode
+        else:
+            self.simulation_mode = self.winuhid_sim_mode
+
         self.vigembus_installed = config.get("vigembus_installed", False)
         self.window_width = config.get("window_width", None)
         self.window_height = config.get("window_height", None)
@@ -290,6 +321,8 @@ class Config:
             
             data['driver_installed'] = self.driver_installed
             data['driver_type'] = self.driver_type
+            data['vigembus_sim_mode'] = self.vigembus_sim_mode
+            data['winuhid_sim_mode'] = self.winuhid_sim_mode
             data['vigembus_installed'] = self.vigembus_installed
             data['window_width'] = self.window_width
             data['window_height'] = self.window_height

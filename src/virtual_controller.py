@@ -62,7 +62,7 @@ class VirtualController:
         self.hold_mode = "Horizontal"
         self.active_gyro_side = "Right"
         
-        self.mode = getattr(CONFIG, "simulation_mode", "Xbox")
+        self.mode = getattr(CONFIG, "simulation_mode", "Xbox One")
         self.driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         self._setup_vg_controller()
         
@@ -115,6 +115,8 @@ class VirtualController:
             except Exception as e:
                 logger.error(f"ViGEmBus initialization failed: {e}. Falling back to WinUHid.")
                 CONFIG.driver_type = "WinUHid"
+                CONFIG.simulation_mode = getattr(CONFIG, "winuhid_sim_mode", "PS5")
+                self.mode = CONFIG.simulation_mode
                 CONFIG.vigembus_installed = False
                 CONFIG.save_config()
                 driver_type = "WinUHid"
@@ -887,7 +889,7 @@ class VirtualController:
             if self.vg_controller is not None:
                 driver_type = self.driver_type
                 if driver_type == "WinUHid":
-                    if self.mode == "Xbox":
+                    if self.mode == "Xbox One":
                         if winuhid._winuhid_devs:
                             winuhid._winuhid_devs.WinUHidXOneInitializeInputReport(ctypes.byref(self.vg_controller.report))
                     elif self.mode == "PS4":
@@ -898,7 +900,7 @@ class VirtualController:
                             winuhid._winuhid_devs.WinUHidPS5InitializeInputReport(ctypes.byref(self.vg_controller.report))
                 else: # ViGEmBus
                     vigem = get_vigem()
-                    if self.mode == "Xbox":
+                    if self.mode == "Xbox360":
                         self.vg_controller.report = vigem.XUSB_REPORT()
                     else: # PS4
                         self.report_ex = DS4_REPORT_EX()

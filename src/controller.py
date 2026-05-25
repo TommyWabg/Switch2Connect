@@ -615,64 +615,68 @@ class Controller:
 
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False):
         strength = getattr(CONFIG, "vibration_strength", 5)
-        
-        is_pro = self.is_pro_controller()
-        if ignore_freq_scaling:
-            scale_factor = 1.0
-            lf_scale_factor = 1.0
-            hf_scale_factor = 1.0
-        elif is_pro:
-            scale_factor = strength / 5.0
-            lf_scale_factor = scale_factor
-            hf_scale_factor = scale_factor
-        else:
-            # For Joy-con: S=0 -> 0.0, S=5 -> (lf=0.8, hf=0.64), S=10 -> (lf=0.96, hf=1.12)
-            # Piecewise linear interpolation for smooth steps
-            if strength <= 5:
-                lf_scale_factor = strength * 0.16
-                hf_scale_factor = strength * 0.128
-            else:
-                lf_scale_factor = 0.8 + (strength - 5) * 0.032
-                hf_scale_factor = 0.64 + (strength - 5) * 0.096
-
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
+        is_pro = self.is_pro_controller()
+
         if ignore_freq_scaling:
-            freq_factor = 1.0
+            lf_multiplier = 1.3
+            hf_multiplier = 1.0 if is_pro else 0.6
         else:
-            freq_factor = (freq_setting - 1) / 27.0
+            # Low Frequency mapping based on 0.6.6: default (S=5) behaves like 0.6.6 strength=10 (factor = 2.0)
+            target_lf_mult = (strength / 5.0) * 2.0
+
+            # High Frequency mapping based on 0.6.6: default (S=5) behaves like 0.6.6 strength=5 (factor = 1.0)
+            target_hf_scale = (strength / 5.0) * 1.0
+
+            # High Frequency amplitude reduction factor:
+            # - Pro: F=10 -> 1.0, F=5 -> 0.5, F=1 -> 0.8
+            # - Joy-con: F=10 -> 0.4, F=5 -> 0.5, F=1 -> 0.8
+            # Interpolated piecewise linearly:
+            if is_pro:
+                if freq_setting <= 5:
+                    hf_amp_factor = 0.8 - 0.075 * (freq_setting - 1)
+                else:
+                    hf_amp_factor = 0.5 + 0.1 * (freq_setting - 5)
+            else:
+                if freq_setting <= 5:
+                    hf_amp_factor = 0.8 - 0.075 * (freq_setting - 1)
+                else:
+                    hf_amp_factor = 0.5 - 0.02 * (freq_setting - 5)
+
+            # Apply limits from 0.7.1 to prevent physical hardware limitations from being exceeded
+            if is_pro:
+                lf_multiplier = min(2.6, target_lf_mult) # 2.6 = 2.0 * 1.3
+                hf_multiplier = min(2.0, target_hf_scale) * hf_amp_factor
+            else:
+                lf_multiplier = min(1.248, target_lf_mult) # 1.248 = 0.96 * 1.3
+                hf_multiplier = min(1.12, target_hf_scale) * hf_amp_factor
+
+        # LF frequency is constant (freq_factor_lf = 1.0) so frequency slider has no effect
+        freq_factor_lf = 1.0
+        # HF default (F=10) behaves like 0.6.6 frequency=5 (factor = 4/9)
+        if is_pro:
+            freq_factor_hf = (freq_setting - 1) * 4 / 81.0
+        else:
+            # Joy-con: HF frequency at F=10 matches Pro/prev HF frequency at F=8 (factor = 28/81)
+            freq_factor_hf = (freq_setting - 1) * 28 / 729.0
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             if ignore_freq_scaling:
                 scaled_lf_freq = v.lf_freq
                 scaled_hf_freq = v.hf_freq
-                hf_amp_factor = 1.0 if is_pro else 0.6
             else:
-                F_limit = 240
-                
-                # Low frequency scaling
-                if v.lf_freq > F_limit:
-                    scaled_lf_freq = F_limit + (v.lf_freq - F_limit) * freq_factor
-                else:
-                    scaled_lf_freq = v.lf_freq
-                    
-                # High frequency scaling and amplitude reduction factor
-                if v.hf_freq > F_limit:
-                    scaled_hf_freq = F_limit + (v.hf_freq - F_limit) * freq_factor
-                    if is_pro:
-                        hf_amp_factor = 3.0 ** -(((10 - freq_setting) / 9.0) ** 1.2)
-                    else:
-                        # For Joy-con: Max high frequency vibration factor is 0.6.
-                        # Min vibration (at setting 1) is 0.8 * max (0.6) = 0.48.
-                        hf_amp_factor = 0.6 * (0.8 ** (((10 - freq_setting) / 9.0) ** 1.2))
-                else:
-                    scaled_hf_freq = v.hf_freq
-                    hf_amp_factor = 1.0 if is_pro else 0.6
+                # Frequency scaling formula based on 0.6.6
+                new_min_lf = 0.5 * v.lf_freq + 0.5
+                scaled_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
+
+                new_min_hf = 0.5 * v.hf_freq + 0.5
+                scaled_hf_freq = new_min_hf + (v.hf_freq - new_min_hf) * freq_factor_hf
 
             scaled_lf_freq = min(511, max(1, int(scaled_lf_freq)))
             scaled_hf_freq = min(511, max(1, int(scaled_hf_freq)))
             
-            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_scale_factor * 1.3)))
-            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_scale_factor * hf_amp_factor)))
+            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier)))
+            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier)))
             
             return VibrationData(
                 lf_freq=scaled_lf_freq,
