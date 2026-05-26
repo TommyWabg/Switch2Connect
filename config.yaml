@@ -3,8 +3,12 @@ auto_disconnect_days: 0
 auto_disconnect_enabled: false
 auto_disconnect_hours: 0
 auto_disconnect_minutes: 0
-c_mapping: Calibration
-calibration_data: {}
+c_mapping: Default
+calibration_data:
+  E0:EF:BF:81:06:9F:
+  - 5.419047619047619
+  - -16.057142857142857
+  - -0.012698412698412698
 capt_mapping: Capture
 driver_installed: false
 driver_type: WinUHid
@@ -16,19 +20,25 @@ gyro_bias_l:
 - 0.0
 - 0.0
 gyro_bias_r:
-- 0.0
-- 0.0
-- 0.0
+- 5.419047619047619
+- -16.057142857142857
+- -0.012698412698412698
 gyro_mode: World
 gyro_sensitivity: 3.0
 home_mapping: Default
-joycon_hold_mode: {}
-mag_calibration_data: {}
+joycon_hold_mode:
+  E0:EF:BF:F0:0E:17: Horizontal
+mag_calibration_data:
+  E0:EF:BF:81:06:9F:
+  - 130.5
+  - 85.5
+  - 18.0
 merged_gyro_side: {}
 mouse:
-  enabled: false
+  enabled: true
   sensitivity: 5.0
 open_when_startup: false
+rumble_mode: Switch
 simulation_mode: PS5
 sll_mapping: Default
 slr_mapping: PS_R_Touch
@@ -43,7 +53,11 @@ stick_r_bias:
 - 0.0
 vibration_frequency: 10
 vibration_strength: 5
-vigembus_installed: false
-virtual_gyro_soft_deadzone: 2.0
+vibration_strength_switch: 5
+vibration_strength_xbox: 5
+vigembus_installed: true
+vigembus_sim_mode: Xbox360
+virtual_gyro_soft_deadzone: 0.0
 window_height: 1080
 window_width: 1240
+winuhid_sim_mode: PS5
