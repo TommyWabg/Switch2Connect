@@ -281,6 +281,7 @@ class Controller:
         self.gyro_bias_integral = (0.0, 0.0, 0.0)
         self.gyro_start_time = 0
         self.gyro_active_side_prev = False
+        self.gyro_steering_origin_accel = None
         
         self.is_mag_calibrating = False
         self.mag_bias = (0.0, 0.0, 0.0)
@@ -618,9 +619,32 @@ class Controller:
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
 
+        rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+
         if ignore_freq_scaling:
             lf_multiplier = 1.3
             hf_multiplier = 1.0 if is_pro else 0.6
+        elif rumble_mode == "Switch":
+            if is_pro:
+                if strength <= 5.0:
+                    lf_multiplier = (strength / 5.0)
+                    hf_multiplier = (strength / 5.0) * 0.6
+                else:
+                    t = (strength - 5.0) / 5.0
+                    lf_multiplier = 1.0 + (2.6 - 1.0) * t
+                    hf_multiplier = 0.6 + (2.0 - 0.6) * t
+                lf_multiplier = min(2.6, lf_multiplier)
+                hf_multiplier = min(2.0, hf_multiplier)
+            else:
+                if strength <= 5.0:
+                    lf_multiplier = (strength / 5.0) * 0.6
+                    hf_multiplier = (strength / 5.0) * 0.6
+                else:
+                    t = (strength - 5.0) / 5.0
+                    lf_multiplier = 0.6 + (0.84 - 0.6) * t
+                    hf_multiplier = 0.6 + (1.12 - 0.6) * t
+                lf_multiplier = min(0.84, lf_multiplier)
+                hf_multiplier = min(1.12, hf_multiplier)
         else:
             # Low Frequency mapping based on 0.6.6: default (S=5) behaves like 0.6.6 strength=10 (factor = 2.0)
             target_lf_mult = (strength / 5.0) * 2.0
@@ -633,7 +657,7 @@ class Controller:
                 lf_multiplier = min(2.6, target_lf_mult) # 2.6 = 2.0 * 1.3
                 hf_multiplier = min(2.0, target_hf_scale)
             else:
-                lf_multiplier = min(1.248, target_lf_mult) # 1.248 = 0.96 * 1.3
+                lf_multiplier = min(0.84, target_lf_mult) # 0.84 is the Joy-Con LF upper limit (based on S=7)
                 hf_multiplier = min(1.12, target_hf_scale)
 
         # LF frequency is constant (freq_factor_lf = 1.0) so frequency slider has no effect
@@ -646,7 +670,7 @@ class Controller:
             freq_factor_hf = (freq_setting - 1) * 28 / 729.0
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
-            if ignore_freq_scaling:
+            if ignore_freq_scaling or rumble_mode == "Switch":
                 scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
                 scaled_hf_freq = min(511, max(1, int(v.hf_freq)))
                 lf_mask = 1.0
@@ -679,17 +703,17 @@ class Controller:
                     hf_mapped = 1.0 + ((scaled_hf_freq - min_hf_freq) / denom) * 9.0
                     hf_mapped = min(10.0, max(1.0, hf_mapped))
 
-                    # Calculate base mask values at Strength=5 (F=1 -> 0.7, F=5 -> 0.3, F=10 -> 0.7 for Pro; F=1 -> 0.6, F=5 -> 0.3, F=10 -> 0.2 for Joy-Con)
+                    # Calculate base mask values at Strength=5 (F=1 -> 0.25, F=5 -> 0.1, F=10 -> 0.24 for Pro; F=1 -> 0.19, F=5 -> 0.095, F=10 -> 0.06 for Joy-Con)
                     if is_pro:
                         if hf_mapped <= 5.0:
-                            mask_at_5 = 0.7 - 0.1 * (hf_mapped - 1.0)
+                            mask_at_5 = 0.25 - 0.0375 * (hf_mapped - 1.0)
                         else:
-                            mask_at_5 = 0.3 + 0.08 * (hf_mapped - 5.0)
+                            mask_at_5 = 0.1 + 0.028 * (hf_mapped - 5.0)
                     else:
                         if hf_mapped <= 5.0:
-                            mask_at_5 = 0.6 - 0.075 * (hf_mapped - 1.0)
+                            mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
                         else:
-                            mask_at_5 = 0.3 - 0.02 * (hf_mapped - 5.0)
+                            mask_at_5 = 0.095 - 0.007 * (hf_mapped - 5.0)
 
                     # Calculate target mask values at Strength=10 (F=1 -> 1.0, F=5 -> 0.4, F=10 -> 1.0 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
                     if is_pro:
@@ -1406,6 +1430,7 @@ class Controller:
                 # Reset orientation on activation to prevent jumps
                 self._reset_orientation_from_accel(ax, ay, az)
                 self.gyro_start_time = time.perf_counter()
+                self.gyro_steering_origin_accel = (ax, ay, az)
             self.gyro_mouse_enabled = trigger_pressed
         else:
             if trigger_pressed and not self.gr_was_pressed:
@@ -1413,11 +1438,17 @@ class Controller:
                 if self.gyro_mouse_enabled:
                     # Reset orientation on activation to prevent jumps
                     self._reset_orientation_from_accel(ax, ay, az)
-                    self.gyro_start_time = time.perf_counter() 
+                    self.gyro_start_time = time.perf_counter()
+                    self.gyro_steering_origin_accel = (ax, ay, az)
                 
         self.gr_was_pressed = trigger_pressed
 
+        if not self.gyro_mouse_enabled:
+            self.gyro_steering_origin_accel = None
+
         if self.gyro_mouse_enabled:
+            if getattr(self, 'gyro_steering_origin_accel', None) is None:
+                self.gyro_steering_origin_accel = (ax, ay, az)
             # Dynamically extract and rotate stick inputs for Stick Assist
             is_merged = getattr(self, "is_merged", False)
             if is_merged:
@@ -1516,6 +1547,18 @@ class Controller:
                     # In V-mode or Pro Controller, tilt is on the X axis
                     tilt_value = ax
                 
+                # Adjust tilt_value based on the posture at the moment of activation (origin)
+                if getattr(self, "gyro_steering_origin_accel", None) is not None:
+                    orig_ax, orig_ay, orig_az = self.gyro_steering_origin_accel
+                    if is_horizontal:
+                        if self.is_joycon_right():
+                            orig_tilt = orig_ay
+                        else:
+                            orig_tilt = -orig_ay
+                    else:
+                        orig_tilt = orig_ax
+                    tilt_value -= orig_tilt
+                
                 tilt_normalized = tilt_value / 4000.0  
                 sensitivity = getattr(CONFIG, "gyro_sensitivity", 4.0)
                 # Sensitivity * 1.0 (Inverted sign based on user feedback)
@@ -1547,6 +1590,7 @@ class Controller:
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
             self._own_steer_value = 0.0
+            self.gyro_steering_origin_accel = None
             if getattr(self, 'prev_l_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             if getattr(self, 'prev_r_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
             self.prev_l_click = self.prev_r_click = False
