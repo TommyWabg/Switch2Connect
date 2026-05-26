@@ -1,6 +1,7 @@
 import winuhid_client as winuhid
 from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
 import threading
+import time
 
 _vigem_import_lock = threading.Lock()
 _vigem_module = None
@@ -41,6 +42,8 @@ def get_ds4_dpad(up, down, left, right):
 def float_to_byte(val):
     return int(max(0, min(255, round(val * 127.5 + 128))))
 
+RUMBLE_WRITE_INTERVAL = 0.015
+
 
 
 class VirtualController:
@@ -52,6 +55,16 @@ class VirtualController:
         self.previous_buttons_right = 0x00000000
         self.next_vibration_event = None
         self.vg_controller = None
+        
+        # Thread-safe target vibration state, change event, and task reference
+        self.vibration_lock = threading.Lock()
+        self.target_vibration = VibrationData(lf_amp=0, hf_amp=0)
+        self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+        self.frame_vibrations = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.vibration_dirty = False
+        self.vibration_changed_event = None
+        self.active_vibration_task = None
+        self.cycle_start_time = 0.0
         self.loop = None
         self.touch_tracking_id = 0
         self.was_touching = False
@@ -164,40 +177,94 @@ class VirtualController:
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
-        vibrationData = VibrationData()
-        vibrationData.lf_amp = int(800 * large_motor / 256)
-        vibrationData.hf_amp = int(800 * small_motor / 256)
+        lf_val = int(800 * large_motor / 256)
+        hf_val = int(800 * small_motor / 256)
 
-        if self.next_vibration_event:
-            self.next_vibration_event.set()
-        
-        self.next_vibration_event = asyncio.Event()
-        if large_motor == 0 and small_motor == 0:
-            self.next_vibration_event.set()
-            # Send zero vibration to physical controllers immediately
-            async def send_zero_vibration():
-                zero_vib = VibrationData()
-                zero_vib.lf_amp = 0
-                zero_vib.hf_amp = 0
-                tasks = [c.set_vibration(zero_vib) for c in self.controllers]
-                await asyncio.gather(*tasks)
-            if self.loop and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(send_zero_vibration(), self.loop)
-            return
+        # Calculate time elapsed since the start of the current cycle
+        dt = time.perf_counter() - self.cycle_start_time
+        # Map to one of the three sub-interval frames (for RUMBLE_WRITE_INTERVAL = 0.015, each slot is 5ms)
+        slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+        slot = int(dt / slot_size) if slot_size > 0 else 0
+        if slot < 0:
+            slot = 0
+        elif slot > 2:
+            slot = 2
 
-        stop_event = self.next_vibration_event
-        async def send_vibration_task():
-            while not stop_event.is_set():
-                tasks = [c.set_vibration(vibrationData) for c in self.controllers]
-                await asyncio.gather(*tasks)
-                await asyncio.sleep(0.02)
+        with self.vibration_lock:
+            # Linear superimposition (sum and clamp to 800) for compound haptic waveforms
+            self.frame_vibrations[slot].lf_amp = min(800, self.frame_vibrations[slot].lf_amp + lf_val)
+            self.frame_vibrations[slot].hf_amp = min(800, self.frame_vibrations[slot].hf_amp + hf_val)
+            
+            # Baseline latest value (for sustain fallback)
+            self.latest_vibration.lf_amp = lf_val
+            self.latest_vibration.hf_amp = hf_val
+            
+            self.vibration_dirty = True
 
         if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(send_vibration_task(), self.loop)
+            if self.active_vibration_task is None or self.active_vibration_task.done():
+                self.active_vibration_task = asyncio.run_coroutine_threadsafe(
+                    self._vibration_worker_loop(), self.loop
+                )
+
+    async def _vibration_worker_loop(self):
+        consecutive_zeros = 0
+        while True:
+            # Record start time of the current write cycle
+            self.cycle_start_time = time.perf_counter()
+            
+            with self.vibration_lock:
+                if self.vibration_dirty:
+                    # Retrieve the 3 accumulated sub-interval frames
+                    v1 = VibrationData(lf_amp=self.frame_vibrations[0].lf_amp, hf_amp=self.frame_vibrations[0].hf_amp)
+                    v2 = VibrationData(lf_amp=self.frame_vibrations[1].lf_amp, hf_amp=self.frame_vibrations[1].hf_amp)
+                    v3 = VibrationData(lf_amp=self.frame_vibrations[2].lf_amp, hf_amp=self.frame_vibrations[2].hf_amp)
+                    
+                    # If a frame slot was empty, sustain it with the preceding frame's value
+                    if v1.lf_amp == 0 and v1.hf_amp == 0:
+                        v1.lf_amp = self.latest_vibration.lf_amp
+                        v1.hf_amp = self.latest_vibration.hf_amp
+                    if v2.lf_amp == 0 and v2.hf_amp == 0:
+                        v2.lf_amp = v1.lf_amp
+                        v2.hf_amp = v1.hf_amp
+                    if v3.lf_amp == 0 and v3.hf_amp == 0:
+                        v3.lf_amp = v2.lf_amp
+                        v3.hf_amp = v2.hf_amp
+
+                    # Reset the slots for the next iteration
+                    for f in self.frame_vibrations:
+                        f.lf_amp = 0
+                        f.hf_amp = 0
+                    self.vibration_dirty = False
+                else:
+                    # Sustain the latest baseline value across all 3 frames
+                    v1 = VibrationData(lf_amp=self.latest_vibration.lf_amp, hf_amp=self.latest_vibration.hf_amp)
+                    v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+                    v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+
+            if v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0:
+                if consecutive_zeros >= 2:
+                    break
+                consecutive_zeros += 1
+            else:
+                consecutive_zeros = 0
+
+            # Write the three chronological sub-frames to the physical controllers
+            tasks = [c.set_vibration(v1, v2, v3) for c in self.controllers]
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception as e:
+                    logger.warning(f"Vibration write failed: {e}")
+
+            # Enforce a strict minimum write interval to prevent controller queue backlog
+            await asyncio.sleep(RUMBLE_WRITE_INTERVAL)
 
     async def init_added_controller(self, controller: Controller):
         controller.virtual_controller = self
         self.loop = asyncio.get_running_loop()
+        if self.vibration_changed_event is None:
+            self.vibration_changed_event = asyncio.Event()
         await self.update_leds()
 
         if self.is_single() and controller.is_joycon():
@@ -237,6 +304,7 @@ class VirtualController:
         controller.current_vy = 0.0
         controller.interp_residual_x = 0.0
         controller.interp_residual_y = 0.0
+        controller.gyro_steering_origin_accel = None
         
         def input_report_callback(inputData: ControllerInputData, controller: Controller):
             

@@ -305,7 +305,11 @@ class Config:
         self.auto_disconnect_days = int(config.get("auto_disconnect_days", 0))
         self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
         self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
-        self.vibration_strength = int(config.get("vibration_strength", 5))
+        self.rumble_mode = config.get("rumble_mode", "Xbox")
+        if self.rumble_mode == "PC":
+            self.rumble_mode = "Xbox"
+        self.vibration_strength_xbox = int(config.get("vibration_strength_xbox", config.get("vibration_strength", 5)))
+        self.vibration_strength_switch = int(config.get("vibration_strength_switch", config.get("vibration_strength", 5)))
         self.vibration_frequency = int(config.get("vibration_frequency", 10))
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
@@ -331,7 +335,10 @@ class Config:
             data['auto_disconnect_hours'] = self.auto_disconnect_hours
             data['auto_disconnect_minutes'] = self.auto_disconnect_minutes
             data['vibration_strength'] = self.vibration_strength
+            data['vibration_strength_xbox'] = self.vibration_strength_xbox
+            data['vibration_strength_switch'] = self.vibration_strength_switch
             data['vibration_frequency'] = self.vibration_frequency
+            data['rumble_mode'] = self.rumble_mode
             
             data['simulation_mode'] = self.simulation_mode
             data['open_when_startup'] = self.open_when_startup
@@ -374,6 +381,20 @@ class Config:
             logger.info(f"[{time.strftime('%H:%M:%S')}] Config saved successfully to {self.config_file_path}")
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
+
+    @property
+    def vibration_strength(self):
+        if getattr(self, 'rumble_mode', 'Xbox') == 'Switch':
+            return getattr(self, 'vibration_strength_switch', 5)
+        else:
+            return getattr(self, 'vibration_strength_xbox', 5)
+
+    @vibration_strength.setter
+    def vibration_strength(self, val):
+        if getattr(self, 'rumble_mode', 'Xbox') == 'Switch':
+            self.vibration_strength_switch = val
+        else:
+            self.vibration_strength_xbox = val
     
 CONFIG = Config(get_resource("config.yaml"))
 

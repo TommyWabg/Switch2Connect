@@ -1800,14 +1800,19 @@ class ControllerWindow:
         self.layout_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         row_vibration = tk.Frame(self.settings_frame, bg=background_color); row_vibration.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_vibration, text="Vibration:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_vibration, text="Rumble Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        self.rumble_mode_switch = ToggleSwitch(row_vibration, ["Xbox", "Switch"], ["Xbox", "Switch"], getattr(CONFIG, "rumble_mode", "Xbox"), self.update_rumble_mode_setting, background_color)
+        self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+
+        tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         self.vibration_strength_scale = tk.Scale(row_vibration, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_strength)
         self.vibration_strength_scale.set(getattr(CONFIG, "vibration_strength", 5))
         self.vibration_strength_scale.pack(side=tk.LEFT)
-        tk.Label(row_vibration, text="Frequency:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+
+        self.vibration_frequency_label = tk.Label(row_vibration, text="Frequency:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")))
         self.vibration_frequency_scale = tk.Scale(row_vibration, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_frequency)
         self.vibration_frequency_scale.set(getattr(CONFIG, "vibration_frequency", 10))
-        self.vibration_frequency_scale.pack(side=tk.LEFT)
+        self.update_rumble_mode_ui(getattr(CONFIG, "rumble_mode", "Xbox"))
 
         row_mouse = tk.Frame(self.settings_frame, bg=background_color); row_mouse.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_mouse, text="Joy-con Mouse:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
@@ -1943,6 +1948,20 @@ class ControllerWindow:
             CONFIG.save_config()
         except Exception as e:
             logger.error(f"Failed to save vibration frequency setting: {e}")
+
+    def update_rumble_mode_setting(self, val):
+        CONFIG.rumble_mode = val
+        CONFIG.save_config()
+        self.update_rumble_mode_ui(val)
+        self.vibration_strength_scale.set(CONFIG.vibration_strength)
+
+    def update_rumble_mode_ui(self, mode):
+        if mode == "Switch":
+            self.vibration_frequency_label.pack_forget()
+            self.vibration_frequency_scale.pack_forget()
+        else:
+            self.vibration_frequency_label.pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+            self.vibration_frequency_scale.pack(side=tk.LEFT)
 
     def update_startup_setting(self, val):
         CONFIG.open_when_startup = val

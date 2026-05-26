@@ -637,12 +637,12 @@ class Controller:
                 hf_multiplier = min(2.0, hf_multiplier)
             else:
                 if strength <= 5.0:
-                    lf_multiplier = (strength / 5.0) * 0.6
-                    hf_multiplier = (strength / 5.0) * 0.6
+                    lf_multiplier = (strength / 5.0) * 0.504
+                    hf_multiplier = (strength / 5.0) * 0.672
                 else:
                     t = (strength - 5.0) / 5.0
-                    lf_multiplier = 0.6 + (0.84 - 0.6) * t
-                    hf_multiplier = 0.6 + (1.12 - 0.6) * t
+                    lf_multiplier = 0.504 + (0.84 - 0.504) * t
+                    hf_multiplier = 0.672 + (1.12 - 0.672) * t
                 lf_multiplier = min(0.84, lf_multiplier)
                 hf_multiplier = min(1.12, hf_multiplier)
         else:
