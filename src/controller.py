@@ -663,11 +663,7 @@ class Controller:
         # LF frequency is constant (freq_factor_lf = 1.0) so frequency slider has no effect
         freq_factor_lf = 1.0
         # HF default (F=10) behaves like 0.6.6 frequency=5 (factor = 4/9)
-        if is_pro:
-            freq_factor_hf = (freq_setting - 1) * 4 / 81.0
-        else:
-            # Joy-con: HF frequency at F=10 matches Pro/prev HF frequency at F=8 (factor = 28/81)
-            freq_factor_hf = (freq_setting - 1) * 28 / 729.0
+        freq_factor_hf = (freq_setting - 1) * 4 / 81.0
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             if ignore_freq_scaling or rumble_mode == "Switch":
@@ -694,7 +690,7 @@ class Controller:
                 if v.hf_freq > 0:
                     # Calculate the dynamic range limits of the high-frequency channel
                     # Upper limit (for max hf_freq = 511) when slider is at maximum F=10 (non-stretching):
-                    freq_factor_hf_at_10 = 4.0 / 9.0 if is_pro else 28.0 / 81.0
+                    freq_factor_hf_at_10 = 4.0 / 9.0
                     max_hf_freq = min(511, max(1, int(256.0 + 255.0 * freq_factor_hf_at_10)))
                     # Lower limit is the current output low frequency (scaled_lf_freq)
                     min_hf_freq = scaled_lf_freq
@@ -713,19 +709,19 @@ class Controller:
                         if hf_mapped <= 5.0:
                             mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
                         else:
-                            mask_at_5 = 0.095 - 0.007 * (hf_mapped - 5.0)
+                            mask_at_5 = 0.095 + 0.00164 * (hf_mapped - 5.0)
 
-                    # Calculate target mask values at Strength=10 (F=1 -> 1.0, F=5 -> 0.4, F=10 -> 1.0 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
+                    # Calculate target mask values at Strength=10 (F=1 -> 0.34375, F=5 -> 0.1375, F=10 -> 0.33 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
                     if is_pro:
                         if hf_mapped <= 5.0:
-                            mask_at_10 = 1.0 - 0.15 * (hf_mapped - 1.0)
+                            mask_at_10 = 0.34375 - 0.0515625 * (hf_mapped - 1.0)
                         else:
-                            mask_at_10 = 0.4 + 0.12 * (hf_mapped - 5.0)
+                            mask_at_10 = 0.1375 + 0.0385 * (hf_mapped - 5.0)
                     else:
                         if hf_mapped <= 5.0:
-                            mask_at_10 = 0.8 - 0.1 * (hf_mapped - 1.0)
+                            mask_at_10 = 0.391875 - 0.048984375 * (hf_mapped - 1.0)
                         else:
-                            mask_at_10 = 0.4 + 0.0 * (hf_mapped - 5.0)
+                            mask_at_10 = 0.1959375 + 0.0088125 * (hf_mapped - 5.0)
 
                     # Linearly interpolate mask between Strength=5 and Strength=10 curves
                     if strength >= 5:
