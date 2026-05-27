@@ -481,7 +481,7 @@ class Controller:
     async def initialize(self):
         try:
             # Allow the connection to stabilize
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2.0)
             
             # Explicit check before starting notification
             if not self.client.is_connected:
@@ -503,7 +503,7 @@ class Controller:
                 except Exception as e:
                     if attempt == 2: raise
                     logger.warning(f"Notify failed, retry {attempt+1}: {e}")
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(2.0)
 
             self.controller_info = await self.read_controller_info()
             

@@ -79,8 +79,6 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
     GLOBAL_LOCK = asyncio.Lock()
     CONNECTION_LOCK = asyncio.Lock()
     
-    # NEW: Thoroughly cleanup stale controllers from previous session/sleep
-    # This ensures a fresh state every time the discovery loop starts.
     logger.info("Discovery starting: Performing initial cleanup of stale controllers...")
     for i, vc in enumerate(VIRTUAL_CONTROLLERS):
         if vc is not None:
@@ -172,9 +170,6 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
 
         DISCONNECT_CALLBACK = disconnected_controller
 
-        # Tracks MACs that are in the process of connecting (but not yet established).
-        # Separate from connected_mac_addresses so a failed attempt is immediately
-        # retryable once the scanner sees the device advertising again.
         _connecting_macs: set[str] = set()
 
         async def add_controller(device: BLEDevice, paired: bool):
@@ -187,17 +182,17 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     await controller.connect_ble()
                     logger.info(f"Connected to BLE for {device.address}")
                     controller.disconnected_callback = disconnected_controller
+                    
+                    await controller.initialize()
+                    
                     if not paired:
                         await controller.pair()
                         logger.info(f"Paired successfully to {device.address}")
                     # BLE connection confirmed — promote to connected so scanner won't retry
                     _connecting_macs.discard(device.address)
                     connected_mac_addresses.append(device.address)
-
-                # 2. Perform GATT setup and calibration reading outside the CONNECTION_LOCK
-                await controller.initialize()
                 
-                # 3. Trigger haptic feedback asynchronously in the background
+                # 2. Trigger haptic feedback asynchronously in the background
                 asyncio.create_task(controller.trigger_connection_haptics())
 
                 # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
@@ -333,8 +328,6 @@ def set_shutting_down(val):
 def set_suspending(val):
     global _IS_SUSPENDING
     _IS_SUSPENDING = val
-    # The actual cleanup of VIRTUAL_CONTROLLERS is now handled 
-    # at the start of run_discovery() or via emergency_cleanup().
 
 def emergency_cleanup():
     """Forcefully clear VIRTUAL_CONTROLLERS without waiting for a loop."""
@@ -357,7 +350,6 @@ def emergency_cleanup():
     except Exception as e:
         logger.debug(f"Detach USBIP ports in emergency_cleanup failed: {e}")
     
-    # Also reset the ViGEm bus handle to ensure driver stability
     try:
         from virtual_controller import reset_vigem_bus
         reset_vigem_bus()
@@ -385,8 +377,6 @@ async def _split_controller_async(vc_index):
             await vc.init_added_controller(vc.controllers[0]) # reinit first
             
             slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
-            # Use setup_usb=False so the USBIP attach runs outside the lock in a thread,
-            # matching start_all_pending_virtual_usb and avoiding event-loop blocking.
             new_vc = VirtualController(slot_index + 1, [c2], DISCONNECT_CALLBACK, setup_usb=False)
             VIRTUAL_CONTROLLERS[slot_index] = new_vc
             await new_vc.init_added_controller(c2)
@@ -398,8 +388,6 @@ async def _split_controller_async(vc_index):
                 
             await update_all_player_leds()
 
-    # Start the virtual USB device AFTER releasing the lock so subprocess calls
-    # (detach + usbip attach) don't block the asyncio event loop or hold the lock.
     if new_vc is not None:
         await asyncio.to_thread(new_vc.setup_virtual_device)
 
