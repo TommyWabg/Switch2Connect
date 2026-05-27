@@ -26,6 +26,8 @@ IS_SHUTTING_DOWN = False
 DISCOVERY_LOCK = threading.Lock()
 _CURRENTLY_DISCOVERING = False
 _IS_SUSPENDING = False
+GLOBAL_LOCK = None
+CONNECTION_LOCK = None
 
 async def auto_disconnect_checker(quit_event):
     logger.info("Auto disconnect checker task started.")
@@ -63,6 +65,7 @@ async def auto_disconnect_checker(quit_event):
 
 async def run_discovery(update_controllers_threadsafe, quit_event):
     global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, DISCONNECT_CALLBACK, _CURRENTLY_DISCOVERING
+    global GLOBAL_LOCK, CONNECTION_LOCK
     
     with DISCOVERY_LOCK:
         if _CURRENTLY_DISCOVERING:
@@ -72,6 +75,9 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
     
     UPDATE_CALLBACK = update_controllers_threadsafe
     DISCOVERER_LOOP = asyncio.get_running_loop()
+    
+    GLOBAL_LOCK = asyncio.Lock()
+    CONNECTION_LOCK = asyncio.Lock()
     
     # NEW: Thoroughly cleanup stale controllers from previous session/sleep
     # This ensures a fresh state every time the discovery loop starts.
@@ -84,6 +90,14 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             except Exception as e:
                 logger.error(f"Error in initial cleanup of controller {i}: {e}")
             VIRTUAL_CONTROLLERS[i] = None
+            
+    # Detach all possible USBIP ports to clear stale attachments
+    try:
+        from virtual_controller import detach_usbip_device
+        for p in range(3240, 3248):
+            detach_usbip_device(p)
+    except Exception as e:
+        logger.error(f"Error in initial USBIP port cleanup: {e}")
     
     if UPDATE_CALLBACK:
         UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
@@ -122,10 +136,18 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                 _CURRENTLY_DISCOVERING = False
             return
 
-        lock = asyncio.Lock()
-        
         # Start auto disconnect checker task
         checker_task = asyncio.create_task(auto_disconnect_checker(quit_event))
+        pending_connections_count = 0
+
+        async def start_all_pending_virtual_usb():
+            logger.info("Initializing virtual USB/device setup for all pending controllers in parallel...")
+            tasks = []
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc is not None:
+                    tasks.append(asyncio.to_thread(vc.setup_virtual_device))
+            if tasks:
+                await asyncio.gather(*tasks)
 
         async def disconnected_controller(controller: Controller):
             logger.info(f"Controller disconected {controller.client.address}")
@@ -133,34 +155,54 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             if controller.client.address in connected_mac_addresses:
                 connected_mac_addresses.remove(controller.client.address)
                 
-            async with lock:
+            async with GLOBAL_LOCK:
                 for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
                     if vc is not None and await vc.remove_controller(controller):
                         VIRTUAL_CONTROLLERS[i] = None
             
-            if IS_SHUTTING_DOWN or _IS_SUSPENDING:
-                return
+                if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                    return
+                    
+                reorder_controllers()
                 
-            reorder_controllers()
-            
-            if UPDATE_CALLBACK is not None:
-                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
-            
-            await update_all_player_leds()
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                
+                await update_all_player_leds()
 
         DISCONNECT_CALLBACK = disconnected_controller
 
-        async def add_controller(device: BLEDevice, paired: bool):
-            try:
-                controller = await Controller.create_from_device(device)
-                logger.info(f"Connected to {device.address}")
-                controller.disconnected_callback = disconnected_controller
-                if not paired:
-                    await controller.pair()
-                    logger.info(f"Paired successfully to {device.address}")
+        # Tracks MACs that are in the process of connecting (but not yet established).
+        # Separate from connected_mac_addresses so a failed attempt is immediately
+        # retryable once the scanner sees the device advertising again.
+        _connecting_macs: set[str] = set()
 
-                virtual_controller = None
-                async with lock:
+        async def add_controller(device: BLEDevice, paired: bool):
+            nonlocal pending_connections_count
+            controller = None
+            try:
+                # 1. Serialize BLE connection & pairing phase to prevent WinRT concurrency crashes
+                async with CONNECTION_LOCK:
+                    controller = Controller(device)
+                    await controller.connect_ble()
+                    logger.info(f"Connected to BLE for {device.address}")
+                    controller.disconnected_callback = disconnected_controller
+                    if not paired:
+                        await controller.pair()
+                        logger.info(f"Paired successfully to {device.address}")
+                    # BLE connection confirmed — promote to connected so scanner won't retry
+                    _connecting_macs.discard(device.address)
+                    connected_mac_addresses.append(device.address)
+
+                # 2. Perform GATT setup and calibration reading outside the CONNECTION_LOCK
+                await controller.initialize()
+                
+                # 3. Trigger haptic feedback asynchronously in the background
+                asyncio.create_task(controller.trigger_connection_haptics())
+
+                # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
+                async with GLOBAL_LOCK:
+                    virtual_controller = None
                     if CONFIG.combine_joycons and not controller.side_buttons_pressed:
                         if controller.is_joycon_left():
                             virtual_controller = next(filter(lambda vc: vc is not None and vc.is_single_joycon_right(), VIRTUAL_CONTROLLERS), None)
@@ -169,29 +211,46 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
 
                     if virtual_controller is None:
                         slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
-                        virtual_controller = VirtualController(slot_index + 1, disconnected_controller)
+                        virtual_controller = VirtualController(slot_index + 1, [controller], disconnected_controller, setup_usb=False)
                         VIRTUAL_CONTROLLERS[slot_index] = virtual_controller
+                    else:
+                        virtual_controller.add_controller(controller)
                     
-                    virtual_controller.add_controller(controller)
-                
-                await virtual_controller.init_added_controller(controller)
-                
-                reorder_controllers()
-                
-                if UPDATE_CALLBACK is not None:
-                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
-                
-                await update_all_player_leds()
+                    await virtual_controller.init_added_controller(controller)
+                    
+                    reorder_controllers()
+                    
+                    if UPDATE_CALLBACK is not None:
+                        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                    
+                    await update_all_player_leds()
 
-                logger.info(VIRTUAL_CONTROLLERS)
+                    logger.info(VIRTUAL_CONTROLLERS)
+                    
+                    pending_connections_count = max(0, pending_connections_count - 1)
+                    logger.info(f"Controller {device.address} connected. Remaining pending connections: {pending_connections_count}")
+                    if pending_connections_count == 0:
+                        await start_all_pending_virtual_usb()
             except Exception:
                 logger.exception(f"Unable to initialize device {device.address}")
                 if device.address in connected_mac_addresses:
                     connected_mac_addresses.remove(device.address)
+                _connecting_macs.discard(device.address)
+                async with GLOBAL_LOCK:
+                    pending_connections_count = max(0, pending_connections_count - 1)
+                    logger.info(f"Connection failed for {device.address}. Remaining pending connections: {pending_connections_count}")
+                    if pending_connections_count == 0:
+                        await start_all_pending_virtual_usb()
+                if controller is not None:
+                    try:
+                        await controller.disconnect()
+                    except Exception:
+                        pass
                 print("\nConnection failed. Please press a button on the controller or hold SYNC to re-pair.")
 
         async def callback(device: BLEDevice, advertising_data: AdvertisementData):
-            if device.address in connected_mac_addresses:
+            nonlocal pending_connections_count
+            if device.address in connected_mac_addresses or device.address in _connecting_macs:
                 return
             nintendo_manufacturer_data = advertising_data.manufacturer_data.get(NINTENDO_BLUETOOTH_MANUFACTURER_ID)
             if nintendo_manufacturer_data:
@@ -202,12 +261,16 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     logger.debug(f"Manufacturer data: {to_hex(nintendo_manufacturer_data)}")
                     if reconnect_mac == 0:
                         logger.info(f"Found pairing device {CONTROLER_NAMES[product_id]} {device.address}")
-                        connected_mac_addresses.append(device.address)
-                        await add_controller(device, False)
+                        _connecting_macs.add(device.address)
+                        async with GLOBAL_LOCK:
+                            pending_connections_count += 1
+                        asyncio.create_task(add_controller(device, False))
                     elif reconnect_mac == host_mac_value:
                         logger.info(f"Found already paired device {CONTROLER_NAMES[product_id]} {device.address}")
-                        connected_mac_addresses.append(device.address)
-                        await add_controller(device, True)
+                        _connecting_macs.add(device.address)
+                        async with GLOBAL_LOCK:
+                            pending_connections_count += 1
+                        asyncio.create_task(add_controller(device, True))
 
         async with BleakScanner(callback) as scanner:
             print("Presss a button on a paired controller, or hold sync button on an unpaired controller")
@@ -232,6 +295,7 @@ def start_discoverer(update_controllers_threadsafe, quit_event):
 def reorder_controllers():
     global VIRTUAL_CONTROLLERS
     with DISCOVERY_LOCK:
+
         active_vcs = []
         for vc in VIRTUAL_CONTROLLERS:
             if vc is not None:
@@ -283,7 +347,15 @@ def emergency_cleanup():
                 vc.force_close()
             except:
                 pass
-    VIRTUAL_CONTROLLERS[i] = None
+        VIRTUAL_CONTROLLERS[i] = None
+        
+    # Detach all possible USBIP ports to clear stale attachments
+    try:
+        from virtual_controller import detach_usbip_device
+        for p in range(3240, 3248):
+            detach_usbip_device(p)
+    except Exception as e:
+        logger.debug(f"Detach USBIP ports in emergency_cleanup failed: {e}")
     
     # Also reset the ViGEm bus handle to ensure driver stability
     try:
@@ -302,50 +374,66 @@ async def update_all_player_leds():
                 await c.set_leds(vc.player_number)
 
 async def _split_controller_async(vc_index):
-    vc = VIRTUAL_CONTROLLERS[vc_index]
-    if vc is not None and not vc.is_single():
-        c2 = vc.controllers.pop()
-        await vc.init_added_controller(vc.controllers[0]) # reinit first
-        
-        slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
-        new_vc = VirtualController(slot_index + 1, DISCONNECT_CALLBACK)
-        new_vc.add_controller(c2)
-        VIRTUAL_CONTROLLERS[slot_index] = new_vc
-        await new_vc.init_added_controller(c2)
-        
-        reorder_controllers()
-
-        if UPDATE_CALLBACK is not None:
-            UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+    global GLOBAL_LOCK
+    if GLOBAL_LOCK is None:
+        return
+    new_vc = None
+    async with GLOBAL_LOCK:
+        vc = VIRTUAL_CONTROLLERS[vc_index]
+        if vc is not None and not vc.is_single():
+            c2 = vc.controllers.pop()
+            await vc.init_added_controller(vc.controllers[0]) # reinit first
             
-        await update_all_player_leds()
+            slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
+            # Use setup_usb=False so the USBIP attach runs outside the lock in a thread,
+            # matching start_all_pending_virtual_usb and avoiding event-loop blocking.
+            new_vc = VirtualController(slot_index + 1, [c2], DISCONNECT_CALLBACK, setup_usb=False)
+            VIRTUAL_CONTROLLERS[slot_index] = new_vc
+            await new_vc.init_added_controller(c2)
+            
+            reorder_controllers()
+
+            if UPDATE_CALLBACK is not None:
+                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                
+            await update_all_player_leds()
+
+    # Start the virtual USB device AFTER releasing the lock so subprocess calls
+    # (detach + usbip attach) don't block the asyncio event loop or hold the lock.
+    if new_vc is not None:
+        await asyncio.to_thread(new_vc.setup_virtual_device)
+
 
 def split_controller(vc_index):
     if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
         asyncio.run_coroutine_threadsafe(_split_controller_async(vc_index), DISCOVERER_LOOP)
 
 async def _merge_controllers_async(vc_index1, vc_index2):
-    # Ensure vc_index1 is the lower index to prioritize Player 1
-    if vc_index1 > vc_index2:
-        vc_index1, vc_index2 = vc_index2, vc_index1
-        
-    vc1 = VIRTUAL_CONTROLLERS[vc_index1]
-    vc2 = VIRTUAL_CONTROLLERS[vc_index2]
-    
-    if vc1 is not None and vc2 is not None and vc1.is_single() and vc2.is_single():
-        c2 = vc2.controllers[0]
-        await vc2.remove_controller(c2)
-        VIRTUAL_CONTROLLERS[vc_index2] = None
-        
-        vc1.add_controller(c2)
-        await vc1.init_added_controller(c2)
-        
-        reorder_controllers()
-
-        if UPDATE_CALLBACK is not None:
-            UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+    global GLOBAL_LOCK
+    if GLOBAL_LOCK is None:
+        return
+    async with GLOBAL_LOCK:
+        # Ensure vc_index1 is the lower index to prioritize Player 1
+        if vc_index1 > vc_index2:
+            vc_index1, vc_index2 = vc_index2, vc_index1
             
-        await update_all_player_leds()
+        vc1 = VIRTUAL_CONTROLLERS[vc_index1]
+        vc2 = VIRTUAL_CONTROLLERS[vc_index2]
+        
+        if vc1 is not None and vc2 is not None and vc1.is_single() and vc2.is_single():
+            c2 = vc2.controllers[0]
+            await vc2.remove_controller(c2)
+            VIRTUAL_CONTROLLERS[vc_index2] = None
+            
+            vc1.add_controller(c2)
+            await vc1.init_added_controller(c2)
+            
+            reorder_controllers()
+
+            if UPDATE_CALLBACK is not None:
+                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                
+            await update_all_player_leds()
 
 def merge_controllers(vc_index1, vc_index2):
     if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():

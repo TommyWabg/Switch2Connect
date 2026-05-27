@@ -2,6 +2,7 @@ import bleak
 from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic, BleakError
 from bleak.backends.device import BLEDevice
 import asyncio
+BLE_CONNECTION_LOCK = asyncio.Lock()
 import logging
 import bluetooth
 import win32api
@@ -97,6 +98,7 @@ class MouseState:
     lb: bool
     mb: bool 
     rb: bool
+    ir_active: bool = False
 
 @dataclass
 class StickCalibrationData:
@@ -436,7 +438,7 @@ class Controller:
         
         force_ui_update()
     
-    async def connect(self):
+    async def connect_ble(self):
         if (self.client is not None):
             raise Exception("Already connected")
         
@@ -444,41 +446,42 @@ class Controller:
             if (self.disconnected_callback is not None):
                 asyncio.create_task(self.disconnected_callback(self))
         
-        try:
-            self.client = BleakClient(self.device, disconnected_callback=disconnected_callback)
-            await self.client.connect(timeout=20.0)
-            
-            logger.info(f"Connected to {self.device.address}")
-            
-            import sys
-            if sys.platform == "win32":
-                wd_bluetooth = None
+        self.client = BleakClient(self.device, disconnected_callback=disconnected_callback)
+        await self.client.connect(timeout=20.0)
+        
+        logger.info(f"Connected to {self.device.address}")
+        
+        import sys
+        if sys.platform == "win32":
+            wd_bluetooth = None
+            try:
+                import winrt.windows.devices.bluetooth as wd_bluetooth
+            except ImportError:
                 try:
-                    import winrt.windows.devices.bluetooth as wd_bluetooth
+                    import bleak_winrt.windows.devices.bluetooth as wd_bluetooth
                 except ImportError:
-                    try:
-                        import bleak_winrt.windows.devices.bluetooth as wd_bluetooth
-                    except ImportError:
-                        logger.info("Windows Bluetooth WinRT components not found. Skipping throughput optimization.")
+                    logger.info("Windows Bluetooth WinRT components not found. Skipping throughput optimization.")
 
-                if wd_bluetooth:
-                    try:
-                        if hasattr(wd_bluetooth, 'BluetoothLEPreferredConnectionParameters'):
-                            params = wd_bluetooth.BluetoothLEPreferredConnectionParameters.throughput_optimized
-                            device = getattr(self.client._backend, "_requester", None)
-                            if device:
-                                if hasattr(device, 'request_preferred_connection_parameters_async'):
-                                    await device.request_preferred_connection_parameters_async(params)
-                                elif hasattr(device, 'request_preferred_connection_parameters'):
-                                    device.request_preferred_connection_parameters(params)
-                                logger.info(f"ThroughputOptimized applied for {self.device.address}")
-                        else:
-                            logger.info("ThroughputOptimized not available on this Windows version.")
-                    except Exception as e:
-                        logger.warning(f"Failed to apply ThroughputOptimized (non-fatal): {e}")
+            if wd_bluetooth:
+                try:
+                    if hasattr(wd_bluetooth, 'BluetoothLEPreferredConnectionParameters'):
+                        params = wd_bluetooth.BluetoothLEPreferredConnectionParameters.throughput_optimized
+                        device = getattr(self.client._backend, "_requester", None)
+                        if device:
+                            if hasattr(device, 'request_preferred_connection_parameters_async'):
+                                await device.request_preferred_connection_parameters_async(params)
+                            elif hasattr(device, 'request_preferred_connection_parameters'):
+                                device.request_preferred_connection_parameters(params)
+                            logger.info(f"ThroughputOptimized applied for {self.device.address}")
+                    else:
+                        logger.info("ThroughputOptimized not available on this Windows version.")
+                except Exception as e:
+                    logger.warning(f"Failed to apply ThroughputOptimized (non-fatal): {e}")
 
+    async def initialize(self):
+        try:
             # Allow the connection to stabilize
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.5)
             
             # Explicit check before starting notification
             if not self.client.is_connected:
@@ -500,7 +503,7 @@ class Controller:
                 except Exception as e:
                     if attempt == 2: raise
                     logger.warning(f"Notify failed, retry {attempt+1}: {e}")
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(1.0)
 
             self.controller_info = await self.read_controller_info()
             
@@ -533,6 +536,9 @@ class Controller:
             raise
 
         logger.info(f"Successfully initialized {self.device.address} ({self.controller_info.product_id:04x}) : {self.controller_info}")
+        self.connected_at = time.time()
+
+    async def trigger_connection_haptics(self):
         try:
             bass_thump = VibrationData(lf_freq=0x060, lf_amp=0x350, hf_freq=0x0c0, hf_amp=0x250)
             sharp_click = VibrationData(hf_freq=0x1e2, hf_amp=0x300, lf_amp=0x030)
@@ -545,14 +551,22 @@ class Controller:
             await asyncio.sleep(0.01) 
             
             await self.set_vibration(sharp_click, ignore_freq_scaling=True)
-            await asyncio.sleep(1) 
+            await asyncio.sleep(1.0) 
             
             await self.set_vibration(stop_vibration, ignore_freq_scaling=True)
-            logger.info("Connection haptic feedback triggered.")
+            logger.info(f"Controller {self.device.address}: Connection haptic feedback triggered.")
         except Exception as e:
-            logger.warning(f"Failed to trigger haptic feedback: {e}")
+            logger.warning(f"Failed to trigger haptic feedback for {self.device.address}: {e}")
 
-        self.connected_at = time.time()
+    async def connect(self):
+        async with BLE_CONNECTION_LOCK:
+            await self.connect_ble()
+            await asyncio.sleep(0.3) 
+            
+            await self.initialize()
+            await self.trigger_connection_haptics()
+            
+            await asyncio.sleep(0.1)
 
     @classmethod
     async def create_from_device(cls, device: BLEDevice):
@@ -749,13 +763,20 @@ class Controller:
         v2 = scale_and_clamp(vibration2)
         v3 = scale_and_clamp(vibration3)
 
-        motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes() + v1.get_bytes() + v2.get_bytes() + v3.get_bytes()
-        if self.is_joycon_left():
-            await self.client.write_gatt_char(VIBRATION_WRITE_JOYCON_L_UUID, (b'\x00' + motor_vibrations))
-        elif self.is_joycon_right():
-            await self.client.write_gatt_char(VIBRATION_WRITE_JOYCON_R_UUID, (b'\x00' + motor_vibrations))
-        elif self.is_pro_controller():
-            await self.client.write_gatt_char(VIBRATION_WRITE_PRO_CONTROLLER_UUID, (b'\x00' + motor_vibrations + motor_vibrations))
+        motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + v1.get_bytes() + v2.get_bytes() + v3.get_bytes()
+        
+        try:
+            uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
+                VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
+            )
+            payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
+            
+            await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+        except Exception as e:
+            logger.debug(f"Vibration write failed: {e}")
+            
+        self.vibration_packet_id += 1
+
         self.vibration_packet_id += 1
 
     async def set_leds(self, player_number: int, reversed=False):
@@ -825,6 +846,9 @@ class Controller:
             # Filter out virtual button bits and garbage bits from physical reports (retaining only valid physical bits <= 0x03FFFFFF)
             inputData.buttons &= 0x03FFFFFF
 
+            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
+                self.simulate_mouse(inputData)
+
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False):
                 bx, by, bz = self.gyro_bias
@@ -874,7 +898,7 @@ class Controller:
                 (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None),
                 (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home"),
                 (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture"), 0x00002000, "Capture"),
-                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Mute"),
+                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "Mute"),
                 (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None),
                 (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None),
                 (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None),
@@ -888,7 +912,8 @@ class Controller:
                     if resolved == "Gyro": trigger_gyro = True
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
                     elif resolved == "Capture": trigger_screenshot = True
-                    elif resolved == "Chat": trigger_key_c = True
+                    elif resolved == "Chat":
+                        inputData.buttons |= SWITCH_BUTTONS.get("C", 0x00004000)
                     elif resolved == "Mute": inputData.buttons |= 0x10000000
                     elif resolved == "Calibration": trigger_calibration = True
                     elif resolved == "Game Bar": trigger_game_bar = True
@@ -948,7 +973,13 @@ class Controller:
             inputData.buttons &= ~0x0F
             
             abxy_mode = getattr(CONFIG, "abxy_mode", "Xbox")
-            if abxy_mode == "Switch":
+            is_switch_emu = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2"
+            if is_switch_emu:
+                should_swap = (abxy_mode == "Xbox")
+            else:
+                should_swap = (abxy_mode == "Switch")
+            
+            if should_swap:
                 if raw_down_pressed:  inputData.buttons |= 0x08
                 if raw_right_pressed: inputData.buttons |= 0x04
                 if raw_left_pressed:  inputData.buttons |= 0x02
@@ -995,7 +1026,6 @@ class Controller:
             if getattr(self, 'is_calibrating', False) or getattr(self, 'is_mag_calibrating', False):
                 self.simulate_gyro_mouse(inputData, False, False, False)
             else:
-                self.simulate_mouse(inputData)
                 # Record own trigger state and use shared trigger (for combined mode cross-controller activation)
                 self._own_gyro_trigger = trigger_gyro
                 self._own_zr_pressed = bool(inputData.buttons & SWITCH_BUTTONS.get("ZR", 0))
@@ -1104,6 +1134,40 @@ class Controller:
                     
                     inputData.gyroscope = (gx_dz, gy_dz, gz_dz)
 
+            try:
+                vc = getattr(self, 'virtual_controller', None)
+                if vc is not None:
+                    current_time = time.perf_counter()
+                    last_rumble_time = getattr(self, 'last_rumble_time', 0)
+                    
+                    if current_time - last_rumble_time >= 0.007:
+                        self.last_rumble_time = current_time
+                        
+                        v1, v2, v3, is_zero = vc.get_current_vibration_frames()
+                        
+                        if not getattr(self, '_rumble_task_running', False):
+                            
+                            async def safe_send(v1_c, v2_c, v3_c):
+                                self._rumble_task_running = True
+                                try:
+                                    await self.set_vibration(v1_c, v2_c, v3_c)
+                                finally:
+                                    self._rumble_task_running = False
+
+                            if is_zero:
+                                if not getattr(self, 'rumble_stopped', False):
+                                    self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                    asyncio.get_running_loop().create_task(safe_send(v1, v2, v3))
+                                    if self._zero_count >= 3:
+                                        self.rumble_stopped = True
+                            else:
+                                self.rumble_stopped = False
+                                self._zero_count = 0
+                                asyncio.get_running_loop().create_task(safe_send(v1, v2, v3))
+            
+            except Exception as e:
+                logger.debug(f"Sync rumble failed: {e}")
+
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
 
@@ -1208,20 +1272,31 @@ class Controller:
         mouse_config = CONFIG.mouse_config
         
         if mouse_config.enabled and self.is_joycon():
-            self.jc_mouse_active = True 
-            
-            if inputData.mouse_distance != 0 and inputData.mouse_distance < 1000 and inputData.mouse_roughness < 4000:
-                x, y = inputData.mouse_coords
-                mouseButtonsConfig = mouse_config.joycon_l_buttons if self.is_joycon_left() else mouse_config.joycon_r_buttons
-                lb = inputData.buttons & mouseButtonsConfig.left_button
-                mb = inputData.buttons & mouseButtonsConfig.middle_button
-                rb = inputData.buttons & mouseButtonsConfig.right_button
-                
-                inputData.buttons &= ~(mouseButtonsConfig.left_button | mouseButtonsConfig.middle_button | mouseButtonsConfig.right_button)
+            # Check if mouse coordinate data is valid to mark the controller as active IR mouse
+            ir_active = (inputData.mouse_distance != 0 and inputData.mouse_distance < 1000 and inputData.mouse_roughness < 4000)
 
-                if getattr(self, 'previous_mouse_state', None) is not None:
+            if ir_active:
+                self.jc_mouse_active = True 
+                
+                # Determine which config to use
+                mouseButtonsConfig = mouse_config.joycon_l_buttons if self.is_joycon_left() else mouse_config.joycon_r_buttons
+                
+                # Extract current button states
+                lb = bool(inputData.buttons & mouseButtonsConfig.left_button) if mouseButtonsConfig.left_button else False
+                mb = bool(inputData.buttons & mouseButtonsConfig.middle_button) if mouseButtonsConfig.middle_button else False
+                rb = bool(inputData.buttons & mouseButtonsConfig.right_button) if mouseButtonsConfig.right_button else False
+                
+                # Consume/Clear these buttons so they don't trigger virtual controller outputs
+                clear_mask = 0
+                if mouseButtonsConfig.left_button: clear_mask |= mouseButtonsConfig.left_button
+                if mouseButtonsConfig.middle_button: clear_mask |= mouseButtonsConfig.middle_button
+                if mouseButtonsConfig.right_button: clear_mask |= mouseButtonsConfig.right_button
+                inputData.buttons &= ~clear_mask
+
+                x, y = inputData.mouse_coords
+                if getattr(self, 'previous_mouse_state', None) is not None and self.previous_mouse_state.ir_active:
                     dx = signed_looping_difference_16bit(self.previous_mouse_state.x, x)
-                    dy = signed_looping_difference_16bit(self.previous_mouse_state.y ,y)
+                    dy = signed_looping_difference_16bit(self.previous_mouse_state.y, y)
 
                     if dx != 0 or dy != 0:
                         self.jc_target_vx = dx * mouse_config.sensitivity * 0.009
@@ -1229,29 +1304,53 @@ class Controller:
                     else:
                         self.jc_target_vx = 0.0
                         self.jc_target_vy = 0.0
+                else:
+                    self.jc_target_vx = 0.0
+                    self.jc_target_vy = 0.0
 
-                    mx, my = win32api.GetCursorPos()
-                    press_or_release_mouse_button(lb, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                    press_or_release_mouse_button(mb, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                    press_or_release_mouse_button(rb, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+                # Get previous button states
+                prev_lb = self.previous_mouse_state.lb if getattr(self, 'previous_mouse_state', None) is not None else False
+                prev_mb = self.previous_mouse_state.mb if getattr(self, 'previous_mouse_state', None) is not None else False
+                prev_rb = self.previous_mouse_state.rb if getattr(self, 'previous_mouse_state', None) is not None else False
 
-                    if self.is_joycon_right():
-                        scroll_value = inputData.right_stick[1]
-                    else:
-                        scroll_value = inputData.left_stick[1]
+                # Inject mouse clicks immediately
+                mx, my = win32api.GetCursorPos()
+                press_or_release_mouse_button(lb, prev_lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                press_or_release_mouse_button(mb, prev_mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                press_or_release_mouse_button(rb, prev_rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
 
-                    if abs(scroll_value) > 0.2:
-                        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, int(scroll_value * 60 * mouse_config.scroll_sensitivity), 0)
-                        
-                self.previous_mouse_state = MouseState(x, y, bool(lb), bool(mb), bool(rb))
+                # Scroll wheel handling
+                if self.is_joycon_right():
+                    scroll_value = inputData.right_stick[1]
+                else:
+                    scroll_value = inputData.left_stick[1]
+
+                if abs(scroll_value) > 0.2:
+                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, int(scroll_value * 60 * mouse_config.scroll_sensitivity), 0)
+                            
+                self.previous_mouse_state = MouseState(x, y, lb, mb, rb, ir_active)
             else:
-                self.previous_mouse_state = None
+                self.jc_mouse_active = False
                 self.jc_target_vx = 0.0
                 self.jc_target_vy = 0.0
+                # Exited IR Mouse Mode: release any pressed mouse buttons instantly
+                if getattr(self, 'previous_mouse_state', None) is not None:
+                    mx, my = win32api.GetCursorPos()
+                    press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                    press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                    press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+                self.previous_mouse_state = None
         else:
             self.jc_mouse_active = False
             self.jc_target_vx = 0.0
             self.jc_target_vy = 0.0
+            # If mouse mode is disabled or it's not a Joycon, make sure any pressed mouse button is released!
+            if getattr(self, 'previous_mouse_state', None) is not None:
+                mx, my = win32api.GetCursorPos()
+                press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+            self.previous_mouse_state = None
 
     def simulate_gyro_mouse(self, inputData: ControllerInputData, trigger_pressed: bool = False, zr_pressed: bool = False, zl_pressed: bool = False):
         if getattr(self, 'is_calibrating', False):

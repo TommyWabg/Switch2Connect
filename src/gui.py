@@ -928,6 +928,20 @@ class ControllerWindow:
             return False
 
     def check_driver_installation(self):
+        # If driver type is USBIP, check USBIP driver instead
+        if getattr(CONFIG, "driver_type", "") == "USBIP":
+            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+            if not os.path.exists(usbip_exe):
+                from tkinter import messagebox
+                answer = messagebox.askyesno(
+                    "Install USBIP Driver",
+                    "Switch2 emulation is selected, but the USBIP driver is not installed.\n\n"
+                    "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
+                )
+                if answer:
+                    self.run_usbip_install(show_success_msg=False)
+            return
+
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         if driver_type == "ViGEmBus":
             self.check_vigembus_installation()
@@ -1286,6 +1300,33 @@ class ControllerWindow:
             else:
                 self.run_driver_install()
 
+    def update_driver_buttons_visibility(self):
+        if not hasattr(self, 'top_btn_frame'):
+            return
+        scaling_factor = getattr(self, 'scaling_factor', 1.0)
+        
+        # First, unpack all frames from top_btn_frame to preserve order
+        if hasattr(self, 'driver_frame'): self.driver_frame.pack_forget()
+        if hasattr(self, 'usbip_frame'): self.usbip_frame.pack_forget()
+        if hasattr(self, 'startup_frame'): self.startup_frame.pack_forget()
+        if hasattr(self, 'min_frame'): self.min_frame.pack_forget()
+        if hasattr(self, 'hide_frame'): self.hide_frame.pack_forget()
+        
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        
+        # Pack the active driver button
+        if driver_type == "USBIP":
+            if hasattr(self, 'usbip_frame'):
+                self.usbip_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        else:
+            if hasattr(self, 'driver_frame'):
+                self.driver_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+                
+        # Pack the rest of the buttons
+        if hasattr(self, 'startup_frame'): self.startup_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        if hasattr(self, 'min_frame'): self.min_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        if hasattr(self, 'hide_frame'): self.hide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+
     def update_driver_button(self):
         if not hasattr(self, 'driver_btn') or not self.driver_btn:
             return
@@ -1297,6 +1338,222 @@ class ControllerWindow:
             installed = getattr(CONFIG, 'driver_installed', False)
             text = "Uninstall WinUHid Driver" if installed else "Install WinUHid Driver"
         self.driver_btn.config(text=text)
+        self.update_driver_buttons_visibility()
+
+    def update_usbip_button(self):
+        if not hasattr(self, 'usbip_btn') or not self.usbip_btn:
+            return
+        usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+        text = "Uninstall USBIP Driver" if os.path.exists(usbip_exe) else "Install USBIP Driver"
+        self.usbip_btn.config(text=text)
+        self.update_driver_buttons_visibility()
+
+    def on_usbip_btn_clicked(self):
+        usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+        from tkinter import messagebox
+        if os.path.exists(usbip_exe):
+            if messagebox.askyesno("Uninstall USBIP Driver", "Are you sure you want to uninstall the USBIP driver?\n(Requires administrator privileges.)"):
+                self.run_usbip_uninstall()
+        else:
+            if messagebox.askyesno(
+                "Install USBIP Driver",
+                "Are you sure you want to install the USBIP driver?\n\n"
+                "WARNING: During the installation of USBIP-win2, Windows USB hubs will restart briefly, which will temporarily disconnect other USB peripherals (mice, keyboards, etc.).\n\n"
+                "Do you want to proceed?\n(Requires administrator privileges.)"
+            ):
+                self.run_usbip_install()
+
+    def run_usbip_install(self, show_success_msg=True):
+        import sys
+        import os
+        from tkinter import messagebox
+        
+        # Stop discoverer before installation
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+            
+        # Run emergency cleanup to close all virtual controller handles immediately
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        install_ps1 = get_driver_path("install_usbip.ps1")
+        if os.path.exists(install_ps1):
+            try:
+                progress_win = tk.Toplevel(self.root)
+                progress_win.title("USBIP Driver Installation")
+                progress_win.geometry(f"{int(450 * scaling_factor)}x{int(130 * scaling_factor)}+150+150")
+                progress_win.resizable(False, False)
+                progress_win.config(bg="#1E1E1E")
+                progress_win.transient(self.root)
+                progress_win.grab_set()
+                
+                label = tk.Label(
+                    progress_win,
+                    text="Installing USBIP-win2 Driver...\nPlease authorize the UAC prompt if asked.",
+                    fg="white", bg="#1E1E1E",
+                    font=scale_font(("Arial", 11, "bold"))
+                )
+                label.pack(pady=int(40 * scaling_factor))
+                
+                # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
+                info = SHELLEXECUTEINFOW()
+                info.cbSize = ctypes.sizeof(info)
+                info.fMask = SEE_MASK_NOCLOSEPROCESS
+                info.hwnd = None
+                info.lpVerb = "runas"
+                info.lpFile = "powershell.exe"
+                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{install_ps1}"'
+                info.lpDirectory = None
+                info.nShow = 1  # SW_SHOWNORMAL
+                
+                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
+                if not launched:
+                    # User cancelled the UAC prompt or it failed
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    messagebox.showerror("Error", "USBIP driver installation was cancelled or failed to start (UAC prompt declined).")
+                    if discoverer_was_running:
+                        self.start_discoverer_thread()
+                    return
+                
+                hProcess = info.hProcess
+                proc_exit_code = [0]
+
+                def check_process():
+                    if hProcess:
+                        res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                        if res == WAIT_TIMEOUT:
+                            progress_win.after(200, check_process)
+                        else:
+                            exit_code = wintypes.DWORD()
+                            ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                            ctypes.windll.kernel32.CloseHandle(hProcess)
+                            proc_exit_code[0] = exit_code.value
+                            progress_win.grab_release()
+                            progress_win.destroy()
+                    else:
+                        progress_win.grab_release()
+                        progress_win.destroy()
+                            
+                progress_win.after(200, check_process)
+                self.root.wait_window(progress_win)
+                
+                logger.info(f"USBIP driver installer process exited with code: {proc_exit_code[0]}")
+                
+                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                usbip_installed_ok = os.path.exists(usbip_exe)
+                if usbip_installed_ok:
+                    if show_success_msg:
+                        messagebox.showinfo("Success", "USBIP-win2 driver installed successfully.")
+                else:
+                    messagebox.showerror(
+                        "Error",
+                        "USBIP driver installation was not completed or failed."
+                    )
+                self.update_usbip_button()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start the USBIP installer: {e}")
+        else:
+            messagebox.showerror("Error", "Could not find install_usbip.ps1. Please verify the integrity of the application files.")
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
+
+    def run_usbip_uninstall(self):
+        import sys
+        import os
+        from tkinter import messagebox
+        
+        # Stop discoverer before uninstallation
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+            
+        # Run emergency cleanup to close all virtual controller handles immediately
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        uninstaller_exe = "C:\\Program Files\\USBip\\unins000.exe"
+        if os.path.exists(uninstaller_exe):
+            try:
+                progress_win = tk.Toplevel(self.root)
+                progress_win.title("USBIP Driver Uninstallation")
+                progress_win.geometry(f"{int(450 * scaling_factor)}x{int(130 * scaling_factor)}+150+150")
+                progress_win.resizable(False, False)
+                progress_win.config(bg="#1E1E1E")
+                progress_win.transient(self.root)
+                progress_win.grab_set()
+                
+                label = tk.Label(
+                    progress_win,
+                    text="Running USBIP-win2 Uninstaller...\nPlease follow the uninstall wizard on the screen.",
+                    fg="white", bg="#1E1E1E",
+                    font=scale_font(("Arial", 11, "bold"))
+                )
+                label.pack(pady=int(40 * scaling_factor))
+                
+                # Bypassing CMD and launching the uninstaller directly via ShellExecuteExW (runas verb)
+                info = SHELLEXECUTEINFOW()
+                info.cbSize = ctypes.sizeof(info)
+                info.fMask = SEE_MASK_NOCLOSEPROCESS
+                info.hwnd = None
+                info.lpVerb = "runas"
+                info.lpFile = uninstaller_exe
+                info.lpParameters = ""
+                info.lpDirectory = "C:\\Program Files\\USBip"
+                info.nShow = 1  # SW_SHOWNORMAL
+                
+                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
+                if not launched:
+                    # User cancelled the UAC prompt or it failed
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    messagebox.showerror("Error", "USBIP driver uninstallation was cancelled or failed to start (UAC prompt declined).")
+                    if discoverer_was_running:
+                        self.start_discoverer_thread()
+                    return
+
+                hProcess = info.hProcess
+                proc_exit_code = [0]
+
+                def check_process():
+                    if hProcess:
+                        res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                        if res == WAIT_TIMEOUT:
+                            progress_win.after(200, check_process)
+                        else:
+                            exit_code = wintypes.DWORD()
+                            ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                            ctypes.windll.kernel32.CloseHandle(hProcess)
+                            proc_exit_code[0] = exit_code.value
+                            progress_win.grab_release()
+                            progress_win.destroy()
+                    else:
+                        progress_win.grab_release()
+                        progress_win.destroy()
+                            
+                progress_win.after(200, check_process)
+                self.root.wait_window(progress_win)
+                
+                logger.info(f"USBIP driver uninstaller process exited with code: {proc_exit_code[0]}")
+                
+                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                usbip_removed_ok = not os.path.exists(usbip_exe)
+                if usbip_removed_ok:
+                    messagebox.showinfo("Success", "USBIP driver uninstalled successfully.")
+                else:
+                    messagebox.showinfo("Information", "USBIP driver uninstaller closed.")
+                self.update_usbip_button()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start the USBIP uninstaller: {e}")
+        else:
+            messagebox.showerror("Error", f"Could not find uninstaller at {uninstaller_exe}.")
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
 
 
     def init_interface(self):
@@ -1488,10 +1745,13 @@ class ControllerWindow:
 
         # Driver Install/Uninstall Button
         self.driver_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
-        self.driver_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.driver_btn = tk.Button(self.driver_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.on_driver_btn_clicked)
         self.driver_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
-        self.update_driver_button()
+
+        # USBIP Driver Button
+        self.usbip_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
+        self.usbip_btn = tk.Button(self.usbip_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.on_usbip_btn_clicked)
+        self.usbip_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         # Startup Button
         self.startup_frame = tk.Frame(self.top_btn_frame, bg=highlight_color if CONFIG.open_when_startup else button_gray)
@@ -1512,6 +1772,9 @@ class ControllerWindow:
         self.hide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.hide_btn = tk.Button(self.hide_frame, text="Hide to System Tray", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.hide_to_tray)
         self.hide_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        self.update_driver_button()
+        self.update_usbip_button()
 
         self.update([None])
 
@@ -1779,7 +2042,7 @@ class ControllerWindow:
         
         # Driver Switch
         tk.Label(row_global, text="Driver:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.driver_switch = ToggleSwitch(row_global, ["WinUHid", "ViGEmBus"], ["WinUHid", "ViGEmBus"], getattr(CONFIG, "driver_type", "WinUHid"), self.update_driver_type_setting, background_color)
+        self.driver_switch = ToggleSwitch(row_global, ["WinUHid", "ViGEmBus", "USBIP"], ["WinUHid", "ViGEmBus", "USBIP"], getattr(CONFIG, "driver_type", "WinUHid"), self.update_driver_type_setting, background_color)
         self.driver_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Emu Mode
@@ -1788,6 +2051,8 @@ class ControllerWindow:
         initial_driver = getattr(CONFIG, "driver_type", "WinUHid")
         if initial_driver == "ViGEmBus":
             sim_options = ["Xbox360", "PS4"]
+        elif initial_driver == "USBIP":
+            sim_options = ["Switch2"]
         else:
             sim_options = ["Xbox One", "PS4", "PS5"]
             
@@ -1863,6 +2128,23 @@ class ControllerWindow:
                 # Revert to WinUHid options in GUI
                 self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
                 return
+        elif val == "USBIP":
+            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+            if not os.path.exists(usbip_exe):
+                from tkinter import messagebox
+                answer = messagebox.askyesno(
+                    "Install USBIP Driver",
+                    "The USBIP driver is required but is not installed.\n\n"
+                    "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
+                )
+                if answer:
+                    self.run_usbip_install(show_success_msg=True)
+                    if not os.path.exists(usbip_exe):
+                        self.driver_switch.set_value(old_driver)
+                        return
+                else:
+                    self.driver_switch.set_value(old_driver)
+                    return
         else:
             self.check_driver_installation()
             
@@ -1871,16 +2153,21 @@ class ControllerWindow:
         # Load the remembered simulation mode for the target driver
         if val == "ViGEmBus":
             CONFIG.simulation_mode = CONFIG.vigembus_sim_mode
+        elif val == "USBIP":
+            CONFIG.simulation_mode = "Switch2"
         else:
             CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             
         # Update sim mode switch options and set value
         if val == "ViGEmBus":
             self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
+        elif val == "USBIP":
+            self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], CONFIG.simulation_mode)
         else:
             self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
             
         CONFIG.save_config()
+        self._refresh_mapping_comboboxes()
         
         # Apply the driver change to all running virtual controllers immediately
         if hasattr(self, 'current_controllers'):
@@ -1889,18 +2176,7 @@ class ControllerWindow:
                 if vc is not None:
                     with vc.state_lock:
                         if hasattr(vc, 'vg_controller') and vc.vg_controller is not None:
-                            try:
-                                vc.vg_controller.unregister_notification()
-                            except Exception:
-                                pass
-                            if hasattr(vc.vg_controller, 'cmp_func'):
-                                vc.vg_controller.cmp_func = None
-                            if hasattr(vc.vg_controller, 'close'):
-                                try:
-                                    vc.vg_controller.close()
-                                except Exception:
-                                    pass
-                            vc.vg_controller = None
+                            vc.cleanup_vg_controller()
             
             # Wait for PnP subsystem to settle
             import gc
@@ -1919,17 +2195,36 @@ class ControllerWindow:
                     if vc.loop and vc.loop.is_running():
                         asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
  
+    def _refresh_mapping_comboboxes(self):
+        for key in ["home", "capt", "c", "gl", "gr", "sll", "srl", "slr", "srr"]:
+            combo = getattr(self, f"{key}_combo", None)
+            if combo:
+                combo.set(getattr(CONFIG, f"{key}_mapping"))
+
     def update_sim_mode_setting(self, val):
         CONFIG.simulation_mode = val
-        if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus":
-            CONFIG.vigembus_sim_mode = val
-        else:
-            CONFIG.winuhid_sim_mode = val
+        if val != "Switch2":
+            if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus":
+                CONFIG.vigembus_sim_mode = val
+            else:
+                CONFIG.winuhid_sim_mode = val
             
         if hasattr(self, 'current_controllers'):
             for vc in self.current_controllers:
                 if vc is not None: vc.set_mode(val)
         CONFIG.save_config()
+        self._refresh_mapping_comboboxes()
+
+    def _revert_from_switch2_pro(self):
+        default_mode = "PS4" if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus" else "PS5"
+        CONFIG.simulation_mode = default_mode
+        if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus":
+            CONFIG.vigembus_sim_mode = default_mode
+        else:
+            CONFIG.winuhid_sim_mode = default_mode
+        self.sim_mode_switch.set_value(default_mode)
+        CONFIG.save_config()
+        self._refresh_mapping_comboboxes()
 
     def update_layout_setting(self, val):
         CONFIG.abxy_mode = val
@@ -1994,6 +2289,7 @@ class ControllerWindow:
             with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
             data['abxy_mode'] = CONFIG.abxy_mode  
             for k in ['home_mapping','capt_mapping','gl_mapping','gr_mapping','c_mapping','sll_mapping','srl_mapping','slr_mapping','srr_mapping']: data[k] = getattr(CONFIG, k)
+            data['button_remaps'] = CONFIG.button_remaps
             with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)
         except Exception as e: logger.error(f"Failed to save settings: {e}")
         self.root.focus_set()
@@ -2009,6 +2305,8 @@ class ControllerWindow:
         if hasattr(self, 'driver_switch') and self.driver_switch.values[self.driver_switch.current_index] != active_driver:
             if active_driver == "ViGEmBus":
                 CONFIG.simulation_mode = CONFIG.vigembus_sim_mode
+            elif active_driver == "USBIP":
+                CONFIG.simulation_mode = "Switch2"
             else:
                 CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             CONFIG.save_config()
@@ -2017,6 +2315,8 @@ class ControllerWindow:
             self.update_driver_button()
             if active_driver == "ViGEmBus":
                 self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
+            elif active_driver == "USBIP":
+                self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], CONFIG.simulation_mode)
             else:
                 self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
         # A slot is only "connected" if the VirtualController exists AND has physical controllers

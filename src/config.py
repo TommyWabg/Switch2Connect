@@ -6,6 +6,19 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+def save_config(config_data, filepath="config.yaml"):
+    temp_path = filepath + ".tmp"
+    
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config_data, f, allow_unicode=True)
+            
+        os.replace(temp_path, filepath)
+        
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 SWITCH_BUTTONS = {
     "Y":     0x00000001,
@@ -41,7 +54,7 @@ SWITCH_BUTTONS = {
 BACK_BUTTON_OPTIONS = [
     "Default", "Gyro", "Calibration", "Home", "Capture", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
-    "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT"
+    "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR"
 ]
 
 XB_BUTTONS = {
@@ -110,10 +123,10 @@ class MouseButtonConfig:
     middle_button: int
     right_button: int
 
-    def __init__(self, buttons_dict: dict[str, str]):
-        self.left_button = SWITCH_BUTTONS.get(buttons_dict.get("left_button"), 0)
-        self.middle_button = SWITCH_BUTTONS.get(buttons_dict.get("middle_button"), 0)
-        self.right_button = SWITCH_BUTTONS.get(buttons_dict.get("right_button"), 0)
+    def __init__(self, buttons_dict: dict[str, str], default_left: str = None, default_middle: str = None, default_right: str = None):
+        self.left_button = SWITCH_BUTTONS.get(buttons_dict.get("left_button") or default_left, 0)
+        self.middle_button = SWITCH_BUTTONS.get(buttons_dict.get("middle_button") or default_middle, 0)
+        self.right_button = SWITCH_BUTTONS.get(buttons_dict.get("right_button") or default_right, 0)
 
 @dataclass
 class MouseConfig:
@@ -128,8 +141,8 @@ class MouseConfig:
         self.sensitivity = config_dict.get("sensitivity", 1.0)
         self.scroll_sensitivity = config_dict.get("scroll_sensitivity", 1.0)
         buttons_config = config_dict.get("buttons", {})
-        self.joycon_l_buttons = MouseButtonConfig(buttons_config.get("left_joycon", {}))
-        self.joycon_r_buttons = MouseButtonConfig(buttons_config.get("right_joycon", {}))
+        self.joycon_l_buttons = MouseButtonConfig(buttons_config.get("left_joycon", {}), default_left="L", default_right="ZL")
+        self.joycon_r_buttons = MouseButtonConfig(buttons_config.get("right_joycon", {}), default_left="R", default_right="ZR")
 
 def get_app_root():
     if hasattr(sys, '_MEIPASS'):
@@ -227,16 +240,32 @@ class Config:
         self.procon_config = ButtonConfig(btns.get("procon", {}))
 
         self.mouse_config = MouseConfig(config.get("mouse", {}))
-        self.gl_mapping = config.get("gl_mapping", "Default")
-        self.gr_mapping = config.get("gr_mapping", "Gyro")
-        self.c_mapping = config.get("c_mapping", "Default")
-        self.slr_mapping = config.get("slr_mapping", "Gyro")
-        self.srl_mapping = config.get("srl_mapping", "Default")
-        self.sll_mapping = config.get("sll_mapping", "Default")
-        self.srr_mapping = config.get("srr_mapping", "Default")
-        self.home_mapping = config.get("home_mapping", "Default")
-        _capt = config.get("capt_mapping", "Capture")
-        self.capt_mapping = "Capture" if _capt in ("None", "CAPT", "Default") else _capt
+        # Define categories and defaults for button remaps
+        self.button_remaps = config.get("button_remaps", {}) or {}
+        categories = ["xbox", "ps", "switch2"]
+        default_mappings = {
+            "gl_mapping": "Default",
+            "gr_mapping": "Gyro",
+            "c_mapping": "Default",
+            "slr_mapping": "Gyro",
+            "srl_mapping": "Default",
+            "sll_mapping": "Default",
+            "srr_mapping": "Default",
+            "home_mapping": "Default",
+            "capt_mapping": "Capture"
+        }
+        
+        # Populate each category, falling back to top-level key or default
+        for cat in categories:
+            if cat not in self.button_remaps:
+                self.button_remaps[cat] = {}
+            for key, def_val in default_mappings.items():
+                if key not in self.button_remaps[cat]:
+                    # For backward compatibility, check top-level config first
+                    val = config.get(key, def_val)
+                    if key == "capt_mapping" and val in ("None", "CAPT", "Default"):
+                        val = "Capture"
+                    self.button_remaps[cat][key] = val
         self.abxy_mode = config.get("abxy_mode", "Xbox") 
         
         self.gyro_mode = config.get("gyro_mode", "World")
@@ -266,8 +295,13 @@ class Config:
             self.virtual_gyro_soft_deadzone = float(val)
         self.driver_installed = config.get("driver_installed", False)
         self.driver_type = config.get("driver_type", "WinUHid")
+        if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
+            self.driver_type = "WinUHid"
         
         self.simulation_mode = config.get("simulation_mode", "Xbox One")
+        if self.simulation_mode == "Switch 2 Pro":
+            self.simulation_mode = "Switch2"
+            
         if self.simulation_mode == "Xbox":
             if self.driver_type == "ViGEmBus":
                 self.simulation_mode = "Xbox360"
@@ -293,10 +327,13 @@ class Config:
             else:
                 self.winuhid_sim_mode = "PS5"
 
-        if self.driver_type == "ViGEmBus":
-            self.simulation_mode = self.vigembus_sim_mode
-        else:
-            self.simulation_mode = self.winuhid_sim_mode
+        if self.driver_type == "USBIP":
+            self.simulation_mode = "Switch2"
+        elif self.simulation_mode != "Switch2":
+            if self.driver_type == "ViGEmBus":
+                self.simulation_mode = self.vigembus_sim_mode
+            else:
+                self.simulation_mode = self.winuhid_sim_mode
 
         self.vigembus_installed = config.get("vigembus_installed", False)
         self.window_width = config.get("window_width", None)
@@ -369,6 +406,7 @@ class Config:
             data['mag_calibration_data'] = self.mag_calibration_data
             data['joycon_hold_mode'] = self.joycon_hold_mode
             data['merged_gyro_side'] = self.merged_gyro_side
+            data['button_remaps'] = self.button_remaps
             
             if 'mouse' not in data:
                 data['mouse'] = {}
@@ -395,6 +433,105 @@ class Config:
             self.vibration_strength_switch = val
         else:
             self.vibration_strength_xbox = val
+
+    def get_current_category(self):
+        mode = getattr(self, "simulation_mode", "Xbox One")
+        if mode == "Switch2":
+            return "switch2"
+        elif "PS" in mode:
+            return "ps"
+        else:
+            return "xbox"
+
+    @property
+    def gl_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("gl_mapping", "Default")
+    @gl_mapping.setter
+    def gl_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["gl_mapping"] = val
+
+    @property
+    def gr_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("gr_mapping", "Gyro")
+    @gr_mapping.setter
+    def gr_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["gr_mapping"] = val
+
+    @property
+    def c_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("c_mapping", "Default")
+    @c_mapping.setter
+    def c_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["c_mapping"] = val
+
+    @property
+    def slr_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("slr_mapping", "Gyro")
+    @slr_mapping.setter
+    def slr_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["slr_mapping"] = val
+
+    @property
+    def srl_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("srl_mapping", "Default")
+    @srl_mapping.setter
+    def srl_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["srl_mapping"] = val
+
+    @property
+    def sll_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("sll_mapping", "Default")
+    @sll_mapping.setter
+    def sll_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["sll_mapping"] = val
+
+    @property
+    def srr_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("srr_mapping", "Default")
+    @srr_mapping.setter
+    def srr_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["srr_mapping"] = val
+
+    @property
+    def home_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("home_mapping", "Default")
+    @home_mapping.setter
+    def home_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["home_mapping"] = val
+
+    @property
+    def capt_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("capt_mapping", "Capture")
+    @capt_mapping.setter
+    def capt_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["capt_mapping"] = val
     
 CONFIG = Config(get_resource("config.yaml"))
 
