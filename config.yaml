@@ -3,12 +3,39 @@ auto_disconnect_days: 0
 auto_disconnect_enabled: false
 auto_disconnect_hours: 0
 auto_disconnect_minutes: 0
+button_remaps:
+  ps:
+    c_mapping: Default
+    capt_mapping: Capture
+    gl_mapping: PS_L_Touch
+    gr_mapping: PS_R_Touch
+    home_mapping: Default
+    sll_mapping: Default
+    slr_mapping: PS_R_Touch
+    srl_mapping: PS_L_Touch
+    srr_mapping: Default
+  switch2:
+    c_mapping: Default
+    capt_mapping: Capture
+    gl_mapping: GL
+    gr_mapping: GR
+    home_mapping: Default
+    sll_mapping: Default
+    slr_mapping: GR
+    srl_mapping: GL
+    srr_mapping: Default
+  xbox:
+    c_mapping: Default
+    capt_mapping: Capture
+    gl_mapping: Default
+    gr_mapping: Default
+    home_mapping: Default
+    sll_mapping: Default
+    slr_mapping: Default
+    srl_mapping: Default
+    srr_mapping: Default
 c_mapping: Default
-calibration_data:
-  E0:EF:BF:81:06:9F:
-  - 5.419047619047619
-  - -16.057142857142857
-  - -0.012698412698412698
+calibration_data: {}
 capt_mapping: Capture
 driver_installed: false
 driver_type: WinUHid
@@ -20,23 +47,18 @@ gyro_bias_l:
 - 0.0
 - 0.0
 gyro_bias_r:
-- 5.419047619047619
-- -16.057142857142857
-- -0.012698412698412698
+- 0.0
+- 0.0
+- 0.0
 gyro_mode: World
-gyro_sensitivity: 3.0
+gyro_sensitivity: 4.0
 home_mapping: Default
-joycon_hold_mode:
-  E0:EF:BF:F0:0E:17: Horizontal
-mag_calibration_data:
-  E0:EF:BF:81:06:9F:
-  - 130.5
-  - 85.5
-  - 18.0
+joycon_hold_mode: {}
+mag_calibration_data: {}
 merged_gyro_side: {}
 mouse:
   enabled: true
-  sensitivity: 5.0
+  sensitivity: 4.0
 open_when_startup: false
 rumble_mode: Switch
 simulation_mode: PS5

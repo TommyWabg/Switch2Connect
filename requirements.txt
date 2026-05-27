@@ -17,3 +17,4 @@ numpy==1.26.4
 # External C/C++ Driver & Sub-library Repositories (For reference / self-compilation)
 # WinUHid Driver: https://github.com/lurebat/WinUHid
 # Fusion IMU Library: https://github.com/xioTechnologies/Fusion
+# USBIP Driver (usbip-win2): https://github.com/czgdp1807/usbip-win2

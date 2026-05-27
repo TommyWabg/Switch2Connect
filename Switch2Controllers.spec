@@ -1,18 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/install_driver.ps1', 'drivers'), ('drivers/install.bat', 'drivers'), ('drivers/uninstall_driver.ps1', 'drivers'), ('drivers/uninstall.bat', 'drivers'), ('drivers/uninstall_vigembus.ps1', 'drivers'), ('drivers/uninstall_vigembus.bat', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHid Driver/WinUHidDriver.inf', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHid Driver/WinUHidDriver.dll', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHid Driver/winuhiddriver.cat', 'drivers'), ('WinUHid-main/WinUHid Driver/build/Release/x64/WinUHidDriver.cer', 'drivers')]
+datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/install_driver.ps1', 'drivers'), ('drivers/install.bat', 'drivers'), ('drivers/uninstall_driver.ps1', 'drivers'), ('drivers/uninstall.bat', 'drivers'), ('drivers/uninstall_vigembus.ps1', 'drivers'), ('drivers/uninstall_vigembus.bat', 'drivers'), ('drivers/USBip-0.9.7.7-x64.exe', 'drivers'), ('drivers/install_usbip.ps1', 'drivers'), ('drivers/uninstall_usbip.ps1', 'drivers'), ('drivers/WinUHidDriver.inf', 'drivers'), ('drivers/WinUHidDriver.dll', 'drivers'), ('drivers/winuhiddriver.cat', 'drivers'), ('WinUHid-main/WinUHidDriver.cer', 'drivers')]
 binaries = [('drivers/WinUHid.dll', 'drivers'), ('drivers/WinUHidDevs.dll', 'drivers')]
-hiddenimports = ['imufusion']
+hiddenimports = ['imufusion', 'usbip_server']
 tmp_ret = collect_all('vgamepad')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('imufusion')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('bleak')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('winrt')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('bluetooth')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['src\\gui.py'],
-    pathex=[],
+    pathex=['src'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
