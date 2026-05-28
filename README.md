@@ -29,13 +29,13 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Added V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
 * **Per-Joy-Con V/H Mode Persistence:** The application now records and remembers whether each single Joy-Con is held vertically or horizontally. Layout preferences (Vertical or Horizontal) are dynamically mapped to each controller's Bluetooth MAC address and saved in `config.yaml`.
 * **Dual-Controller Gyro Selection (L/R Gyro):** When using a pair of Joy-cons as a single virtual controller, you can now manually select which Joy-con (Left or Right) provides the motion data. This allows for greater flexibility, letting you choose your preferred hand for gyro aiming or motion controls.
+* **Customizable Rumble Strength:** Introduced a new Vibration Strength slider in the settings panel (ranging from 0 to 10), allowing users to dynamically scale the intensity of the controller's haptic feedback.
+* **Rumble Frequency Slider:** You can now customize the vibration/rumble frequency directly from the settings panel.
 * **Dual Rumble Mode Toggle:** Introduced a toggle switch in the user interface to easily switch between Xbox and Switch rumble modes. 
   * **Xbox Mode:** Tailored for standard PC games to simulate dual-motor rumble by activating dynamic frequency scaling and high-frequency masking to mimic traditional gamepad motors. 
     * **Strength 5 and Frequency 10** emulates the feel of a DualSense Edge controller.
     * **Strength 10 and Frequency 10** emulates the rumble of an Xbox Elite Series 1 Controller.
   * **Switch Mode:** Mimics the native Switch HD Rumble (LRA) experience. It bypasses custom frequency scaling and masking, routing raw frequency data directly to the controller for a tighter, softer, and more detailed tactile feedback. Best suited for native Nintendo game emulations.
-* **Customizable Vibration Strength:** Introduced a new Vibration Strength slider in the settings panel (ranging from 0 to 10), allowing users to dynamically scale the intensity of the controller's haptic feedback.
-* **Rumble Frequency Slider:** You can now customize the vibration/rumble frequency directly from the settings panel.
 * **Interactive Controller Identification:** Added a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Added rumble feedback (including a connection confirmation rumble) and mapped the Capture button to native Windows screenshots (`Win + PrtScn`).
 * **One-Click Disconnect:** Added a convenient 'X' button to the top right of each connected controller's UI block. You can now manually disconnect specific controllers directly from the interface without needing to power them off physically.
