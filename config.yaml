@@ -1,42 +1,77 @@
-abxy_mode: Switch
+abxy_mode: Xbox
 auto_disconnect_days: 0
 auto_disconnect_enabled: false
 auto_disconnect_hours: 0
 auto_disconnect_minutes: 0
+auto_disconnect_mode: 'OFF'
 button_remaps:
-  ps:
-    c_mapping: Default
-    capt_mapping: Capture
+  ps4:
+    abxy_mode: Xbox
+    c_mapping: Calibration
+    capt_mapping: Default
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
+    rumble_mode: Xbox
     sll_mapping: Default
     slr_mapping: PS_R_Touch
     srl_mapping: PS_L_Touch
     srr_mapping: Default
-  switch2:
+    vibration_frequency: 10
+    vibration_strength: 5
+    vibration_strength_switch: 5
+    vibration_strength_xbox: 5
+  ps5:
+    abxy_mode: Xbox
     c_mapping: Default
-    capt_mapping: Capture
+    capt_mapping: Default
+    gl_mapping: PS_L_Touch
+    gr_mapping: PS_R_Touch
+    home_mapping: Default
+    rumble_mode: Xbox
+    sll_mapping: Default
+    slr_mapping: PS_R_Touch
+    srl_mapping: PS_L_Touch
+    srr_mapping: Default
+    vibration_frequency: 10
+    vibration_strength: 5
+    vibration_strength_switch: 5
+    vibration_strength_xbox: 5
+  switch2:
+    abxy_mode: Switch
+    c_mapping: Default
+    capt_mapping: Default
     gl_mapping: GL
     gr_mapping: GR
     home_mapping: Default
+    rumble_mode: Switch
     sll_mapping: Default
     slr_mapping: GR
     srl_mapping: GL
     srr_mapping: Default
+    vibration_frequency: 10
+    vibration_strength: 5
+    vibration_strength_switch: 5
+    vibration_strength_xbox: 5
   xbox:
-    c_mapping: Default
-    capt_mapping: Capture
+    abxy_mode: Xbox
+    c_mapping: Calibration
+    capt_mapping: Default
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
+    rumble_mode: Xbox
     sll_mapping: Default
     slr_mapping: Default
     srl_mapping: Default
     srr_mapping: Default
+    vibration_frequency: 10
+    vibration_strength: 10
+    vibration_strength_switch: 5
+    vibration_strength_xbox: 10
 c_mapping: Default
 calibration_data: {}
-capt_mapping: Capture
+capt_mapping: Default
 driver_installed: false
 driver_type: WinUHid
 gl_mapping: PS_L_Touch
@@ -53,14 +88,16 @@ gyro_bias_r:
 gyro_mode: World
 gyro_sensitivity: 4.0
 home_mapping: Default
-joycon_hold_mode: {}
+joycon_hold_mode:
+  E0:EF:BF:EF:CC:BD: Vertical
+  E0:EF:BF:F0:0E:17: Horizontal
 mag_calibration_data: {}
 merged_gyro_side: {}
 mouse:
   enabled: true
   sensitivity: 4.0
 open_when_startup: false
-rumble_mode: Switch
+rumble_mode: Xbox
 simulation_mode: PS5
 sll_mapping: Default
 slr_mapping: PS_R_Touch
