@@ -22,8 +22,8 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
   * **Adjustable Soft Deadzone Slider:** Added a slider for adjusting soft deadzone value for passthrough gyro data. (Soft deadzone subtracts the active deadzone value from the input magnitude. Output begins smoothly from `0.0` right at the threshold boundary, eliminating step-jump discontinuities.)
 * **Gyro Calibration:** **Calibrate Gyro** button for calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
-* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_R`, `SR_L` and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, or standard buttons.
-* **Categorized Button Mapping Profiles:** Segregated custom button mapping configurations into three independent target categories: **Xbox**, **PlayStation (PS)**, and **Switch 2**. Remap profiles are now saved and loaded automatically based on the active emulation mode.
+* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, print screen, or standard buttons.
+* **Categorized Button Mapping Profiles:** Segregated custom button mapping and rumble configurations into three independent target categories: **Xbox**, **PS4**, **PS5**, and **Switch 2**. Remap profiles are now saved and loaded automatically based on the active emulation mode.
 * **Joy-con Mouse Toggle:** A new dedicated switch in the GUI to enable or disable the Joy-con mouse mode. This prevents accidental cursor movement during gameplay.
 * **Dynamic Split & Merge System:** The new **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Added V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
@@ -39,6 +39,9 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Interactive Controller Identification:** Added a dedicated **Ping** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Added rumble feedback (including a connection confirmation rumble) and mapped the Capture button to native Windows screenshots (`Win + PrtScn`).
 * **One-Click Disconnect:** Added a convenient 'X' button to the top right of each connected controller's UI block. You can now manually disconnect specific controllers directly from the interface without needing to power them off physically.
+* **Auto-Disconnect Options:** Added a 3-way Auto-Disconnect toggle (OFF, Inactive, Absolute).
+  * **Inactive:** tracks physical button and stick inputs to automatically disconnect idle controllers while keeping active players connected.
+  * **Absolute:** tracks the overall time each controller is connected to the app and disconnects the ones that reach the time limit.
 * **Dedicated UI Driver Controls:** Added **Install/Uninstall Driver** buttons to the left of the "Run At Startup" button.
 * **Run at Startup:** Added a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
