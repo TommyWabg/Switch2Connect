@@ -3,22 +3,11 @@ import os
 import yaml
 import logging
 import sys
+import threading
 
 logger = logging.getLogger(__name__)
 
-def save_config(config_data, filepath="config.yaml"):
-    temp_path = filepath + ".tmp"
-    
-    try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            yaml.dump(config_data, f, allow_unicode=True)
-            
-        os.replace(temp_path, filepath)
-        
-    except Exception as e:
-        logger.error(f"Failed to save config: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+# (Standalone save_config removed as requested)
 
 SWITCH_BUTTONS = {
     "Y":     0x00000001,
@@ -35,6 +24,7 @@ SWITCH_BUTTONS = {
     "L_STK": 0x00000800,
     "HOME":  0x00001000,
     "CAPT":  0x00002000,
+    "Capture": 0x00002000,
     "C":     0x00004000,
     "DOWN":  0x00010000,
     "UP":    0x00020000,
@@ -52,7 +42,7 @@ SWITCH_BUTTONS = {
 }
 
 BACK_BUTTON_OPTIONS = [
-    "Default", "Gyro", "Calibration", "Home", "Capture", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
+    "Default", "Gyro", "Calibration", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR"
 ]
@@ -221,6 +211,10 @@ class Config:
                     import shutil
                     shutil.copy(bundled_config, self.config_file_path)
 
+        self._save_lock = threading.Lock()
+        self.load_config()
+
+    def load_config(self):
         config = {}
         try:
             with open(self.config_file_path, 'r', encoding='utf-8') as cf:
@@ -228,7 +222,6 @@ class Config:
         except Exception as e:
             logger.error(f"Error loading config file: {e}")
 
-        
         self.combine_joycons = config.get("combine_joycons", True)
         self.deadzone = config.get("deadzone", 50)
         self.controller_mode = config.get("controller_mode", "Xbox")
@@ -242,7 +235,17 @@ class Config:
         self.mouse_config = MouseConfig(config.get("mouse", {}))
         # Define categories and defaults for button remaps
         self.button_remaps = config.get("button_remaps", {}) or {}
-        categories = ["xbox", "ps", "switch2"]
+        
+        # Backward compatibility migration from 'ps' to 'ps4' and 'ps5'
+        if "ps" in self.button_remaps:
+            import copy
+            if "ps4" not in self.button_remaps:
+                self.button_remaps["ps4"] = copy.deepcopy(self.button_remaps["ps"])
+            if "ps5" not in self.button_remaps:
+                self.button_remaps["ps5"] = copy.deepcopy(self.button_remaps["ps"])
+            self.button_remaps.pop("ps", None)
+
+        categories = ["xbox", "ps4", "ps5", "switch2"]
         default_mappings = {
             "gl_mapping": "Default",
             "gr_mapping": "Gyro",
@@ -252,7 +255,12 @@ class Config:
             "sll_mapping": "Default",
             "srr_mapping": "Default",
             "home_mapping": "Default",
-            "capt_mapping": "Capture"
+            "capt_mapping": "PrtSc",
+            "abxy_mode": "Xbox",
+            "rumble_mode": "Xbox",
+            "vibration_strength_xbox": 5,
+            "vibration_strength_switch": 5,
+            "vibration_frequency": 10
         }
         
         # Populate each category, falling back to top-level key or default
@@ -261,12 +269,31 @@ class Config:
                 self.button_remaps[cat] = {}
             for key, def_val in default_mappings.items():
                 if key not in self.button_remaps[cat]:
+                    old_cat_data = config.get("button_remaps", {}).get(cat, {})
                     # For backward compatibility, check top-level config first
-                    val = config.get(key, def_val)
-                    if key == "capt_mapping" and val in ("None", "CAPT", "Default"):
-                        val = "Capture"
+                    if key == "abxy_mode":
+                        top_level_def = "Switch" if cat == "switch2" else "Xbox"
+                        val = config.get("abxy_mode", top_level_def)
+                    elif key == "rumble_mode":
+                        top_level_def = "Switch" if cat == "switch2" else "Xbox"
+                        val = config.get("rumble_mode", top_level_def)
+                    elif key == "vibration_strength_xbox":
+                        val = old_cat_data.get("vibration_strength", config.get("vibration_strength_xbox", config.get("vibration_strength", def_val)))
+                    elif key == "vibration_strength_switch":
+                        val = old_cat_data.get("vibration_strength", config.get("vibration_strength_switch", config.get("vibration_strength", def_val)))
+                    elif key == "vibration_frequency":
+                        val = config.get("vibration_frequency", def_val)
+                    elif key == "capt_mapping":
+                        default_capt = "Capture" if cat == "switch2" else "PrtSc"
+                        val = config.get("capt_mapping", default_capt)
+                        if val in ("None", "CAPT", "Default", "Capture"):
+                            val = "Capture" if cat == "switch2" else "PrtSc"
+                    else:
+                        val = config.get(key, def_val)
+                    
+                    if key == "rumble_mode" and val == "PC":
+                        val = "Xbox"
                     self.button_remaps[cat][key] = val
-        self.abxy_mode = config.get("abxy_mode", "Xbox") 
         
         self.gyro_mode = config.get("gyro_mode", "World")
         self.gyro_sensitivity = float(config.get("gyro_sensitivity", 0.3))
@@ -338,108 +365,146 @@ class Config:
         self.vigembus_installed = config.get("vigembus_installed", False)
         self.window_width = config.get("window_width", None)
         self.window_height = config.get("window_height", None)
-        self.auto_disconnect_enabled = config.get("auto_disconnect_enabled", False)
+        self._auto_disconnect_mode = config.get("auto_disconnect_mode", "Absolute" if config.get("auto_disconnect_enabled", False) else "OFF")
+        if self._auto_disconnect_mode not in ["OFF", "Inactive", "Absolute"]:
+            self._auto_disconnect_mode = "Absolute" if config.get("auto_disconnect_enabled", False) else "OFF"
         self.auto_disconnect_days = int(config.get("auto_disconnect_days", 0))
         self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
         self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
-        self.rumble_mode = config.get("rumble_mode", "Xbox")
-        if self.rumble_mode == "PC":
-            self.rumble_mode = "Xbox"
-        self.vibration_strength_xbox = int(config.get("vibration_strength_xbox", config.get("vibration_strength", 5)))
-        self.vibration_strength_switch = int(config.get("vibration_strength_switch", config.get("vibration_strength", 5)))
-        self.vibration_frequency = int(config.get("vibration_frequency", 10))
+        # abxy_mode, rumble_mode, vibration_strength, vibration_frequency are now properties managed per Emu Mode category
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
         
     def save_config(self):
-        try:
-            # Read current file to preserve comments/other sections if possible
-            # (Though yaml.dump will lose comments anyway, but we load first)
-            data = {}
-            if os.path.exists(self.config_file_path):
-                with open(self.config_file_path, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f) or {}
-            
-            data['driver_installed'] = self.driver_installed
-            data['driver_type'] = self.driver_type
-            data['vigembus_sim_mode'] = self.vigembus_sim_mode
-            data['winuhid_sim_mode'] = self.winuhid_sim_mode
-            data['vigembus_installed'] = self.vigembus_installed
-            data['window_width'] = self.window_width
-            data['window_height'] = self.window_height
-            data['auto_disconnect_enabled'] = self.auto_disconnect_enabled
-            data['auto_disconnect_days'] = self.auto_disconnect_days
-            data['auto_disconnect_hours'] = self.auto_disconnect_hours
-            data['auto_disconnect_minutes'] = self.auto_disconnect_minutes
-            data['vibration_strength'] = self.vibration_strength
-            data['vibration_strength_xbox'] = self.vibration_strength_xbox
-            data['vibration_strength_switch'] = self.vibration_strength_switch
-            data['vibration_frequency'] = self.vibration_frequency
-            data['rumble_mode'] = self.rumble_mode
-            
-            data['simulation_mode'] = self.simulation_mode
-            data['open_when_startup'] = self.open_when_startup
-            data['start_minimized'] = self.start_minimized
-            data['stabilized_gyro'] = self.stabilized_gyro
-            data['steam_roll_compensation'] = self.steam_roll_compensation
-            data['virtual_gyro_soft_deadzone'] = self.virtual_gyro_soft_deadzone
-            data['abxy_mode'] = self.abxy_mode
-            data['gl_mapping'] = self.gl_mapping
-            data['gr_mapping'] = self.gr_mapping
-            data['c_mapping'] = self.c_mapping
-            data['slr_mapping'] = self.slr_mapping
-            data['srl_mapping'] = self.srl_mapping
-            data['sll_mapping'] = self.sll_mapping
-            data['srr_mapping'] = self.srr_mapping
-            data['home_mapping'] = self.home_mapping
-            data['capt_mapping'] = self.capt_mapping
-            
-            data['gyro_mode'] = self.gyro_mode
-            data['gyro_sensitivity'] = self.gyro_sensitivity
-            data['gyro_activation_mode'] = self.gyro_activation_mode
-            data['stick_mouse_sensitivity'] = self.stick_mouse_sensitivity
-            
-            data['gyro_bias_l'] = self.gyro_bias_l
-            data['gyro_bias_r'] = self.gyro_bias_r
-            data['stick_r_bias'] = self.stick_r_bias
-            data['calibration_data'] = self.calibration_data
-            data['mag_calibration_data'] = self.mag_calibration_data
-            data['joycon_hold_mode'] = self.joycon_hold_mode
-            data['merged_gyro_side'] = self.merged_gyro_side
-            data['button_remaps'] = self.button_remaps
-            
-            if 'mouse' not in data:
-                data['mouse'] = {}
-            data['mouse']['enabled'] = self.mouse_config.enabled
-            data['mouse']['sensitivity'] = self.mouse_config.sensitivity
-            
-            with open(self.config_file_path, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, default_flow_style=False)
-            import time
-            logger.info(f"[{time.strftime('%H:%M:%S')}] Config saved successfully to {self.config_file_path}")
-        except Exception as e:
-            logger.error(f"Failed to save config: {e}")
+        # Snapshot config values in the calling thread
+        data = {
+            'driver_installed': self.driver_installed,
+            'driver_type': self.driver_type,
+            'vigembus_sim_mode': self.vigembus_sim_mode,
+            'winuhid_sim_mode': self.winuhid_sim_mode,
+            'vigembus_installed': self.vigembus_installed,
+            'window_width': self.window_width,
+            'window_height': self.window_height,
+            'auto_disconnect_enabled': self.auto_disconnect_enabled,
+            'auto_disconnect_mode': self.auto_disconnect_mode,
+            'auto_disconnect_days': self.auto_disconnect_days,
+            'auto_disconnect_hours': self.auto_disconnect_hours,
+            'auto_disconnect_minutes': self.auto_disconnect_minutes,
+            'vibration_strength': self.vibration_strength,
+            'vibration_strength_xbox': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_xbox", 5),
+            'vibration_strength_switch': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_switch", 5),
+            'vibration_frequency': self.vibration_frequency,
+            'rumble_mode': self.rumble_mode,
+            'simulation_mode': self.simulation_mode,
+            'open_when_startup': self.open_when_startup,
+            'start_minimized': self.start_minimized,
+            'stabilized_gyro': self.stabilized_gyro,
+            'steam_roll_compensation': self.steam_roll_compensation,
+            'virtual_gyro_soft_deadzone': self.virtual_gyro_soft_deadzone,
+            'abxy_mode': self.abxy_mode,
+            'gl_mapping': self.gl_mapping,
+            'gr_mapping': self.gr_mapping,
+            'c_mapping': self.c_mapping,
+            'slr_mapping': self.slr_mapping,
+            'srl_mapping': self.srl_mapping,
+            'sll_mapping': self.sll_mapping,
+            'srr_mapping': self.srr_mapping,
+            'home_mapping': self.home_mapping,
+            'capt_mapping': self.capt_mapping,
+            'gyro_mode': self.gyro_mode,
+            'gyro_sensitivity': self.gyro_sensitivity,
+            'gyro_activation_mode': self.gyro_activation_mode,
+            'stick_mouse_sensitivity': self.stick_mouse_sensitivity,
+            'gyro_bias_l': self.gyro_bias_l,
+            'gyro_bias_r': self.gyro_bias_r,
+            'stick_r_bias': self.stick_r_bias,
+            'calibration_data': self.calibration_data,
+            'mag_calibration_data': self.mag_calibration_data,
+            'joycon_hold_mode': self.joycon_hold_mode,
+            'merged_gyro_side': self.merged_gyro_side,
+            'button_remaps': self.button_remaps,
+            'mouse': {
+                'enabled': self.mouse_config.enabled,
+                'sensitivity': self.mouse_config.sensitivity
+            }
+        }
+        
+        def _async_write():
+            with self._save_lock:
+                try:
+                    existing_data = {}
+                    if os.path.exists(self.config_file_path):
+                        try:
+                            with open(self.config_file_path, 'r', encoding='utf-8') as f:
+                                existing_data = yaml.safe_load(f) or {}
+                        except Exception:
+                            pass
+                    
+                    existing_data.update(data)
+                    
+                    with open(self.config_file_path, 'w', encoding='utf-8') as f:
+                        yaml.dump(existing_data, f, default_flow_style=False)
+                    import time
+                    logger.info(f"[{time.strftime('%H:%M:%S')}] Config saved successfully (async) to {self.config_file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save config asynchronously: {e}")
+
+        threading.Thread(target=_async_write, daemon=True).start()
+
+    @property
+    def abxy_mode(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("abxy_mode", "Xbox")
+
+    @abxy_mode.setter
+    def abxy_mode(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["abxy_mode"] = val
+
+    @property
+    def rumble_mode(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("rumble_mode", "Xbox")
+
+    @rumble_mode.setter
+    def rumble_mode(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["rumble_mode"] = val
 
     @property
     def vibration_strength(self):
-        if getattr(self, 'rumble_mode', 'Xbox') == 'Switch':
-            return getattr(self, 'vibration_strength_switch', 5)
-        else:
-            return getattr(self, 'vibration_strength_xbox', 5)
+        cat = self.get_current_category()
+        mode = self.rumble_mode.lower() 
+        return int(self.button_remaps.get(cat, {}).get(f"vibration_strength_{mode}", 5))
 
     @vibration_strength.setter
     def vibration_strength(self, val):
-        if getattr(self, 'rumble_mode', 'Xbox') == 'Switch':
-            self.vibration_strength_switch = val
-        else:
-            self.vibration_strength_xbox = val
+        cat = self.get_current_category()
+        mode = self.rumble_mode.lower() 
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat][f"vibration_strength_{mode}"] = int(val)
+
+    @property
+    def vibration_frequency(self):
+        cat = self.get_current_category()
+        return int(self.button_remaps.get(cat, {}).get("vibration_frequency", 10))
+
+    @vibration_frequency.setter
+    def vibration_frequency(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["vibration_frequency"] = int(val)
 
     def get_current_category(self):
         mode = getattr(self, "simulation_mode", "Xbox One")
         if mode == "Switch2":
             return "switch2"
-        elif "PS" in mode:
-            return "ps"
+        elif mode == "PS4":
+            return "ps4"
+        elif mode == "PS5":
+            return "ps5"
         else:
             return "xbox"
 
@@ -526,12 +591,34 @@ class Config:
     @property
     def capt_mapping(self):
         cat = self.get_current_category()
-        return self.button_remaps.get(cat, {}).get("capt_mapping", "Capture")
+        default_capt = "Capture" if cat == "switch2" else "PrtSc"
+        return self.button_remaps.get(cat, {}).get("capt_mapping", default_capt)
     @capt_mapping.setter
     def capt_mapping(self, val):
         cat = self.get_current_category()
         if cat not in self.button_remaps: self.button_remaps[cat] = {}
         self.button_remaps[cat]["capt_mapping"] = val
+    
+    @property
+    def auto_disconnect_mode(self):
+        return self._auto_disconnect_mode
+        
+    @auto_disconnect_mode.setter
+    def auto_disconnect_mode(self, val):
+        if val in ["OFF", "Inactive", "Absolute"]:
+            self._auto_disconnect_mode = val
+
+    @property
+    def auto_disconnect_enabled(self):
+        return self._auto_disconnect_mode != "OFF"
+
+    @auto_disconnect_enabled.setter
+    def auto_disconnect_enabled(self, val):
+        if val:
+            if self._auto_disconnect_mode == "OFF":
+                self._auto_disconnect_mode = "Absolute"
+        else:
+            self._auto_disconnect_mode = "OFF"
     
 CONFIG = Config(get_resource("config.yaml"))
 

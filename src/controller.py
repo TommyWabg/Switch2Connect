@@ -110,11 +110,11 @@ class StickCalibrationData:
         if len(data) >= 9:
             self.center = get_stick_xy(data[0:3])
             # Max/min are absolute offsets from center
-            self.max = get_stick_xy(data[3:6])
-            self.min = get_stick_xy(data[6:9])
+            self.max = get_stick_xy(data[6:9])
+            self.min = get_stick_xy(data[3:6])
             
             # Sanity check: if calibration is all zeros/FF, use defaults to prevent stuck stick
-            if self.center == (0, 0) and self.max == (0, 0):
+            if (self.center == (0, 0) and self.max == (0, 0)) or (self.center == (4095, 4095) and self.max == (4095, 4095)):
                 self.center = (2048, 2048)
                 self.max = (1500, 1500)
                 self.min = (1500, 1500)
@@ -217,6 +217,7 @@ class Controller:
         self.right_stick_calibration: StickCalibrationData = None
         self.previous_mouse_state: MouseState = None
         self.connected_at = None
+        self.last_input_time = time.time()
 
         self.side_buttons_pressed = False
         self.response_future = None
@@ -434,23 +435,33 @@ class Controller:
             self.is_calibration_counting_down = True
             self.calibration_countdown_end = time.perf_counter() + 5.0
             self.last_remaining_sec = 5
-            show_notification("Switch 2 Controller", "Gyro calibration starts in 5 seconds. Please keep the controller stationary.")
+            show_notification("Switch 2 Controller", "Gyro calibration starts in 5 seconds. Please keep the controllers stationary.")
         
         force_ui_update()
     
     async def connect_ble(self):
-        if (self.client is not None):
-            raise Exception("Already connected")
+        try:
+            if (self.client is not None):
+                raise Exception("Already connected")
         
-        def disconnected_callback(client: BleakClient):
-            if (self.disconnected_callback is not None):
-                asyncio.create_task(self.disconnected_callback(self))
+            def disconnected_callback(client: BleakClient):
+                if (self.disconnected_callback is not None):
+                    asyncio.create_task(self.disconnected_callback(self))
         
-        self.client = BleakClient(self.device, disconnected_callback=disconnected_callback)
-        await self.client.connect(timeout=20.0)
+            self.client = BleakClient(self.device, disconnected_callback=disconnected_callback)
+            await self.client.connect(timeout=20.0)
         
-        logger.info(f"Connected to {self.device.address}")
+            logger.info(f"Connected to {self.device.address}")
         
+        except Exception as e:
+            logger.error(f"Error occured during connection phase: {e}")
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except:
+                    pass
+            raise e
+
         import sys
         if sys.platform == "win32":
             wd_bluetooth = None
@@ -481,7 +492,7 @@ class Controller:
     async def initialize(self):
         try:
             # Allow the connection to stabilize
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.5)
             
             # Explicit check before starting notification
             if not self.client.is_connected:
@@ -537,6 +548,7 @@ class Controller:
 
         logger.info(f"Successfully initialized {self.device.address} ({self.controller_info.product_id:04x}) : {self.controller_info}")
         self.connected_at = time.time()
+        self.last_input_time = time.time()
 
     async def trigger_connection_haptics(self):
         try:
@@ -777,8 +789,6 @@ class Controller:
             
         self.vibration_packet_id += 1
 
-        self.vibration_packet_id += 1
-
     async def set_leds(self, player_number: int, reversed=False):
         if player_number > 8: player_number = 8
         value = LED_PATTERN[player_number]
@@ -836,6 +846,11 @@ class Controller:
                 logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} first packet {self._packet_count}: {to_hex(data[3:6])}")
                 
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration)
+            
+            # Reset inactivity timer if there is physical input (buttons or sticks outside deadzone)
+            if (inputData.buttons & 0x03FFFFFF) != 0 or inputData.left_stick != (0.0, 0.0) or inputData.right_stick != (0.0, 0.0):
+                self.last_input_time = time.time()
+
             self.battery_voltage = inputData.battery_voltage
             self.last_accel = inputData.accelerometer
 
@@ -897,7 +912,7 @@ class Controller:
                 (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None),
                 (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None),
                 (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home"),
-                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture"), 0x00002000, "Capture"),
+                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "PrtSc"),
                 (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "Mute"),
                 (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None),
                 (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None),
@@ -911,7 +926,7 @@ class Controller:
                 if is_pressed:
                     if resolved == "Gyro": trigger_gyro = True
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
-                    elif resolved == "Capture": trigger_screenshot = True
+                    elif resolved == "PrtSc": trigger_screenshot = True
                     elif resolved == "Chat":
                         inputData.buttons |= SWITCH_BUTTONS.get("C", 0x00004000)
                     elif resolved == "Mute": inputData.buttons |= 0x10000000

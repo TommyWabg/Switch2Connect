@@ -63,6 +63,7 @@ class USBIPServer:
         
         # Lock for thread safety
         self.lock = threading.Lock()
+        self.send_lock = threading.Lock()
 
     def start(self):
         self.running = True
@@ -156,6 +157,11 @@ class USBIPServer:
         except Exception as e:
             logger.error(f"Error in client handler: {e}")
         finally:
+            if self.on_rumble_callback:
+                try:
+                    self.on_rumble_callback(bytearray(64))
+                except Exception:
+                    pass
             try:
                 sock.close()
             except Exception:
@@ -275,9 +281,11 @@ class USBIPServer:
             logger.info(f"Control Reply: actual_length={actual_length}, data={reply_data.hex()}")
         elif ep == 1: # HID Interface Endpoint (Interface 0)
             if direction == 1: # IN (Read input state)
+                # Use non-blocking read: always reply immediately with the latest state.
+                # Blocking here delays the emulator's NEXT OUT (rumble) URB submission,
+                # causing a cascading queue backlog proportional to the timeout value.
                 try:
-                    # Wait for a new frame, or fallback to last state if timeout (keeps polling responsive)
-                    reply_data = self.input_queue.get(timeout=0.05)
+                    reply_data = self.input_queue.get_nowait()
                 except queue.Empty:
                     with self.lock:
                         reply_data = bytes(self.last_state)
@@ -319,10 +327,11 @@ class USBIPServer:
             b"\x00" * 8 # setup padding
         )
         
-        if direction == 1 and actual_length > 0:
-            sock.sendall(ret_header + reply_data)
-        else:
-            sock.sendall(ret_header)
+        with self.send_lock:
+            if direction == 1 and actual_length > 0:
+                sock.sendall(ret_header + reply_data)
+            else:
+                sock.sendall(ret_header)
 
     def _handle_control_request(self, setup, transfer_length):
         req_type, request, value, index, length = struct.unpack("<BBHHH", setup)

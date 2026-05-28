@@ -1,0 +1,84 @@
+=== Diff for controller.py ===
+--- controller 8.2.py
++++ controller.py
+@@ -1155,7 +1155,7 @@
+                     current_time = time.perf_counter()
+                     last_rumble_time = getattr(self, 'last_rumble_time', 0)
+                     
+-                    if current_time - last_rumble_time >= 0.015:
++                    if current_time - last_rumble_time >= 0.007:
+                         self.last_rumble_time = current_time
+                         
+                         v1, v2, v3, is_zero = vc.get_current_vibration_frames()
+@@ -1170,12 +1170,6 @@
+                                     self._rumble_task_running = False
+ 
+                             if is_zero:
+-                                # If watchdog or disconnect triggered a force-clear, reset the
+-                                # rumble_stopped gate so zero packets are allowed through again.
+-                                if getattr(vc, 'rumble_force_clear', False):
+-                                    self.rumble_stopped = False
+-                                    self._zero_count = 0
+-                                    vc.rumble_force_clear = False
+                                 if not getattr(self, 'rumble_stopped', False):
+                                     self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                     asyncio.get_running_loop().create_task(safe_send(v1, v2, v3))
+
+
+=== Diff for virtual_controller.py ===
+--- virtual_controller 8.2.py
++++ virtual_controller.py
+@@ -434,27 +434,16 @@
+     def get_current_vibration_frames(self):
+         with self.vibration_lock:
+             if self.vibration_dirty:
+-                # 建立完整的 VibrationData 副本，確保 Switch 模式的頻率與振幅資料均被保留
+-                v1 = VibrationData(
+-                    lf_freq=self.frame_vibrations[0].lf_freq, lf_en_tone=self.frame_vibrations[0].lf_en_tone, lf_amp=self.frame_vibrations[0].lf_amp,
+-                    hf_freq=self.frame_vibrations[0].hf_freq, hf_en_tone=self.frame_vibrations[0].hf_en_tone, hf_amp=self.frame_vibrations[0].hf_amp
+-                )
+-                v2 = VibrationData(
+-                    lf_freq=self.frame_vibrations[1].lf_freq, lf_en_tone=self.frame_vibrations[1].lf_en_tone, lf_amp=self.frame_vibrations[1].lf_amp,
+-                    hf_freq=self.frame_vibrations[1].hf_freq, hf_en_tone=self.frame_vibrations[1].hf_en_tone, hf_amp=self.frame_vibrations[1].hf_amp
+-                )
+-                v3 = VibrationData(
+-                    lf_freq=self.frame_vibrations[2].lf_freq, lf_en_tone=self.frame_vibrations[2].lf_en_tone, lf_amp=self.frame_vibrations[2].lf_amp,
+-                    hf_freq=self.frame_vibrations[2].hf_freq, hf_en_tone=self.frame_vibrations[2].hf_en_tone, hf_amp=self.frame_vibrations[2].hf_amp
+-                )
+-                
+-                # 原本的補幀與平滑化邏輯
++                v1 = VibrationData(lf_amp=self.frame_vibrations[0].lf_amp, hf_amp=self.frame_vibrations[0].hf_amp)
++                v2 = VibrationData(lf_amp=self.frame_vibrations[1].lf_amp, hf_amp=self.frame_vibrations[1].hf_amp)
++                v3 = VibrationData(lf_amp=self.frame_vibrations[2].lf_amp, hf_amp=self.frame_vibrations[2].hf_amp)
++                
+                 if v1.lf_amp == 0 and v1.hf_amp == 0:
+-                    v1.lf_freq, v1.lf_amp, v1.hf_freq, v1.hf_amp = self.latest_vibration.lf_freq, self.latest_vibration.lf_amp, self.latest_vibration.hf_freq, self.latest_vibration.hf_amp
++                    v1.lf_amp, v1.hf_amp = self.latest_vibration.lf_amp, self.latest_vibration.hf_amp
+                 if v2.lf_amp == 0 and v2.hf_amp == 0:
+-                    v2.lf_freq, v2.lf_amp, v2.hf_freq, v2.hf_amp = v1.lf_freq, v1.lf_amp, v1.hf_freq, v1.hf_amp
++                    v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                 if v3.lf_amp == 0 and v3.hf_amp == 0:
+-                    v3.lf_freq, v3.lf_amp, v3.hf_freq, v3.hf_amp = v2.lf_freq, v2.lf_amp, v2.hf_freq, v2.hf_amp
++                    v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+ 
+                 for f in self.frame_vibrations:
+                     f.lf_amp = 0
+@@ -462,13 +451,9 @@
+                 self.vibration_dirty = False
+                 self.cycle_start_time = time.perf_counter()
+             else:
+-                # 延續上一訊號狀態
+-                v1 = VibrationData(
+-                    lf_freq=self.latest_vibration.lf_freq, lf_en_tone=self.latest_vibration.lf_en_tone, lf_amp=self.latest_vibration.lf_amp,
+-                    hf_freq=self.latest_vibration.hf_freq, hf_en_tone=self.latest_vibration.hf_en_tone, hf_amp=self.latest_vibration.hf_amp
+-                )
+-                v2 = VibrationData(lf_freq=v1.lf_freq, lf_en_tone=v1.lf_en_tone, lf_amp=v1.lf_amp, hf_freq=v1.hf_freq, hf_en_tone=v1.hf_en_tone, hf_amp=v1.hf_amp)
+-                v3 = VibrationData(lf_freq=v1.lf_freq, lf_en_tone=v1.lf_en_tone, lf_amp=v1.lf_amp, hf_freq=v1.hf_freq, hf_en_tone=v1.hf_en_tone, hf_amp=v1.hf_amp)
++                v1 = VibrationData(lf_amp=self.latest_vibration.lf_amp, hf_amp=self.latest_vibration.hf_amp)
++                v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
++                v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+                 self.cycle_start_time = time.perf_counter()
+ 
+         is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+
+

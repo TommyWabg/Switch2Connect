@@ -883,11 +883,12 @@ class ControllerWindow:
         self.last_width = CONFIG.window_width
         self.last_height = CONFIG.window_height
 
-    def check_vigembus_installation(self):
+    def check_vigembus_installation(self, save=True):
         installed = is_vigembus_installed()
         if not installed:
             CONFIG.vigembus_installed = False
-            CONFIG.save_config()
+            if save:
+                CONFIG.save_config()
             
             from tkinter import messagebox
             import webbrowser
@@ -909,7 +910,8 @@ class ControllerWindow:
             bus = test_vigem.win.virtual_gamepad.VBus()
             del bus
             CONFIG.vigembus_installed = True
-            CONFIG.save_config()
+            if save:
+                CONFIG.save_config()
             return True
         except Exception as e:
             from tkinter import messagebox
@@ -921,13 +923,14 @@ class ControllerWindow:
             CONFIG.driver_type = "WinUHid"
             CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             CONFIG.vigembus_installed = False
-            CONFIG.save_config()
+            if save:
+                CONFIG.save_config()
             if hasattr(self, 'driver_switch'):
                 self.driver_switch.set_value("WinUHid")
             self.update_driver_button()
             return False
 
-    def check_driver_installation(self):
+    def check_driver_installation(self, save=True):
         # If driver type is USBIP, check USBIP driver instead
         if getattr(CONFIG, "driver_type", "") == "USBIP":
             usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
@@ -944,7 +947,7 @@ class ControllerWindow:
 
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         if driver_type == "ViGEmBus":
-            self.check_vigembus_installation()
+            self.check_vigembus_installation(save=save)
             return
 
         # 如果yaml裡有已安裝的紀錄：開啟app時不再檢查是否有安裝，無條件開啟app
@@ -954,7 +957,8 @@ class ControllerWindow:
         if is_driver_installed():
             # 如果檢查結果是已安裝，自動記錄到yaml裡
             CONFIG.driver_installed = True
-            CONFIG.save_config()
+            if save:
+                CONFIG.save_config()
             return
             
         from tkinter import messagebox
@@ -1876,7 +1880,7 @@ class ControllerWindow:
         self.auto_disconnect_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
         tk.Label(self.auto_disconnect_frame, text="Auto Disconnect:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
-        self.auto_disconnect_switch = ToggleSwitch(self.auto_disconnect_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "auto_disconnect_enabled", False), command=self.update_auto_disconnect_enabled, bg_color=background_color)
+        self.auto_disconnect_switch = ToggleSwitch(self.auto_disconnect_frame, labels=["OFF", "Inactive", "Absolute"], values=["OFF", "Inactive", "Absolute"], initial_value=getattr(CONFIG, "auto_disconnect_mode", "OFF"), command=self.update_auto_disconnect_mode, bg_color=background_color)
         self.auto_disconnect_switch.grid(row=0, column=1, padx=int(5 * scaling_factor), sticky="w")
         
         tk.Label(self.auto_disconnect_frame, text="Disconnect after:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
@@ -1909,8 +1913,8 @@ class ControllerWindow:
         self.hour_entry.bind("<KeyRelease>", self.on_auto_disconnect_time_changed)
         self.minute_entry.bind("<KeyRelease>", self.on_auto_disconnect_time_changed)
 
-    def update_auto_disconnect_enabled(self, val):
-        CONFIG.auto_disconnect_enabled = val
+    def update_auto_disconnect_mode(self, val):
+        CONFIG.auto_disconnect_mode = val
         CONFIG.save_config()
 
     def on_auto_disconnect_time_changed(self, event=None):
@@ -2115,18 +2119,19 @@ class ControllerWindow:
             setattr(self, f"{key}_combo", combo)
 
     def update_driver_type_setting(self, val):
+        # 1. 先讀檔
+        CONFIG.load_config()
+
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
+        old_sim_mode = getattr(CONFIG, "simulation_mode", "Xbox One")
         if old_driver == val:
             return
             
-        CONFIG.driver_type = val
-        CONFIG.save_config()
-        
-        # Check driver installation
+        # Check driver installation BEFORE updating CONFIG or recreating controllers!
         if val == "ViGEmBus":
-            if not self.check_vigembus_installation():
-                # Revert to WinUHid options in GUI
-                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
+            if not self.check_vigembus_installation(save=False):
+                # Revert to old driver
+                self.driver_switch.set_value(old_driver)
                 return
         elif val == "USBIP":
             usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
@@ -2146,8 +2151,23 @@ class ControllerWindow:
                     self.driver_switch.set_value(old_driver)
                     return
         else:
-            self.check_driver_installation()
-            
+            if not is_driver_installed() and not getattr(CONFIG, 'driver_installed', False):
+                from tkinter import messagebox
+                answer = messagebox.askyesno(
+                    "Install Virtual Controller Driver",
+                    "WinUHid driver is not installed on your system.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
+                )
+                if answer:
+                    self.run_driver_install(show_success_msg=False)
+                    if not is_driver_installed():
+                        self.driver_switch.set_value(old_driver)
+                        return
+                else:
+                    self.driver_switch.set_value(old_driver)
+                    return
+
+        # If we got here, checking was successful! Apply the mode switch in memory:
+        CONFIG.driver_type = val
         self.update_driver_button()
         
         # Load the remembered simulation mode for the target driver
@@ -2166,42 +2186,92 @@ class ControllerWindow:
         else:
             self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
             
-        CONFIG.save_config()
-        self._refresh_mapping_comboboxes()
-        
         # Apply the driver change to all running virtual controllers immediately
+        success = True
         if hasattr(self, 'current_controllers'):
-            # Pass 1: Cleanly close all running virtual controllers
-            for vc in self.current_controllers:
-                if vc is not None:
-                    with vc.state_lock:
-                        if hasattr(vc, 'vg_controller') and vc.vg_controller is not None:
-                            vc.cleanup_vg_controller()
+            try:
+                # Pass 1: Cleanly close all running virtual controllers
+                for vc in self.current_controllers:
+                    if vc is not None:
+                        with vc.state_lock:
+                            if hasattr(vc, 'vg_controller') and vc.vg_controller is not None:
+                                vc.cleanup_vg_controller()
+                
+                # Wait for PnP subsystem to settle
+                import gc
+                gc.collect()
+                import time
+                time.sleep(0.5)
+                
+                # Pass 2: Recreate them under the new driver/mode sequentially
+                for i, vc in enumerate(self.current_controllers):
+                    if vc is not None:
+                        if i > 0:
+                            time.sleep(0.2)
+                        with vc.state_lock:
+                            vc.mode = CONFIG.simulation_mode
+                            vc._setup_vg_controller()
+                        if vc.loop and vc.loop.is_running():
+                            asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
+            except Exception as e:
+                logger.error(f"Failed to recreate controllers during driver mode switch: {e}")
+                success = False
+
+        if not success:
+            # Revert CONFIG memory values by reloading from disk
+            CONFIG.load_config()
+            # Revert the GUI switches
+            self.driver_switch.set_value(old_driver)
+            self.update_driver_button()
             
-            # Wait for PnP subsystem to settle
-            import gc
-            gc.collect()
-            import time
-            time.sleep(0.5)
+            if old_driver == "ViGEmBus":
+                self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], old_sim_mode)
+            elif old_driver == "USBIP":
+                self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], old_sim_mode)
+            else:
+                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], old_sim_mode)
+                
+            # Recreate controllers under old config
+            if hasattr(self, 'current_controllers'):
+                try:
+                    for vc in self.current_controllers:
+                        if vc is not None:
+                            with vc.state_lock:
+                                vc.mode = old_sim_mode
+                                vc._setup_vg_controller()
+                            if vc.loop and vc.loop.is_running():
+                                asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
+                except Exception as re_err:
+                    logger.error(f"Failed to restore controllers to old driver: {re_err}")
+        else:
+            # 存檔
+            CONFIG.save_config()
             
-            # Pass 2: Recreate them under the new driver/mode sequentially
-            for i, vc in enumerate(self.current_controllers):
-                if vc is not None:
-                    if i > 0:
-                        time.sleep(0.2)
-                    with vc.state_lock:
-                        vc.mode = CONFIG.simulation_mode
-                        vc._setup_vg_controller()
-                    if vc.loop and vc.loop.is_running():
-                        asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
+        self._refresh_mapping_comboboxes()
  
     def _refresh_mapping_comboboxes(self):
         for key in ["home", "capt", "c", "gl", "gr", "sll", "srl", "slr", "srr"]:
             combo = getattr(self, f"{key}_combo", None)
             if combo:
                 combo.set(getattr(CONFIG, f"{key}_mapping"))
+        if hasattr(self, 'layout_switch'):
+            self.layout_switch.set_value(CONFIG.abxy_mode)
+        if hasattr(self, 'rumble_mode_switch'):
+            self.rumble_mode_switch.set_value(CONFIG.rumble_mode)
+            self.update_rumble_mode_ui(CONFIG.rumble_mode)
+        if hasattr(self, 'vibration_strength_scale'):
+            self.vibration_strength_scale.set(CONFIG.vibration_strength)
+        if hasattr(self, 'vibration_frequency_scale'):
+            self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
 
     def update_sim_mode_setting(self, val):
+        # 1. 先讀檔
+        CONFIG.load_config()
+        
+        old_mode = getattr(CONFIG, "simulation_mode", "Xbox One")
+        if old_mode == val:
+            return
+            
         CONFIG.simulation_mode = val
         if val != "Switch2":
             if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus":
@@ -2209,10 +2279,34 @@ class ControllerWindow:
             else:
                 CONFIG.winuhid_sim_mode = val
             
+        success = True
+        reverted_vcs = []
         if hasattr(self, 'current_controllers'):
-            for vc in self.current_controllers:
-                if vc is not None: vc.set_mode(val)
-        CONFIG.save_config()
+            try:
+                for vc in self.current_controllers:
+                    if vc is not None:
+                        vc.set_mode(val)
+                        reverted_vcs.append(vc)
+            except Exception as e:
+                logger.error(f"Failed to switch emulation mode: {e}")
+                success = False
+                
+        if not success:
+            # Revert CONFIG memory values by reloading from disk
+            CONFIG.load_config()
+            # Revert set_mode on already switched controllers
+            for vc in reverted_vcs:
+                if vc is not None:
+                    try:
+                        vc.set_mode(old_mode)
+                    except Exception:
+                        pass
+            # Revert the UI switch
+            self.sim_mode_switch.set_value(old_mode)
+        else:
+            # 存檔
+            CONFIG.save_config()
+            
         self._refresh_mapping_comboboxes()
 
     def _revert_from_switch2_pro(self):
@@ -2249,6 +2343,7 @@ class ControllerWindow:
         CONFIG.save_config()
         self.update_rumble_mode_ui(val)
         self.vibration_strength_scale.set(CONFIG.vibration_strength)
+        self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
 
     def update_rumble_mode_ui(self, mode):
         if mode == "Switch":
@@ -2288,6 +2383,11 @@ class ControllerWindow:
         try:
             with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
             data['abxy_mode'] = CONFIG.abxy_mode  
+            data['rumble_mode'] = CONFIG.rumble_mode
+            data['vibration_strength'] = CONFIG.vibration_strength
+            data['vibration_frequency'] = CONFIG.vibration_frequency
+            data['vibration_strength_xbox'] = CONFIG.button_remaps.get(CONFIG.get_current_category(), {}).get("vibration_strength_xbox", 5)
+            data['vibration_strength_switch'] = CONFIG.button_remaps.get(CONFIG.get_current_category(), {}).get("vibration_strength_switch", 5)
             for k in ['home_mapping','capt_mapping','gl_mapping','gr_mapping','c_mapping','sll_mapping','srl_mapping','slr_mapping','srr_mapping']: data[k] = getattr(CONFIG, k)
             data['button_remaps'] = CONFIG.button_remaps
             with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)

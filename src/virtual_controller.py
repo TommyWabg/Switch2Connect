@@ -56,7 +56,7 @@ def detach_usbip_device(server_port: int):
         
     bus_id = f"1-{server_port - 3240 + 1}"
     try:
-        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True)
+        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
         if res.returncode != 0:
             return
             
@@ -71,9 +71,44 @@ def detach_usbip_device(server_port: int):
                 port_num_str = port_match.group(1)
                 if f":{server_port}" in port_block or f"/{bus_id}" in port_block:
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with server port {server_port} (bus_id: {bus_id})")
-                    subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
     except Exception as e:
         logger.error(f"Error detaching USBIP device for port {server_port}: {e}")
+
+def detach_all_usbip_devices():
+    import subprocess
+    import os
+    import re
+    
+    usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+    if not os.path.exists(usbip_exe):
+        return
+        
+    try:
+        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        if res.returncode != 0:
+            return
+            
+        ports = res.stdout.split("Port ")
+        for port_block in ports[1:]:
+            lines = port_block.splitlines()
+            if not lines:
+                continue
+            first_line = lines[0]
+            port_match = re.match(r"^(\d+):", first_line)
+            if port_match:
+                port_num_str = port_match.group(1)
+                should_detach = False
+                for p in range(3240, 3248):
+                    bus_id = f"1-{p - 3240 + 1}"
+                    if f":{p}" in port_block or f"/{bus_id}" in port_block:
+                        should_detach = True
+                        break
+                if should_detach:
+                    logger.info(f"Detaching USBIP device on port {port_num_str} associated with a virtual controller slot")
+                    subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+    except Exception as e:
+        logger.error(f"Error detaching all USBIP devices: {e}")
 
 RUMBLE_WRITE_INTERVAL = 0.015
 MAC_TO_PORT = {}
@@ -139,6 +174,11 @@ class VirtualController:
         self.last_s2_az = 0
         self.next_vibration_event = None
         self.vg_controller = None
+        self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+        self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+        self.slot_inputs = [[(0x0e1, 0, 0x1e1, 0)] for _ in range(3)]
+        self.slot_inputs_right = [[(0x0e1, 0, 0x1e1, 0)] for _ in range(3)]
+        self.rumble_force_clear = False
         
         # Thread-safe target vibration state, change event, and task reference
         self.vibration_lock = threading.Lock()
@@ -167,7 +207,7 @@ class VirtualController:
             self.vg_controller = None
             self.usbip_server = None
         
-        self.state_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self._disconnect_lock = asyncio.Lock()
         self.running = True
         self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
@@ -242,7 +282,7 @@ class VirtualController:
                         detach_usbip_device(server_port)
                         # Give Windows PnP manager a moment to process the detach before attaching
                         time.sleep(0.2)
-                        subprocess.Popen([usbip_exe, "-t", str(server_port), "attach", "-r", "127.0.0.1", "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.Popen([usbip_exe, "-t", str(server_port), "attach", "-r", "127.0.0.1", "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
                         logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on port {server_port}")
                     except Exception as e:
                         logger.error(f"Failed to attach USBIP device: {e}")
@@ -316,7 +356,8 @@ class VirtualController:
                     logger.info("Switched to virtual Xbox 360 controller via WinUHid")
                 self.driver_type = "WinUHid"
 
-            self.vg_controller.register_notification(callback_function=self.vibration_callback)
+            if self.vg_controller is not None:
+                self.vg_controller.register_notification(callback_function=self.vibration_callback)
             time.sleep(0.5)
 
         self.previous_buttons_left = 0x00000000
@@ -351,11 +392,9 @@ class VirtualController:
         import math
         import discoverer
         
-        # 將 0-255 的馬達強度轉換為 0-800 的原始虛擬振幅
         lf_val = int(800 * large_motor / 256)
         hf_val = int(800 * small_motor / 256)
 
-        # 【核心修復】動態補足非同步時鐘：若本機 loop 未就緒，自動咬合全域主事件迴圈，徹底根除無震動問題
         if self.loop is None or not self.loop.is_running():
             if discoverer.DISCOVERER_LOOP and discoverer.DISCOVERER_LOOP.is_running():
                 self.loop = discoverer.DISCOVERER_LOOP
@@ -365,7 +404,6 @@ class VirtualController:
                 except RuntimeError:
                     pass
 
-        # 計算時間差，將其精準映射到 15ms 週期中的 3 個子幀插槽 (Slot 0, 1, 2)
         dt = time.perf_counter() - self.cycle_start_time
         slot_size = RUMBLE_WRITE_INTERVAL / 3.0
         slot = int(dt / slot_size) if slot_size > 0 else 0
@@ -375,24 +413,19 @@ class VirtualController:
             slot = 2
 
         with self.vibration_lock:
-            # 1. 執行多波形線性相加 (Addition)
             raw_lf = self.frame_vibrations[slot].lf_amp + lf_val
             raw_hf = self.frame_vibrations[slot].hf_amp + hf_val
             
-            # 2. 低頻重低音馬達防爆機制 (Knee 點設在 560，剩餘 240 空間進行動態壓縮)
             if raw_lf <= 560:
                 self.frame_vibrations[slot].lf_amp = int(raw_lf)
             else:
-                # 使用雙曲正切函數讓曲線平滑延伸，無論怎麼疊加相加，最大值永遠自然逼近 800
                 self.frame_vibrations[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf - 560) / 240))
                 
-            # 3. 高頻細緻馬達防爆機制
             if raw_hf <= 560:
                 self.frame_vibrations[slot].hf_amp = int(raw_hf)
             else:
                 self.frame_vibrations[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf - 560) / 240))
             
-            # 更新最新基準值作為維持訊號
             self.latest_vibration.lf_amp = lf_val
             self.latest_vibration.hf_amp = hf_val
             
@@ -416,14 +449,15 @@ class VirtualController:
                     f.lf_amp = 0
                     f.hf_amp = 0
                 self.vibration_dirty = False
+                self.cycle_start_time = time.perf_counter()
             else:
                 v1 = VibrationData(lf_amp=self.latest_vibration.lf_amp, hf_amp=self.latest_vibration.hf_amp)
                 v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
                 v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+                self.cycle_start_time = time.perf_counter()
 
         is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
         return v1, v2, v3, is_zero
-
 
     async def init_added_controller(self, controller: Controller):
         controller.virtual_controller = self
@@ -475,7 +509,12 @@ class VirtualController:
             if self.vg_controller is None:
                 return
                 
-            is_switch_layout = (CONFIG.abxy_mode == "Switch") if self.mode != "Switch2" else (CONFIG.abxy_mode == "Xbox")
+            # Xbox One, Xbox360, PS4, PS5: abxy_mode=="Switch" triggers Switch layout swap.
+            # Switch2 uses abxy_mode=="Xbox" (inverted naming convention).
+            if self.mode == "Switch2":
+                is_switch_layout = (CONFIG.abxy_mode == "Xbox")
+            else:
+                is_switch_layout = (CONFIG.abxy_mode == "Switch")
             
             if len(self.controllers) == 2 or controller.is_pro_controller():
                 controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
@@ -627,10 +666,16 @@ class VirtualController:
             # Record raw buttons for shared click logic in next report
             controller._last_raw_buttons = current_buttons
 
-        controller.set_input_report_callback(input_report_callback)
+        def wrapped_callback(inputData: ControllerInputData, controller: Controller):
+            with self.state_lock:
+                input_report_callback(inputData, controller)
+
+        controller.set_input_report_callback(wrapped_callback)
 
     def update_as_ps4(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         with self.state_lock:
+            if self.vg_controller is None:
+                return
             self._update_as_ps4_locked(inputData, buttons, controller)
 
     def _update_as_ps4_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
@@ -778,6 +823,8 @@ class VirtualController:
 
     def update_as_ps5(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         with self.state_lock:
+            if self.vg_controller is None:
+                return
             self._update_as_ps5_locked(inputData, buttons, controller)
 
     def _update_as_ps5_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
@@ -969,20 +1016,33 @@ class VirtualController:
 
     def update_as_xbox(self, inputData: ControllerInputData, buttons: int, controller: Controller, buttonsConfig: ButtonConfig):
         with self.state_lock:
+            if self.vg_controller is None:
+                return
             # Phase 1: Button Mapping (Respects GUI layout setting)
             xb_btns = 0
-            if CONFIG.abxy_mode == "Xbox":
-                # When UI says "Xbox", we want "Switch layout" (positional match)
-                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
-                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
-                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
-                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
-            else: # Switch layout in UI
-                # When UI says "Switch", we want "Xbox layout" (name match)
-                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
-                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
-                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
-                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
+            
+            if self.mode == "Xbox360":
+                if CONFIG.abxy_mode == "Switch":
+                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["Y"]
+                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["X"]
+                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["B"]
+                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["A"]
+                else:
+                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["Y"]
+                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["X"]
+                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["B"]
+                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["A"]
+            else:
+                if CONFIG.abxy_mode == "Switch":
+                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
+                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
+                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
+                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
+                else:
+                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
+                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
+                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
+                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
                     
             if buttons & SWITCH_BUTTONS["L"]: xb_btns |= XB_BUTTONS["LB"]
             if buttons & SWITCH_BUTTONS["R"]: xb_btns |= XB_BUTTONS["RB"]
@@ -1286,8 +1346,9 @@ class VirtualController:
             # (e.g. from a split that was followed immediately by a merge) sees the flag
             # and skips creating a zombie USBIP server.
             self.running = False
-            if hasattr(self, 'vg_controller') and self.vg_controller is not None:
-                self.cleanup_vg_controller()
+            with self.state_lock:
+                if hasattr(self, 'vg_controller') and self.vg_controller is not None:
+                    self.cleanup_vg_controller()
                 
             if self.mode == "Switch2":
                 server_port = self.server_port
@@ -1306,8 +1367,29 @@ class VirtualController:
             return False
 
     def _usbip_rumble_callback(self, out_data):
-        if len(out_data) < 2 or out_data[0] != 0x02:
+        # Disconnect active-push: bytearray(64) from usbip_server means connection dropped
+        # In this case out_data[0] == 0x00, so we handle it separately to clear rumble state.
+        if len(out_data) < 1:
             return
+        if out_data[0] != 0x02:
+            # Explicitly clear all rumble state on disconnect (or unknown packet)
+            with self.vibration_lock:
+                self.frame_vibrations = [VibrationData() for _ in range(3)]
+                for i in range(3):
+                    self.slot_inputs[i].clear()
+                    self.slot_inputs[i].append((0x0e1, 0, 0x1e1, 0))
+                self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+                for i in range(3):
+                    self.slot_inputs_right[i].clear()
+                    self.slot_inputs_right[i].append((0x0e1, 0, 0x1e1, 0))
+                self.vibration_dirty = True
+                self.rumble_force_clear = True  # Signal controller.py to reset rumble_stopped
+            # Reset watchdog so it does NOT fire immediately after this clear
+            self.last_rumble_received_time = time.perf_counter()
+            return
+
+        # Valid rumble packet: update watchdog timestamp
+        self.last_rumble_received_time = time.perf_counter()
             
         def is_neutral(offset):
             return (out_data[offset] == 0x87 and 
@@ -1316,6 +1398,34 @@ class VirtualController:
                     out_data[offset+3] == 0x11 and 
                     out_data[offset+4] == 0x00)
                     
+        def vibration_data_from_bytes(b):
+            value = int.from_bytes(b, byteorder='little')
+            return VibrationData(
+                lf_freq = value & 0x1FF,
+                lf_en_tone = bool((value >> 9) & 1),
+                lf_amp = (value >> 10) & 0x3FF,
+                hf_freq = (value >> 20) & 0x1FF,
+                hf_en_tone = bool((value >> 29) & 1),
+                hf_amp = (value >> 30) & 0x3FF
+            )
+            
+        def decode_5byte_frame(frame_bytes):
+            value = int.from_bytes(frame_bytes, byteorder='little')
+            lf_freq = value & 0x1FF
+            lf_amp_10bit = (value >> 10) & 0x3FF
+            hf_freq = (value >> 20) & 0x1FF
+            hf_amp_10bit = (value >> 30) & 0x3FF
+            
+            # Extract 7-bit amplitudes
+            lf_amp_7bit = int(lf_amp_10bit * 127 / 1023)
+            hf_amp_7bit = int(hf_amp_10bit * 127 / 1023)
+            
+            # Scale to 0-800 scale
+            lf_val = int(lf_amp_7bit * 800 / 127)
+            hf_val = int(hf_amp_7bit * 800 / 127)
+            
+            return lf_freq, lf_val, hf_freq, hf_val
+            
         active = False
         for b in out_data[2:]:
             if b != 0:
@@ -1325,22 +1435,30 @@ class VirtualController:
         if len(out_data) >= 23 and is_neutral(2) and is_neutral(18):
             active = False
             
+        rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+        
         if active:
-            b1 = out_data[3]
-            b2 = out_data[4]
-            b3 = out_data[5]
-            b4 = out_data[6]
+            v1 = vibration_data_from_bytes(out_data[2:7])
+            v2 = vibration_data_from_bytes(out_data[7:12])
+            v3 = vibration_data_from_bytes(out_data[12:17])
             
-            highAmp = ((b1 & 0xfc) << 4) | ((b2 & 0x0f) << 12)
-            lowAmp = (b3 & 0xc0) | (b4 << 8)
-            
-            large_motor = int(max(0, min(255, (lowAmp / 29000.0) * 255)))
-            small_motor = int(max(0, min(255, (highAmp / 29000.0) * 255)))
+            if rumble_mode != "Switch":
+                XBOX_LF_FREQ = 0x0e1
+                XBOX_HF_FREQ = 0x1e1
+                
+                v1.lf_freq = XBOX_LF_FREQ; v1.hf_freq = XBOX_HF_FREQ
+                v2.lf_freq = XBOX_LF_FREQ; v2.hf_freq = XBOX_HF_FREQ
+                v3.lf_freq = XBOX_LF_FREQ; v3.hf_freq = XBOX_HF_FREQ
+
+            with self.vibration_lock:
+                self.frame_vibrations = [v1, v2, v3]
+                self.latest_vibration = v3
+                self.vibration_dirty = True
         else:
-            large_motor = 0
-            small_motor = 0
-            
-        self.vibration_callback(None, None, large_motor, small_motor, 0, None)
+            with self.vibration_lock:
+                self.frame_vibrations = [VibrationData() for _ in range(3)]
+                self.latest_vibration = VibrationData()
+                self.vibration_dirty = True
 
     def update_as_switch2_pro(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         state = bytearray(64)
@@ -1379,7 +1497,7 @@ class VirtualController:
         if controller.is_joycon():
             joycon_mappings = [
                 getattr(CONFIG, "home_mapping", "Default"),
-                getattr(CONFIG, "capt_mapping", "Capture"),
+                getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "PrtSc"),
                 getattr(CONFIG, "c_mapping", "Default"),
                 getattr(CONFIG, "sll_mapping", "Default"),
                 getattr(CONFIG, "srl_mapping", "Default"),

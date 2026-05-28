@@ -48,18 +48,30 @@ async def auto_disconnect_checker(quit_event):
             now = time.time()
             from discoverer import VIRTUAL_CONTROLLERS
             
+            mode = getattr(CONFIG, "auto_disconnect_mode", "Absolute")
             for vc in VIRTUAL_CONTROLLERS:
                 if vc is not None and getattr(vc, 'running', False):
                     should_disconnect = False
                     for c in vc.controllers:
-                        connected_at = getattr(c, 'connected_at', None)
-                        if connected_at is not None and (now - connected_at) >= timeout:
-                            should_disconnect = True
-                            break
+                        if mode == "Inactive":
+                            last_input = getattr(c, 'last_input_time', None)
+                            if last_input is not None and (now - last_input) >= timeout:
+                                should_disconnect = True
+                                break
+                        else: # Absolute
+                            connected_at = getattr(c, 'connected_at', None)
+                            if connected_at is not None and (now - connected_at) >= timeout:
+                                should_disconnect = True
+                                break
                     if should_disconnect:
-                        logger.info(f"Auto Disconnect: Player {vc.player_number} connection duration exceeded limit. Disconnecting...")
-                        vc.trigger_disconnect()
-                        show_notification("Auto Disconnect", f"Player {vc.player_number} has been auto-disconnected after reaching the set time limit.")
+                        if mode == "Inactive":
+                            logger.info(f"Auto Disconnect: Player {vc.player_number} inactivity duration exceeded limit. Disconnecting...")
+                            vc.trigger_disconnect()
+                            show_notification("Auto Disconnect", f"Player {vc.player_number} has been auto-disconnected due to inactivity.")
+                        else:
+                            logger.info(f"Auto Disconnect: Player {vc.player_number} connection duration exceeded limit. Disconnecting...")
+                            vc.trigger_disconnect()
+                            show_notification("Auto Disconnect", f"Player {vc.player_number} has been auto-disconnected after reaching the set time limit.")
         except Exception as e:
             logger.error(f"Error in auto_disconnect_checker: {e}")
 
@@ -91,9 +103,8 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             
     # Detach all possible USBIP ports to clear stale attachments
     try:
-        from virtual_controller import detach_usbip_device
-        for p in range(3240, 3248):
-            detach_usbip_device(p)
+        from virtual_controller import detach_all_usbip_devices
+        detach_all_usbip_devices()
     except Exception as e:
         logger.error(f"Error in initial USBIP port cleanup: {e}")
     
@@ -242,6 +253,9 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     except Exception:
                         pass
                 print("\nConnection failed. Please press a button on the controller or hold SYNC to re-pair.")
+            
+            finally:
+                _connecting_macs.discard(device.address)
 
         async def callback(device: BLEDevice, advertising_data: AdvertisementData):
             nonlocal pending_connections_count
@@ -344,9 +358,8 @@ def emergency_cleanup():
         
     # Detach all possible USBIP ports to clear stale attachments
     try:
-        from virtual_controller import detach_usbip_device
-        for p in range(3240, 3248):
-            detach_usbip_device(p)
+        from virtual_controller import detach_all_usbip_devices
+        detach_all_usbip_devices()
     except Exception as e:
         logger.debug(f"Detach USBIP ports in emergency_cleanup failed: {e}")
     
