@@ -657,6 +657,17 @@ JOYCON_REPORT_DESC = bytes.fromhex(
 )
 
 
+SWITCH1_PRO_REPORT_DESCRIPTOR = bytes.fromhex(
+    "050115000904a1018530050105091901290a150025017501950a550065008102"
+    "0509190b290e150025017501950481027501950281030b01000100a1000b3000"
+    "01000b310001000b320001000b35000100150027ffff0000751095048102c00b"
+    "39000100150025073500463b0165147504950181020509190f29121500250175"
+    "01950481027508953481030600ff852109017508953f8103858109027508953f"
+    "8103850109037508953f9183851009047508953f9183858009057508953f9183"
+    "858209067508953f9183c0"
+)
+
+
 class USBIPJoyConServer(USBIPServer):
     def __init__(self, device_type="L", host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
         super().__init__(host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
@@ -800,7 +811,12 @@ class USBIPJoyConServer(USBIPServer):
                 self.last_ep1_in_time = time.perf_counter()
 
                 try:
-                    reply_data = self.input_queue.get_nowait()
+                    reply_data_bytes = self.input_queue.get_nowait()
+                    reply_data = bytearray(reply_data_bytes)
+                    if len(reply_data) > 0 and reply_data[0] == 0x30:
+                        reply_data[1] = self.seq_num & 0xff
+                        self.seq_num += 1
+                    reply_data = bytes(reply_data)
                 except queue.Empty:
                     with self.lock:
                         if self.last_state[0] == 0x30:
@@ -912,11 +928,14 @@ class USBIPJoyConServer(USBIPServer):
                     s = "Nintendo Co., Ltd.".encode("utf-16le")
                     desc = struct.pack("<BB", 2 + len(s), 3) + s
                 elif desc_idx == 2: # iProduct
-                    name = "Joy-Con (L)" if self.device_type == "L" else "Joy-Con (R)"
+                    if self.device_type == "Pro":
+                        name = "Pro Controller"
+                    else:
+                        name = "Joy-Con (L)" if self.device_type == "L" else "Joy-Con (R)"
                     s = name.encode("utf-16le")
                     desc = struct.pack("<BB", 2 + len(s), 3) + s
                 elif desc_idx == 3: # iSerialNumber
-                    serial_str = f"JOYCON_{self.device_type}_{self.bus_id}"
+                    serial_str = f"PRO_{self.bus_id}" if self.device_type == "Pro" else f"JOYCON_{self.device_type}_{self.bus_id}"
                     s = serial_str.encode("utf-16le")
                     desc = struct.pack("<BB", 2 + len(s), 3) + s
                 elif desc_idx == 0xEE: # MSFT100 OS String Descriptor (enables MS OS Descriptors)
@@ -929,7 +948,10 @@ class USBIPJoyConServer(USBIPServer):
                 return desc[:length]
             
             elif desc_type == 0x22: # HID Report Descriptor
-                return JOYCON_REPORT_DESC[:length]
+                if self.device_type == "Pro":
+                    return SWITCH1_PRO_REPORT_DESCRIPTOR[:length]
+                else:
+                    return JOYCON_REPORT_DESC[:length]
         
         if req_type == 0x81 and request == 0x06:
             desc_type = value >> 8
@@ -990,7 +1012,7 @@ class USBIPJoyConServer(USBIPServer):
         
         # Sticks neutral calibration
         r[6] = 0x00; r[7] = 0x08; r[8] = 0x80
-        r[9] = 0x79; r[10] = 0xD7; r[11] = 0x7E
+        r[9] = 0x00; r[10] = 0x08; r[11] = 0x80
         
         r[12] = 0x00
         r[13] = ack
@@ -1023,14 +1045,24 @@ class USBIPJoyConServer(USBIPServer):
             reply = self._build_subcommand_reply(0x01)
         elif subcmd == 0x02:
             self._device_info_queried = True
+            
+            if self.device_type == "L":
+                dev_byte = 0x01
+            elif self.device_type == "R":
+                dev_byte = 0x02
+            else: # Pro
+                dev_byte = 0x03
+                
             info = [
                 0x03, 0x8B,
-                0x01 if self.device_type == "L" else 0x02,
+                dev_byte,
                 0x02,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x01,
                 0x01,
             ]
+            if self.mac_bytes:
+                info[4:10] = self.mac_bytes[::-1]
             reply = self._build_subcommand_reply(0x02, ack=0x82, reply_data=info)
         elif subcmd == 0x03:
             reply = self._build_subcommand_reply(0x03)
@@ -1079,39 +1111,36 @@ class USBIPJoyConServer(USBIPServer):
         length = data[15]
         reply_data = [data[11], data[12], 0x00, 0x00, length]
         spi = [0xFF] * length
+        stick_calib = [0x00, 0x08, 0x80, 0x00, 0x07, 0x70, 0x00, 0x07, 0x70]
+        stick_params = [
+            0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ]
+
         if addr == 0x6050:
             spi = ([0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])[:length]
-        elif addr == 0x6080:
-            val = 0xF1 if self.device_type == "L" else 0x0F
-            left_factory = [0xFF, 0xF7, 0x7F, 0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F]
-            magic = [0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63]
-            right_factory = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
-            magic2 = [0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63]
-            spi = ([0x5E, 0x01, 0x00, 0x00, val, 0x0F if self.device_type == "L" else 0xF0] +
-                    left_factory + magic + right_factory + magic2)[:length]
-        elif addr == 0x6098:
-            right_factory = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
-            spi = (right_factory + [0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63])[:length]
         elif addr == 0x603D:
-            if self.device_type == "L":
-                l_cal = [0xFF, 0xF7, 0x7F, 0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F]
-                r_cal = [0xFF] * 9
-            else:
-                l_cal = [0xFF] * 9
-                r_cal = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
-            extra = [0xFF, 0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF]
-            spi = (l_cal + r_cal + extra)[:length]
+            spi = (stick_calib + [0xFF]*20)[:length]
         elif addr == 0x6046:
-            r_cal = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
-            extra = [0xFF, 0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF]
-            spi = (r_cal + extra)[:length]
+            spi = (stick_calib + [0xFF]*20)[:length]
+        elif addr == 0x6080:
+            val = 0xF1 if self.device_type == "L" else (0x0F if self.device_type == "R" else 0x00)
+            sensor_calib = [0x5E, 0x01, 0x00, 0x00, val, 0x0F if self.device_type == "L" else (0xF0 if self.device_type == "R" else 0x00)]
+            spi = (sensor_calib + stick_params + stick_params + [0xFF]*20)[:length]
+        elif addr == 0x6086:
+            spi = (stick_params + [0xFF]*20)[:length]
+        elif addr == 0x6098:
+            spi = (stick_params + [0xFF]*20)[:length]
+        elif addr == 0x8010:
+            spi = ([0xB2, 0xA1] + stick_calib + [0xFF]*20)[:length]
+        elif addr == 0x801B:
+            spi = ([0xB2, 0xA1] + stick_calib + [0xFF]*20)[:length]
         elif addr == 0x6020:
             spi = ([0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01,
                     0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
                     0x19, 0x00, 0xDD, 0xFF, 0xDC, 0xFF,
                     0x3B, 0x34, 0x3B, 0x34, 0x3B, 0x34])[:length]
-        elif addr == 0x8010:
-            spi = [0xFF] * length
+
         reply_data += spi
         return self._build_subcommand_reply(0x10, ack=0x90, reply_data=reply_data)
 
@@ -1124,4 +1153,10 @@ class USBIPJoyConLServer(USBIPJoyConServer):
 class USBIPJoyConRServer(USBIPJoyConServer):
     def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
         super().__init__(device_type="R", host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
+
+
+class USBIPProControllerServer(USBIPJoyConServer):
+    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
+        super().__init__(device_type="Pro", host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
+        self.product_id = 0x2009
 

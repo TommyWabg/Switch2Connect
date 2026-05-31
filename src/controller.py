@@ -707,17 +707,30 @@ class Controller:
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             is_switch1 = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch1"
 
-            if ignore_freq_scaling or (rumble_mode == "Switch" and not is_switch1):
+            # In Switch 1 mode, rumble is always natively Switch format, regardless of the global rumble_mode setting.
+            is_pure_switch_rumble = is_switch1 or rumble_mode == "Switch"
+
+            if ignore_freq_scaling or (is_pure_switch_rumble and not is_switch1):
                 scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
                 scaled_hf_freq = min(511, max(1, int(v.hf_freq)))
                 lf_mask = 1.0
                 hf_mask = 1.0
             else:
-                if rumble_mode == "Switch" and is_switch1:
+                if is_pure_switch_rumble:
                     scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
                     scaled_hf_freq = min(511, max(1, int(v.hf_freq)))
+                    
+                    if is_switch1 and is_pro:
+                        # Artificial Frequency Expander: Switch OS compresses Pro Controller frequencies.
+                        # We stretch the high frequencies upwards to restore the crisp Joy-Con feel on Gen 2 Pro.
+                        if scaled_hf_freq > 80:
+                            scaled_hf_freq = min(511, int(80 + (scaled_hf_freq - 80) * 1.5))
+                            
+                        # Optional: Slightly expand the LF range downwards for deeper bass
+                        if scaled_lf_freq < 80:
+                            scaled_lf_freq = max(1, int(80 - (80 - scaled_lf_freq) * 1.2))
                 else:
-                    # Frequency scaling formula based on 0.6.6
+                    # Frequency scaling formula based on 0.6.6 for non-Switch rumble modes
                     new_min_lf = 0.5 * v.lf_freq + 0.5
                     temp_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
 
@@ -733,48 +746,52 @@ class Controller:
 
                 # Determine if the target is mid-high frequency simulating small motor (using original frequency v.hf_freq)
                 if v.hf_freq > 0:
-                    # Calculate the dynamic range limits of the high-frequency channel
-                    # Upper limit (for max hf_freq = 511) when slider is at maximum F=10 (non-stretching):
-                    freq_factor_hf_at_10 = 4.0 / 9.0
-                    max_hf_freq = min(511, max(1, int(256.0 + 255.0 * freq_factor_hf_at_10)))
-                    # Lower limit is the current output low frequency (scaled_lf_freq)
-                    min_hf_freq = scaled_lf_freq
-
-                    denom = max(1.0, max_hf_freq - min_hf_freq)
-                    hf_mapped = 1.0 + ((scaled_hf_freq - min_hf_freq) / denom) * 9.0
-                    hf_mapped = min(10.0, max(1.0, hf_mapped))
-
-                    # Calculate base mask values at Strength=5 (F=1 -> 0.25, F=5 -> 0.1, F=10 -> 0.24 for Pro; F=1 -> 0.19, F=5 -> 0.095, F=10 -> 0.06 for Joy-Con)
-                    if is_pro:
-                        if hf_mapped <= 5.0:
-                            mask_at_5 = 0.25 - 0.0375 * (hf_mapped - 1.0)
-                        else:
-                            mask_at_5 = 0.1 + 0.028 * (hf_mapped - 5.0)
+                    if is_switch1 and is_pro:
+                        # Temporarily remove Pro Controller strength mask in Switch 1 emu mode
+                        hf_mask = 1.0
                     else:
-                        if hf_mapped <= 5.0:
-                            mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
-                        else:
-                            mask_at_5 = 0.095 + 0.00164 * (hf_mapped - 5.0)
+                        # Calculate the dynamic range limits of the high-frequency channel
+                        # Upper limit (for max hf_freq = 511) when slider is at maximum F=10 (non-stretching):
+                        freq_factor_hf_at_10 = 4.0 / 9.0
+                        max_hf_freq = min(511, max(1, int(256.0 + 255.0 * freq_factor_hf_at_10)))
+                        # Lower limit is the current output low frequency (scaled_lf_freq)
+                        min_hf_freq = scaled_lf_freq
 
-                    # Calculate target mask values at Strength=10 (F=1 -> 0.34375, F=5 -> 0.1375, F=10 -> 0.33 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
-                    if is_pro:
-                        if hf_mapped <= 5.0:
-                            mask_at_10 = 0.34375 - 0.0515625 * (hf_mapped - 1.0)
-                        else:
-                            mask_at_10 = 0.1375 + 0.0385 * (hf_mapped - 5.0)
-                    else:
-                        if hf_mapped <= 5.0:
-                            mask_at_10 = 0.391875 - 0.048984375 * (hf_mapped - 1.0)
-                        else:
-                            mask_at_10 = 0.1959375 + 0.0088125 * (hf_mapped - 5.0)
+                        denom = max(1.0, max_hf_freq - min_hf_freq)
+                        hf_mapped = 1.0 + ((scaled_hf_freq - min_hf_freq) / denom) * 9.0
+                        hf_mapped = min(10.0, max(1.0, hf_mapped))
 
-                    # Linearly interpolate mask between Strength=5 and Strength=10 curves
-                    if strength >= 5:
-                        t = (strength - 5.0) / 5.0
-                        t = min(1.0, max(0.0, t))
-                        hf_mask = mask_at_5 + (mask_at_10 - mask_at_5) * t
-                    else:
-                        hf_mask = mask_at_5
+                        # Calculate base mask values at Strength=5 (F=1 -> 0.25, F=5 -> 0.1, F=10 -> 0.24 for Pro; F=1 -> 0.19, F=5 -> 0.095, F=10 -> 0.06 for Joy-Con)
+                        if is_pro:
+                            if hf_mapped <= 5.0:
+                                mask_at_5 = 0.25 - 0.0375 * (hf_mapped - 1.0)
+                            else:
+                                mask_at_5 = 0.1 + 0.028 * (hf_mapped - 5.0)
+                        else:
+                            if hf_mapped <= 5.0:
+                                mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
+                            else:
+                                mask_at_5 = 0.095 + 0.00164 * (hf_mapped - 5.0)
+
+                        # Calculate target mask values at Strength=10 (F=1 -> 0.34375, F=5 -> 0.1375, F=10 -> 0.33 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
+                        if is_pro:
+                            if hf_mapped <= 5.0:
+                                mask_at_10 = 0.34375 - 0.0515625 * (hf_mapped - 1.0)
+                            else:
+                                mask_at_10 = 0.1375 + 0.0385 * (hf_mapped - 5.0)
+                        else:
+                            if hf_mapped <= 5.0:
+                                mask_at_10 = 0.391875 - 0.048984375 * (hf_mapped - 1.0)
+                            else:
+                                mask_at_10 = 0.1959375 + 0.0088125 * (hf_mapped - 5.0)
+
+                        # Linearly interpolate mask between Strength=5 and Strength=10 curves
+                        if strength >= 5:
+                            t = (strength - 5.0) / 5.0
+                            t = min(1.0, max(0.0, t))
+                            hf_mask = mask_at_5 + (mask_at_10 - mask_at_5) * t
+                        else:
+                            hf_mask = mask_at_5
                 else:
                     hf_mask = 1.0
 
