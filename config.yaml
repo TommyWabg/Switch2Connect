@@ -31,7 +31,7 @@ button_remaps:
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
-    joycon_hold_mode:
+    joycon_hold_mode: &id001
       E0:EF:BF:EF:CC:BD: Vertical
       E0:EF:BF:F0:0E:17: Vertical
     rumble_mode: Xbox
@@ -87,7 +87,7 @@ button_remaps:
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
-    joycon_hold_mode: &id001
+    joycon_hold_mode:
       E0:EF:BF:EF:CC:BD: Vertical
       E0:EF:BF:F0:0E:17: Vertical
     rumble_mode: Xbox
@@ -99,7 +99,7 @@ button_remaps:
     vibration_strength: 10
     vibration_strength_switch: 5
     vibration_strength_xbox: 5
-c_mapping: Calibration
+c_mapping: Default
 calibration_data:
   E0:EF:BF:81:06:9F:
   - 5.480891719745223
@@ -116,8 +116,8 @@ calibration_data:
 capt_mapping: Default
 driver_installed: false
 driver_type: WinUHid
-gl_mapping: Default
-gr_mapping: Default
+gl_mapping: PS_L_Touch
+gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
 gyro_bias_l:
 - -1.6572327044025157
@@ -143,10 +143,10 @@ mouse:
   sensitivity: 4.0
 open_when_startup: false
 rumble_mode: Xbox
-simulation_mode: Xbox One
+simulation_mode: PS5
 sll_mapping: Default
-slr_mapping: Default
-srl_mapping: Default
+slr_mapping: PS_R_Touch
+srl_mapping: PS_L_Touch
 srr_mapping: Default
 stabilized_gyro: true
 start_minimized: false
@@ -165,4 +165,4 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1080
 window_width: 1240
-winuhid_sim_mode: Xbox One
+winuhid_sim_mode: PS5
