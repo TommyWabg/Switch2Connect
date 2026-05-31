@@ -73,8 +73,8 @@ button_remaps:
       E0:EF:BF:F0:0E:17: Vertical
     rumble_mode: Switch
     sll_mapping: Default
-    slr_mapping: Default
-    srl_mapping: Default
+    slr_mapping: GR
+    srl_mapping: GL
     srr_mapping: Default
     vibration_frequency: 10
     vibration_strength: 5
@@ -155,7 +155,7 @@ stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
-usbip_sim_mode: Switch1
+usbip_sim_mode: Switch2
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_switch: 5
