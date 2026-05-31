@@ -721,24 +721,29 @@ class PlayerInfoBlock:
             if getattr(self, 'merge_btn', None): self.merge_frame.place_forget()
             if getattr(self, 'mode_switch', None): self.mode_switch.place_forget()
 
-            if not getattr(self, 'gyro_btn_l', None):
-                self.gyro_frame_l = tk.Frame(self.battery_frame, bg=block_color)
-                self.gyro_frame_r = tk.Frame(self.battery_frame, bg=block_color)
-                self.gyro_btn_l = tk.Button(self.gyro_frame_l, text="L Gyro", font=scale_font(("Arial", 8, "bold")), bd=0, relief=tk.FLAT, command=lambda: self._on_gyro_side_toggled("Left"))
-                self.gyro_btn_r = tk.Button(self.gyro_frame_r, text="R Gyro", font=scale_font(("Arial", 8, "bold")), bd=0, relief=tk.FLAT, command=lambda: self._on_gyro_side_toggled("Right"))
-                self.gyro_btn_l.pack(); self.gyro_btn_r.pack()
-
-            self.gyro_frame_l.place(relx=0.04, rely=0.5, anchor=tk.W)
-            self.gyro_frame_r.place(relx=0.96, rely=0.5, anchor=tk.E)
-            if virtualController.active_gyro_side == "Left":
-                self.gyro_frame_l.config(bg=highlight_color)
-                self.gyro_frame_r.config(bg=button_gray)
+            if virtualController.mode != "Switch1":
+                if not getattr(self, 'gyro_btn_l', None):
+                    self.gyro_frame_l = tk.Frame(self.battery_frame, bg=block_color)
+                    self.gyro_frame_r = tk.Frame(self.battery_frame, bg=block_color)
+                    self.gyro_btn_l = tk.Button(self.gyro_frame_l, text="L Gyro", font=scale_font(("Arial", 8, "bold")), bd=0, relief=tk.FLAT, command=lambda: self._on_gyro_side_toggled("Left"))
+                    self.gyro_btn_r = tk.Button(self.gyro_frame_r, text="R Gyro", font=scale_font(("Arial", 8, "bold")), bd=0, relief=tk.FLAT, command=lambda: self._on_gyro_side_toggled("Right"))
+                    self.gyro_btn_l.pack(); self.gyro_btn_r.pack()
+    
+                self.gyro_frame_l.place(relx=0.04, rely=0.5, anchor=tk.W)
+                self.gyro_frame_r.place(relx=0.96, rely=0.5, anchor=tk.E)
+                if virtualController.active_gyro_side == "Left":
+                    self.gyro_frame_l.config(bg=highlight_color)
+                    self.gyro_frame_r.config(bg=button_gray)
+                else:
+                    self.gyro_frame_l.config(bg=button_gray)
+                    self.gyro_frame_r.config(bg=highlight_color)
+                self.gyro_btn_l.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+                self.gyro_btn_r.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+                for b in [self.gyro_btn_l, self.gyro_btn_r]: b.config(bg=button_gray, fg="#FFFFFF")
             else:
-                self.gyro_frame_l.config(bg=button_gray)
-                self.gyro_frame_r.config(bg=highlight_color)
-            self.gyro_btn_l.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
-            self.gyro_btn_r.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
-            for b in [self.gyro_btn_l, self.gyro_btn_r]: b.config(bg=button_gray, fg="#FFFFFF")
+                if getattr(self, 'gyro_btn_l', None):
+                    self.gyro_frame_l.place_forget()
+                    self.gyro_frame_r.place_forget()
         else:
             if getattr(self, 'split_frame', None): self.split_frame.place_forget()
             if getattr(self, 'gyro_btn_l', None):
@@ -773,12 +778,15 @@ class PlayerInfoBlock:
                     self.merge_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor)) # Consistent size
                 elif getattr(self, 'merge_btn', None): self.merge_frame.place_forget()
 
-                if not getattr(self, 'mode_switch', None):
-                    self.mode_switch = ToggleSwitch(self.battery_frame, ["V", "H"], ["Vertical", "Horizontal"], virtualController.hold_mode, self._on_hold_mode_toggled, block_color)
-                    for btn_data in self.mode_switch.buttons:
-                        btn_data[0].config(font=scale_font(("Arial", 9, "bold")), width=2, padx=0, pady=0)
-                self.mode_switch.place(relx=0.98, rely=0.5, anchor=tk.E)
-                self.mode_switch.set_value(virtualController.hold_mode)
+                if virtualController.mode != "Switch1":
+                    if not getattr(self, 'mode_switch', None):
+                        self.mode_switch = ToggleSwitch(self.battery_frame, ["V", "H"], ["Vertical", "Horizontal"], virtualController.hold_mode, self._on_hold_mode_toggled, block_color)
+                        for btn_data in self.mode_switch.buttons:
+                            btn_data[0].config(font=scale_font(("Arial", 9, "bold")), width=2, padx=0, pady=0)
+                    self.mode_switch.place(relx=0.98, rely=0.5, anchor=tk.E)
+                    self.mode_switch.set_value(virtualController.hold_mode)
+                else:
+                    if getattr(self, 'mode_switch', None): self.mode_switch.place_forget()
             else:
                 if getattr(self, 'merge_btn', None): self.merge_frame.place_forget()
                 if getattr(self, 'mode_switch', None): self.mode_switch.place_forget()
@@ -938,7 +946,7 @@ class ControllerWindow:
                 from tkinter import messagebox
                 answer = messagebox.askyesno(
                     "Install USBIP Driver",
-                    "Switch2 emulation is selected, but the USBIP driver is not installed.\n\n"
+                    "Switch emulation is selected, but the USBIP driver is not installed.\n\n"
                     "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
@@ -2056,7 +2064,7 @@ class ControllerWindow:
         if initial_driver == "ViGEmBus":
             sim_options = ["Xbox360", "PS4"]
         elif initial_driver == "USBIP":
-            sim_options = ["Switch2"]
+            sim_options = ["Switch1", "Switch2"]
         else:
             sim_options = ["Xbox One", "PS4", "PS5"]
             
@@ -2174,7 +2182,7 @@ class ControllerWindow:
         if val == "ViGEmBus":
             CONFIG.simulation_mode = CONFIG.vigembus_sim_mode
         elif val == "USBIP":
-            CONFIG.simulation_mode = "Switch2"
+            CONFIG.simulation_mode = CONFIG.usbip_sim_mode
         else:
             CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             
@@ -2182,7 +2190,7 @@ class ControllerWindow:
         if val == "ViGEmBus":
             self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
         elif val == "USBIP":
-            self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], CONFIG.simulation_mode)
+            self.sim_mode_switch.update_options(["Switch1", "Switch2"], ["Switch1", "Switch2"], CONFIG.simulation_mode)
         else:
             self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
             
@@ -2210,6 +2218,14 @@ class ControllerWindow:
                             time.sleep(0.2)
                         with vc.state_lock:
                             vc.mode = CONFIG.simulation_mode
+                            if vc.mode == "Switch1":
+                                vc.hold_mode = "Vertical"
+                            elif vc.is_single() and len(vc.controllers) > 0:
+                                addr = vc.controllers[0].device.address
+                                if addr in CONFIG.joycon_hold_mode:
+                                    vc.hold_mode = CONFIG.joycon_hold_mode[addr]
+                                else:
+                                    vc.hold_mode = "Vertical"
                             vc._setup_vg_controller()
                         if vc.loop and vc.loop.is_running():
                             asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
@@ -2229,7 +2245,7 @@ class ControllerWindow:
             elif old_driver == "USBIP":
                 self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], old_sim_mode)
             else:
-                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], old_sim_mode)
+                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5", "Switch1"], ["Xbox One", "PS4", "PS5", "Switch1"], old_sim_mode)
                 
             # Recreate controllers under old config
             if hasattr(self, 'current_controllers'):
@@ -2238,6 +2254,14 @@ class ControllerWindow:
                         if vc is not None:
                             with vc.state_lock:
                                 vc.mode = old_sim_mode
+                                if vc.mode == "Switch1":
+                                    vc.hold_mode = "Vertical"
+                                elif vc.is_single() and len(vc.controllers) > 0:
+                                    addr = vc.controllers[0].device.address
+                                    if addr in CONFIG.joycon_hold_mode:
+                                        vc.hold_mode = CONFIG.joycon_hold_mode[addr]
+                                    else:
+                                        vc.hold_mode = "Vertical"
                                 vc._setup_vg_controller()
                             if vc.loop and vc.loop.is_running():
                                 asyncio.run_coroutine_threadsafe(vc.update_leds(), vc.loop)
@@ -2248,7 +2272,20 @@ class ControllerWindow:
             CONFIG.save_config()
             
         self._refresh_mapping_comboboxes()
+        self.force_refresh_player_slots()
  
+    def force_refresh_player_slots(self):
+        if hasattr(self, 'current_controllers'):
+            if getattr(self, 'players_info', None) is not None:
+                for p in self.players_info:
+                    if hasattr(p, 'main_frame') and p.main_frame:
+                        p.main_frame.destroy()
+                self.players_info = None
+            self.update(self.current_controllers)
+            try:
+                self.root.update_idletasks()
+            except:
+                pass
     def _refresh_mapping_comboboxes(self):
         for key in ["home", "capt", "c", "gl", "gr", "sll", "srl", "slr", "srr"]:
             combo = getattr(self, f"{key}_combo", None)
@@ -2273,11 +2310,13 @@ class ControllerWindow:
             return
             
         CONFIG.simulation_mode = val
-        if val != "Switch2":
-            if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus":
-                CONFIG.vigembus_sim_mode = val
-            else:
-                CONFIG.winuhid_sim_mode = val
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if driver_type == "ViGEmBus":
+            CONFIG.vigembus_sim_mode = val
+        elif driver_type == "USBIP":
+            CONFIG.usbip_sim_mode = val
+        else:
+            CONFIG.winuhid_sim_mode = val
             
         success = True
         reverted_vcs = []
@@ -2308,6 +2347,7 @@ class ControllerWindow:
             CONFIG.save_config()
             
         self._refresh_mapping_comboboxes()
+        self.force_refresh_player_slots()
 
     def _revert_from_switch2_pro(self):
         default_mode = "PS4" if getattr(CONFIG, "driver_type", "WinUHid") == "ViGEmBus" else "PS5"
@@ -2319,6 +2359,7 @@ class ControllerWindow:
         self.sim_mode_switch.set_value(default_mode)
         CONFIG.save_config()
         self._refresh_mapping_comboboxes()
+        self.force_refresh_player_slots()
 
     def update_layout_setting(self, val):
         CONFIG.abxy_mode = val
@@ -2406,7 +2447,7 @@ class ControllerWindow:
             if active_driver == "ViGEmBus":
                 CONFIG.simulation_mode = CONFIG.vigembus_sim_mode
             elif active_driver == "USBIP":
-                CONFIG.simulation_mode = "Switch2"
+                CONFIG.simulation_mode = CONFIG.usbip_sim_mode
             else:
                 CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
             CONFIG.save_config()
@@ -2416,7 +2457,7 @@ class ControllerWindow:
             if active_driver == "ViGEmBus":
                 self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
             elif active_driver == "USBIP":
-                self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], CONFIG.simulation_mode)
+                self.sim_mode_switch.update_options(["Switch1", "Switch2"], ["Switch1", "Switch2"], CONFIG.simulation_mode)
             else:
                 self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
         # A slot is only "connected" if the VirtualController exists AND has physical controllers
@@ -2425,8 +2466,18 @@ class ControllerWindow:
         if any_connected:
             if self.players_info is None:
                 for w in self.main_frame.winfo_children(): w.destroy()
-                self.players_info = [PlayerInfoBlock(self.main_frame, self) for i in range(4)]
-                for p in self.players_info: p.main_frame.pack(padx=10, pady=10, side=tk.LEFT)
+                
+                self.row1 = tk.Frame(self.main_frame, bg=background_color)
+                self.row1.pack(pady=5, fill=tk.X)
+                self.row2 = tk.Frame(self.main_frame, bg=background_color)
+                self.row2.pack(pady=5, fill=tk.X)
+                
+                self.players_info = []
+                for i in range(8):
+                    parent_row = self.row1 if i < 4 else self.row2
+                    p = PlayerInfoBlock(parent_row, self)
+                    p.main_frame.pack(padx=10, pady=10, side=tk.LEFT)
+                    self.players_info.append(p)
             for i, player_info in enumerate(self.players_info):
                 vc = controllers_info[i] if i < len(controllers_info) else None
                 if vc is not None and len(vc.controllers) > 0: 

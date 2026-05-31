@@ -28,6 +28,67 @@ except Exception as e:
     logger.error(f"Failed to load WinUHid DLLs: {e}")
     _winuhid = None
     _winuhid_devs = None
+# Custom device structures for WinUHid.dll
+class GUID(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("Data1", ctypes.c_uint),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8)
+    ]
+
+class WINUHID_DEVICE_CONFIG(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("SupportedEvents", ctypes.c_int),
+        ("VendorID", ctypes.c_ushort),
+        ("ProductID", ctypes.c_ushort),
+        ("VersionNumber", ctypes.c_ushort),
+        ("ReportDescriptorLength", ctypes.c_ushort),
+        ("ReportDescriptor", ctypes.c_void_p),
+        ("ContainerId", GUID),
+        ("InstanceID", ctypes.c_wchar_p),
+        ("HardwareIDs", ctypes.c_wchar_p),
+        ("ReadReportPeriodUs", ctypes.c_uint)
+    ]
+
+class WINUHID_EVENT_WRITE(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("DataLength", ctypes.c_ulong),
+        ("Data", ctypes.c_ubyte * 1024)
+    ]
+
+class WINUHID_EVENT_READ(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("DataLength", ctypes.c_ulong)
+    ]
+
+class WINUHID_EVENT_UNION(ctypes.Union):
+    _pack_ = 1
+    _fields_ = [
+        ("Write", WINUHID_EVENT_WRITE),
+        ("Read", WINUHID_EVENT_READ)
+    ]
+
+class WINUHID_EVENT(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("Type", ctypes.c_int),
+        ("RequestId", ctypes.c_ulong),
+        ("ReportId", ctypes.c_ubyte),
+        ("u", WINUHID_EVENT_UNION)
+    ]
+
+WINUHID_EVENT_NONE = 0x0
+WINUHID_EVENT_GET_FEATURE = 0x1
+WINUHID_EVENT_SET_FEATURE = 0x2
+WINUHID_EVENT_WRITE_REPORT = 0x4
+WINUHID_EVENT_READ_REPORT = 0x8
+
+WINUHID_EVENT_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(WINUHID_EVENT))
 
 # Structs for PS4
 class WINUHID_PS4_TOUCH_POINT(ctypes.Structure):
@@ -266,6 +327,28 @@ class WINUHID_PS5_GAMEPAD_INFO(ctypes.Structure):
 
 # Function prototypes configuration helper
 def setup_prototypes():
+    if _winuhid is not None:
+        _winuhid.WinUHidCreateDevice.argtypes = [ctypes.POINTER(WINUHID_DEVICE_CONFIG)]
+        _winuhid.WinUHidCreateDevice.restype = ctypes.c_void_p
+
+        _winuhid.WinUHidSubmitInputReport.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+        _winuhid.WinUHidSubmitInputReport.restype = ctypes.c_bool
+
+        _winuhid.WinUHidStartDevice.argtypes = [ctypes.c_void_p, WINUHID_EVENT_CALLBACK, ctypes.c_void_p]
+        _winuhid.WinUHidStartDevice.restype = ctypes.c_bool
+
+        _winuhid.WinUHidCompleteWriteEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINUHID_EVENT), ctypes.c_bool]
+        _winuhid.WinUHidCompleteWriteEvent.restype = None
+
+        _winuhid.WinUHidCompleteReadEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINUHID_EVENT), ctypes.c_void_p, ctypes.c_ulong]
+        _winuhid.WinUHidCompleteReadEvent.restype = None
+
+        _winuhid.WinUHidStopDevice.argtypes = [ctypes.c_void_p]
+        _winuhid.WinUHidStopDevice.restype = None
+
+        _winuhid.WinUHidDestroyDevice.argtypes = [ctypes.c_void_p]
+        _winuhid.WinUHidDestroyDevice.restype = None
+
     if _winuhid_devs is None:
         return
         
@@ -574,3 +657,6 @@ class VX360Gamepad:
 
     def __del__(self):
         self.close()
+
+
+

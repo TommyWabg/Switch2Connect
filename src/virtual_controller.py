@@ -2,6 +2,7 @@ import struct
 import winuhid_client as winuhid
 from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
 import threading
+
 VIRTUAL_DEVICE_CREATION_LOCK = threading.Lock()
 import time
 
@@ -28,6 +29,7 @@ import gc
 from controller import Controller, ControllerInputData, VibrationData
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
+from utils import USBIPAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,31 @@ def detach_all_usbip_devices():
 RUMBLE_WRITE_INTERVAL = 0.015
 MAC_TO_PORT = {}
 
+def get_or_assign_port_for_mac(mac):
+    global MAC_TO_PORT
+    if mac in MAC_TO_PORT:
+        return MAC_TO_PORT[mac]
+    
+    import discoverer
+    used_ports = set()
+    for vc in discoverer.VIRTUAL_CONTROLLERS:
+        if vc is not None:
+            if hasattr(vc, 'server_port'):
+                used_ports.add(vc.server_port)
+            if hasattr(vc, 'server_port_l') and vc.server_port_l:
+                used_ports.add(vc.server_port_l)
+            if hasattr(vc, 'server_port_r') and vc.server_port_r:
+                used_ports.add(vc.server_port_r)
+    
+    used_ports.update(MAC_TO_PORT.values())
+    
+    for p in range(3240, 3256):
+        if p not in used_ports:
+            MAC_TO_PORT[mac] = p
+            return p
+    return 3240
+
+
 
 
 class VirtualController:
@@ -128,38 +155,23 @@ class VirtualController:
         self._player_number = player_number
         self.controllers = controllers or []
         
-        # Dynamically determine port and bus ID mapped to the physical controller.
-        # The mapping is PERMANENT for the app session: once a MAC is bound to a port
-        # it keeps that port across disconnect/reconnect and merge/split cycles.
-        # This guarantees a stable bus_id and serial number so Steam recognises the
-        # device immediately on every subsequent connection.
-        target_port = 3240
+        self.on_disconnected_callback = on_disconnected_callback
+        
         if self.controllers:
             mac = self.controllers[0].device.address
-            global MAC_TO_PORT
-            if mac in MAC_TO_PORT:
-                # Reuse the same port this controller always had.
-                target_port = MAC_TO_PORT[mac]
+            
+            global MAC_TO_USBIP
+            if 'MAC_TO_USBIP' not in globals():
+                MAC_TO_USBIP = {}
+                
+            if mac in MAC_TO_USBIP:
+                self.host_ip, self.bus_id, self.server_port = MAC_TO_USBIP[mac]
             else:
-                # First time we see this MAC: assign the next free port and remember it.
-                import discoverer
-                used_ports = {vc.server_port for vc in discoverer.VIRTUAL_CONTROLLERS if vc is not None}
-                for p in range(3240, 3248):
-                    if p not in used_ports:
-                        target_port = p
-                        break
-                MAC_TO_PORT[mac] = target_port
+                self.host_ip, self.bus_id, self.server_port = USBIPAllocator.allocate()
+                MAC_TO_USBIP[mac] = (self.host_ip, self.bus_id, self.server_port)
         else:
-            import discoverer
-            used_ports = {vc.server_port for vc in discoverer.VIRTUAL_CONTROLLERS if vc is not None}
-            for p in range(3240, 3248):
-                if p not in used_ports:
-                    target_port = p
-                    break
+            self.host_ip, self.bus_id, self.server_port = USBIPAllocator.allocate()
                     
-        self.server_port = target_port
-        self.bus_id = f"1-{target_port - 3240 + 1}"
-        self.on_disconnected_callback = on_disconnected_callback
         self.previous_buttons_left = 0x00000000
         self.previous_buttons_right = 0x00000000
         self.last_s2_lx = 0.0
@@ -176,6 +188,8 @@ class VirtualController:
         self.vg_controller = None
         self.switch_vibrations_left = [VibrationData() for _ in range(3)]
         self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+        self.vibration_dirty_l = False
+        self.vibration_dirty_r = False
         self.slot_inputs = [[(0x0e1, 0, 0x1e1, 0)] for _ in range(3)]
         self.slot_inputs_right = [[(0x0e1, 0, 0x1e1, 0)] for _ in range(3)]
         self.rumble_force_clear = False
@@ -196,11 +210,13 @@ class VirtualController:
         self.was_touching_1 = False
         self.touch_start_time = 0.0
         
-        self.hold_mode = "Horizontal"
+        self.hold_mode = "Vertical"
         self.active_gyro_side = "Right"
         
         self.mode = getattr(CONFIG, "simulation_mode", "Xbox One")
         self.driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if self.mode == "Switch1":
+            self.hold_mode = "Vertical"
         if setup_usb:
             self._setup_vg_controller()
         else:
@@ -214,6 +230,43 @@ class VirtualController:
         self.update_thread.start()
 
     def cleanup_vg_controller(self):
+        for suffix in ('', '_l', '_r'):
+            port_attr = f'server_port{suffix}' if suffix else 'server_port'
+            server_attr = f'usbip_server{suffix}' if suffix else 'usbip_server'
+            
+            if hasattr(self, server_attr) and getattr(self, server_attr):
+                if hasattr(self, port_attr) and getattr(self, port_attr):
+                    try:
+                        detach_usbip_device(getattr(self, port_attr))
+                    except Exception:
+                        pass
+                try:
+                    getattr(self, server_attr).stop()
+                except Exception:
+                    pass
+                setattr(self, server_attr, None)
+
+        if hasattr(self, 'vg_controller_l') and self.vg_controller_l is not None:
+            try:
+                self.vg_controller_l.unregister_notification()
+            except:
+                pass
+            try:
+                self.vg_controller_l.close()
+            except:
+                pass
+            self.vg_controller_l = None
+        if hasattr(self, 'vg_controller_r') and self.vg_controller_r is not None:
+            try:
+                self.vg_controller_r.unregister_notification()
+            except:
+                pass
+            try:
+                self.vg_controller_r.close()
+            except:
+                pass
+            self.vg_controller_r = None
+
         if self.vg_controller is not None:
             try:
                 self.vg_controller.unregister_notification()
@@ -263,33 +316,95 @@ class VirtualController:
 
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
 
-        if self.mode == "Switch2":
+        if self.mode in ("Switch1", "Switch2"):
             import os
             import subprocess
-            try:
-                bus_id = self.bus_id
-                mac_address = None
-                if self.controllers:
-                    mac_address = self.controllers[0].device.address
-                # Start local USBIP server on slot-specific port and bus_id
-                self.usbip_server = USBIPServer(port=server_port, on_rumble_callback=self._usbip_rumble_callback, bus_id=bus_id, mac_address=mac_address)
-                self.usbip_server.start()
+            
+            # 1. First detach and stop any existing servers
+            self.cleanup_vg_controller()
+            
+            # Force GC to release sockets/files
+            gc.collect()
+            time.sleep(0.5)
+            
+            if self.mode == "Switch2":
+                try:
+                    bus_id = self.bus_id
+                    mac_address = None
+                    if self.controllers:
+                        mac_address = self.controllers[0].device.address
+                    # Start local USBIP server on slot-specific port and bus_id
+                    self.usbip_server = USBIPServer(host=self.host_ip, port=server_port, on_rumble_callback=self._usbip_rumble_callback, bus_id=bus_id, mac_address=mac_address)
+                    self.usbip_server.start()
+                    
+                    # Run usbip attach subprocess
+                    usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                    if os.path.exists(usbip_exe):
+                        try:
+                            detach_usbip_device(server_port)
+                            # Give Windows PnP manager a moment to process the detach before attaching
+                            time.sleep(0.2)
+                            subprocess.Popen([usbip_exe, "-t", str(self.server_port), "attach", "-r", self.host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                            logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on port {server_port}")
+                        except Exception as e:
+                            logger.error(f"Failed to attach USBIP device: {e}")
+                    else:
+                        logger.error(f"usbip.exe not found at {usbip_exe}!")
+                except Exception as e:
+                    logger.error(f"Failed to initialize USBIP Server: {e}")
+            else: # Switch1
+                from usbip_server import USBIPJoyConLServer, USBIPJoyConRServer
+                self.usbip_server_l = None
+                self.usbip_server_r = None
                 
-                # Run usbip attach subprocess
-                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-                if os.path.exists(usbip_exe):
-                    try:
-                        detach_usbip_device(server_port)
-                        # Give Windows PnP manager a moment to process the detach before attaching
-                        time.sleep(0.2)
-                        subprocess.Popen([usbip_exe, "-t", str(server_port), "attach", "-r", "127.0.0.1", "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
-                        logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on port {server_port}")
-                    except Exception as e:
-                        logger.error(f"Failed to attach USBIP device: {e}")
-                else:
-                    logger.error(f"usbip.exe not found at {usbip_exe}!")
-            except Exception as e:
-                logger.error(f"Failed to initialize USBIP Server: {e}")
+                # Check each controller
+                for c in self.controllers:
+                    mac_address = c.device.address
+                    
+                    host_ip, bus_id, port = USBIPAllocator.allocate()
+                    
+                    if c.is_joycon_left():
+                        try:
+                            self.server_port_l = port
+                            self.bus_id_l = bus_id
+                            self.host_ip_l = host_ip
+                            detach_usbip_device(port)
+                            
+                            self.usbip_server_l = USBIPJoyConLServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Left"), bus_id=bus_id, mac_address=mac_address)
+                            self.usbip_server_l.start()
+                            
+                            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                            if os.path.exists(usbip_exe):
+                                time.sleep(0.2)
+                                subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                                logger.info(f"Attached virtual Joy-Con (L) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                            else:
+                                logger.error(f"usbip.exe not found at {usbip_exe}!")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize Joy-Con (L) USBIP server/attach: {e}")
+                            
+                    elif c.is_joycon_right():
+                        try:
+                            self.server_port_r = port
+                            self.bus_id_r = bus_id
+                            self.host_ip_r = host_ip
+                            detach_usbip_device(port)
+                            
+                            self.usbip_server_r = USBIPJoyConRServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Right"), bus_id=bus_id, mac_address=mac_address)
+                            self.usbip_server_r.start()
+                            
+                            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                            if os.path.exists(usbip_exe):
+                                time.sleep(0.2)
+                                subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                                logger.info(f"Attached virtual Joy-Con (R) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                            else:
+                                logger.error(f"usbip.exe not found at {usbip_exe}!")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize Joy-Con (R) USBIP server/attach: {e}")
+                            
+                    else:
+                        logger.warning("Pro Controller or GC Controller is temporarily excluded in Switch1 emulation mode")
 
             class MockGamepad:
                 def register_notification(self, callback_function):
@@ -351,12 +466,13 @@ class VirtualController:
                     self.report.BatteryPercent = 10
                     self.report.BatteryState = 2
                     logger.info("Switched to virtual PS5 controller via WinUHid")
+
                 else:
                     self.vg_controller = winuhid.VX360Gamepad()
                     logger.info("Switched to virtual Xbox 360 controller via WinUHid")
                 self.driver_type = "WinUHid"
 
-            if self.vg_controller is not None:
+            if self.vg_controller is not None and self.mode != "Switch1":
                 self.vg_controller.register_notification(callback_function=self.vibration_callback)
             time.sleep(0.5)
 
@@ -382,6 +498,17 @@ class VirtualController:
             self.reset_inputs()
             with self.state_lock:
                 self.mode = new_mode
+                
+                if self.mode == "Switch1":
+                    self.hold_mode = "Vertical"
+                elif self.is_single() and len(self.controllers) > 0:
+                    from config import CONFIG
+                    addr = self.controllers[0].device.address
+                    if addr in CONFIG.joycon_hold_mode:
+                        self.hold_mode = CONFIG.joycon_hold_mode[addr]
+                    else:
+                        self.hold_mode = "Vertical"
+                
                 if self.vg_controller is not None:
                     self._setup_vg_controller()
             self.reset_inputs()
@@ -431,7 +558,32 @@ class VirtualController:
             
             self.vibration_dirty = True
 
-    def get_current_vibration_frames(self):
+    def get_current_vibration_frames(self, is_left=True):
+        if self.mode == "Switch1":
+            with self.vibration_lock:
+                vibs = self.switch_vibrations_left if is_left else self.switch_vibrations_right
+                
+                v1 = VibrationData(
+                    lf_freq=vibs[0].lf_freq, lf_amp=vibs[0].lf_amp, lf_en_tone=vibs[0].lf_en_tone,
+                    hf_freq=vibs[0].hf_freq, hf_amp=vibs[0].hf_amp, hf_en_tone=vibs[0].hf_en_tone
+                )
+                v2 = VibrationData(
+                    lf_freq=vibs[1].lf_freq, lf_amp=vibs[1].lf_amp, lf_en_tone=vibs[1].lf_en_tone,
+                    hf_freq=vibs[1].hf_freq, hf_amp=vibs[1].hf_amp, hf_en_tone=vibs[1].hf_en_tone
+                )
+                v3 = VibrationData(
+                    lf_freq=vibs[2].lf_freq, lf_amp=vibs[2].lf_amp, lf_en_tone=vibs[2].lf_en_tone,
+                    hf_freq=vibs[2].hf_freq, hf_amp=vibs[2].hf_amp, hf_en_tone=vibs[2].hf_en_tone
+                )
+                
+                if is_left:
+                    self.vibration_dirty_l = False
+                else:
+                    self.vibration_dirty_r = False
+            
+            is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+            return v1, v2, v3, is_zero
+
         with self.vibration_lock:
             if self.vibration_dirty:
                 v1 = VibrationData(lf_amp=self.frame_vibrations[0].lf_amp, hf_amp=self.frame_vibrations[0].hf_amp)
@@ -466,7 +618,61 @@ class VirtualController:
             self.vibration_changed_event = asyncio.Event()
         await self.update_leds()
 
-        if self.is_single() and controller.is_joycon():
+        if self.mode == "Switch1":
+            self.hold_mode = "Vertical"
+            from usbip_server import USBIPJoyConLServer, USBIPJoyConRServer
+            import os
+            import subprocess
+            import time
+            from utils import USBIPAllocator
+            
+            mac_address = controller.device.address
+            if controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is None:
+                host_ip, bus_id, port = USBIPAllocator.allocate()
+                self.server_port_l = port
+                self.bus_id_l = bus_id
+                self.host_ip_l = host_ip
+                try:
+                    detach_usbip_device(port)
+                except Exception:
+                    pass
+                self.usbip_server_l = USBIPJoyConLServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Left"), bus_id=bus_id, mac_address=mac_address)
+                self.usbip_server_l.start()
+                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                if os.path.exists(usbip_exe):
+                    time.sleep(0.2)
+                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    logger.info(f"Re-Attached virtual Joy-Con (L) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+            elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is None:
+                host_ip, bus_id, port = USBIPAllocator.allocate()
+                self.server_port_r = port
+                self.bus_id_r = bus_id
+                self.host_ip_r = host_ip
+                try:
+                    detach_usbip_device(port)
+                except Exception:
+                    pass
+                self.usbip_server_r = USBIPJoyConRServer(host=host_ip, port=port, on_rumble_callback=lambda d, p=port: self._usbip_rumble_callback(d, side="Right"), bus_id=bus_id, mac_address=mac_address)
+                self.usbip_server_r.start()
+                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                if os.path.exists(usbip_exe):
+                    time.sleep(0.2)
+                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    logger.info(f"Re-Attached virtual Joy-Con (R) for Player {self.player_number} via USBIP on {host_ip}:{port}")
+            
+            if self.vg_controller is None:
+                class MockGamepad:
+                    def register_notification(self, callback_function):
+                        pass
+                    def unregister_notification(self):
+                        pass
+                    def update(self):
+                        pass
+                    def close(self):
+                        pass
+                self.vg_controller = MockGamepad()
+                self.driver_type = "USBIP"
+        elif self.is_single() and controller.is_joycon():
             addr = controller.device.address
             if addr in CONFIG.joycon_hold_mode:
                 self.hold_mode = CONFIG.joycon_hold_mode[addr]
@@ -511,7 +717,7 @@ class VirtualController:
                 
             # Xbox One, Xbox360, PS4, PS5: abxy_mode=="Switch" triggers Switch layout swap.
             # Switch2 uses abxy_mode=="Xbox" (inverted naming convention).
-            if self.mode == "Switch2":
+            if self.mode == "Switch2" or self.mode == "Switch1":
                 is_switch_layout = (CONFIG.abxy_mode == "Xbox")
             else:
                 is_switch_layout = (CONFIG.abxy_mode == "Switch")
@@ -521,7 +727,7 @@ class VirtualController:
                 controller.hold_mode = "Vertical"
             else:
                 controller.gyro_active = True
-                controller.hold_mode = getattr(self, "hold_mode", "Horizontal")
+                controller.hold_mode = getattr(self, "hold_mode", "Vertical")
             
             # In combined mode, share gyro trigger from any side to all controllers
             # Allows the gyro-active controller to receive the trigger signal
@@ -569,7 +775,7 @@ class VirtualController:
                 
             current_buttons = inputData.buttons 
             
-            if len(self.controllers) == 1:
+            if len(self.controllers) == 1 and self.mode != "Switch1":
                 if controller.is_joycon_left():
                     if self.hold_mode == "Vertical":
                         inputData.right_stick = inputData.left_stick
@@ -660,6 +866,11 @@ class VirtualController:
                 self.update_as_ps5(inputData, buttons, controller)
             elif self.mode == "Switch2":
                 self.update_as_switch2_pro(inputData, buttons, controller)
+            elif self.mode == "Switch1":
+                if controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
+                    self.update_as_switch1_joycon_l(inputData, buttons, controller)
+                elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
+                    self.update_as_switch1_joycon_r(inputData, buttons, controller)
             else:
                 self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
             
@@ -672,7 +883,127 @@ class VirtualController:
 
         controller.set_input_report_callback(wrapped_callback)
 
+
+    def _build_switch1_report(self, inputData: ControllerInputData, buttons: int, controller, device_type: str):
+        state = bytearray(50)
+        state[0] = 0x30
+        state[2] = 0x9E if device_type == "L" else 0x8E
+        
+        hold_mode = getattr(self, 'hold_mode', 'Vertical')
+
+        lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
+        gx, gy, gz, ax, ay, az = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        if device_type == "L":
+            lx = inputData.left_stick[0]
+            ly = inputData.left_stick[1]
+            
+            if hold_mode == "Vertical":
+                gx, gy, gz =  inputData.gyroscope[1],  -inputData.gyroscope[0],  inputData.gyroscope[2]
+                ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
+            else: # Horizontal
+                gx, gy, gz =  inputData.gyroscope[0], inputData.gyroscope[1],  inputData.gyroscope[2]
+                ax, ay, az =  inputData.accelerometer[0], inputData.accelerometer[1],  inputData.accelerometer[2]
+                
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
+                
+        else: # device_type == "R"
+            rx = inputData.right_stick[0]
+            ry = inputData.right_stick[1]
+            
+            if hold_mode == "Vertical":
+                gx, gy, gz =  inputData.gyroscope[1], inputData.gyroscope[0], -inputData.gyroscope[2]
+                ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
+            else: # Horizontal
+                gx, gy, gz = -inputData.gyroscope[0], inputData.gyroscope[1], -inputData.gyroscope[2]
+                ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
+                
+            if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
+                rx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
+
+        def float_to_12bit(val):
+            return int(max(0, min(4095, round((val + 1.0) * 2047.5))))
+
+        lx_12 = float_to_12bit(lx)
+        ly_12 = float_to_12bit(ly)
+        rx_12 = float_to_12bit(rx)
+        ry_12 = float_to_12bit(ry)
+
+        # Left stick packed (bytes 6-8)
+        state[6] = lx_12 & 0xff
+        state[7] = ((lx_12 >> 8) & 0x0f) | ((ly_12 & 0x0f) << 4)
+        state[8] = (ly_12 >> 4) & 0xff
+
+        # Right stick packed (bytes 9-11)
+        state[9] = rx_12 & 0xff
+        state[10] = ((rx_12 >> 8) & 0x0f) | ((ry_12 & 0x0f) << 4)
+        state[11] = (ry_12 >> 4) & 0xff
+
+        b3, b4, b5 = 0, 0, 0
+        
+        if device_type == "L":
+            if buttons & SWITCH_BUTTONS["DOWN"]:  b5 |= 0x01
+            if buttons & SWITCH_BUTTONS["UP"]:    b5 |= 0x02
+            if buttons & SWITCH_BUTTONS["RIGHT"]: b5 |= 0x04
+            if buttons & SWITCH_BUTTONS["LEFT"]:  b5 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("SR_L", 0): b5 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("SL_L", 0): b5 |= 0x20
+            if buttons & SWITCH_BUTTONS["L"]:     b5 |= 0x40
+            if buttons & SWITCH_BUTTONS["ZL"]:    b5 |= 0x80
+            
+            if buttons & SWITCH_BUTTONS["MINUS"]: b4 |= 0x01
+            if buttons & SWITCH_BUTTONS["L_STK"]: b4 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("CAPT", 0): b4 |= 0x20
+        else: # Right Joycon
+            if buttons & SWITCH_BUTTONS["Y"]:     b3 |= 0x01
+            if buttons & SWITCH_BUTTONS["X"]:     b3 |= 0x02
+            if buttons & SWITCH_BUTTONS["B"]:     b3 |= 0x04
+            if buttons & SWITCH_BUTTONS["A"]:     b3 |= 0x08
+            if buttons & SWITCH_BUTTONS.get("SR_R", 0): b3 |= 0x10
+            if buttons & SWITCH_BUTTONS.get("SL_R", 0): b3 |= 0x20
+            if buttons & SWITCH_BUTTONS["R"]:     b3 |= 0x40
+            if buttons & SWITCH_BUTTONS["ZR"]:    b3 |= 0x80
+            
+            if buttons & SWITCH_BUTTONS["PLUS"]:  b4 |= 0x02
+            if buttons & SWITCH_BUTTONS["R_STK"]: b4 |= 0x04
+            if buttons & SWITCH_BUTTONS.get("HOME", 0): b4 |= 0x10
+            
+        state[3] = b3
+        state[4] = b4
+        state[5] = b5
+
+        def clamp_i16(v): return max(-32768, min(32767, int(round(v))))
+
+
+        imu_frame = struct.pack('<6h', 
+            clamp_i16(ax), clamp_i16(ay), clamp_i16(az), 
+            clamp_i16(gx), clamp_i16(gy), clamp_i16(gz)
+        )
+        
+        # Single IMU frame (bytes 13-24) + microsecond timestamp at bytes 25-28
+        # Matches Switch2 Emu approach: 1 frame + timestamp instead of 3 duplicated frames
+        state[13:25] = imu_frame
+        now_us = int(time.perf_counter() * 1000000) & 0xffffffff
+        state[25:29] = struct.pack("<I", now_us)
+        # bytes 29-48 remain zero (no frame 2/3)
+
+        return state
+
+    def update_as_switch1_joycon_l(self, inputData: ControllerInputData, buttons: int, controller):
+        if self.driver_type == "USBIP":
+            if hasattr(self, 'usbip_server_l') and self.usbip_server_l:
+                state = self._build_switch1_report(inputData, buttons, controller, device_type="L")
+                self.usbip_server_l.update_state(state)
+
+    def update_as_switch1_joycon_r(self, inputData: ControllerInputData, buttons: int, controller):
+        if self.driver_type == "USBIP":
+            if hasattr(self, 'usbip_server_r') and self.usbip_server_r:
+                state = self._build_switch1_report(inputData, buttons, controller, device_type="R")
+                self.usbip_server_r.update_state(state)
+
     def update_as_ps4(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+
         with self.state_lock:
             if self.vg_controller is None:
                 return
@@ -1174,7 +1505,10 @@ class VirtualController:
                         logger.error(f"Failed to update DS4 ex via ViGEmBus: {e}")
                         self.vg_controller.update()
                 else:
-                    self.vg_controller.update()
+                    if self.mode == "Switch1":
+                        pass
+                    else:
+                        self.vg_controller.update()
         
         logger.info(f"Player {self.player_number}: Update loop thread finished.")
                 
@@ -1188,35 +1522,54 @@ class VirtualController:
                     self.last_s2_rx = 0.0; self.last_s2_ry = 0.0
                     self.last_s2_gx = 0; self.last_s2_gy = 0; self.last_s2_gz = 0
                     self.last_s2_ax = 0; self.last_s2_ay = 0; self.last_s2_az = 0
-                    
+
                     state = bytearray(64)
                     state[0] = 0x05
                     state[2] = 0x12
-                    
+
                     state[11] = 2048 & 0xff
                     state[12] = ((2048 >> 8) & 0x0f) | ((2048 & 0x0f) << 4)
                     state[13] = (2048 >> 4) & 0xff
                     state[14] = 2048 & 0xff
                     state[15] = ((2048 >> 8) & 0x0f) | ((2048 & 0x0f) << 4)
                     state[16] = (2048 >> 4) & 0xff
-                    
+
                     state[42] = 0x01
                     if hasattr(self, 'usbip_server') and self.usbip_server:
                         self.usbip_server.update_state(state)
-                elif driver_type == "WinUHid":
-                    if self.mode == "Xbox One":
-                        if winuhid._winuhid_devs:
-                            winuhid._winuhid_devs.WinUHidXOneInitializeInputReport(ctypes.byref(self.vg_controller.report))
-                    elif self.mode == "PS4":
-                        if winuhid._winuhid_devs:
-                            winuhid._winuhid_devs.WinUHidPS4InitializeInputReport(ctypes.byref(self.vg_controller.report))
-                    elif self.mode == "PS5":
-                        if winuhid._winuhid_devs:
-                            winuhid._winuhid_devs.WinUHidPS5InitializeInputReport(ctypes.byref(self.vg_controller.report))
-                else: # ViGEmBus
+                elif self.mode == "Switch1":
+                    self.last_s2_lx = 0.0; self.last_s2_ly = 0.0; self.last_s2_rx = 0.0; self.last_s2_ry = 0.0
+                    self.last_s2_gx = 0; self.last_s2_gy = 0; self.last_s2_gz = 0
+                    self.last_s2_ax = 0; self.last_s2_ay = 0; self.last_s2_az = 0
+                    
+                    state_l = bytearray(50)
+                    state_l[0] = 0x30
+                    state_l[2] = 0x9E
+                    state_l[6] = 0x00
+                    state_l[7] = 0x08
+                    state_l[8] = 0x80
+                    state_l[9] = 0x00
+                    state_l[10] = 0x08
+                    state_l[11] = 0x80
+                    
+                    state_r = bytearray(50)
+                    state_r[0] = 0x30
+                    state_r[2] = 0x8E
+                    state_r[6] = 0x00
+                    state_r[7] = 0x08
+                    state_r[8] = 0x80
+                    state_r[9] = 0x00
+                    state_r[10] = 0x08
+                    state_r[11] = 0x80
+                    
+                    if hasattr(self, 'usbip_server_l') and self.usbip_server_l:
+                        self.usbip_server_l.update_state(state_l)
+                    if hasattr(self, 'usbip_server_r') and self.usbip_server_r:
+                        self.usbip_server_r.update_state(state_r)
+                else:  # ViGEmBus
                     if self.mode == "Xbox360":
                         self.vg_controller.reset()
-                    else: # PS4
+                    else:  # PS4
                         self.report_ex = DS4_REPORT_EX()
                         self.report_ex.Report.bThumbLX = 128
                         self.report_ex.Report.bThumbLY = 128
@@ -1224,6 +1577,7 @@ class VirtualController:
                         self.report_ex.Report.bThumbRY = 128
                         self.report_ex.Report.bBatteryLvl = 0xAF
                         self.report_ex.Report.bBatteryLvlSpecial = 0x08
+
             logger.info(f"Player {self.player_number}: Virtual inputs reset to neutral.")
             self.previous_buttons_left = 0x00000000
             self.previous_buttons_right = 0x00000000
@@ -1283,9 +1637,7 @@ class VirtualController:
             logger.info(f"Player {self.player_number}: Cleaning up virtual device and physical connections...")
             
             with self.state_lock:
-                if hasattr(self, 'vg_controller') and self.vg_controller is not None:
-                    logger.info(f"Player {self.player_number}: Unregistering notifications and clearing vg_controller")
-                    self.cleanup_vg_controller()
+                self.cleanup_vg_controller()
                     
             server_port = self.server_port
             detach_usbip_device(server_port)
@@ -1331,9 +1683,11 @@ class VirtualController:
             logger.error("Event loop not found or not running.")
 
     async def remove_controller(self, controller: Controller, clear_mac_port: bool = False) -> bool:
-        if controller in self.controllers:
-            self.controllers.remove(controller)
-            if clear_mac_port:
+        if controller not in self.controllers:
+            return False
+            
+        self.controllers.remove(controller)
+        if clear_mac_port:
                 # Only clear the MAC->port mapping when the physical controller truly disconnects
                 # (BLE disconnect), NOT during merge/split operations where it stays connected.
                 mac = controller.device.address
@@ -1347,8 +1701,7 @@ class VirtualController:
             # and skips creating a zombie USBIP server.
             self.running = False
             with self.state_lock:
-                if hasattr(self, 'vg_controller') and self.vg_controller is not None:
-                    self.cleanup_vg_controller()
+                self.cleanup_vg_controller()
                 
             if self.mode == "Switch2":
                 server_port = self.server_port
@@ -1362,15 +1715,106 @@ class VirtualController:
                 
             return True 
         else:
+            if self.mode == "Switch1":
+                if controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
+                    if hasattr(self, 'server_port_l') and self.server_port_l:
+                        try:
+                            detach_usbip_device(self.server_port_l)
+                        except Exception:
+                            pass
+                    try:
+                        self.usbip_server_l.stop()
+                    except Exception:
+                        pass
+                    self.usbip_server_l = None
+                elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
+                    if hasattr(self, 'server_port_r') and self.server_port_r:
+                        try:
+                            detach_usbip_device(self.server_port_r)
+                        except Exception:
+                            pass
+                    try:
+                        self.usbip_server_r.stop()
+                    except Exception:
+                        pass
+                    self.usbip_server_r = None
+
             if getattr(self, 'running', True):
-                await self.init_added_controller(self.controllers[0])
+                try:
+                    await self.init_added_controller(self.controllers[0])
+                except Exception as e:
+                    logger.error(f"Failed to re-init remaining controller after split/remove: {e}")
             return False
 
-    def _usbip_rumble_callback(self, out_data):
+    def _usbip_rumble_callback(self, out_data, side="Left"):
         # Disconnect active-push: bytearray(64) from usbip_server means connection dropped
         # In this case out_data[0] == 0x00, so we handle it separately to clear rumble state.
         if len(out_data) < 1:
             return
+            
+        if self.mode == "Switch1":
+            if out_data[0] == 0: # Connection dropped
+                with self.vibration_lock:
+                    if side == "Left":
+                        self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+                        self.vibration_dirty_l = True
+                    else:
+                        self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+                        self.vibration_dirty_r = True
+                return
+                
+            def decode_32bit_rumble(b):
+                hf_amp = b[1] & 0xFE
+                hf_amp_encoded = hf_amp >> 1
+                lf_amp_encoded = (b[3] - 64) * 2 + (1 if (b[2] & 0x80) else 0)
+                lf_amp_encoded = max(0, lf_amp_encoded)
+                
+                def encoded_to_linear(encoded):
+                    if encoded <= 0:
+                        return 0.0
+                    if encoded >= 32:
+                        return (2.0 ** (encoded / 32.0)) / 8.7
+                    elif encoded >= 16:
+                        return (2.0 ** (encoded / 16.0)) / 17.0
+                    else:
+                        return (encoded / 16.0) * 0.12
+                
+                hf_val = int(encoded_to_linear(hf_amp_encoded) * 800)
+                lf_val = int(encoded_to_linear(lf_amp_encoded) * 800)
+                
+                hf_freq_encoded = b[0] | ((b[1] & 0x01) << 8)
+                lf_freq_encoded = b[2] & 0x7F
+                
+                return VibrationData(
+                    lf_freq=lf_freq_encoded,
+                    lf_en_tone=False,
+                    lf_amp=lf_val,
+                    hf_freq=hf_freq_encoded,
+                    hf_en_tone=False,
+                    hf_amp=hf_val
+                )
+
+            if len(out_data) >= 6:
+                if side == "Left":
+                    v1 = decode_32bit_rumble(out_data[2:6])
+                else:
+                    if len(out_data) >= 10:
+                        v1 = decode_32bit_rumble(out_data[6:10])
+                    else:
+                        v1 = decode_32bit_rumble(out_data[2:6])
+                
+                v2 = v1
+                v3 = v1
+                
+                with self.vibration_lock:
+                    if side == "Left":
+                        self.switch_vibrations_left = [v1, v2, v3]
+                        self.vibration_dirty_l = True
+                    else:
+                        self.switch_vibrations_right = [v1, v2, v3]
+                        self.vibration_dirty_r = True
+            return
+
         if out_data[0] != 0x02:
             # Explicitly clear all rumble state on disconnect (or unknown packet)
             with self.vibration_lock:
@@ -1497,7 +1941,7 @@ class VirtualController:
         if controller.is_joycon():
             joycon_mappings = [
                 getattr(CONFIG, "home_mapping", "Default"),
-                getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "PrtSc"),
+                getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"),
                 getattr(CONFIG, "c_mapping", "Default"),
                 getattr(CONFIG, "sll_mapping", "Default"),
                 getattr(CONFIG, "srl_mapping", "Default"),
@@ -1617,6 +2061,8 @@ class VirtualController:
         
         if hasattr(self, 'usbip_server') and self.usbip_server:
             self.usbip_server.update_state(state)
+
+
 
 def reset_vigem_bus(force=False):
     """

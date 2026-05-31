@@ -18,7 +18,7 @@ from config import CONFIG
 logger = logging.getLogger(__name__)
 
 NINTENDO_BLUETOOTH_MANUFACTURER_ID = 0x0553
-VIRTUAL_CONTROLLERS = [None] * 8
+VIRTUAL_CONTROLLERS = [None] * 10
 UPDATE_CALLBACK = None
 DISCOVERER_LOOP = None
 DISCONNECT_CALLBACK = None
@@ -281,9 +281,24 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                             pending_connections_count += 1
                         asyncio.create_task(add_controller(device, True))
 
-        async with BleakScanner(callback) as scanner:
-            print("Presss a button on a paired controller, or hold sync button on an unpaired controller")
-            await asyncio.get_event_loop().run_in_executor(None, quit_event.wait)
+        while not quit_event.is_set():
+            try:
+                async with BleakScanner(callback) as scanner:
+                    print("Press a button on a paired controller, or hold sync button on an unpaired controller")
+                    while not quit_event.is_set():
+                        await asyncio.sleep(1.0)
+                        # On Windows, check if the watcher was aborted (e.g. Bluetooth turned off)
+                        if hasattr(scanner, '_backend') and hasattr(scanner._backend, 'watcher'):
+                            status = getattr(scanner._backend.watcher, 'status', None)
+                            if status is not None and hasattr(status, 'value'):
+                                if status.value == 4: # BluetoothLEAdvertisementWatcherStatus.Aborted
+                                    logger.warning("Bluetooth watcher aborted (likely Bluetooth turned off). Restarting scanner...")
+                                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Bluetooth scanner error: {e}. Retrying in 2 seconds...")
+                await asyncio.sleep(2.0)
     finally:
         with DISCOVERY_LOCK:
             _CURRENTLY_DISCOVERING = False
@@ -328,7 +343,7 @@ def reorder_controllers():
 
         active_vcs.sort(key=get_priority)
         
-        new_list = [None] * 8
+        new_list = [None] * 10
         for i, vc in enumerate(active_vcs):
             new_list[i] = vc
             vc.player_number = i + 1
@@ -391,6 +406,37 @@ async def _split_controller_async(vc_index):
             
             slot_index = next(i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c == None)
             new_vc = VirtualController(slot_index + 1, [c2], DISCONNECT_CALLBACK, setup_usb=False)
+            
+            if vc.mode == "Switch1":
+                # Switch1: split without resetting USBIP. Transfer the appropriate server to new_vc.
+                with vc.state_lock, new_vc.state_lock:
+                    new_vc.mode = "Switch1"
+                    new_vc.hold_mode = "Vertical"
+                    new_vc.driver_type = "USBIP"
+                    class MockGamepad:
+                        def register_notification(self, callback_function): pass
+                        def unregister_notification(self): pass
+                        def update(self): pass
+                        def close(self): pass
+                    new_vc.vg_controller = MockGamepad()
+                    
+                    if c2.is_joycon_right():
+                        new_vc.usbip_server_r = getattr(vc, 'usbip_server_r', None)
+                        new_vc.server_port_r = getattr(vc, 'server_port_r', None)
+                        new_vc.bus_id_r = getattr(vc, 'bus_id_r', None)
+                        new_vc.host_ip_r = getattr(vc, 'host_ip_r', None)
+                        if new_vc.usbip_server_r:
+                            new_vc.usbip_server_r.on_rumble_callback = lambda d, p=new_vc.server_port_r: new_vc._usbip_rumble_callback(d, side="Right")
+                        vc.usbip_server_r = None
+                    elif c2.is_joycon_left():
+                        new_vc.usbip_server_l = getattr(vc, 'usbip_server_l', None)
+                        new_vc.server_port_l = getattr(vc, 'server_port_l', None)
+                        new_vc.bus_id_l = getattr(vc, 'bus_id_l', None)
+                        new_vc.host_ip_l = getattr(vc, 'host_ip_l', None)
+                        if new_vc.usbip_server_l:
+                            new_vc.usbip_server_l.on_rumble_callback = lambda d, p=new_vc.server_port_l: new_vc._usbip_rumble_callback(d, side="Left")
+                        vc.usbip_server_l = None
+
             VIRTUAL_CONTROLLERS[slot_index] = new_vc
             await new_vc.init_added_controller(c2)
             
@@ -402,7 +448,13 @@ async def _split_controller_async(vc_index):
             await update_all_player_leds()
 
     if new_vc is not None:
-        await asyncio.to_thread(new_vc.setup_virtual_device)
+        if vc.mode == "Switch1":
+            pass # Handled above
+        else:
+            with vc.state_lock:
+                vc.cleanup_vg_controller()
+            await asyncio.to_thread(vc.setup_virtual_device)
+            await asyncio.to_thread(new_vc.setup_virtual_device)
 
 
 def split_controller(vc_index):
@@ -423,6 +475,30 @@ async def _merge_controllers_async(vc_index1, vc_index2):
         
         if vc1 is not None and vc2 is not None and vc1.is_single() and vc2.is_single():
             c2 = vc2.controllers[0]
+            
+            # Switch1 Emu Mode: extract the usbip servers from vc2 BEFORE removing the controller
+            # so remove_controller's cleanup won't shut them down!
+            if vc1.mode == "Switch1":
+                with vc1.state_lock, vc2.state_lock:
+                    if c2.is_joycon_right():
+                        vc1.usbip_server_r = getattr(vc2, 'usbip_server_r', None)
+                        vc1.server_port_r = getattr(vc2, 'server_port_r', None)
+                        vc1.bus_id_r = getattr(vc2, 'bus_id_r', None)
+                        vc1.host_ip_r = getattr(vc2, 'host_ip_r', None)
+                        if vc1.usbip_server_r:
+                            vc1.usbip_server_r.on_rumble_callback = lambda d, p=vc1.server_port_r: vc1._usbip_rumble_callback(d, side="Right")
+                        vc2.usbip_server_r = None
+                        vc2.server_port_r = None
+                    elif c2.is_joycon_left():
+                        vc1.usbip_server_l = getattr(vc2, 'usbip_server_l', None)
+                        vc1.server_port_l = getattr(vc2, 'server_port_l', None)
+                        vc1.bus_id_l = getattr(vc2, 'bus_id_l', None)
+                        vc1.host_ip_l = getattr(vc2, 'host_ip_l', None)
+                        if vc1.usbip_server_l:
+                            vc1.usbip_server_l.on_rumble_callback = lambda d, p=vc1.server_port_l: vc1._usbip_rumble_callback(d, side="Left")
+                        vc2.usbip_server_l = None
+                        vc2.server_port_l = None
+                        
             await vc2.remove_controller(c2)
             VIRTUAL_CONTROLLERS[vc_index2] = None
             
@@ -435,6 +511,13 @@ async def _merge_controllers_async(vc_index1, vc_index2):
                 UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
                 
             await update_all_player_leds()
+            
+            if vc1.mode == "Switch1":
+                pass # We already transferred it above, nothing else to do here
+            else:
+                with vc1.state_lock:
+                    vc1.cleanup_vg_controller()
+                await asyncio.to_thread(vc1.setup_virtual_device)
 
 def merge_controllers(vc_index1, vc_index2):
     if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():

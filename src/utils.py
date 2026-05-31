@@ -3,6 +3,24 @@ import winreg
 import sys
 import os
 import math
+import threading
+class USBIPAllocator:
+    _lock = threading.Lock()
+    _counter = 1
+
+    @classmethod
+    def allocate(cls):
+        with cls._lock:
+            host = f"127.0.0.{cls._counter}"
+            bus_id = f"1-{cls._counter}"
+            port = 3240 + (cls._counter - 1)
+            
+            cls._counter += 1
+            if cls._counter > 254:
+                cls._counter = 1
+                
+            return host, bus_id, port
+
 from config import CONFIG
 
 def to_hex(buffer):

@@ -645,11 +645,24 @@ class Controller:
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
 
+        is_switch1 = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch1"
+
         rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
 
         if ignore_freq_scaling:
             lf_multiplier = 1.3
             hf_multiplier = 1.0 if is_pro else 0.6
+        elif is_switch1:
+            lf_multiplier = strength / 5.0
+            hf_multiplier = strength / 5.0
+            
+            # Apply limits to prevent physical hardware limitations from being exceeded
+            if is_pro:
+                lf_multiplier = min(2.6, lf_multiplier)
+                hf_multiplier = min(2.0, hf_multiplier)
+            else:
+                lf_multiplier = min(0.84, lf_multiplier)
+                hf_multiplier = min(1.12, hf_multiplier)
         elif rumble_mode == "Switch":
             if is_pro:
                 if strength <= 5.0:
@@ -692,22 +705,28 @@ class Controller:
         freq_factor_hf = (freq_setting - 1) * 4 / 81.0
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
-            if ignore_freq_scaling or rumble_mode == "Switch":
+            is_switch1 = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch1"
+
+            if ignore_freq_scaling or (rumble_mode == "Switch" and not is_switch1):
                 scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
                 scaled_hf_freq = min(511, max(1, int(v.hf_freq)))
                 lf_mask = 1.0
                 hf_mask = 1.0
             else:
-                # Frequency scaling formula based on 0.6.6
-                new_min_lf = 0.5 * v.lf_freq + 0.5
-                temp_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
+                if rumble_mode == "Switch" and is_switch1:
+                    scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
+                    scaled_hf_freq = min(511, max(1, int(v.hf_freq)))
+                else:
+                    # Frequency scaling formula based on 0.6.6
+                    new_min_lf = 0.5 * v.lf_freq + 0.5
+                    temp_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
 
-                new_min_hf = 0.5 * v.hf_freq + 0.5
-                temp_hf_freq = new_min_hf + (v.hf_freq - new_min_hf) * freq_factor_hf
+                    new_min_hf = 0.5 * v.hf_freq + 0.5
+                    temp_hf_freq = new_min_hf + (v.hf_freq - new_min_hf) * freq_factor_hf
 
-                # Clamped actual output frequencies
-                scaled_lf_freq = min(511, max(1, int(temp_lf_freq)))
-                scaled_hf_freq = min(511, max(1, int(temp_hf_freq)))
+                    # Clamped actual output frequencies
+                    scaled_lf_freq = min(511, max(1, int(temp_lf_freq)))
+                    scaled_hf_freq = min(511, max(1, int(temp_hf_freq)))
 
                 # LF (large motor thumps) is not targeted for high-frequency small motor simulation masking
                 lf_mask = 1.0
@@ -847,8 +866,10 @@ class Controller:
                 
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration)
             
-            # Reset inactivity timer if there is physical input (buttons or sticks outside deadzone)
-            if (inputData.buttons & 0x03FFFFFF) != 0 or inputData.left_stick != (0.0, 0.0) or inputData.right_stick != (0.0, 0.0):
+            # Reset inactivity timer if there is physical input (buttons or sticks outside 20% deadzone)
+            if (inputData.buttons & 0x03FFFFFF) != 0 or \
+               abs(inputData.left_stick[0]) > 0.2 or abs(inputData.left_stick[1]) > 0.2 or \
+               abs(inputData.right_stick[0]) > 0.2 or abs(inputData.right_stick[1]) > 0.2:
                 self.last_input_time = time.time()
 
             self.battery_voltage = inputData.battery_voltage
@@ -912,7 +933,7 @@ class Controller:
                 (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None),
                 (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None),
                 (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home"),
-                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "PrtSc"),
+                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"),
                 (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "Mute"),
                 (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None),
                 (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None),
@@ -988,7 +1009,7 @@ class Controller:
             inputData.buttons &= ~0x0F
             
             abxy_mode = getattr(CONFIG, "abxy_mode", "Xbox")
-            is_switch_emu = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2"
+            is_switch_emu = getattr(CONFIG, "simulation_mode", "Xbox One") in ["Switch2", "Switch1"]
             if is_switch_emu:
                 should_swap = (abxy_mode == "Xbox")
             else:
@@ -1158,7 +1179,12 @@ class Controller:
                     if current_time - last_rumble_time >= 0.007:
                         self.last_rumble_time = current_time
                         
-                        v1, v2, v3, is_zero = vc.get_current_vibration_frames()
+                        if getattr(vc, 'rumble_force_clear', False):
+                            self.rumble_stopped = False
+                            self._zero_count = 0
+                            vc.rumble_force_clear = False
+                        
+                        v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
                         
                         if not getattr(self, '_rumble_task_running', False):
                             

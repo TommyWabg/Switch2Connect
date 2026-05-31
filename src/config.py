@@ -245,7 +245,8 @@ class Config:
                 self.button_remaps["ps5"] = copy.deepcopy(self.button_remaps["ps"])
             self.button_remaps.pop("ps", None)
 
-        categories = ["xbox", "ps4", "ps5", "switch2"]
+        categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
+        old_hold_mode = config.get("joycon_hold_mode", {}) or {}
         default_mappings = {
             "gl_mapping": "Default",
             "gr_mapping": "Gyro",
@@ -267,15 +268,17 @@ class Config:
         for cat in categories:
             if cat not in self.button_remaps:
                 self.button_remaps[cat] = {}
+            if "joycon_hold_mode" not in self.button_remaps[cat]:
+                self.button_remaps[cat]["joycon_hold_mode"] = old_hold_mode.copy()
             for key, def_val in default_mappings.items():
                 if key not in self.button_remaps[cat]:
                     old_cat_data = config.get("button_remaps", {}).get(cat, {})
                     # For backward compatibility, check top-level config first
                     if key == "abxy_mode":
-                        top_level_def = "Switch" if cat == "switch2" else "Xbox"
+                        top_level_def = "Switch" if cat in ("switch1", "switch2") else "Xbox"
                         val = config.get("abxy_mode", top_level_def)
                     elif key == "rumble_mode":
-                        top_level_def = "Switch" if cat == "switch2" else "Xbox"
+                        top_level_def = "Switch" if cat in ("switch1", "switch2") else "Xbox"
                         val = config.get("rumble_mode", top_level_def)
                     elif key == "vibration_strength_xbox":
                         val = old_cat_data.get("vibration_strength", config.get("vibration_strength_xbox", config.get("vibration_strength", def_val)))
@@ -284,10 +287,10 @@ class Config:
                     elif key == "vibration_frequency":
                         val = config.get("vibration_frequency", def_val)
                     elif key == "capt_mapping":
-                        default_capt = "Capture" if cat == "switch2" else "PrtSc"
+                        default_capt = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
                         val = config.get("capt_mapping", default_capt)
                         if val in ("None", "CAPT", "Default", "Capture"):
-                            val = "Capture" if cat == "switch2" else "PrtSc"
+                            val = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
                     else:
                         val = config.get(key, def_val)
                     
@@ -308,7 +311,6 @@ class Config:
         # MAC address -> Calibration data mapping dictionary
         self.calibration_data = config.get("calibration_data", {}) or {}
         self.mag_calibration_data = config.get("mag_calibration_data", {}) or {}
-        self.joycon_hold_mode = config.get("joycon_hold_mode", {}) or {}
         self.merged_gyro_side = config.get("merged_gyro_side", {}) or {}
         
         self.open_when_startup = config.get("open_when_startup", False)
@@ -337,6 +339,7 @@ class Config:
 
         self.vigembus_sim_mode = config.get("vigembus_sim_mode", None)
         self.winuhid_sim_mode = config.get("winuhid_sim_mode", None)
+        self.usbip_sim_mode = config.get("usbip_sim_mode", None)
         
         if self.vigembus_sim_mode == "Xbox":
             self.vigembus_sim_mode = "Xbox360"
@@ -353,10 +356,15 @@ class Config:
                 self.winuhid_sim_mode = self.simulation_mode if self.simulation_mode in ["Xbox One", "PS4", "PS5"] else "PS5"
             else:
                 self.winuhid_sim_mode = "PS5"
+        if self.usbip_sim_mode is None:
+            if self.driver_type == "USBIP":
+                self.usbip_sim_mode = self.simulation_mode if self.simulation_mode in ["Switch1", "Switch2"] else "Switch2"
+            else:
+                self.usbip_sim_mode = "Switch2"
 
         if self.driver_type == "USBIP":
-            self.simulation_mode = "Switch2"
-        elif self.simulation_mode != "Switch2":
+            self.simulation_mode = self.usbip_sim_mode
+        elif self.simulation_mode in ["Switch1", "Switch2"]:
             if self.driver_type == "ViGEmBus":
                 self.simulation_mode = self.vigembus_sim_mode
             else:
@@ -382,6 +390,7 @@ class Config:
             'driver_type': self.driver_type,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
+            'usbip_sim_mode': self.usbip_sim_mode,
             'vigembus_installed': self.vigembus_installed,
             'window_width': self.window_width,
             'window_height': self.window_height,
@@ -501,6 +510,8 @@ class Config:
         mode = getattr(self, "simulation_mode", "Xbox One")
         if mode == "Switch2":
             return "switch2"
+        elif mode == "Switch1":
+            return "switch1"
         elif mode == "PS4":
             return "ps4"
         elif mode == "PS5":
@@ -591,13 +602,27 @@ class Config:
     @property
     def capt_mapping(self):
         cat = self.get_current_category()
-        default_capt = "Capture" if cat == "switch2" else "PrtSc"
+        default_capt = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
         return self.button_remaps.get(cat, {}).get("capt_mapping", default_capt)
     @capt_mapping.setter
     def capt_mapping(self, val):
         cat = self.get_current_category()
         if cat not in self.button_remaps: self.button_remaps[cat] = {}
         self.button_remaps[cat]["capt_mapping"] = val
+        
+    @property
+    def joycon_hold_mode(self):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        if "joycon_hold_mode" not in self.button_remaps[cat]:
+            self.button_remaps[cat]["joycon_hold_mode"] = {}
+        return self.button_remaps[cat]["joycon_hold_mode"]
+        
+    @joycon_hold_mode.setter
+    def joycon_hold_mode(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["joycon_hold_mode"] = val
     
     @property
     def auto_disconnect_mode(self):

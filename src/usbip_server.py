@@ -7,6 +7,13 @@ import queue
 
 logger = logging.getLogger(__name__)
 
+# Switch 2 Pro Controller - HID Report Descriptor (31 Bytes)
+SWITCH_PRO_REPORT_DESCRIPTOR = bytes([
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00,
+    0x75, 0x08, 0x85, 0x05, 0x95, 0x3f, 0x09, 0x01, 0x81, 0x02,
+    0x85, 0x02, 0x95, 0x3f, 0x09, 0x01, 0x91, 0x02, 0xc0
+])
+
 # USBIP Protocol Constants
 USBIP_VERSION = 0x0111
 OP_REQ_DEVLIST = 0x8005
@@ -56,6 +63,7 @@ class USBIPServer:
         # State queue for inputs and bulk responses
         self.input_queue = queue.Queue(maxsize=1)
         self.bulk_response_queue = queue.Queue()
+        self.pending_in_urbs = queue.Queue()
         self.last_state = bytearray(64)
         self.last_state[0] = 0x05 # Report ID
         self.last_state[2] = 0x12 # Switch 2 status byte
@@ -73,6 +81,7 @@ class USBIPServer:
         self.server_socket.listen(1)
         
         self.server_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.in_thread = threading.Thread(target=self._in_urb_loop, daemon=True)
         self.server_thread.start()
         logger.info(f"USBIP Server started on {self.host}:{self.port}")
 
@@ -87,6 +96,7 @@ class USBIPServer:
         
         # Wake up any blocked queues
         self.update_state(self.last_state)
+        self.pending_in_urbs.put(None)
         
         if self.server_thread:
             self.server_thread.join(timeout=2.0)
@@ -278,12 +288,14 @@ class USBIPServer:
         if ep == 0: # Control Endpoint
             reply_data = self._handle_control_request(setup, transfer_length)
             actual_length = len(reply_data)
-            logger.info(f"Control Reply: actual_length={actual_length}, data={reply_data.hex()}")
-        elif ep == 1: # HID Interface Endpoint (Interface 0)
+        elif ep == 1: # HID Interface Endpoint
             if direction == 1: # IN (Read input state)
-                # Use non-blocking read: always reply immediately with the latest state.
-                # Blocking here delays the emulator's NEXT OUT (rumble) URB submission,
-                # causing a cascading queue backlog proportional to the timeout value.
+                now = time.perf_counter()
+                elapsed = now - getattr(self, 'last_ep1_in_time', 0)
+                if elapsed < 0.004:
+                    time.sleep(0.004 - elapsed)
+                self.last_ep1_in_time = time.perf_counter()
+                
                 try:
                     reply_data = self.input_queue.get_nowait()
                 except queue.Empty:
@@ -295,15 +307,14 @@ class USBIPServer:
                     if self.on_rumble_callback:
                         self.on_rumble_callback(out_data)
                     actual_length = len(out_data)
-        elif ep == 2: # WinUSB Bulk Interface Endpoint (Interface 1)
-            if direction == 1: # IN (Read reply from command)
+        elif ep == 2: # WinUSB Bulk Interface Endpoint
+            if direction == 1: # IN
                 try:
-                    # Non-blocking pop; if nothing is ready, return nothing
                     reply_data = self.bulk_response_queue.get_nowait()
                 except queue.Empty:
                     reply_data = b""
                 actual_length = len(reply_data)
-            else: # OUT (Write command)
+            else: # OUT
                 if len(out_data) > 0:
                     self._handle_bulk_command(out_data)
                     actual_length = len(out_data)
@@ -311,20 +322,10 @@ class USBIPServer:
             logger.warning(f"Submit request to unknown endpoint: {ep}")
             status = -1
             
-        # Send RET_SUBMIT header (48 bytes) + reply data if IN
         ret_header = struct.pack(
             "!IIIII i IIII 8s",
-            USBIP_RET_SUBMIT,
-            seqnum,
-            devid,
-            direction,
-            ep,
-            status,
-            actual_length,
-            0, # start_frame
-            0, # number_of_packets
-            0, # error_count
-            b"\x00" * 8 # setup padding
+            USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
+            0, 0, 0, b"\x00" * 8
         )
         
         with self.send_lock:
@@ -332,6 +333,57 @@ class USBIPServer:
                 sock.sendall(ret_header + reply_data)
             else:
                 sock.sendall(ret_header)
+
+    def _in_urb_loop(self):
+        """專門處理 IN URB 的背景執行緒，以智慧限速消除 Burst (防止 dt=0)，同時避免延遲堆疊"""
+        last_send_time = time.perf_counter()
+        while self.running:
+            try:
+                urb = self.pending_in_urbs.get()
+                if urb is None:
+                    break
+                sock, seqnum, devid, direction, ep = urb
+                
+                now = time.perf_counter()
+                elapsed = now - last_send_time
+                if elapsed < 0.001:
+                    time.sleep(0.001 - elapsed)
+                
+                self._process_deferred_in_urb(sock, seqnum, devid, direction, ep)
+                last_send_time = time.perf_counter()
+            except Exception as e:
+                if self.running:
+                    logger.debug(f"IN URB worker error: {e}")
+
+    def _process_deferred_in_urb(self, sock, seqnum, devid, direction, ep):
+        status = 0
+        reply_data = b""
+        
+        if ep == 1:
+            try:
+                reply_data = self.subcmd_reply_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    reply_data = self.input_queue.get_nowait()
+                except queue.Empty:
+                    with self.lock:
+                        reply_data = bytes(self.last_state)
+        else:
+            status = -1
+            
+        actual_length = len(reply_data)
+        ret_header = struct.pack(
+            "!IIIII i IIII 8s",
+            USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
+            0, 0, 0, b"\x00" * 8
+        )
+        
+        try:
+            with self.send_lock:
+                sock.sendall(ret_header + reply_data)
+        except Exception:
+            pass
+
 
     def _handle_control_request(self, setup, transfer_length):
         req_type, request, value, index, length = struct.unpack("<BBHHH", setup)
@@ -383,7 +435,7 @@ class USBIPServer:
                     0x00,   # bCountryCode
                     1,      # bNumDescriptors
                     0x22,   # bDescriptorType = Report
-                    31      # wDescriptorLength (must match report_desc below)
+                    len(SWITCH_PRO_REPORT_DESCRIPTOR)      # wDescriptorLength (must match report_desc below)
                 )
                 # Endpoint Descriptor format: bLength(7) bDescType(5) bEndpointAddress bmAttributes wMaxPacketSize bInterval
                 # Correct struct: <BBBBHB = 1+1+1+1+2+1 = 7 bytes total
@@ -448,23 +500,7 @@ class USBIPServer:
             
             elif desc_type == 0x22: # HID Report Descriptor (from Interface descriptor request context)
                 # Vendor-defined: report 0x09 = 64-byte input, report 0x02 = 64-byte output
-                report_desc = bytes([
-                    0x06, 0x00, 0xff,  # Usage Page (Vendor Defined 0xFF00)
-                    0x09, 0x01,        # Usage (Vendor Usage 1)
-                    0xa1, 0x01,        # Collection (Application)
-                    0x15, 0x00,        # Logical Minimum (0)
-                    0x26, 0xff, 0x00,  # Logical Maximum (255)
-                    0x75, 0x08,        # Report Size (8)
-                    0x85, 0x05,        # Report ID (5)
-                    0x95, 0x3f,        # Report Count (63)
-                    0x09, 0x01,        # Usage (Vendor Usage 1)
-                    0x81, 0x02,        # Input (Data, Variable, Absolute)
-                    0x85, 0x02,        # Report ID (2)
-                    0x95, 0x3f,        # Report Count (63)
-                    0x09, 0x01,        # Usage (Vendor Usage 1)
-                    0x91, 0x02,        # Output (Data, Variable, Absolute)
-                    0xc0               # End Collection
-                ])
+                report_desc = SWITCH_PRO_REPORT_DESCRIPTOR
                 logger.info(f"  -> HID Report Descriptor ({len(report_desc)} bytes)")
                 return report_desc[:length]
         
@@ -472,11 +508,7 @@ class USBIPServer:
         if req_type == 0x81 and request == 0x06:
             desc_type = value >> 8
             if desc_type == 0x22: # HID Report Descriptor
-                report_desc = bytes([
-                    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00,
-                    0x75, 0x08, 0x85, 0x05, 0x95, 0x3f, 0x09, 0x01, 0x81, 0x02,
-                    0x85, 0x02, 0x95, 0x3f, 0x09, 0x01, 0x91, 0x02, 0xc0
-                ])
+                report_desc = SWITCH_PRO_REPORT_DESCRIPTOR
                 logger.info(f"  -> Interface HID Report Descriptor ({len(report_desc)} bytes)")
                 return report_desc[:length]
         
@@ -613,3 +645,483 @@ class USBIPServer:
         reply[12:16] = cmd[12:16] # copy address
         reply[16:] = data
         return reply
+
+
+JOYCON_REPORT_DESC = bytes.fromhex(
+    "05010905a1010601ff8521092175089531810285300930750895318102853109"
+    "317508966901810285320932750896690181028533093375089669018102853f"
+    "0509190129101500250175019510810205010939150025077504950181420509"
+    "7504950181010501093009310933093416000027ffff00007510950481020601"
+    "ff85010901750895319102851009107508953191028511091175089531910285"
+    "120912750895319102c0"
+)
+
+
+class USBIPJoyConServer(USBIPServer):
+    def __init__(self, device_type="L", host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
+        super().__init__(host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
+        self.device_type = device_type
+        self.product_id = 0x2006 if device_type == "L" else 0x2007
+        self._timer = 0
+        self._device_info_queried = False
+        self._vibration_enabled = False
+        self._imu_enabled = False
+        
+        # Subcommand reply queue
+        self.subcmd_reply_queue = queue.Queue(maxsize=4)
+        
+        # Default standard 50-byte input report (0x30)
+        self.last_state = bytearray(50)
+        self.last_state[0] = 0x30
+        self.last_state[2] = 0x9E if device_type == "L" else 0x8E
+        # Neutral sticks: left=2048 (0x800), right=2048 (0x800)
+        # Left stick (bytes 6-8):
+        self.last_state[6] = 0x00
+        self.last_state[7] = 0x08
+        self.last_state[8] = 0x80
+        # Right stick (bytes 9-11):
+        self.last_state[9] = 0x00
+        self.last_state[10] = 0x08
+        self.last_state[11] = 0x80
+
+    def start(self):
+        super().start()
+        self.in_thread.start()
+        
+    def update_state(self, state_bytes):
+        """JoyCon override: 不遞增 seq_num（由 EP1 IN 真正送出時遞增）"""
+        with self.lock:
+            self.last_state = bytearray(state_bytes)
+        try:
+            if self.input_queue.full():
+                self.input_queue.get_nowait()
+            self.input_queue.put_nowait(bytes(self.last_state))
+        except Exception:
+            pass
+            
+    def _get_device_desc(self):
+        path = f"/sys/devices/virtual/usbip/{self.bus_id}".encode('ascii')
+        busid_bytes = self.bus_id.encode('ascii')
+        devnum = self.devnum
+        return struct.pack(
+            "!256s32sIIIHHHBBBBBB",
+            path,
+            busid_bytes,
+            1,      # busnum
+            devnum, # devnum
+            3,      # speed = High Speed (480Mbps) -- bulk EP2 requires High Speed
+            0x057e, # idVendor = Nintendo
+            self.product_id, # idProduct
+            0x0200, # bcdDevice = 2.00
+            0x00,   # bDeviceClass
+            0x00,   # bDeviceSubClass
+            0x00,   # bDeviceProtocol
+            0x01,   # bConfigurationValue
+            0x01,   # bNumConfigurations
+            0x02    # bNumInterfaces (HID + WinUSB bulk)
+        )
+
+    def _send_devlist(self, sock):
+        reply_header = struct.pack("!HHI I", USBIP_VERSION, OP_REP_DEVLIST, 0, 1)
+        dev_desc = self._get_device_desc()
+        
+        # 2 Interfaces
+        iface0 = struct.pack("!BBBB", 0x03, 0x00, 0x00, 0x00) # Interface 0: HID
+        iface1 = struct.pack("!BBBB", 0xFF, 0x00, 0x00, 0x00) # Interface 1: Vendor Specific (WinUSB)
+        
+        sock.sendall(reply_header + dev_desc + iface0 + iface1)
+
+    def _handle_submit(self, sock, seqnum, devid, direction, ep, transfer_length, setup, out_data):
+        status = 0
+        actual_length = 0
+        reply_data = b""
+        
+        if ep == 0: # Control
+            reply_data = self._handle_control_request(setup, transfer_length)
+            actual_length = len(reply_data)
+        elif ep == 1: # HID
+            if direction == 1: # IN
+                # Defer IN URB to background thread to avoid blocking Socket recv
+                self.pending_in_urbs.put((sock, seqnum, devid, direction, ep))
+                return
+            else: # OUT
+                if len(out_data) > 0:
+                    self._handle_output_report(out_data)
+                    actual_length = len(out_data)
+                
+                # Immediate ACK for OUT without data payload
+                ret_header = struct.pack(
+                    "!IIIII i IIII 8s",
+                    USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
+                    0, 0, 0, b"\x00" * 8
+                )
+                with self.send_lock:
+                    sock.sendall(ret_header)
+                return
+        elif ep == 2: # WinUSB Bulk Interface
+            if direction == 1: # IN
+                try:
+                    reply_data = self.bulk_response_queue.get_nowait()
+                except queue.Empty:
+                    reply_data = b""
+                actual_length = len(reply_data)
+            else: # OUT
+                if len(out_data) > 0:
+                    self._handle_bulk_command(out_data)
+                    actual_length = len(out_data)
+        else:
+            status = -1
+            
+        ret_header = struct.pack(
+            "!IIIII i IIII 8s",
+            USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
+            0, 0, 0, b"\x00" * 8
+        )
+        
+        with self.send_lock:
+            if direction == 1 and actual_length > 0:
+                sock.sendall(ret_header + reply_data)
+            else:
+                sock.sendall(ret_header)
+
+    def _process_deferred_in_urb(self, sock, seqnum, devid, direction, ep):
+        status = 0
+        reply_data = b""
+        
+        if ep == 1:
+            try:
+                reply_data = self.subcmd_reply_queue.get_nowait()
+            except queue.Empty:
+                # 節流 input（限速 250Hz）
+                now = time.perf_counter()
+                elapsed = now - getattr(self, 'last_ep1_in_time', 0)
+                if elapsed < 0.004:
+                    time.sleep(0.004 - elapsed)
+                self.last_ep1_in_time = time.perf_counter()
+
+                try:
+                    reply_data = self.input_queue.get_nowait()
+                except queue.Empty:
+                    with self.lock:
+                        if self.last_state[0] == 0x30:
+                            self.last_state[1] = self.seq_num & 0xff
+                            self.seq_num += 1
+                        reply_data = bytes(self.last_state)
+        else:
+            status = -1
+            
+        actual_length = len(reply_data)
+        ret_header = struct.pack(
+            "!IIIII i IIII 8s",
+            USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
+            0, 0, 0, b"\x00" * 8
+        )
+        
+        try:
+            with self.send_lock:
+                sock.sendall(ret_header + reply_data)
+        except Exception:
+            pass
+
+    def _handle_control_request(self, setup, transfer_length):
+        req_type, request, value, index, length = struct.unpack("<BBHHH", setup)
+        logger.info(f"Joy-Con Control Request: req_type={req_type:#04x}, req={request:#04x}, value={value:#06x}, index={index:#06x}, len={length}")
+        
+        # Standard Device-to-Host Get Descriptor
+        if req_type == 0x80 and request == 0x06:
+            desc_type = value >> 8
+            desc_idx = value & 0xff
+            
+            if desc_type == 0x01: # Device Descriptor
+                desc = struct.pack(
+                    "<BBHBBBBHHHBBBB",
+                    18,     # bLength
+                    1,      # bDescriptorType = Device
+                    0x0200, # bcdUSB = USB 2.0
+                    0x00,   # bDeviceClass
+                    0x00,   # bDeviceSubClass
+                    0x00,   # bDeviceProtocol
+                    0x40,   # bMaxPacketSize0 = 64 bytes
+                    0x057e, # idVendor = Nintendo
+                    self.product_id, # idProduct
+                    0x0200, # bcdDevice = 2.00
+                    1,      # iManufacturer
+                    2,      # iProduct
+                    3,      # iSerialNumber
+                    1       # bNumConfigurations
+                )
+                return desc[:length]
+                
+            elif desc_type == 0x02: # Config Descriptor (HID + WinUSB Bulk)
+                iface0 = struct.pack("<BBBBBBBBB",
+                    9, 4,       # bLength, bDescriptorType=Interface
+                    0,          # bInterfaceNumber
+                    0,          # bAlternateSetting
+                    2,          # bNumEndpoints
+                    0x03,       # bInterfaceClass = HID
+                    0x00,       # bInterfaceSubClass (0=no boot)
+                    0x00,       # bInterfaceProtocol (0=none)
+                    0           # iInterface
+                )
+                hid = struct.pack("<BBHBBBH",
+                    9,      # bLength
+                    0x21,   # bDescriptorType = HID
+                    0x0111, # bcdHID = 1.11
+                    0x00,   # bCountryCode
+                    1,      # bNumDescriptors
+                    0x22,   # bDescriptorType = Report
+                    len(JOYCON_REPORT_DESC) # wDescriptorLength
+                )
+                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 8)  # Interrupt IN
+                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 8)  # Interrupt OUT
+                
+                # Interface 1: Vendor Specific (WinUSB Bulk)
+                iface1 = struct.pack("<BBBBBBBBB",
+                    9, 4,       # bLength, bDescriptorType=Interface
+                    1,          # bInterfaceNumber
+                    0,          # bAlternateSetting
+                    2,          # bNumEndpoints
+                    0xFF,       # bInterfaceClass = Vendor Specific
+                    0x00,       # bInterfaceSubClass
+                    0x00,       # bInterfaceProtocol
+                    0           # iInterface
+                )
+                ep2_in  = struct.pack("<BBBBHB", 7, 5, 0x82, 0x02, 512, 0)  # Bulk IN
+                ep2_out = struct.pack("<BBBBHB", 7, 5, 0x02, 0x02, 512, 0)  # Bulk OUT
+                
+                interfaces = iface0 + hid + ep1_in + ep1_out + iface1 + ep2_in + ep2_out
+                total_len = 9 + len(interfaces)
+                
+                cfg = struct.pack("<BBHBBBBB",
+                    9,          # bLength
+                    2,          # bDescriptorType = Configuration
+                    total_len,  # wTotalLength
+                    2,          # bNumInterfaces (HID + WinUSB)
+                    1,          # bConfigurationValue
+                    0,          # iConfiguration
+                    0xA0,       # bmAttributes
+                    250         # bMaxPower
+                )
+                desc = cfg + interfaces
+                return desc[:length]
+                
+            elif desc_type == 0x03: # String Descriptor
+                if desc_idx == 0: # Supported Languages
+                    desc = struct.pack("<BBH", 4, 3, 0x0409)
+                elif desc_idx == 1: # iManufacturer
+                    s = "Nintendo Co., Ltd.".encode("utf-16le")
+                    desc = struct.pack("<BB", 2 + len(s), 3) + s
+                elif desc_idx == 2: # iProduct
+                    name = "Joy-Con (L)" if self.device_type == "L" else "Joy-Con (R)"
+                    s = name.encode("utf-16le")
+                    desc = struct.pack("<BB", 2 + len(s), 3) + s
+                elif desc_idx == 3: # iSerialNumber
+                    serial_str = f"JOYCON_{self.device_type}_{self.bus_id}"
+                    s = serial_str.encode("utf-16le")
+                    desc = struct.pack("<BB", 2 + len(s), 3) + s
+                elif desc_idx == 0xEE: # MSFT100 OS String Descriptor (enables MS OS Descriptors)
+                    # Must be exactly 18 bytes
+                    s = "MSFT100".encode("utf-16le")  # 14 bytes
+                    desc = struct.pack("<BB", 18, 3) + s + bytes([0xcd, 0x00])  # bVendorCode=0xcd, bPad=0
+                    logger.info("  -> Joy-Con MSFT100 OS String Descriptor")
+                else:
+                    desc = b""
+                return desc[:length]
+            
+            elif desc_type == 0x22: # HID Report Descriptor
+                return JOYCON_REPORT_DESC[:length]
+        
+        if req_type == 0x81 and request == 0x06:
+            desc_type = value >> 8
+            if desc_type == 0x22: # HID Report Descriptor
+                return JOYCON_REPORT_DESC[:length]
+                
+        if request == 0x00 and req_type in (0x80, 0x81, 0x82):
+            return struct.pack("<H", 0x0001)[:length]
+            
+        if req_type in (0x00, 0x01, 0x21) and request in (0x09, 0x0a, 0x0b):
+            return b""
+
+        # Vendor-specific MS OS Descriptors (device-to-host) — enables WinUSB for Interface 1
+        if (req_type & 0x40) == 0x40 and request == 0xcd:
+            if index == 0x0004: # Extended Compat ID Descriptor -> WINUSB for Interface 1
+                header  = struct.pack("<IHHB7s", 40, 0x0100, 4, 1, b"\x00" * 7)
+                section = struct.pack("<BB8s8s6s", 1, 1, b"WINUSB\x00\x00", b"\x00" * 8, b"\x00" * 6)
+                result  = (header + section)[:length]
+                logger.info(f"  -> Joy-Con MS OS ExtCompatID Descriptor ({len(result)} bytes)")
+                return result
+            elif index == 0x0005: # Extended Properties Descriptor -> DeviceInterfaceGUID
+                prop_name = "DeviceInterfaceGUID".encode("utf-16le") + b"\x00\x00"
+                prop_data = "{6F13725E-EF0E-4FD3-AE5F-B2DE989EC825}".encode("utf-16le") + b"\x00\x00"
+                prop_size  = 4 + 4 + 2 + len(prop_name) + 4 + len(prop_data)
+                total_size = 10 + prop_size
+                header = struct.pack("<IHHH", total_size, 0x0100, 5, 1)
+                prop   = struct.pack("<IIH", prop_size, 1, len(prop_name)) + prop_name + struct.pack("<I", len(prop_data)) + prop_data
+                result = (header + prop)[:length]
+                logger.info(f"  -> Joy-Con MS OS ExtProperties Descriptor ({len(result)} bytes)")
+                return result
+
+        logger.warning(f"Joy-Con Control Request UNHANDLED: req_type={req_type:#04x}, req={request:#04x}")
+        return b""
+
+    def _handle_bulk_command(self, cmd):
+        """Override: simple ACK for all WinUSB Bulk OUT commands on Interface 1.
+        Joy-Con does not use the Switch2 Bulk protocol — return a generic ACK.
+        """
+        logger.info(f"Joy-Con Bulk CMD: {cmd[:min(len(cmd), 16)].hex()}")
+        reply = bytearray(8)
+        if len(cmd) > 0: reply[0] = cmd[0]
+        reply[1] = 0x01
+        if len(cmd) > 2: reply[2] = cmd[2]
+        if len(cmd) > 3: reply[3] = cmd[3]
+        if len(cmd) > 4: reply[4] = cmd[4]
+        reply[5] = 0xf8
+        self.bulk_response_queue.put(bytes(reply))
+
+    def _build_subcommand_reply(self, subcmd, ack=0x80, reply_data=None):
+        r = bytearray(50)
+        r[0] = 0x21
+        self._timer = (self._timer + 1) & 0xFF
+        r[1] = self._timer
+        r[2] = 0x9E if self.device_type == "L" else 0x8E
+        
+        # Buttons
+        r[3] = 0x00; r[4] = 0x00; r[5] = 0x00
+        
+        # Sticks neutral calibration
+        r[6] = 0x00; r[7] = 0x08; r[8] = 0x80
+        r[9] = 0x79; r[10] = 0xD7; r[11] = 0x7E
+        
+        r[12] = 0x00
+        r[13] = ack
+        r[14] = subcmd
+        if reply_data:
+            for i, b in enumerate(reply_data):
+                if 15 + i < 50:
+                    r[15 + i] = b
+        return bytes(r)
+
+    def _handle_output_report(self, data):
+        logger.info(f"Joy-Con Output Report: len={len(data)}, data={data.hex()}")
+        if len(data) < 2:
+            return
+        report_id = data[0]
+        if report_id == 0x01 and len(data) >= 11:
+            if self.on_rumble_callback:
+                self.on_rumble_callback(data)
+            subcmd = data[10]
+            self._dispatch_subcommand(subcmd, data)
+        elif report_id == 0x10:
+            if self.on_rumble_callback:
+                self.on_rumble_callback(data)
+
+    def _dispatch_subcommand(self, subcmd, data):
+        reply = None
+        if subcmd == 0x00:
+            reply = self._build_subcommand_reply(0x00)
+        elif subcmd == 0x01:
+            reply = self._build_subcommand_reply(0x01)
+        elif subcmd == 0x02:
+            self._device_info_queried = True
+            info = [
+                0x03, 0x8B,
+                0x01 if self.device_type == "L" else 0x02,
+                0x02,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x01,
+                0x01,
+            ]
+            reply = self._build_subcommand_reply(0x02, ack=0x82, reply_data=info)
+        elif subcmd == 0x03:
+            reply = self._build_subcommand_reply(0x03)
+        elif subcmd == 0x04:
+            reply = self._build_subcommand_reply(0x04, ack=0x83)
+        elif subcmd == 0x08:
+            reply = self._build_subcommand_reply(0x08)
+        elif subcmd == 0x10:
+            reply = self._handle_spi_read(data)
+        elif subcmd == 0x21:
+            nfc_reply = [0x01, 0x00, 0xFF, 0x00, 0x08, 0x00, 0x1B, 0x01]
+            r = self._build_subcommand_reply(0x21, ack=0xA0, reply_data=nfc_reply)
+            r[49] = 0xC8
+            reply = r
+        elif subcmd == 0x22:
+            reply = self._build_subcommand_reply(0x22)
+        elif subcmd == 0x30:
+            reply = self._build_subcommand_reply(0x30)
+        elif subcmd == 0x40:
+            self._imu_enabled = (len(data) > 11 and data[11] == 0x01)
+            reply = self._build_subcommand_reply(0x40)
+        elif subcmd == 0x41:
+            reply = self._build_subcommand_reply(0x41)
+        elif subcmd == 0x42:
+            reply = self._build_subcommand_reply(0x42)
+        elif subcmd == 0x43:
+            reply = self._build_subcommand_reply(0x43)
+        elif subcmd == 0x48:
+            self._vibration_enabled = (len(data) > 11 and data[11] == 0x01)
+            reply = self._build_subcommand_reply(0x48, ack=0x82)
+        else:
+            reply = self._build_subcommand_reply(subcmd)
+
+        if reply:
+            logger.info(f"Joy-Con Subcommand REPLY: subcmd={subcmd:#04x}, data={reply.hex()}")
+            if self.subcmd_reply_queue.full():
+                try: self.subcmd_reply_queue.get_nowait()
+                except queue.Empty: pass
+            try: self.subcmd_reply_queue.put_nowait(reply)
+            except queue.Full: pass
+
+    def _handle_spi_read(self, data):
+        if len(data) < 16:
+            return self._build_subcommand_reply(0x10, ack=0x90)
+        addr = data[11] | (data[12] << 8)
+        length = data[15]
+        reply_data = [data[11], data[12], 0x00, 0x00, length]
+        spi = [0xFF] * length
+        if addr == 0x6050:
+            spi = ([0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])[:length]
+        elif addr == 0x6080:
+            val = 0xF1 if self.device_type == "L" else 0x0F
+            left_factory = [0xFF, 0xF7, 0x7F, 0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F]
+            magic = [0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63]
+            right_factory = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
+            magic2 = [0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63]
+            spi = ([0x5E, 0x01, 0x00, 0x00, val, 0x0F if self.device_type == "L" else 0xF0] +
+                    left_factory + magic + right_factory + magic2)[:length]
+        elif addr == 0x6098:
+            right_factory = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
+            spi = (right_factory + [0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63])[:length]
+        elif addr == 0x603D:
+            if self.device_type == "L":
+                l_cal = [0xFF, 0xF7, 0x7F, 0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F]
+                r_cal = [0xFF] * 9
+            else:
+                l_cal = [0xFF] * 9
+                r_cal = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
+            extra = [0xFF, 0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF]
+            spi = (l_cal + r_cal + extra)[:length]
+        elif addr == 0x6046:
+            r_cal = [0x00, 0x08, 0x80, 0xFF, 0xF7, 0x7F, 0xFF, 0xF7, 0x7F]
+            extra = [0xFF, 0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF]
+            spi = (r_cal + extra)[:length]
+        elif addr == 0x6020:
+            spi = ([0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01,
+                    0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
+                    0x19, 0x00, 0xDD, 0xFF, 0xDC, 0xFF,
+                    0x3B, 0x34, 0x3B, 0x34, 0x3B, 0x34])[:length]
+        elif addr == 0x8010:
+            spi = [0xFF] * length
+        reply_data += spi
+        return self._build_subcommand_reply(0x10, ack=0x90, reply_data=reply_data)
+
+
+class USBIPJoyConLServer(USBIPJoyConServer):
+    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
+        super().__init__(device_type="L", host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
+
+
+class USBIPJoyConRServer(USBIPJoyConServer):
+    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
+        super().__init__(device_type="R", host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
+
