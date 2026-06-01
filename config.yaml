@@ -1,9 +1,9 @@
 abxy_mode: Xbox
 auto_disconnect_days: 0
-auto_disconnect_enabled: true
+auto_disconnect_enabled: false
 auto_disconnect_hours: 0
-auto_disconnect_minutes: 1
-auto_disconnect_mode: Inactive
+auto_disconnect_minutes: 0
+auto_disconnect_mode: 'OFF'
 button_remaps:
   ps4:
     abxy_mode: Xbox
@@ -162,7 +162,7 @@ stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
-usbip_sim_mode: Switch2
+usbip_sim_mode: Switch1
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_switch: 5
