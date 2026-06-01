@@ -216,8 +216,12 @@ class ControllerInputData:
             self.battery_voltage = 3.7
             self.battery_current = 0.0
             self.temperature = 25.0
-            self.accelerometer = (0, 0, 0)
-            self.gyroscope = (0, 0, 0)
+            if len(data) >= 27:
+                self.accelerometer = (decodes(data[15:17]), decodes(data[17:19]), decodes(data[19:21]))
+                self.gyroscope = (decodes(data[21:23]), decodes(data[23:25]), decodes(data[25:27]))
+            else:
+                self.accelerometer = (0, 0, 0)
+                self.gyroscope = (0, 0, 0)
         else:
             self.time = decodeu(data[0:4])
             self.buttons = decodeu(data[4:8])
@@ -593,7 +597,10 @@ class Controller:
             
             if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
                 logger.info(f"Enabling GameCube Haptics for {self.device.address}")
-                await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
+                try:
+                    await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
+                except Exception as e:
+                    logger.warning(f"Failed to enable GameCube Haptics: {e}")
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
@@ -610,11 +617,19 @@ class Controller:
                 self.mag_bias = tuple(mag_cal_data[addr])
                 logger.info(f"Loaded per-device mag calibration for {addr}")
                 
-            self.stick_calibration, self.second_stick_calibration = await self.read_calibration_data()
+            try:
+                self.stick_calibration, self.second_stick_calibration = await self.read_calibration_data()
+            except Exception as e:
+                logger.warning(f"Failed to read calibration data: {e}")
+                self.stick_calibration, self.second_stick_calibration = None, None
 
             await self.enable_input_notify_callback()
             
-            await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
+            if self.controller_info.product_id != NSO_GAMECUBE_CONTROLLER_PID:
+                try:
+                    await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
+                except Exception as e:
+                    logger.warning(f"Failed to enable features: {e}")
 
             self.interp_running = True
             self.interp_thread = threading.Thread(target=self._interpolation_thread_loop, daemon=True)
