@@ -9,6 +9,7 @@ button_remaps:
     abxy_mode: Xbox
     c_mapping: Calibration
     capt_mapping: Default
+    gc_trigger_mode: 100% at Max
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
@@ -28,6 +29,7 @@ button_remaps:
     abxy_mode: Xbox
     c_mapping: Default
     capt_mapping: Default
+    gc_trigger_mode: 100% at Max
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
@@ -47,6 +49,7 @@ button_remaps:
     abxy_mode: Switch
     c_mapping: Calibration
     capt_mapping: Default
+    gc_trigger_mode: 100% at Bump
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
@@ -65,6 +68,7 @@ button_remaps:
     abxy_mode: Switch
     c_mapping: Default
     capt_mapping: Default
+    gc_trigger_mode: 100% at Bump
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
@@ -84,6 +88,7 @@ button_remaps:
     abxy_mode: Xbox
     c_mapping: Calibration
     capt_mapping: Default
+    gc_trigger_mode: 100% at Max
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
@@ -116,6 +121,8 @@ calibration_data:
 capt_mapping: Default
 driver_installed: false
 driver_type: WinUHid
+gc_trigger_calibration_data: {}
+gc_trigger_mode: 100% at Max
 gl_mapping: PS_L_Touch
 gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
@@ -163,6 +170,6 @@ vibration_strength_xbox: 5
 vigembus_installed: true
 vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
-window_height: 1080
+window_height: 1140
 window_width: 1240
 winuhid_sim_mode: PS5
