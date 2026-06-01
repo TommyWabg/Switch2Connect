@@ -26,7 +26,7 @@ import threading
 import ctypes
 import logging
 import gc
-from controller import Controller, ControllerInputData, VibrationData
+from controller import Controller, ControllerInputData, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
 from utils import USBIPAllocator
@@ -1317,8 +1317,12 @@ class VirtualController:
         self.was_touching = touch_0_down or touch_1_down
 
         # 4. Triggers
-        report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
-        report.RightTrigger = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+        if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            report.LeftTrigger = inputData.left_trigger
+            report.RightTrigger = inputData.right_trigger
+        else:
+            report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+            report.RightTrigger = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
 
         # 5. Joysticks Routing
         if not hasattr(self, 'last_lx'):
@@ -1465,8 +1469,12 @@ class VirtualController:
             if buttons & SWITCH_BUTTONS["L"]: xb_btns |= XB_BUTTONS["LB"]
             if buttons & SWITCH_BUTTONS["R"]: xb_btns |= XB_BUTTONS["RB"]
             
-            lt = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
-            rt = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+            if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                lt = inputData.left_trigger
+                rt = inputData.right_trigger
+            else:
+                lt = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+                rt = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
             
             if buttons & SWITCH_BUTTONS["MINUS"]: xb_btns |= XB_BUTTONS["BACK"]
             if buttons & SWITCH_BUTTONS["PLUS"]: xb_btns |= XB_BUTTONS["START"]

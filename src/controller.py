@@ -62,6 +62,8 @@ COMMAND_LEDS = 0x09
 SUBCOMMAND_LEDS_SET_PLAYER = 0x07
 COMMAND_VIBRATION = 0x0A
 SUBCOMMAND_VIBRATION_PLAY_PRESET = 0x02
+COMMAND_HAPTICS_INIT = 0x03
+SUBCOMMAND_HAPTICS_ENABLE = 0x0A
 COMMAND_MEMORY = 0x02
 SUBCOMMAND_MEMORY_READ = 0x04
 COMMAND_PAIR = 0x15
@@ -143,22 +145,93 @@ class ControllerInputData:
     temperature: float
     accelerometer: tuple[int, int, int]
     gyroscope: tuple[int, int, int]
+    left_trigger: int = 0
+    right_trigger: int = 0
+    left_trigger_raw: int = 0
+    right_trigger_raw: int = 0
 
-    def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData, right_stick_calibration: StickCalibrationData):
+    def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData, right_stick_calibration: StickCalibrationData, product_id: int = 0, gc_trigger_calib: list = None):
         self.raw_data = data
-        self.time = decodeu(data[0:4])
-        self.buttons = decodeu(data[4:8])
-        self.left_stick = get_stick_xy(data[10:13])
-        self.right_stick = get_stick_xy(data[13:16])
-        self.mouse_coords = decodeu(data[16:18]), decodeu(data[18:20])
-        self.mouse_roughness = decodeu(data[20:22])
-        self.mouse_distance = decodeu(data[22:24])
-        self.magnometer = decodes(data[25:27]), decodes(data[27:29]), decodes(data[29:31])
-        self.battery_voltage = decodeu(data[31:33]) / 1000.0
-        self.battery_current = decodeu(data[33:35]) / 100.0
-        self.temperature = 25 + decodeu(data[46:48]) / 127.0
-        self.accelerometer = decodes(data[48:50]), decodes(data[50:52]), decodes(data[52:54])
-        self.gyroscope = decodes(data[54:56]), decodes(data[56:58]), decodes(data[58:60])
+        
+        if product_id == NSO_GAMECUBE_CONTROLLER_PID:
+            self.time = data[0]
+            
+            b1 = data[2]
+            b2 = data[3]
+            b3 = data[4]
+            
+            buttons_val = 0
+            if b1 & 0x01: buttons_val |= 0x00000004 # B
+            if b1 & 0x02: buttons_val |= 0x00000008 # A
+            if b1 & 0x04: buttons_val |= 0x00000001 # Y
+            if b1 & 0x08: buttons_val |= 0x00000002 # X
+            if b1 & 0x10: buttons_val |= 0x00000040 # R
+            if b1 & 0x20: buttons_val |= 0x00000080 # Z -> ZR
+            if b1 & 0x40: buttons_val |= 0x00000200 # Start -> PLUS
+            
+            if b2 & 0x01: buttons_val |= 0x00010000 # D-Down
+            if b2 & 0x02: buttons_val |= 0x00040000 # D-Right
+            if b2 & 0x04: buttons_val |= 0x00080000 # D-Left
+            if b2 & 0x08: buttons_val |= 0x00020000 # D-Up
+            if b2 & 0x10: buttons_val |= 0x00400000 # L
+            if b2 & 0x20: buttons_val |= 0x00800000 # ZL
+            
+            if b3 & 0x01: buttons_val |= 0x00001000 # Home
+            if b3 & 0x02: buttons_val |= 0x00002000 # Capture
+            
+            self.buttons = buttons_val
+            
+            self.left_stick = get_stick_xy(data[5:8])
+            self.right_stick = get_stick_xy(data[8:11])
+            
+            if not gc_trigger_calib or len(gc_trigger_calib) < 6:
+                if gc_trigger_calib and len(gc_trigger_calib) == 4:
+                    # Upgrade from 4 to 6: min, max -> min, max, max
+                    gc_trigger_calib = [gc_trigger_calib[0], gc_trigger_calib[1], gc_trigger_calib[1], gc_trigger_calib[2], gc_trigger_calib[3], gc_trigger_calib[3]]
+                else:
+                    gc_trigger_calib = [36, 190, 240, 36, 190, 240]
+            
+            mode = getattr(CONFIG, 'gc_trigger_mode', '100% at Bump')
+            l_max = gc_trigger_calib[1] if mode == '100% at Bump' else gc_trigger_calib[2]
+            r_max = gc_trigger_calib[4] if mode == '100% at Bump' else gc_trigger_calib[5]
+                
+            def remap_trigger_value(value: int, min_in: int, max_in: int) -> int:
+                min_out, max_out = 0, 255
+                clamped_value = max(min_in, min(value, max_in))
+                if max_in > min_in:
+                    percentage = (clamped_value - min_in) / (max_in - min_in)
+                else:
+                    percentage = 0.0
+                return int(percentage * (max_out - min_out)) + min_out
+                
+            self.left_trigger_raw = data[12] if len(data) > 12 else 0
+            self.right_trigger_raw = data[13] if len(data) > 13 else 0
+            self.left_trigger = remap_trigger_value(self.left_trigger_raw, gc_trigger_calib[0], l_max)
+            self.right_trigger = remap_trigger_value(self.right_trigger_raw, gc_trigger_calib[3], r_max)
+            
+            self.mouse_coords = (0, 0)
+            self.mouse_roughness = 0
+            self.mouse_distance = 0
+            self.magnometer = (0, 0, 0)
+            self.battery_voltage = 3.7
+            self.battery_current = 0.0
+            self.temperature = 25.0
+            self.accelerometer = (0, 0, 0)
+            self.gyroscope = (0, 0, 0)
+        else:
+            self.time = decodeu(data[0:4])
+            self.buttons = decodeu(data[4:8])
+            self.left_stick = get_stick_xy(data[10:13])
+            self.right_stick = get_stick_xy(data[13:16])
+            self.mouse_coords = decodeu(data[16:18]), decodeu(data[18:20])
+            self.mouse_roughness = decodeu(data[20:22])
+            self.mouse_distance = decodeu(data[22:24])
+            self.magnometer = decodes(data[25:27]), decodes(data[27:29]), decodes(data[29:31])
+            self.battery_voltage = decodeu(data[31:33]) / 1000.0
+            self.battery_current = decodeu(data[33:35]) / 100.0
+            self.temperature = 25 + decodeu(data[46:48]) / 127.0
+            self.accelerometer = decodes(data[48:50]), decodes(data[50:52]), decodes(data[52:54])
+            self.gyroscope = decodes(data[54:56]), decodes(data[56:58]), decodes(data[58:60])
 
         if left_stick_calibration:
             self.left_stick = left_stick_calibration.apply_calibration(self.left_stick)
@@ -517,6 +590,10 @@ class Controller:
                     await asyncio.sleep(2.0)
 
             self.controller_info = await self.read_controller_info()
+            
+            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
+                logger.info(f"Enabling GameCube Haptics for {self.device.address}")
+                await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
@@ -881,13 +958,30 @@ class Controller:
                 self._packet_count += 1
                 logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} first packet {self._packet_count}: {to_hex(data[3:6])}")
                 
-            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration)
+            gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
+            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
             
-            # Reset inactivity timer if there is physical input (buttons or sticks outside 20% deadzone)
-            if (inputData.buttons & 0x03FFFFFF) != 0 or \
-               abs(inputData.left_stick[0]) > 0.2 or abs(inputData.left_stick[1]) > 0.2 or \
-               abs(inputData.right_stick[0]) > 0.2 or abs(inputData.right_stick[1]) > 0.2:
+            # Reset inactivity timer if there is physical input change
+            current_buttons = inputData.buttons & 0x03FFFFFF
+            if not hasattr(self, '_prev_idle_buttons'):
+                self._prev_idle_buttons = current_buttons
+                self._prev_idle_lx = inputData.left_stick[0]
+                self._prev_idle_ly = inputData.left_stick[1]
+                self._prev_idle_rx = inputData.right_stick[0]
+                self._prev_idle_ry = inputData.right_stick[1]
                 self.last_input_time = time.time()
+            elif current_buttons != self._prev_idle_buttons or \
+                 abs(inputData.left_stick[0] - self._prev_idle_lx) > 0.05 or \
+                 abs(inputData.left_stick[1] - self._prev_idle_ly) > 0.05 or \
+                 abs(inputData.right_stick[0] - self._prev_idle_rx) > 0.05 or \
+                 abs(inputData.right_stick[1] - self._prev_idle_ry) > 0.05:
+                
+                self.last_input_time = time.time()
+                self._prev_idle_buttons = current_buttons
+                self._prev_idle_lx = inputData.left_stick[0]
+                self._prev_idle_ly = inputData.left_stick[1]
+                self._prev_idle_rx = inputData.right_stick[0]
+                self._prev_idle_ry = inputData.right_stick[1]
 
             self.battery_voltage = inputData.battery_voltage
             self.last_accel = inputData.accelerometer
