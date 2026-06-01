@@ -10,7 +10,7 @@ import logging
 import asyncio
 import os
 import ctypes
-from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID
+from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
 from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, get_driver_path
 from virtual_controller import VirtualController
@@ -459,6 +459,8 @@ class PlayerInfoBlock:
             image = self.joycon2right_sideway if self.current_vc.hold_mode == "Horizontal" else self.joycon2right_vertical
         elif self.current_vc.is_single_joycon_left():
             image = self.joycon2left_sideway if self.current_vc.hold_mode == "Horizontal" else self.joycon2left_vertical
+        elif len(self.current_vc.controllers) > 0 and getattr(self.current_vc.controllers[0].controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            image = self.gamecubecontroller
         else:
             image = self.procontroller2
         if image:
@@ -598,6 +600,7 @@ class PlayerInfoBlock:
             self.joycon2right_vertical = self.joycon2right_sideway
             self.joycon2left_vertical = self.joycon2left_sideway
         self.procontroller2 = load_img("images/procontroller2.png")
+        self.gamecubecontroller = load_img("images/nsogamecubecontroller.png")
         
         bat_w, bat_h = int(28 * sf), int(14 * sf)
         self.battery_h = load_img("images/battery_h.png", bat_w, bat_h)
