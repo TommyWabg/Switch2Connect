@@ -147,8 +147,10 @@ class ControllerInputData:
     gyroscope: tuple[int, int, int]
     left_trigger: int = 0
     right_trigger: int = 0
+    left_trigger_raw: int = 0
+    right_trigger_raw: int = 0
 
-    def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData, right_stick_calibration: StickCalibrationData, product_id: int = 0):
+    def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData, right_stick_calibration: StickCalibrationData, product_id: int = 0, gc_trigger_calib: list = None):
         self.raw_data = data
         
         if product_id == NSO_GAMECUBE_CONTROLLER_PID:
@@ -182,15 +184,30 @@ class ControllerInputData:
             self.left_stick = get_stick_xy(data[5:8])
             self.right_stick = get_stick_xy(data[8:11])
             
-            def remap_trigger_value(value: int) -> int:
-                min_in, max_in = 36, 240
+            if not gc_trigger_calib or len(gc_trigger_calib) < 6:
+                if gc_trigger_calib and len(gc_trigger_calib) == 4:
+                    # Upgrade from 4 to 6: min, max -> min, max, max
+                    gc_trigger_calib = [gc_trigger_calib[0], gc_trigger_calib[1], gc_trigger_calib[1], gc_trigger_calib[2], gc_trigger_calib[3], gc_trigger_calib[3]]
+                else:
+                    gc_trigger_calib = [36, 190, 240, 36, 190, 240]
+            
+            mode = getattr(CONFIG, 'gc_trigger_mode', '100% at Bump')
+            l_max = gc_trigger_calib[1] if mode == '100% at Bump' else gc_trigger_calib[2]
+            r_max = gc_trigger_calib[4] if mode == '100% at Bump' else gc_trigger_calib[5]
+                
+            def remap_trigger_value(value: int, min_in: int, max_in: int) -> int:
                 min_out, max_out = 0, 255
                 clamped_value = max(min_in, min(value, max_in))
-                percentage = (clamped_value - min_in) / (max_in - min_in)
+                if max_in > min_in:
+                    percentage = (clamped_value - min_in) / (max_in - min_in)
+                else:
+                    percentage = 0.0
                 return int(percentage * (max_out - min_out)) + min_out
                 
-            self.left_trigger = remap_trigger_value(data[12]) if len(data) > 12 else 0
-            self.right_trigger = remap_trigger_value(data[13]) if len(data) > 13 else 0
+            self.left_trigger_raw = data[12] if len(data) > 12 else 0
+            self.right_trigger_raw = data[13] if len(data) > 13 else 0
+            self.left_trigger = remap_trigger_value(self.left_trigger_raw, gc_trigger_calib[0], l_max)
+            self.right_trigger = remap_trigger_value(self.right_trigger_raw, gc_trigger_calib[3], r_max)
             
             self.mouse_coords = (0, 0)
             self.mouse_roughness = 0
@@ -941,7 +958,8 @@ class Controller:
                 self._packet_count += 1
                 logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} first packet {self._packet_count}: {to_hex(data[3:6])}")
                 
-            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0))
+            gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
+            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
             
             # Reset inactivity timer if there is physical input (buttons or sticks outside 20% deadzone)
             if (inputData.buttons & 0x03FFFFFF) != 0 or \

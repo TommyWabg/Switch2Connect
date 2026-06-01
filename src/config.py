@@ -261,7 +261,8 @@ class Config:
             "rumble_mode": "Xbox",
             "vibration_strength_xbox": 5,
             "vibration_strength_switch": 5,
-            "vibration_frequency": 10
+            "vibration_frequency": 10,
+            "gc_trigger_mode": "100% at Bump"
         }
         
         # Populate each category, falling back to top-level key or default
@@ -311,6 +312,7 @@ class Config:
         # MAC address -> Calibration data mapping dictionary
         self.calibration_data = config.get("calibration_data", {}) or {}
         self.mag_calibration_data = config.get("mag_calibration_data", {}) or {}
+        self.gc_trigger_calibration_data = config.get("gc_trigger_calibration_data", {}) or {}
         self.merged_gyro_side = config.get("merged_gyro_side", {}) or {}
         
         self.open_when_startup = config.get("open_when_startup", False)
@@ -429,6 +431,8 @@ class Config:
             'stick_r_bias': self.stick_r_bias,
             'calibration_data': self.calibration_data,
             'mag_calibration_data': self.mag_calibration_data,
+            'gc_trigger_calibration_data': self.gc_trigger_calibration_data,
+            'gc_trigger_mode': self.gc_trigger_mode,
             'joycon_hold_mode': self.joycon_hold_mode,
             'merged_gyro_side': self.merged_gyro_side,
             'button_remaps': self.button_remaps,
@@ -644,6 +648,17 @@ class Config:
                 self._auto_disconnect_mode = "Absolute"
         else:
             self._auto_disconnect_mode = "OFF"
+            
+    @property
+    def gc_trigger_mode(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("gc_trigger_mode", "100% at Bump")
+        
+    @gc_trigger_mode.setter
+    def gc_trigger_mode(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["gc_trigger_mode"] = val
     
 CONFIG = Config(get_resource("config.yaml"))
 

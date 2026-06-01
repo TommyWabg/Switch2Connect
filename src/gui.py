@@ -881,6 +881,101 @@ class CalibrationOverlay:
             self.window.destroy()
         self.window = None
 
+class GCTriggerCalibrationWizard:
+    def __init__(self, root, gc_controller):
+        self.root = root
+        self.gc_controller = gc_controller
+        self.window = tk.Toplevel(root)
+        self.window.title("GameCube Trigger Calibration")
+        w, h = int(450 * scaling_factor), int(180 * scaling_factor)
+        self.window.geometry(f"{w}x{h}")
+        self.window.attributes("-topmost", True)
+        self.window.configure(bg=background_color)
+        
+        self.step = 0
+        self.min_l = 36
+        self.bump_l = 190
+        self.max_l = 240
+        self.min_r = 36
+        self.bump_r = 190
+        self.max_r = 240
+
+        self.title_label = tk.Label(self.window, text="Step 1: Base State", font=scale_font(("Arial", 14, "bold")), bg=background_color, fg=highlight_color)
+        self.title_label.pack(pady=(int(10 * scaling_factor), 0))
+
+        self.desc_label = tk.Label(self.window, text="Release both triggers completely and wait a moment.\nThen click Next.", font=scale_font(("Arial", 11)), bg=background_color, fg="white", wraplength=int(400 * scaling_factor))
+        self.desc_label.pack(pady=int(10 * scaling_factor))
+
+        self.val_label = tk.Label(self.window, text="L: 0 | R: 0", font=scale_font(("Arial", 10)), bg=background_color, fg="#888888")
+        self.val_label.pack(pady=(0, int(10 * scaling_factor)))
+
+        self.btn_frame = tk.Frame(self.window, bg=background_color)
+        self.btn_frame.pack()
+
+        self.cancel_btn = tk.Button(self.btn_frame, text="Cancel", font=scale_font(("Arial", 10)), bg=button_gray, fg="white", bd=0, command=self.close)
+        self.cancel_btn.pack(side=tk.LEFT, padx=int(10 * scaling_factor))
+
+        self.next_btn = tk.Button(self.btn_frame, text="Next", font=scale_font(("Arial", 10, "bold")), bg=highlight_color, fg="black", bd=0, command=self.on_next)
+        self.next_btn.pack(side=tk.LEFT, padx=int(10 * scaling_factor))
+
+        self.update_loop()
+
+    def update_loop(self):
+        if not self.window.winfo_exists():
+            return
+        if hasattr(self.gc_controller, 'last_input_data') and self.gc_controller.last_input_data:
+            l = self.gc_controller.last_input_data.left_trigger_raw
+            r = self.gc_controller.last_input_data.right_trigger_raw
+            self.val_label.config(text=f"L: {l} | R: {r}")
+            
+            if self.step == 0:
+                self.min_l = l
+                self.min_r = r
+            elif self.step == 1:
+                if l > self.bump_l: self.bump_l = l
+            elif self.step == 2:
+                if l > self.max_l: self.max_l = l
+            elif self.step == 3:
+                if r > self.bump_r: self.bump_r = r
+            elif self.step == 4:
+                if r > self.max_r: self.max_r = r
+
+        self.root.after(50, self.update_loop)
+
+    def on_next(self):
+        if self.step == 0:
+            self.step = 1
+            self.title_label.config(text="Step 2: Left Trigger (Bump)")
+            self.desc_label.config(text="Press the LEFT trigger down just until you feel the click (bump).\nHold it there and click Next.")
+            self.bump_l = 0
+        elif self.step == 1:
+            self.step = 2
+            self.title_label.config(text="Step 3: Left Trigger (Max)")
+            self.desc_label.config(text="Fully press the LEFT trigger all the way down past the click.\nWhile holding it down, click Next.")
+            self.max_l = 0
+        elif self.step == 2:
+            self.step = 3
+            self.title_label.config(text="Step 4: Right Trigger (Bump)")
+            self.desc_label.config(text="Press the RIGHT trigger down just until you feel the click (bump).\nHold it there and click Next.")
+            self.bump_r = 0
+        elif self.step == 3:
+            self.step = 4
+            self.title_label.config(text="Step 5: Right Trigger (Max)")
+            self.desc_label.config(text="Fully press the RIGHT trigger all the way down past the click.\nWhile holding it down, click Finish.")
+            self.max_r = 0
+            self.next_btn.config(text="Finish")
+        elif self.step == 4:
+            CONFIG.gc_trigger_calibration_data[self.gc_controller.device.address] = [self.min_l, self.bump_l, self.max_l, self.min_r, self.bump_r, self.max_r]
+            CONFIG.save_config()
+            logger.info(f"Saved GC Trigger Calibration for {self.gc_controller.device.address}: {CONFIG.gc_trigger_calibration_data[self.gc_controller.device.address]}")
+            from tkinter import messagebox
+            messagebox.showinfo("Success", "GameCube Trigger Calibration saved successfully!")
+            self.close()
+
+    def close(self):
+        if self.window and self.window.winfo_exists():
+            self.window.destroy()
+
 class ControllerWindow:
     def __init__(self):
         self.root = None
@@ -1611,7 +1706,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering size)
         default_w = 1240
-        default_h = 1080
+        default_h = 1140
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
@@ -2129,6 +2224,35 @@ class ControllerWindow:
             combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
             setattr(self, f"{key}_combo", combo)
 
+        row_gc = tk.Frame(self.settings_frame, bg=background_color); row_gc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
+        tk.Label(row_gc, text="GameCube Controller:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        
+        self.gc_trigger_calib_btn = tk.Button(row_gc, text="Trigger Calibration", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_gc_trigger_calib_clicked)
+        self.gc_trigger_calib_btn.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(10 * scaling_factor)))
+
+        tk.Label(row_gc, text="Trigger Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
+        self.gc_trigger_mode_combo = ttk.Combobox(row_gc, values=["100% at Bump", "100% at Max"], font=scale_font(("Arial", 12, "bold")), state="readonly", width=14, justify="center")
+        self.gc_trigger_mode_combo.set(getattr(CONFIG, "gc_trigger_mode", "100% at Bump"))
+        self.gc_trigger_mode_combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        self.gc_trigger_mode_combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
+
+    def on_gc_trigger_calib_clicked(self):
+        gc_controller = None
+        for vc in VIRTUAL_CONTROLLERS:
+            if vc and len(vc.controllers) > 0:
+                for c in vc.controllers:
+                    if getattr(c.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                        gc_controller = c
+                        break
+                if gc_controller:
+                    break
+        if not gc_controller:
+            from tkinter import messagebox
+            messagebox.showinfo("Not Found", "No NSO GameCube Controller is currently connected.")
+            return
+
+        GCTriggerCalibrationWizard(self.root, gc_controller)
+
     def update_driver_type_setting(self, val):
         # 1. 先讀檔
         CONFIG.load_config()
@@ -2294,6 +2418,8 @@ class ControllerWindow:
             combo = getattr(self, f"{key}_combo", None)
             if combo:
                 combo.set(getattr(CONFIG, f"{key}_mapping"))
+        if hasattr(self, 'gc_trigger_mode_combo'):
+            self.gc_trigger_mode_combo.set(CONFIG.gc_trigger_mode)
         if hasattr(self, 'layout_switch'):
             self.layout_switch.set_value(CONFIG.abxy_mode)
         if hasattr(self, 'rumble_mode_switch'):
@@ -2424,6 +2550,8 @@ class ControllerWindow:
         CONFIG.srl_mapping = self.srl_combo.get()
         CONFIG.slr_mapping = self.slr_combo.get()
         CONFIG.srr_mapping = self.srr_combo.get()
+        if hasattr(self, 'gc_trigger_mode_combo'):
+            CONFIG.gc_trigger_mode = self.gc_trigger_mode_combo.get()
         try:
             with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
             data['abxy_mode'] = CONFIG.abxy_mode  
@@ -2472,12 +2600,10 @@ class ControllerWindow:
                 
                 self.row1 = tk.Frame(self.main_frame, bg=background_color)
                 self.row1.pack(pady=5, fill=tk.X)
-                self.row2 = tk.Frame(self.main_frame, bg=background_color)
-                self.row2.pack(pady=5, fill=tk.X)
                 
                 self.players_info = []
-                for i in range(8):
-                    parent_row = self.row1 if i < 4 else self.row2
+                for i in range(4):
+                    parent_row = self.row1
                     p = PlayerInfoBlock(parent_row, self)
                     p.main_frame.pack(padx=10, pady=10, side=tk.LEFT)
                     self.players_info.append(p)
