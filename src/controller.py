@@ -239,9 +239,11 @@ class ControllerInputData:
             if len(data) >= 27:
                 self.accelerometer = (decodes(data[15:17]), decodes(data[17:19]), decodes(data[19:21]))
                 self.gyroscope = (decodes(data[21:23]), decodes(data[23:25]), decodes(data[25:27]))
+                self.magnometer = (0, 0, 0)
             else:
                 self.accelerometer = (0, 0, 0)
                 self.gyroscope = (0, 0, 0)
+                self.magnometer = (0, 0, 0)
         else:
             self.time = decodeu(data[0:4])
             self.buttons = decodeu(data[4:8])
