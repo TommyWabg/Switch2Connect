@@ -687,8 +687,7 @@ class Controller:
 
             await self.enable_input_notify_callback()
             
-            if getattr(self.controller_info, 'product_id', 0) != NSO_GAMECUBE_CONTROLLER_PID:
-                await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
+            await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
 
             self.interp_running = True
             self.interp_thread = threading.Thread(target=self._interpolation_thread_loop, daemon=True)
