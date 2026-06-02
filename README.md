@@ -23,6 +23,12 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Gyro Calibration:** **Calibrate Gyro** button for calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
 * **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, print screen, or standard buttons.
+* **Advanced Custom Input Remapping:** Introduced a powerful new "Custom" mapping feature. Users can now record and assign any complex combination of keyboard keys, mouse clicks, or controller buttons to a single input. This flexible system supports both "Tap" (fires the recorded sequence momentarily) and "Hold" (sustains the sequence for as long as the button is pressed) modes.
+  * Click the dropdown menu and select the "Custom" option.
+  * Press and hold your desired combination of keyboard keys, mouse clicks, and/or controller buttons simultaneously.
+  * Release all inputs. The recording will automatically stop and save your sequence.
+  * Click the adjacent toggle button to switch between **Tap** (triggers the sequence once) and **Hold** (keeps the sequence pressed as long as you hold the controller button).
+  * Click the **X** button to remove custom input and fall back to the default.
 * **Categorized Button Mapping Profiles:** Segregated custom button mapping and rumble configurations into three independent target categories: **Xbox**, **PS4**, **PS5**, and **Switch 2**. Remap profiles are now saved and loaded automatically based on the active emulation mode.
 * **Joy-con Mouse Toggle:** A new dedicated switch in the GUI to enable or disable the Joy-con mouse mode. This prevents accidental cursor movement during gameplay.
 * **Dynamic Split & Merge System:** The new **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
