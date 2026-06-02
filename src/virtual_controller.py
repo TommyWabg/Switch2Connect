@@ -1156,8 +1156,12 @@ class VirtualController:
             self.was_touching = is_touching
             report.sCurrentTouch.bIsUpTrackingNum2 = 0x80
 
-            report.bTriggerL = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
-            report.bTriggerR = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+            if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                report.bTriggerL = inputData.left_trigger
+                report.bTriggerR = inputData.right_trigger
+            else:
+                report.bTriggerL = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
+                report.bTriggerR = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
 
             # Joystick routing
             if not hasattr(self, 'last_lx'):

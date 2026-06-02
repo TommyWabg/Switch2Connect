@@ -46,7 +46,6 @@ async def auto_disconnect_checker(quit_event):
                 continue
                 
             now = time.time()
-            from discoverer import VIRTUAL_CONTROLLERS
             
             mode = getattr(CONFIG, "auto_disconnect_mode", "Absolute")
             for vc in VIRTUAL_CONTROLLERS:
@@ -67,11 +66,9 @@ async def auto_disconnect_checker(quit_event):
                         if mode == "Inactive":
                             logger.info(f"Auto Disconnect: Player {vc.player_number} inactivity duration exceeded limit. Disconnecting...")
                             vc.trigger_disconnect()
-                            show_notification("Auto Disconnect", f"Player {vc.player_number} has been auto-disconnected due to inactivity.")
                         else:
                             logger.info(f"Auto Disconnect: Player {vc.player_number} connection duration exceeded limit. Disconnecting...")
                             vc.trigger_disconnect()
-                            show_notification("Auto Disconnect", f"Player {vc.player_number} has been auto-disconnected after reaching the set time limit.")
         except Exception as e:
             logger.error(f"Error in auto_disconnect_checker: {e}")
 

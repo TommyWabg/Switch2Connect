@@ -40,12 +40,18 @@ JOYCON2_RIGHT_PID = 0x2066
 JOYCON2_LEFT_PID = 0x2067
 PRO_CONTROLLER2_PID = 0x2069
 NSO_GAMECUBE_CONTROLLER_PID = 0x2073
+PRO_CONTROLLER_PID = 0x2009
+JOYCON_L_PID = 0x2006
+JOYCON_R_PID = 0x2007
 
 CONTROLER_NAMES = {
     JOYCON2_RIGHT_PID: "Joy-con 2 (Right)",
     JOYCON2_LEFT_PID: "Joy-con 2 (Left)",
     PRO_CONTROLLER2_PID: "Pro Controller 2",
-    NSO_GAMECUBE_CONTROLLER_PID: "NSO Gamecube Controller"
+    NSO_GAMECUBE_CONTROLLER_PID: "NSO Gamecube Controller",
+    PRO_CONTROLLER_PID: "Pro Controller",
+    JOYCON_L_PID: "Joy-con (Left)",
+    JOYCON_R_PID: "Joy-con (Right)"
 }
 
 # BLE GATT Characteristics UUID
@@ -165,16 +171,16 @@ class ControllerInputData:
             if b1 & 0x02: buttons_val |= 0x00000008 # A
             if b1 & 0x04: buttons_val |= 0x00000001 # Y
             if b1 & 0x08: buttons_val |= 0x00000002 # X
-            if b1 & 0x10: buttons_val |= 0x00000040 # R
-            if b1 & 0x20: buttons_val |= 0x00000080 # Z -> ZR
+            if b1 & 0x10: buttons_val |= 0x00000080 # R (digital click) -> map to ZR
+            if b1 & 0x20: buttons_val |= 0x00000040 # Z -> map to R
             if b1 & 0x40: buttons_val |= 0x00000200 # Start -> PLUS
             
             if b2 & 0x01: buttons_val |= 0x00010000 # D-Down
             if b2 & 0x02: buttons_val |= 0x00040000 # D-Right
             if b2 & 0x04: buttons_val |= 0x00080000 # D-Left
             if b2 & 0x08: buttons_val |= 0x00020000 # D-Up
-            if b2 & 0x10: buttons_val |= 0x00400000 # L
-            if b2 & 0x20: buttons_val |= 0x00800000 # ZL
+            if b2 & 0x10: buttons_val |= 0x00800000 # L (digital click) -> map to ZL
+            if b2 & 0x20: buttons_val |= 0x00400000 # ZL -> map to L
             
             if b3 & 0x01: buttons_val |= 0x00001000 # Home
             if b3 & 0x02: buttons_val |= 0x00002000 # Capture
@@ -209,6 +215,14 @@ class ControllerInputData:
             self.left_trigger = remap_trigger_value(self.left_trigger_raw, gc_trigger_calib[0], l_max)
             self.right_trigger = remap_trigger_value(self.right_trigger_raw, gc_trigger_calib[3], r_max)
             
+            # Map analog triggers to digital ZL/ZR bits if pressed past 50% (128)
+            # This ensures Switch 1 mode (which only reads digital bits) gets a responsive trigger
+            # without requiring the user to physically bottom-out the controller.
+            if self.left_trigger >= 128:
+                self.buttons |= 0x00800000 # ZL
+            if self.right_trigger >= 128:
+                self.buttons |= 0x00000080 # ZR
+            
             self.mouse_coords = (0, 0)
             self.mouse_roughness = 0
             self.mouse_distance = 0
@@ -216,8 +230,18 @@ class ControllerInputData:
             self.battery_voltage = 3.7
             self.battery_current = 0.0
             self.temperature = 25.0
-            self.accelerometer = (0, 0, 0)
-            self.gyroscope = (0, 0, 0)
+            
+            # Explicitly mask out missing physical buttons on the NSO GameCube Controller
+            # Missing: MINUS (0x0100), L3 (0x0800), R3 (0x0400), SL/SR etc.
+            self.buttons &= ~(0x00000100 | 0x00000400 | 0x00000800)
+
+            # SW2 BLE Protocol: IMU data starts at offset 0x0F (15) and is 40 bytes long
+            if len(data) >= 27:
+                self.accelerometer = (decodes(data[15:17]), decodes(data[17:19]), decodes(data[19:21]))
+                self.gyroscope = (decodes(data[21:23]), decodes(data[23:25]), decodes(data[25:27]))
+            else:
+                self.accelerometer = (0, 0, 0)
+                self.gyroscope = (0, 0, 0)
         else:
             self.time = decodeu(data[0:4])
             self.buttons = decodeu(data[4:8])
@@ -593,7 +617,10 @@ class Controller:
             
             if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
                 logger.info(f"Enabling GameCube Haptics for {self.device.address}")
-                await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
+                try:
+                    await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
+                except Exception as e:
+                    logger.warning(f"Failed to enable GameCube Haptics: {e}")
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
@@ -610,7 +637,11 @@ class Controller:
                 self.mag_bias = tuple(mag_cal_data[addr])
                 logger.info(f"Loaded per-device mag calibration for {addr}")
                 
-            self.stick_calibration, self.second_stick_calibration = await self.read_calibration_data()
+            try:
+                self.stick_calibration, self.second_stick_calibration = await self.read_calibration_data()
+            except Exception as e:
+                logger.warning(f"Failed to read calibration data: {e}")
+                self.stick_calibration, self.second_stick_calibration = None, None
 
             await self.enable_input_notify_callback()
             
@@ -891,10 +922,14 @@ class Controller:
         motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + v1.get_bytes() + v2.get_bytes() + v3.get_bytes()
         
         try:
-            uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
-                VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
-            )
-            payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
+            if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                uuid_to_use = 0x0012
+                payload = b'\x00' + motor_vibrations
+            else:
+                uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
+                    VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
+                )
+                payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
             
             await self.client.write_gatt_char(uuid_to_use, payload, response=False)
         except Exception as e:
@@ -961,11 +996,27 @@ class Controller:
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
             
-            # Reset inactivity timer if there is physical input (buttons or sticks outside 20% deadzone)
-            if (inputData.buttons & 0x03FFFFFF) != 0 or \
-               abs(inputData.left_stick[0]) > 0.2 or abs(inputData.left_stick[1]) > 0.2 or \
-               abs(inputData.right_stick[0]) > 0.2 or abs(inputData.right_stick[1]) > 0.2:
+            # Reset inactivity timer if there is physical input change
+            current_buttons = inputData.buttons & 0x03FFFFFF
+            if not hasattr(self, '_prev_idle_buttons'):
+                self._prev_idle_buttons = current_buttons
+                self._prev_idle_lx = inputData.left_stick[0]
+                self._prev_idle_ly = inputData.left_stick[1]
+                self._prev_idle_rx = inputData.right_stick[0]
+                self._prev_idle_ry = inputData.right_stick[1]
                 self.last_input_time = time.time()
+            elif current_buttons != self._prev_idle_buttons or \
+                 abs(inputData.left_stick[0] - self._prev_idle_lx) > 0.05 or \
+                 abs(inputData.left_stick[1] - self._prev_idle_ly) > 0.05 or \
+                 abs(inputData.right_stick[0] - self._prev_idle_rx) > 0.05 or \
+                 abs(inputData.right_stick[1] - self._prev_idle_ry) > 0.05:
+                
+                self.last_input_time = time.time()
+                self._prev_idle_buttons = current_buttons
+                self._prev_idle_lx = inputData.left_stick[0]
+                self._prev_idle_ly = inputData.left_stick[1]
+                self._prev_idle_rx = inputData.right_stick[0]
+                self._prev_idle_ry = inputData.right_stick[1]
 
             self.battery_voltage = inputData.battery_voltage
             self.last_accel = inputData.accelerometer
@@ -976,6 +1027,7 @@ class Controller:
 
             # Filter out virtual button bits and garbage bits from physical reports (retaining only valid physical bits <= 0x03FFFFFF)
             inputData.buttons &= 0x03FFFFFF
+            self.raw_buttons = inputData.buttons
 
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
                 self.simulate_mouse(inputData)
@@ -1021,25 +1073,80 @@ class Controller:
             trigger_key_c = False
             trigger_game_bar = False
             trigger_hdr_toggle = False
+            trigger_sys_manager = False
 
             mapping_pairs = [
-                # (is_pressed, action, original_bit, default_action)
-                # default_action: what to do when action == "Default". None = pass through original_bit.
-                (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None),
-                (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None),
-                (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home"),
-                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"),
-                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "Mute"),
-                (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None),
-                (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None),
-                (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None),
-                (btn_states["SR_R"], getattr(CONFIG, "srr_mapping",  "Default"), 0x00000010, None),
+                # (is_pressed, action, original_bit, default_action, btn_id)
+                (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None, "gl"),
+                (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None, "gr"),
+                (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home", "home"),
+                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc", "capt"),
+                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "Mute", "c"),
+                (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None, "sll"),
+                (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None, "srl"),
+                (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None, "slr"),
+                (btn_states["SR_R"], getattr(CONFIG, "srr_mapping",  "Default"), 0x00000010, None, "srr"),
             ]
 
+            if not hasattr(self, 'active_custom_keys'):
+                self.active_custom_keys = {}
+            if not hasattr(self, 'active_custom_mouse_wheel'):
+                self.active_custom_mouse_wheel = {}
+
             trigger_calibration = False
-            for is_pressed, action, original_bit, default_action in mapping_pairs:
+            for is_pressed, action, original_bit, default_action, btn_id in mapping_pairs:
                 resolved = default_action if action == "Default" else action
-                if is_pressed:
+                
+                if isinstance(resolved, str) and resolved.startswith("Custom"):
+                    is_custom = True
+                    if resolved.startswith("Custom[Tap]:"):
+                        seq_str = resolved[12:]
+                        mode = "Tap"
+                    elif resolved.startswith("Custom[Hold]:"):
+                        seq_str = resolved[13:]
+                        mode = "Hold"
+                    elif resolved.startswith("Custom:"):
+                        seq_str = resolved[7:]
+                        mode = "Hold"
+                    else:
+                        is_custom = False
+                        
+                    if is_custom:
+                        if not hasattr(self, 'active_tap_keys'): self.active_tap_keys = {}
+                        if not hasattr(self, 'physical_tap_held'): self.physical_tap_held = set()
+                        
+                        # was_pressed tracks if we have processed this physical button press yet
+                        was_pressed = btn_id in self.active_custom_keys or btn_id in self.physical_tap_held
+                        
+                        if is_pressed and not was_pressed:
+                            seq = seq_str.split("+") if seq_str else []
+                            if mode == "Tap":
+                                self.physical_tap_held.add(btn_id)
+                                self.active_tap_keys[btn_id] = (seq, time.perf_counter())
+                                for k in seq:
+                                    self._trigger_custom_os_key(k, True)
+                            else:
+                                self.active_custom_keys[btn_id] = (seq, time.perf_counter(), time.perf_counter())
+                                for k in seq:
+                                    self._trigger_custom_os_key(k, True)
+                        elif not is_pressed and was_pressed:
+                            if btn_id in self.active_custom_keys:
+                                seq, _, _ = self.active_custom_keys.pop(btn_id)
+                                for k in reversed(seq):
+                                    self._trigger_custom_os_key(k, False)
+                            # For Tap mode, we release after timeout, but we clear the physical held state here
+                            if hasattr(self, 'physical_tap_held') and btn_id in self.physical_tap_held:
+                                self.physical_tap_held.remove(btn_id)
+                                
+                elif btn_id in self.active_custom_keys or (hasattr(self, 'physical_tap_held') and btn_id in getattr(self, 'physical_tap_held', set())):
+                    if btn_id in self.active_custom_keys:
+                        seq, _, _ = self.active_custom_keys.pop(btn_id)
+                        for k in reversed(seq):
+                            self._trigger_custom_os_key(k, False)
+                    if hasattr(self, 'physical_tap_held') and btn_id in self.physical_tap_held:
+                        self.physical_tap_held.remove(btn_id)
+                
+                if is_pressed and not (isinstance(resolved, str) and resolved.startswith("Custom")):
                     if resolved == "Gyro": trigger_gyro = True
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
                     elif resolved == "PrtSc": trigger_screenshot = True
@@ -1049,10 +1156,59 @@ class Controller:
                     elif resolved == "Calibration": trigger_calibration = True
                     elif resolved == "Game Bar": trigger_game_bar = True
                     elif resolved == "HDR Toggle": trigger_hdr_toggle = True
+                    elif resolved == "Sys Manager": trigger_sys_manager = True
                     elif resolved is None:
                         inputData.buttons |= original_bit
                     elif resolved in SWITCH_BUTTONS:
                         inputData.buttons |= SWITCH_BUTTONS[resolved]
+
+            # Apply active controller buttons and continuous mouse wheel
+            now = time.perf_counter()
+            
+            if hasattr(self, 'active_tap_keys'):
+                expired_taps = []
+                for btn_id, (seq, trigger_time) in self.active_tap_keys.items():
+                    if now - trigger_time >= 0.05: # 50ms tap duration
+                        for k in reversed(seq):
+                            self._trigger_custom_os_key(k, False)
+                        expired_taps.append(btn_id)
+                for btn_id in expired_taps:
+                    del self.active_tap_keys[btn_id]
+                    
+            # Handle Hold auto-repeat (500ms initial delay, 30ms repeat interval)
+            for btn_id, (seq, initial_time, last_repeat) in self.active_custom_keys.items():
+                if now - initial_time >= 0.5:
+                    if now - last_repeat >= 0.03:
+                        for k in seq:
+                            if k.startswith("VK_"): # Only auto-repeat keyboard keys
+                                self._trigger_custom_os_key(k, True)
+                        self.active_custom_keys[btn_id] = (seq, initial_time, now)
+            
+            # Combine both hold and tap keys for continuous hardware button injection (so console doesn't drop 1-frame taps)
+            all_active_seqs = [seq for seq, _, _ in self.active_custom_keys.values()]
+            if hasattr(self, 'active_tap_keys'):
+                for btn_id, (seq, _) in self.active_tap_keys.items():
+                    all_active_seqs.append(seq)
+
+            for seq in all_active_seqs:
+                for k in seq:
+                    if k.startswith("BTN_"):
+                        btn_name = k[4:]
+                        if btn_name in SWITCH_BUTTONS:
+                            inputData.buttons |= SWITCH_BUTTONS[btn_name]
+                    elif k.startswith("MW_"):
+                        # Mouse wheel only works in Hold mode due to its continuous nature, but we allow it here if they put it in Tap mode
+                        # However, for Tap mode, it will keep scrolling while held, which is acceptable behavior.
+                        pass
+
+            for btn_id, (seq, _, _) in self.active_custom_keys.items():
+                for k in seq:
+                    if k.startswith("MW_"):
+                        last_scroll = self.active_custom_mouse_wheel.get(btn_id, 0)
+                        if now - last_scroll > 0.05: # 20 ticks per second
+                            delta = 120 if k[3:] == "UP" else -120
+                            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+                            self.active_custom_mouse_wheel[btn_id] = now
 
             if trigger_calibration and not getattr(self, 'prev_calibration', False):
                 self._handle_calibration_button_pressed()
@@ -1150,6 +1306,15 @@ class Controller:
                 win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0) # Alt up
                 win32api.keybd_event(0x5B, 0, win32con.KEYEVENTF_KEYUP, 0) # Win up
             self.prev_hdr_toggle = trigger_hdr_toggle
+
+            if trigger_sys_manager and not getattr(self, 'prev_sys_manager', False):
+                win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0) # Ctrl down
+                win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0) # Shift down
+                win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0) # Esc down
+                win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0) # Esc up
+                win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0) # Shift up
+                win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0) # Ctrl up
+            self.prev_sys_manager = trigger_sys_manager
 
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
@@ -1829,6 +1994,44 @@ class Controller:
             self.current_vx = self.current_vy = 0.0
             self.interp_residual_x = self.interp_residual_y = 0.0
 
+    def _trigger_custom_os_key(self, k, is_down):
+        if k.startswith("VK_"):
+            vk_name = k[3:]
+            import win32con
+            import win32api
+            vk_code = getattr(win32con, f"VK_{vk_name}", None)
+            if vk_code is None:
+                if len(vk_name) == 1:
+                    vk_code = ord(vk_name)
+                elif vk_name in ("CONTROL", "CONTROL_L", "CONTROL_R"): vk_code = win32con.VK_CONTROL
+                elif vk_name in ("SHIFT", "SHIFT_L", "SHIFT_R"): vk_code = win32con.VK_SHIFT
+                elif vk_name in ("ALT_L", "ALT_R"): vk_code = win32con.VK_MENU
+                elif vk_name == "MENU": vk_code = win32con.VK_MENU
+                elif vk_name == "SPACE": vk_code = win32con.VK_SPACE
+                elif vk_name == "RETURN": vk_code = win32con.VK_RETURN
+                elif vk_name == "TAB": vk_code = win32con.VK_TAB
+                elif vk_name == "ESCAPE": vk_code = win32con.VK_ESCAPE
+                elif vk_name == "BACKSPACE": vk_code = win32con.VK_BACK
+                elif vk_name == "UP": vk_code = win32con.VK_UP
+                elif vk_name == "DOWN": vk_code = win32con.VK_DOWN
+                elif vk_name == "LEFT": vk_code = win32con.VK_LEFT
+                elif vk_name == "RIGHT": vk_code = win32con.VK_RIGHT
+            if vk_code:
+                if is_down:
+                    win32api.keybd_event(vk_code, 0, 0, 0)
+                else:
+                    win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+        elif k.startswith("MB_"):
+            btn = k[3:]
+            import win32con
+            import win32api
+            flags = 0
+            if btn == "1": flags = win32con.MOUSEEVENTF_LEFTDOWN if is_down else win32con.MOUSEEVENTF_LEFTUP
+            elif btn == "2": flags = win32con.MOUSEEVENTF_MIDDLEDOWN if is_down else win32con.MOUSEEVENTF_MIDDLEUP
+            elif btn == "3": flags = win32con.MOUSEEVENTF_RIGHTDOWN if is_down else win32con.MOUSEEVENTF_RIGHTUP
+            if flags:
+                win32api.mouse_event(flags, 0, 0, 0, 0)
+
     def _interpolation_thread_loop(self):
         last_time = time.perf_counter()
         while self.interp_running:
@@ -1878,7 +2081,7 @@ class Controller:
         return self.is_joycon_left() or self.is_joycon_right()
     
     def is_pro_controller(self):
-        return self.controller_info.product_id == PRO_CONTROLLER2_PID
+        return self.controller_info.product_id in (PRO_CONTROLLER2_PID, PRO_CONTROLLER_PID, NSO_GAMECUBE_CONTROLLER_PID)
 
     def has_second_stick(self):
-        return self.controller_info.product_id in [PRO_CONTROLLER2_PID, NSO_GAMECUBE_CONTROLLER_PID]
+        return self.controller_info.product_id in [PRO_CONTROLLER2_PID, PRO_CONTROLLER_PID, NSO_GAMECUBE_CONTROLLER_PID]

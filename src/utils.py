@@ -180,3 +180,40 @@ def force_ui_update():
     global force_ui_update_callback
     if force_ui_update_callback is not None:
         force_ui_update_callback()
+
+def disable_power_throttling():
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+            _fields_ = [
+                ("Version", wintypes.DWORD),
+                ("ControlMask", wintypes.DWORD),
+                ("StateMask", wintypes.DWORD),
+            ]
+
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        ProcessPowerThrottling = 4
+
+        kernel32 = ctypes.windll.kernel32
+        GetCurrentProcess = kernel32.GetCurrentProcess
+        SetProcessInformation = getattr(kernel32, 'SetProcessInformation', None)
+        if not SetProcessInformation:
+            return False
+            
+        state = PROCESS_POWER_THROTTLING_STATE()
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        state.StateMask = 0  # 0 means turn off throttling for EXECUTION_SPEED
+        
+        res = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            ctypes.byref(state),
+            ctypes.sizeof(state)
+        )
+        return res != 0
+    except Exception:
+        return False
