@@ -2145,6 +2145,226 @@ class ControllerWindow:
 
 
 
+    def start_custom_recording(self, key, entry, combo, custom_frame, mode_var):
+        entry.config(state="normal")
+        entry.delete(0, tk.END)
+        entry.insert(0, "Recording...")
+        entry.config(state="readonly")
+        entry.focus_set()
+        
+        pressed_keys = set()
+        recorded_seq = set()
+        self.recording_controllers = True
+        self.recorded_controller_buttons = set()
+
+        def end_recording():
+            self.recording_controllers = False
+            self.root.unbind("<KeyPress>")
+            self.root.unbind("<KeyRelease>")
+            self.root.unbind("<ButtonPress>")
+            self.root.unbind("<ButtonRelease>")
+            self.root.unbind("<MouseWheel>")
+            self.root.unbind("<FocusOut>")
+            raw_seq = list(recorded_seq) + list(self.recorded_controller_buttons)
+            
+            normalized_seq = set()
+            for k in raw_seq:
+                if k in ("VK_CONTROL", "VK_CONTROL_L", "VK_CONTROL_R", "VK_LCONTROL", "VK_RCONTROL"):
+                    normalized_seq.add("VK_CONTROL")
+                elif k in ("VK_SHIFT", "VK_SHIFT_L", "VK_SHIFT_R", "VK_LSHIFT", "VK_RSHIFT"):
+                    normalized_seq.add("VK_SHIFT")
+                elif k in ("VK_MENU", "VK_ALT", "VK_ALT_L", "VK_ALT_R", "VK_LMENU", "VK_RMENU"):
+                    normalized_seq.add("VK_MENU")
+                elif k in ("VK_WIN", "VK_LWIN", "VK_RWIN", "VK_WIN_L", "VK_WIN_R"):
+                    normalized_seq.add("VK_LWIN")
+                else:
+                    normalized_seq.add(k)
+                    
+            final_seq = sorted(list(normalized_seq))
+            
+            if not final_seq:
+                custom_frame.pack_forget()
+                combo.pack(side=tk.LEFT)
+                combo.set("Default")
+                setattr(CONFIG, f"{key}_mapping", "Default")
+            else:
+                mode = mode_var.get()
+                val = f"Custom[{mode}]:" + "+".join(final_seq)
+                setattr(CONFIG, f"{key}_mapping", val)
+                entry.config(state="normal")
+                entry.delete(0, tk.END)
+                display_val = "+".join(final_seq).replace("VK_", "").replace("MB_", "").replace("BTN_", "")
+                entry.insert(0, display_val)
+                entry.config(state="readonly")
+            self.on_setting_changed()
+
+        def check_release():
+            if not pressed_keys and not getattr(self, 'controller_buttons_pressed', False):
+                end_recording()
+
+        def on_key_press(e):
+            vk = e.keysym.upper()
+            pressed_keys.add(f"VK_{vk}")
+            recorded_seq.add(f"VK_{vk}")
+            return "break"
+
+        def on_key_release(e):
+            vk = e.keysym.upper()
+            if f"VK_{vk}" in pressed_keys:
+                pressed_keys.remove(f"VK_{vk}")
+            check_release()
+            return "break"
+
+        def on_mouse_press(e):
+            btn = f"MB_{e.num}"
+            pressed_keys.add(btn)
+            recorded_seq.add(btn)
+            return "break"
+
+        def on_mouse_release(e):
+            btn = f"MB_{e.num}"
+            if btn in pressed_keys:
+                pressed_keys.remove(btn)
+            check_release()
+            return "break"
+
+        def on_mouse_wheel(e):
+            dir_str = "UP" if e.delta > 0 else "DOWN"
+            recorded_seq.add(f"MW_{dir_str}")
+            self.root.after(100, check_release)
+            return "break"
+
+        self.root.bind("<KeyPress>", on_key_press)
+        self.root.bind("<KeyRelease>", on_key_release)
+        self.root.bind("<ButtonPress>", on_mouse_press)
+        self.root.bind("<ButtonRelease>", on_mouse_release)
+        self.root.bind("<MouseWheel>", on_mouse_wheel)
+        
+        def on_focus_out(e):
+            if e.widget == self.root and getattr(self, 'recording_controllers', False):
+                import ctypes
+                import win32con
+                vk_map = {}
+                for name in dir(win32con):
+                    if name.startswith("VK_"):
+                        val = getattr(win32con, name)
+                        if val not in vk_map:
+                            vk_map[val] = name[3:]
+                for vk in range(8, 255):
+                    if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
+                        if vk in vk_map:
+                            recorded_seq.add(f"VK_{vk_map[vk]}")
+                        elif (65 <= vk <= 90) or (48 <= vk <= 57):
+                            recorded_seq.add(f"VK_{chr(vk)}")
+                end_recording()
+        self.root.bind("<FocusOut>", on_focus_out)
+        
+        def poll_controller():
+            if not getattr(self, 'recording_controllers', False):
+                return
+            from config import SWITCH_BUTTONS
+            any_pressed = False
+            reverse_map = {v: k for k, v in SWITCH_BUTTONS.items() if k not in ["Capture", "PS_C_Click"]}
+            
+            for vc in getattr(self, 'current_controllers', []):
+                if vc is None: continue
+                for c in vc.controllers:
+                    raw = getattr(c, 'raw_buttons', 0)
+                    if raw:
+                        any_pressed = True
+                        for bit, btn_name in reverse_map.items():
+                            if raw & bit:
+                                self.recorded_controller_buttons.add(f"BTN_{btn_name}")
+            
+            self.controller_buttons_pressed = any_pressed
+            if not any_pressed and self.recorded_controller_buttons and not pressed_keys:
+                end_recording()
+                return
+            self.root.after(50, poll_controller)
+            
+        poll_controller()
+
+    def create_mapping_widget(self, parent, key, label_text):
+        tk.Label(parent, text=label_text, bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
+        container = tk.Frame(parent, bg=background_color)
+        container.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        
+        combo = ttk.Combobox(container, values=BACK_BUTTON_OPTIONS, font=scale_font(("Arial", 12, "bold")), state="readonly", width=11, justify="center")
+        
+        custom_frame = tk.Frame(container, bg=background_color)
+        
+        mode_var = tk.StringVar(value="Hold")
+        def toggle_mode():
+            new_mode = "Tap" if mode_var.get() == "Hold" else "Hold"
+            mode_var.set(new_mode)
+            mode_btn.config(text=new_mode)
+            current_val = getattr(CONFIG, f"{key}_mapping")
+            if current_val.startswith("Custom"):
+                if current_val.startswith("Custom[Tap]:") or current_val.startswith("Custom[Hold]:"):
+                    new_val = f"Custom[{new_mode}]:{current_val.split(':', 1)[1]}"
+                else:
+                    new_val = f"Custom[{new_mode}]:{current_val[7:]}"
+                setattr(CONFIG, f"{key}_mapping", new_val)
+                self.on_setting_changed()
+
+        mode_btn = tk.Button(custom_frame, text="Hold", bg=button_gray, fg="white", font=scale_font(("Arial", 9, "bold")), bd=0, relief=tk.FLAT, command=toggle_mode, width=4)
+        mode_btn.pack(side=tk.LEFT, padx=(0, int(2 * scaling_factor)), fill=tk.Y)
+        
+        entry = tk.Entry(custom_frame, font=scale_font(("Arial", 12, "bold")), width=11, justify="center", bg=button_gray, fg="white", readonlybackground=button_gray, insertbackground="white", bd=0, highlightthickness=0)
+        entry.pack(side=tk.LEFT, fill=tk.Y)
+        
+        def on_close():
+            custom_frame.pack_forget()
+            combo.pack(side=tk.LEFT)
+            combo.set("Default")
+            setattr(CONFIG, f"{key}_mapping", "Default")
+            self.on_setting_changed()
+
+        close_btn = tk.Button(custom_frame, text="X", bg="#ff4444", fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=on_close)
+        close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+        
+        current_val = getattr(CONFIG, f"{key}_mapping")
+        if current_val.startswith("Custom"):
+            entry.config(state="normal")
+            entry.delete(0, tk.END)
+            
+            if current_val.startswith("Custom[Tap]:"):
+                mode_var.set("Tap")
+                mode_btn.config(text="Tap")
+                display_val = current_val[12:]
+            elif current_val.startswith("Custom[Hold]:"):
+                mode_var.set("Hold")
+                mode_btn.config(text="Hold")
+                display_val = current_val[13:]
+            else:
+                mode_var.set("Hold")
+                mode_btn.config(text="Hold")
+                display_val = current_val[7:]
+                
+            display_val = display_val.replace("VK_", "").replace("MB_", "").replace("BTN_", "")
+            entry.insert(0, display_val)
+            entry.config(state="readonly")
+            custom_frame.pack(side=tk.LEFT)
+            combo.set("Custom")
+        else:
+            combo.set(current_val)
+            combo.pack(side=tk.LEFT)
+
+        def on_combo_selected(event):
+            if combo.get() == "Custom":
+                combo.pack_forget()
+                custom_frame.pack(side=tk.LEFT)
+                self.start_custom_recording(key, entry, combo, custom_frame, mode_var)
+            else:
+                self.on_setting_changed(event)
+                
+        combo.bind("<<ComboboxSelected>>", on_combo_selected)
+        setattr(self, f"{key}_combo", combo)
+        setattr(self, f"{key}_custom_frame", custom_frame)
+        setattr(self, f"{key}_entry", entry)
+        setattr(self, f"{key}_mode_btn", mode_btn)
+        setattr(self, f"{key}_mode_var", mode_var)
+
     def init_settings_panel(self):
         self.settings_frame = tk.Frame(self.root, bg=background_color)
         self.settings_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
@@ -2200,29 +2420,17 @@ class ControllerWindow:
         row_shared = tk.Frame(self.settings_frame, bg=background_color); row_shared.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_shared, text="Shared Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("home", "Home:"), ("capt", "Capture:"), ("c", "Chat:")]:
-            tk.Label(row_shared, text=label, bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
-            combo = ttk.Combobox(row_shared, values=BACK_BUTTON_OPTIONS, font=scale_font(("Arial", 12, "bold")), state="readonly", width=11, justify="center")
-            combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
-            combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
-            setattr(self, f"{key}_combo", combo)
+            self.create_mapping_widget(row_shared, key, label)
 
         row_pro = tk.Frame(self.settings_frame, bg=background_color); row_pro.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_pro, text="Pro Controller Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("gl", "GL:"), ("gr", "GR:")]:
-            tk.Label(row_pro, text=label, bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
-            combo = ttk.Combobox(row_pro, values=BACK_BUTTON_OPTIONS, font=scale_font(("Arial", 12, "bold")), state="readonly", width=11, justify="center")
-            combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
-            combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
-            setattr(self, f"{key}_combo", combo)
+            self.create_mapping_widget(row_pro, key, label)
 
         row_jc = tk.Frame(self.settings_frame, bg=background_color); row_jc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_jc, text="Joy-con Rail Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("sll", "Left SL:"), ("srl", "Left SR:"), ("slr", "Right SL:"), ("srr", "Right SR:")]:
-            tk.Label(row_jc, text=label, bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
-            combo = ttk.Combobox(row_jc, values=BACK_BUTTON_OPTIONS, font=scale_font(("Arial", 12, "bold")), state="readonly", width=11, justify="center")
-            combo.set(getattr(CONFIG, f"{key}_mapping")); combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
-            combo.bind("<<ComboboxSelected>>", self.on_setting_changed)
-            setattr(self, f"{key}_combo", combo)
+            self.create_mapping_widget(row_jc, key, label)
 
         row_gc = tk.Frame(self.settings_frame, bg=background_color); row_gc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_gc, text="GameCube Controller:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
@@ -2414,8 +2622,43 @@ class ControllerWindow:
     def _refresh_mapping_comboboxes(self):
         for key in ["home", "capt", "c", "gl", "gr", "sll", "srl", "slr", "srr"]:
             combo = getattr(self, f"{key}_combo", None)
+            custom_frame = getattr(self, f"{key}_custom_frame", None)
+            entry = getattr(self, f"{key}_entry", None)
+            mode_btn = getattr(self, f"{key}_mode_btn", None)
+            mode_var = getattr(self, f"{key}_mode_var", None)
+            
             if combo:
-                combo.set(getattr(CONFIG, f"{key}_mapping"))
+                current_val = getattr(CONFIG, f"{key}_mapping")
+                if current_val.startswith("Custom"):
+                    combo.set("Custom")
+                    combo.pack_forget()
+                    if custom_frame and entry and mode_btn and mode_var:
+                        entry.config(state="normal")
+                        entry.delete(0, tk.END)
+                        
+                        if current_val.startswith("Custom[Tap]:"):
+                            mode_var.set("Tap")
+                            mode_btn.config(text="Tap")
+                            display_val = current_val[12:]
+                        elif current_val.startswith("Custom[Hold]:"):
+                            mode_var.set("Hold")
+                            mode_btn.config(text="Hold")
+                            display_val = current_val[13:]
+                        else:
+                            mode_var.set("Hold")
+                            mode_btn.config(text="Hold")
+                            display_val = current_val[7:]
+                            
+                        display_val = display_val.replace("VK_", "").replace("MB_", "").replace("BTN_", "")
+                        entry.insert(0, display_val)
+                        entry.config(state="readonly")
+                        custom_frame.pack(side=tk.LEFT)
+                else:
+                    combo.set(current_val)
+                    if custom_frame:
+                        custom_frame.pack_forget()
+                    combo.pack(side=tk.LEFT)
+                    
         if hasattr(self, 'gc_trigger_mode_switch'):
             self.gc_trigger_mode_switch.set_value(CONFIG.gc_trigger_mode)
         if hasattr(self, 'layout_switch'):
@@ -2544,15 +2787,25 @@ class ControllerWindow:
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
     def on_setting_changed(self, event=None):
-        CONFIG.home_mapping = self.home_combo.get()
-        CONFIG.capt_mapping = self.capt_combo.get()
-        CONFIG.gl_mapping = self.gl_combo.get()
-        CONFIG.gr_mapping = self.gr_combo.get()
-        CONFIG.c_mapping = self.c_combo.get()
-        CONFIG.sll_mapping = self.sll_combo.get()
-        CONFIG.srl_mapping = self.srl_combo.get()
-        CONFIG.slr_mapping = self.slr_combo.get()
-        CONFIG.srr_mapping = self.srr_combo.get()
+        def get_mapping(key):
+            combo = getattr(self, f"{key}_combo", None)
+            if combo is None: return "Default"
+            val = combo.get()
+            if val == "Custom":
+                curr = getattr(CONFIG, f"{key}_mapping", "Default")
+                if curr.startswith("Custom"):
+                    return curr
+            return val
+
+        CONFIG.home_mapping = get_mapping("home")
+        CONFIG.capt_mapping = get_mapping("capt")
+        CONFIG.gl_mapping = get_mapping("gl")
+        CONFIG.gr_mapping = get_mapping("gr")
+        CONFIG.c_mapping = get_mapping("c")
+        CONFIG.sll_mapping = get_mapping("sll")
+        CONFIG.srl_mapping = get_mapping("srl")
+        CONFIG.slr_mapping = get_mapping("slr")
+        CONFIG.srr_mapping = get_mapping("srr")
         if hasattr(self, 'gc_trigger_mode_switch'):
             pass # Value is already saved by the ToggleSwitch command
         try:
