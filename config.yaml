@@ -1,4 +1,4 @@
-abxy_mode: Switch
+abxy_mode: Xbox
 auto_disconnect_days: 0
 auto_disconnect_enabled: false
 auto_disconnect_hours: 0
@@ -33,7 +33,7 @@ button_remaps:
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
-    joycon_hold_mode:
+    joycon_hold_mode: &id001
       E0:EF:BF:EF:CC:BD: Vertical
       E0:EF:BF:F0:0E:17: Vertical
     rumble_mode: Xbox
@@ -53,7 +53,7 @@ button_remaps:
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
-    joycon_hold_mode: &id001
+    joycon_hold_mode:
       E0:EF:BF:EF:CC:BD: Vertical
       E0:EF:BF:F0:0E:17: Horizontal
     rumble_mode: Switch
@@ -104,7 +104,7 @@ button_remaps:
     vibration_strength: 10
     vibration_strength_switch: 5
     vibration_strength_xbox: 5
-c_mapping: Calibration
+c_mapping: Default
 calibration_data:
   E0:EF:BF:81:06:9F:
   - 5.480891719745223
@@ -119,12 +119,12 @@ calibration_data:
   - 1.7830188679245282
   - 5.327044025157233
 capt_mapping: Default
-driver_installed: true
-driver_type: USBIP
+driver_installed: false
+driver_type: WinUHid
 gc_trigger_calibration_data: {}
-gc_trigger_mode: 100% at Bump
-gl_mapping: Default
-gr_mapping: Default
+gc_trigger_mode: 100% at Max
+gl_mapping: PS_L_Touch
+gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
 gyro_bias_l:
 - -1.6572327044025157
@@ -149,11 +149,11 @@ mouse:
   enabled: true
   sensitivity: 4.0
 open_when_startup: false
-rumble_mode: Switch
-simulation_mode: Switch1
+rumble_mode: Xbox
+simulation_mode: PS5
 sll_mapping: Default
-slr_mapping: Default
-srl_mapping: Default
+slr_mapping: PS_R_Touch
+srl_mapping: PS_L_Touch
 srr_mapping: Default
 stabilized_gyro: true
 start_minimized: false
