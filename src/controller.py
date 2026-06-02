@@ -210,8 +210,8 @@ class ControllerInputData:
                     percentage = 0.0
                 return int(percentage * (max_out - min_out)) + min_out
                 
-            self.left_trigger_raw = data[12] if len(data) > 12 else 0
-            self.right_trigger_raw = data[13] if len(data) > 13 else 0
+            self.left_trigger_raw = data[13] if len(data) > 13 else 0
+            self.right_trigger_raw = data[14] if len(data) > 14 else 0
             self.left_trigger = remap_trigger_value(self.left_trigger_raw, gc_trigger_calib[0], l_max)
             self.right_trigger = remap_trigger_value(self.right_trigger_raw, gc_trigger_calib[3], r_max)
             
