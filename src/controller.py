@@ -243,7 +243,6 @@ class ControllerInputData:
                 _gc_debug_counter += 1
                 if _gc_debug_counter % 125 == 0:
                     import logging
-                    logging.getLogger(__name__).warning(f"GC RAW DATA (len={len(data)}): {data.hex(' ')}")
                 self.accelerometer = (decodes(data[34:36]), decodes(data[36:38]), decodes(data[38:40]))
                 self.gyroscope = (decodes(data[40:42]), decodes(data[42:44]), decodes(data[44:46]))
                 self.magnometer = (0, 0, 0)
@@ -809,11 +808,20 @@ class Controller:
         
         if getattr(self, 'controller_info', None) and getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             try:
-                await self.write_command(0x11, 0x03, b'')
-                imu_config = bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                await self.write_command(0x0A, 0x08, imu_config)
+                # Command 0x11, SubCmd 0x03
+                cmd_11 = bytes([0x91, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00])
+                await self.write_output_report(0x11, cmd_11)
+                await asyncio.sleep(0.05)
+                
+                # Command 0x0A, SubCmd 0x08
+                cmd_0A = bytes([
+                    0x91, 0x01, 0x08, 0x00, 0x14, 0x00, 0x00,
+                    0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+                    0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                ])
+                await self.write_output_report(0x0A, cmd_0A)
             except Exception as e:
-                logger.warning(f"Failed to send GameCube IMU init sequence: {e}")
+                logger.warning(f"Failed to send GameCube SW2 IMU init sequence: {e}")
                 
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
