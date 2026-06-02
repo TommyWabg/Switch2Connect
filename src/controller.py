@@ -235,10 +235,10 @@ class ControllerInputData:
             # Missing: MINUS (0x0100), L3 (0x0800), R3 (0x0400), SL/SR etc.
             self.buttons &= ~(0x00000100 | 0x00000400 | 0x00000800)
 
-            # SW2 BLE Protocol: IMU data starts at offset 0x0F (15) and is 40 bytes long
-            if len(data) >= 27:
-                self.accelerometer = (decodes(data[15:17]), decodes(data[17:19]), decodes(data[19:21]))
-                self.gyroscope = (decodes(data[21:23]), decodes(data[23:25]), decodes(data[25:27]))
+            # NSO GameCube Protocol: IMU data starts at offset 14 (3 samples of 12 bytes)
+            if len(data) >= 26:
+                self.accelerometer = (decodes(data[14:16]), decodes(data[16:18]), decodes(data[18:20]))
+                self.gyroscope = (decodes(data[20:22]), decodes(data[22:24]), decodes(data[24:26]))
                 self.magnometer = (0, 0, 0)
             else:
                 self.accelerometer = (0, 0, 0)
