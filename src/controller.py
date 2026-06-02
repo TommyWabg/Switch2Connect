@@ -799,6 +799,15 @@ class Controller:
 
     async def enableFeatures(self, feature_flags: int):
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_INIT, feature_flags.to_bytes().ljust(4, b'\0'))
+        
+        if getattr(self, 'controller_info', None) and getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            try:
+                await self.write_command(0x11, 0x03, b'')
+                imu_config = bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                await self.write_command(0x0A, 0x08, imu_config)
+            except Exception as e:
+                logger.warning(f"Failed to send GameCube IMU init sequence: {e}")
+                
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False):
