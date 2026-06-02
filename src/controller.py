@@ -235,8 +235,8 @@ class ControllerInputData:
             # Missing: MINUS (0x0100), L3 (0x0800), R3 (0x0400), SL/SR etc.
             self.buttons &= ~(0x00000100 | 0x00000400 | 0x00000800)
 
-            # NSO GameCube Protocol: IMU data starts at offset 14 (3 samples of 12 bytes)
-            if len(data) >= 26:
+            # NSO GameCube Protocol: IMU data actually starts at offset 34 based on raw data analysis
+            if len(data) >= 46:
                 global _gc_debug_counter
                 if '_gc_debug_counter' not in globals():
                     _gc_debug_counter = 0
@@ -244,8 +244,8 @@ class ControllerInputData:
                 if _gc_debug_counter % 125 == 0:
                     import logging
                     logging.getLogger(__name__).warning(f"GC RAW DATA (len={len(data)}): {data.hex(' ')}")
-                self.accelerometer = (decodes(data[14:16]), decodes(data[16:18]), decodes(data[18:20]))
-                self.gyroscope = (decodes(data[20:22]), decodes(data[22:24]), decodes(data[24:26]))
+                self.accelerometer = (decodes(data[34:36]), decodes(data[36:38]), decodes(data[38:40]))
+                self.gyroscope = (decodes(data[40:42]), decodes(data[42:44]), decodes(data[44:46]))
                 self.magnometer = (0, 0, 0)
             else:
                 self.accelerometer = (0, 0, 0)
