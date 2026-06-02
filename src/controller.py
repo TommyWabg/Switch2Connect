@@ -235,13 +235,22 @@ class ControllerInputData:
             # Missing: MINUS (0x0100), L3 (0x0800), R3 (0x0400), SL/SR etc.
             self.buttons &= ~(0x00000100 | 0x00000400 | 0x00000800)
 
-            # SW2 BLE Protocol: IMU data starts at offset 0x0F (15) and is 40 bytes long
-            if len(data) >= 27:
-                self.accelerometer = (decodes(data[15:17]), decodes(data[17:19]), decodes(data[19:21]))
-                self.gyroscope = (decodes(data[21:23]), decodes(data[23:25]), decodes(data[25:27]))
+            # NSO GameCube Protocol: IMU data starts at offset 14 (3 samples of 12 bytes)
+            if len(data) >= 26:
+                global _gc_debug_counter
+                if '_gc_debug_counter' not in globals():
+                    _gc_debug_counter = 0
+                _gc_debug_counter += 1
+                if _gc_debug_counter % 125 == 0:
+                    import logging
+                    logging.getLogger(__name__).warning(f"GC RAW DATA (len={len(data)}): {data.hex(' ')}")
+                self.accelerometer = (decodes(data[14:16]), decodes(data[16:18]), decodes(data[18:20]))
+                self.gyroscope = (decodes(data[20:22]), decodes(data[22:24]), decodes(data[24:26]))
+                self.magnometer = (0, 0, 0)
             else:
                 self.accelerometer = (0, 0, 0)
                 self.gyroscope = (0, 0, 0)
+                self.magnometer = (0, 0, 0)
         else:
             self.time = decodeu(data[0:4])
             self.buttons = decodeu(data[4:8])
@@ -687,7 +696,9 @@ class Controller:
 
             await self.enable_input_notify_callback()
             
-            if getattr(self.controller_info, 'product_id', 0) != NSO_GAMECUBE_CONTROLLER_PID:
+            if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                await self.enableFeatures(0x27)
+            else:
                 await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
 
             self.interp_running = True
@@ -795,6 +806,15 @@ class Controller:
 
     async def enableFeatures(self, feature_flags: int):
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_INIT, feature_flags.to_bytes().ljust(4, b'\0'))
+        
+        if getattr(self, 'controller_info', None) and getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            try:
+                await self.write_command(0x11, 0x03, b'')
+                imu_config = bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                await self.write_command(0x0A, 0x08, imu_config)
+            except Exception as e:
+                logger.warning(f"Failed to send GameCube IMU init sequence: {e}")
+                
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False):

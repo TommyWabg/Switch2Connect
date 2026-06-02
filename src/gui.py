@@ -647,7 +647,7 @@ class PlayerInfoBlock:
             if getattr(self, 'mag_frame_r', None): self.mag_frame_r.place_forget()
 
             c = self.get_single_controller()
-            if c is not None:
+            if c is not None and getattr(c.controller_info, 'product_id', 0) != NSO_GAMECUBE_CONTROLLER_PID:
                 if not getattr(self, 'mag_btn_single', None):
                     self.mag_frame_single = tk.Frame(self.controllers_frame, bg=button_gray)
                     self.mag_btn_single = tk.Button(self.mag_frame_single, text="Mag Cal", font=scale_font(("Arial", 8, "bold")), bd=0, relief=tk.FLAT, highlightthickness=0,
