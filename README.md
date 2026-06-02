@@ -81,7 +81,7 @@ Because this app emulates both Xbox One and PS4/PS5 controllers, Steam Input mig
 ## Gyro Calibration Guide
 
 To ensure maximum precision and eliminate "cursor drift," follow these steps to calibrate 6-axis gyro:
-1.  **Stationary Placement:** Place your Pro Controller on a completely flat, stable surface. **Do not touch or move it during the process.**
+1.  **Stationary Placement:** Place your controllers on a completely flat, stable surface. **Do not touch or move it during the process.**
 2.  **Trigger Calibration:** Click the **[Calibrate Gyro]** button in the settings panel.
 3.  **Wait for Countdown:** The UI will display a countdown (`Calibrating (2..)`). 
 4.  **Completion:** Once the button displays `Calibration Done`, the software has calculated the hardware bias and saved it. You do not need to recalibrate unless you experience new drifting issues.
