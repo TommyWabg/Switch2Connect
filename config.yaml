@@ -162,7 +162,7 @@ stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
-usbip_sim_mode: Switch2
+usbip_sim_mode: Switch1
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_switch: 5
