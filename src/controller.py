@@ -598,15 +598,54 @@ class Controller:
 
             self.response_future = None
             def command_response_callback(sender: BleakGATTCharacteristic, data: bytearray):
-                if self.response_future:
+                if self.response_future and not self.response_future.done():
+                    expected = getattr(self, 'expected_command_id', None)
+                    if expected is not None and len(data) > 0 and data[0] != expected:
+                        logger.debug(f"Ignoring unexpected command response for cmd {data[0]}, expected {expected}")
+                        return
                     self.response_future.set_result(data)
             
-            logger.info(f"Starting command response notification for {self.device.address}...")
+            # Dynamic UUID discovery for SW2 Protocol (e.g. GameCube Controller)
+            self.command_write_uuid = COMMAND_WRITE_UUID
+            self.command_response_uuid = COMMAND_RESPONSE_UUID
+            is_sw2_device = False
+            
+            for service in self.client.services:
+                if "ab7de9be" in str(service.uuid).lower():
+                    is_sw2_device = True
+                    wnr_chars = []
+                    notify_chars = []
+                    for char in service.characteristics:
+                        props = char.properties
+                        if "write-without-response" in props or "write" in props:
+                            wnr_chars.append(char)
+                        if "notify" in props:
+                            notify_chars.append(char)
+                    
+                    wnr_chars.sort(key=lambda c: c.handle)
+                    notify_chars.sort(key=lambda c: c.handle)
+                    
+                    # For SW2, the command channel is typically the 2nd WriteNoResp char (handle 0x0014)
+                    if len(wnr_chars) >= 2:
+                        self.command_write_uuid = wnr_chars[1].uuid
+                    elif len(wnr_chars) == 1:
+                        self.command_write_uuid = wnr_chars[0].uuid
+                        
+                    # Command response is typically the 3rd Notify char (handle 0x001A)
+                    if len(notify_chars) >= 3:
+                        self.command_response_uuid = notify_chars[2].uuid
+                    elif len(notify_chars) > 0:
+                        self.command_response_uuid = notify_chars[-1].uuid
+                    
+                    logger.info(f"SW2 Service detected. Using Write: {self.command_write_uuid}, Notify: {self.command_response_uuid}")
+                    break
+
+            logger.info(f"Starting command response notification for {self.device.address} on {self.command_response_uuid}...")
             for attempt in range(3):
                 if not self.client.is_connected:
                     raise BleakError("Connection lost during notify retry")
                 try:
-                    await self.client.start_notify(COMMAND_RESPONSE_UUID, command_response_callback)
+                    await self.client.start_notify(self.command_response_uuid, command_response_callback)
                     break
                 except Exception as e:
                     if attempt == 2: raise
@@ -615,12 +654,15 @@ class Controller:
 
             self.controller_info = await self.read_controller_info()
             
-            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
-                logger.info(f"Enabling GameCube Haptics for {self.device.address}")
+            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID or is_sw2_device:
+                logger.info(f"Setting GameCube Input Mode to 0x30 (Format 3) for {self.device.address}")
                 try:
-                    await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
+                    set_input_mode_cmd = bytearray([
+                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x30
+                    ])
+                    await self.client.write_gatt_char(self.command_write_uuid, set_input_mode_cmd)
                 except Exception as e:
-                    logger.warning(f"Failed to enable GameCube Haptics: {e}")
+                    logger.warning(f"Failed to set GameCube Input Mode: {e}")
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
@@ -737,10 +779,16 @@ class Controller:
     ### Commands & Features ###
 
     async def write_command(self, command_id: int, subcommand_id: int, command_data = b''):
+        self.expected_command_id = command_id
         command_buffer = command_id.to_bytes() + b"\x91\x01" + subcommand_id.to_bytes() + b"\x00" + len(command_data).to_bytes() + b"\x00\x00" + command_data
         self.response_future = asyncio.get_running_loop().create_future()
-        await self.client.write_gatt_char(COMMAND_WRITE_UUID, command_buffer)
-        response_buffer = await self.response_future
+        write_uuid = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
+        await self.client.write_gatt_char(write_uuid, command_buffer)
+        try:
+            response_buffer = await asyncio.wait_for(self.response_future, timeout=2.0)
+        except asyncio.TimeoutError:
+            raise Exception(f"Command response timeout for {command_id}")
+            
         if len(response_buffer) < 8 or response_buffer[0] != command_id or response_buffer[1] != 0x01:
             raise Exception(f"Unexpected response : {response_buffer}")
         return response_buffer[8:]
@@ -924,8 +972,10 @@ class Controller:
         
         try:
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
-                uuid_to_use = 0x0012
-                payload = b'\x00' + motor_vibrations
+                # Use the SW2 command channel for GameCube rumble instead of hardcoded 0x0012
+                uuid_to_use = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
+                is_on = vibration.lf_amp > 0 or vibration.hf_amp > 0
+                payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01 if is_on else 0x00, 0x00, 0x00, 0x00])
             else:
                 uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
                     VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
@@ -996,6 +1046,7 @@ class Controller:
                 
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
+            self.last_input_data = inputData
             
             # Reset inactivity timer if there is physical input change
             current_buttons = inputData.buttons & 0x03FFFFFF
@@ -1475,15 +1526,35 @@ class Controller:
 
         if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             try:
-                # Enable input CCCD
-                await self.client.write_gatt_char(0x000B, b'\x01\x00', response=True)
-                # Disable command response CCCD (Required by protocol to allow input flow)
-                await self.client.write_gatt_char(0x001B, b'\x00\x00', response=True)
+                # To be 100% robust against Windows dynamically mangling UUIDs or shifting Handles,
+                # we find all 'notify' characteristics in the SW2 service and subscribe to them all.
+                # We then filter out the short packets (Format 0 and Command Responses) and only
+                # process the 63-byte Format 3 reports.
+                def gc_input_report_callback(sender: BleakGATTCharacteristic, data: bytearray):
+                    if len(data) < 30:
+                        return
+                    input_report_callback(sender, data)
+
+                notify_chars = []
+                for service in self.client.services:
+                    if "ab7de9be" in str(service.uuid).lower():
+                        for char in service.characteristics:
+                            if "notify" in char.properties:
+                                notify_chars.append(char)
+                
+                if not notify_chars:
+                    logger.warning("No notify characteristics found for GameCube! Falling back.")
+                    await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+                else:
+                    for char in notify_chars:
+                        try:
+                            logger.info(f"Subscribing to GameCube notify characteristic: {char.uuid}")
+                            await self.client.start_notify(char.uuid, gc_input_report_callback)
+                        except Exception as e:
+                            logger.warning(f"Failed to subscribe to {char.uuid}: {e}")
             except Exception as e:
-                logger.warning(f"Failed to setup SW2 CCCDs for GameCube controller: {e}")
-            
-            # SW2 Protocol: Input data flows on 0x000E (Format 3, 63 bytes)
-            await self.client.start_notify(0x000E, input_report_callback)
+                logger.warning(f"Error subscribing to GameCube characteristics: {e}")
+                await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
         else:
             await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
 
