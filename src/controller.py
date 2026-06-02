@@ -621,6 +621,16 @@ class Controller:
                     await self.write_command(COMMAND_HAPTICS_INIT, SUBCOMMAND_HAPTICS_ENABLE, b"\x09\x00\x00\x00")
                 except Exception as e:
                     logger.warning(f"Failed to enable GameCube Haptics: {e}")
+                
+                # Log all characteristics to find the correct UUID for 0x000E
+                try:
+                    for service in self.client.services:
+                        if "ab7de9be" in str(service.uuid).lower():
+                            logger.info(f"SW2 Service found: {service.uuid}")
+                            for char in service.characteristics:
+                                logger.info(f"  Char: {char.uuid} (Handle: {char.handle}) Properties: {char.properties}")
+                except Exception as e:
+                    logger.warning(f"Failed to log characteristics: {e}")
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
@@ -645,7 +655,8 @@ class Controller:
 
             await self.enable_input_notify_callback()
             
-            await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
+            if getattr(self.controller_info, 'product_id', 0) != NSO_GAMECUBE_CONTROLLER_PID:
+                await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
 
             self.interp_running = True
             self.interp_thread = threading.Thread(target=self._interpolation_thread_loop, daemon=True)
@@ -1472,7 +1483,34 @@ class Controller:
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
 
-        await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+        if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            try:
+                # The protocol requires writing 0x0100 to handle 0x000B to enable input, and 0x0000 to 0x001B
+                # In Bleak, we write to descriptors.
+                char_000A = self.client.services.get_characteristic(10) # 0x000A
+                if char_000A:
+                    cccd_000A = char_000A.get_descriptor(11) # 0x000B
+                    if cccd_000A:
+                        await self.client.write_gatt_descriptor(cccd_000A.handle, b'\x01\x00')
+                
+                char_001A = self.client.services.get_characteristic(26) # 0x001A
+                if char_001A:
+                    cccd_001A = char_001A.get_descriptor(27) # 0x001B
+                    if cccd_001A:
+                        await self.client.write_gatt_descriptor(cccd_001A.handle, b'\x00\x00')
+            except Exception as e:
+                logger.warning(f"Failed to configure CCCDs manually: {e}")
+
+            # Find Format 3 characteristic (0x000E)
+            char_000E = self.client.services.get_characteristic(14)
+            if char_000E:
+                logger.info(f"Subscribing to Format 3 characteristic: {char_000E.uuid}")
+                await self.client.start_notify(char_000E.uuid, input_report_callback)
+            else:
+                logger.warning("Format 3 characteristic (0x000E) not found! Falling back.")
+                await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+        else:
+            await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
 
     def set_input_report_callback(self, callback):
         self.input_report_callback = callback
