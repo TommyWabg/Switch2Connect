@@ -1338,7 +1338,22 @@ class Controller:
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
 
-        await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+        if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            try:
+                await self.client.stop_notify(COMMAND_RESPONSE_UUID)
+            except Exception:
+                pass
+            await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+            try:
+                await self.client.start_notify(0x000E, input_report_callback)
+            except Exception as e:
+                logger.warning(f"Failed to start notify on 0x000E: {e}")
+                try:
+                    await self.client.start_notify("ab7de9be-89fe-49ad-828f-118f09df7fd3", input_report_callback)
+                except Exception as e2:
+                    logger.warning(f"Failed to start notify on fd3: {e2}")
+        else:
+            await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
 
     def set_input_report_callback(self, callback):
         self.input_report_callback = callback
@@ -1909,7 +1924,7 @@ class Controller:
         return self.is_joycon_left() or self.is_joycon_right()
     
     def is_pro_controller(self):
-        return self.controller_info.product_id == PRO_CONTROLLER2_PID
+        return self.controller_info.product_id in (PRO_CONTROLLER2_PID, NSO_GAMECUBE_CONTROLLER_PID)
 
     def has_second_stick(self):
         return self.controller_info.product_id in [PRO_CONTROLLER2_PID, NSO_GAMECUBE_CONTROLLER_PID]
