@@ -599,6 +599,10 @@ class Controller:
             self.response_future = None
             def command_response_callback(sender: BleakGATTCharacteristic, data: bytearray):
                 if self.response_future and not self.response_future.done():
+                    expected = getattr(self, 'expected_command_id', None)
+                    if expected is not None and len(data) > 0 and data[0] != expected:
+                        logger.debug(f"Ignoring unexpected command response for cmd {data[0]}, expected {expected}")
+                        return
                     self.response_future.set_result(data)
             
             # Dynamic UUID discovery for SW2 Protocol (e.g. GameCube Controller)
@@ -775,11 +779,16 @@ class Controller:
     ### Commands & Features ###
 
     async def write_command(self, command_id: int, subcommand_id: int, command_data = b''):
+        self.expected_command_id = command_id
         command_buffer = command_id.to_bytes() + b"\x91\x01" + subcommand_id.to_bytes() + b"\x00" + len(command_data).to_bytes() + b"\x00\x00" + command_data
         self.response_future = asyncio.get_running_loop().create_future()
         write_uuid = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
         await self.client.write_gatt_char(write_uuid, command_buffer)
-        response_buffer = await self.response_future
+        try:
+            response_buffer = await asyncio.wait_for(self.response_future, timeout=2.0)
+        except asyncio.TimeoutError:
+            raise Exception(f"Command response timeout for {command_id}")
+            
         if len(response_buffer) < 8 or response_buffer[0] != command_id or response_buffer[1] != 0x01:
             raise Exception(f"Unexpected response : {response_buffer}")
         return response_buffer[8:]
