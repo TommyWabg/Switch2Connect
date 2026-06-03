@@ -188,7 +188,28 @@ def is_vigembus_installed():
 
 logger = logging.getLogger(__name__)
 
-scaling_factor = 1.2
+try:
+    # Break out of Windows terminal DPI virtualization cache to get TRUE physical resolution
+    ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+try:
+    import tkinter as tk
+    temp_root = tk.Tk()
+    temp_root.withdraw()
+    screen_height = temp_root.winfo_screenheight()
+    temp_root.destroy()
+except Exception:
+    screen_height = 1440
+
+# Baseline is 1440p physical height.
+resolution_ratio = (screen_height / 1440.0) * getattr(CONFIG, 'ui_scale', 1.0)
+
+scaling_factor = 1.2 * resolution_ratio
 
 def scale_font(font_tuple):
     if not font_tuple:
@@ -196,11 +217,12 @@ def scale_font(font_tuple):
     if isinstance(font_tuple, tuple) and len(font_tuple) >= 2:
         family, size = font_tuple[0], font_tuple[1]
         weight = font_tuple[2] if len(font_tuple) > 2 else ""
-        if size != 8:
-            size = size + 2
-        else:
-            size = size + 1
-        return (family, int(size), weight)
+        # Convert Tkinter points to physical pixels (1 point = 96/72 pixels)
+        base_pixel_size = size * (96.0 / 72.0)
+        scaled_pixel_size = max(8, int(base_pixel_size * scaling_factor))
+        
+        # Negative size tells Tkinter to use exact physical pixels, preventing DPI double-scaling
+        return (family, -scaled_pixel_size, weight)
     return font_tuple
 
 class PowerListener:
@@ -229,8 +251,8 @@ class PowerListener:
             self.callback(wparam)
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
-controller_frame_size = 200
-battery_height = 40
+controller_frame_size = int(200 * resolution_ratio)
+battery_height = int(40 * resolution_ratio)
 
 # Current Color Scheme (Space Gray / Cyan Accent)
 background_color = "#2D2D2D"
@@ -1682,11 +1704,13 @@ class ControllerWindow:
         self.root.tk.call('tk', 'scaling', 1.3333333333333333)
         self.root.withdraw() # Hide immediately to prevent blank window during check_driver_installation()
         
-        # 2. Get and set global scaling factor
+        # 2. Re-apply global scaling factors to ensure they are up to date with config
         global scaling_factor, controller_frame_size, battery_height
-        scaling_factor = 1.2
+        # resolution_ratio is calculated at the top of the file
+        scaling_factor = 1.2 * resolution_ratio
         controller_frame_size = int(200 * scaling_factor)
         battery_height = int(40 * scaling_factor)
+
 
         self.check_driver_installation()
         
@@ -1705,12 +1729,12 @@ class ControllerWindow:
         self.root.title("Switch2 Controllers")
         
         # 3. Handle window geometry & minsize (remembering size)
-        default_w = 1240
-        default_h = 1140
+        default_w = int(1240 * resolution_ratio)
+        default_h = int(1120 * resolution_ratio)
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
-        self.root.minsize(1240, 920)
+        self.root.minsize(int(1240 * resolution_ratio), int(920 * resolution_ratio))
         self.root.config(bg=background_color, padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.root.bind("<Configure>", self.on_configure)
         
@@ -1882,6 +1906,8 @@ class ControllerWindow:
         self.hide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.hide_btn = tk.Button(self.hide_frame, text="Hide to System Tray", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.hide_to_tray)
         self.hide_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+
 
         self.update_driver_button()
         self.update_usbip_button()
@@ -2097,6 +2123,16 @@ class ControllerWindow:
             data['mouse']['sensitivity'] = new_sens
             with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)
         except Exception as e: logger.error(f"Failed to save mouse sensitivity: {e}")
+
+    def update_ir_activate_threshold(self, val):
+        new_val = int(float(val))
+        CONFIG.mouse_config.ir_activate_threshold = new_val
+        try:
+            with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
+            if 'mouse' not in data: data['mouse'] = {}
+            data['mouse']['ir_activate_threshold'] = new_val
+            with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)
+        except Exception as e: logger.error(f"Failed to save IR activate threshold: {e}")
 
     def on_gyro_setting_changed(self, *args):
         if not hasattr(self, 'sens_scale') or not hasattr(self, 'stick_scale'):
@@ -2416,6 +2452,9 @@ class ControllerWindow:
         tk.Label(row_mouse, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
         self.mouse_sens_scale = tk.Scale(row_mouse, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_mouse_sensitivity)
         self.mouse_sens_scale.set(CONFIG.mouse_config.sensitivity); self.mouse_sens_scale.pack(side=tk.LEFT)
+        tk.Label(row_mouse, text="Activate Threshold:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        self.ir_activate_scale = tk.Scale(row_mouse, from_=1, to=3, resolution=1, orient=tk.HORIZONTAL, length=int(80 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_ir_activate_threshold)
+        self.ir_activate_scale.set(CONFIG.mouse_config.ir_activate_threshold); self.ir_activate_scale.pack(side=tk.LEFT)
 
         row_shared = tk.Frame(self.settings_frame, bg=background_color); row_shared.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_shared, text="Shared Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
@@ -2438,9 +2477,30 @@ class ControllerWindow:
         self.gc_trigger_calib_btn = tk.Button(row_gc, text="Trigger Calibration", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_gc_trigger_calib_clicked)
         self.gc_trigger_calib_btn.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(10 * scaling_factor)))
 
-        tk.Label(row_gc, text="Trigger Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
-        self.gc_trigger_mode_switch = ToggleSwitch(row_gc, labels=["Digital", "Analog"], values=["100% at Bump", "100% at Max"], initial_value=getattr(CONFIG, "gc_trigger_mode", "100% at Bump"), command=self.update_gc_trigger_mode_setting, bg_color=background_color)
-        self.gc_trigger_mode_switch.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        tk.Label(row_gc, text="Analog Trigger 100%:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
+        
+        self.gc_trigger_labels = ["Hair Trigger", "Before Click", "Fully Clicked"]
+        self.gc_trigger_values = ["Hair Trigger", "100% at Bump", "100% at Max"]
+        
+        self.gc_trigger_combo = ttk.Combobox(row_gc, values=self.gc_trigger_labels, font=scale_font(("Arial", 12, "bold")), state="readonly", width=12, justify="center")
+        
+        current_val = getattr(CONFIG, "gc_trigger_mode", "100% at Bump")
+        try:
+            idx = self.gc_trigger_values.index(current_val)
+            self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
+        except ValueError:
+            self.gc_trigger_combo.set(self.gc_trigger_labels[1])
+            
+        def on_gc_trigger_combo_selected(event):
+            selected_label = self.gc_trigger_combo.get()
+            try:
+                idx = self.gc_trigger_labels.index(selected_label)
+                self.update_gc_trigger_mode_setting(self.gc_trigger_values[idx])
+            except ValueError:
+                pass
+                
+        self.gc_trigger_combo.bind("<<ComboboxSelected>>", on_gc_trigger_combo_selected)
+        self.gc_trigger_combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
     def on_gc_trigger_calib_clicked(self):
         gc_controller = None
@@ -2659,8 +2719,12 @@ class ControllerWindow:
                         custom_frame.pack_forget()
                     combo.pack(side=tk.LEFT)
                     
-        if hasattr(self, 'gc_trigger_mode_switch'):
-            self.gc_trigger_mode_switch.set_value(CONFIG.gc_trigger_mode)
+        if hasattr(self, 'gc_trigger_combo'):
+            try:
+                idx = self.gc_trigger_values.index(CONFIG.gc_trigger_mode)
+                self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
+            except ValueError:
+                pass
         if hasattr(self, 'layout_switch'):
             self.layout_switch.set_value(CONFIG.abxy_mode)
         if hasattr(self, 'rumble_mode_switch'):
@@ -2786,6 +2850,8 @@ class ControllerWindow:
         if hasattr(self, 'min_frame'):
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
+
+
     def on_setting_changed(self, event=None):
         def get_mapping(key):
             combo = getattr(self, f"{key}_combo", None)
@@ -2806,8 +2872,8 @@ class ControllerWindow:
         CONFIG.srl_mapping = get_mapping("srl")
         CONFIG.slr_mapping = get_mapping("slr")
         CONFIG.srr_mapping = get_mapping("srr")
-        if hasattr(self, 'gc_trigger_mode_switch'):
-            pass # Value is already saved by the ToggleSwitch command
+        if hasattr(self, 'gc_trigger_combo'):
+            pass # Value is already saved by the Combobox command
         try:
             with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
             data['abxy_mode'] = CONFIG.abxy_mode  

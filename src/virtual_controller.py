@@ -1922,8 +1922,11 @@ class VirtualController:
                 )
 
             if len(out_data) >= 6:
+                rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
                 if side == "Left":
                     v1 = decode_32bit_rumble(out_data[2:6])
+                    if rumble_mode != "Switch":
+                        v1.lf_freq = 0x0e1; v1.hf_freq = 0x1e1
                     v2 = v1
                     v3 = v1
                     with self.vibration_lock:
@@ -1934,6 +1937,8 @@ class VirtualController:
                         v1 = decode_32bit_rumble(out_data[6:10])
                     else:
                         v1 = decode_32bit_rumble(out_data[2:6])
+                    if rumble_mode != "Switch":
+                        v1.lf_freq = 0x0e1; v1.hf_freq = 0x1e1
                     v2 = v1
                     v3 = v1
                     with self.vibration_lock:
@@ -1945,6 +1950,9 @@ class VirtualController:
                         v1_right = decode_32bit_rumble(out_data[6:10])
                     else:
                         v1_right = decode_32bit_rumble(out_data[2:6])
+                    if rumble_mode != "Switch":
+                        v1_left.lf_freq = 0x0e1; v1_left.hf_freq = 0x1e1
+                        v1_right.lf_freq = 0x0e1; v1_right.hf_freq = 0x1e1
                     with self.vibration_lock:
                         self.switch_vibrations_left = [v1_left, v1_left, v1_left]
                         self.switch_vibrations_right = [v1_right, v1_right, v1_right]

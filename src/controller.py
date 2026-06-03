@@ -212,8 +212,15 @@ class ControllerInputData:
                 
             self.left_trigger_raw = data[12] if len(data) > 12 else 0
             self.right_trigger_raw = data[13] if len(data) > 13 else 0
-            self.left_trigger = remap_trigger_value(self.left_trigger_raw, gc_trigger_calib[0], l_max)
-            self.right_trigger = remap_trigger_value(self.right_trigger_raw, gc_trigger_calib[3], r_max)
+            
+            if mode == 'Hair Trigger':
+                l_thresh = gc_trigger_calib[0] + (gc_trigger_calib[2] - gc_trigger_calib[0]) * 0.05
+                r_thresh = gc_trigger_calib[3] + (gc_trigger_calib[5] - gc_trigger_calib[3]) * 0.05
+                self.left_trigger = 255 if self.left_trigger_raw >= l_thresh else 0
+                self.right_trigger = 255 if self.right_trigger_raw >= r_thresh else 0
+            else:
+                self.left_trigger = remap_trigger_value(self.left_trigger_raw, gc_trigger_calib[0], l_max)
+                self.right_trigger = remap_trigger_value(self.right_trigger_raw, gc_trigger_calib[3], r_max)
             
             # Map analog triggers to digital ZL/ZR bits if pressed past 50% (128)
             # This ensures Switch 1 mode (which only reads digital bits) gets a responsive trigger
@@ -235,10 +242,16 @@ class ControllerInputData:
             # Missing: MINUS (0x0100), L3 (0x0800), R3 (0x0400), SL/SR etc.
             self.buttons &= ~(0x00000100 | 0x00000400 | 0x00000800)
 
-            # NSO GameCube Protocol: IMU data starts at offset 14 (3 samples of 12 bytes)
-            if len(data) >= 26:
-                self.accelerometer = (decodes(data[14:16]), decodes(data[16:18]), decodes(data[18:20]))
-                self.gyroscope = (decodes(data[20:22]), decodes(data[22:24]), decodes(data[24:26]))
+            # NSO GameCube Protocol: IMU data actually starts at offset 34 based on raw data analysis
+            if len(data) >= 46:
+                global _gc_debug_counter
+                if '_gc_debug_counter' not in globals():
+                    _gc_debug_counter = 0
+                _gc_debug_counter += 1
+                if _gc_debug_counter % 125 == 0:
+                    import logging
+                self.accelerometer = (decodes(data[34:36]), decodes(data[36:38]), decodes(data[38:40]))
+                self.gyroscope = (decodes(data[40:42]), decodes(data[42:44]), decodes(data[44:46]))
                 self.magnometer = (0, 0, 0)
             else:
                 self.accelerometer = (0, 0, 0)
@@ -802,11 +815,20 @@ class Controller:
         
         if getattr(self, 'controller_info', None) and getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             try:
-                await self.write_command(0x11, 0x03, b'')
-                imu_config = bytes([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                await self.write_command(0x0A, 0x08, imu_config)
+                # Command 0x11, SubCmd 0x03
+                cmd_11 = bytes([0x11, 0x91, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00])
+                await self.client.write_gatt_char(getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID), cmd_11)
+                await asyncio.sleep(0.05)
+                
+                # Command 0x0A, SubCmd 0x08
+                cmd_0A = bytes([
+                    0x0A, 0x91, 0x01, 0x08, 0x00, 0x14, 0x00, 0x00,
+                    0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+                    0x35, 0x00, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                ])
+                await self.client.write_gatt_char(getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID), cmd_0A)
             except Exception as e:
-                logger.warning(f"Failed to send GameCube IMU init sequence: {e}")
+                logger.warning(f"Failed to send GameCube SW2 IMU init sequence: {e}")
                 
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
@@ -823,16 +845,53 @@ class Controller:
             lf_multiplier = 1.3
             hf_multiplier = 1.0 if is_pro else 0.6
         elif is_switch1:
-            lf_multiplier = strength / 5.0
-            hf_multiplier = strength / 5.0
-            
-            # Apply limits to prevent physical hardware limitations from being exceeded
             if is_pro:
-                lf_multiplier = min(2.6, lf_multiplier)
-                hf_multiplier = min(2.0, hf_multiplier)
+                if rumble_mode == "Switch":
+                    # LF: 2.6, HF: 4.0 (Doubled from 2.0)
+                    lf_at_5 = 1.0 * (2.6 / 2.6)
+                    hf_at_5 = 1.2 * (4.0 / 4.0)
+                    
+                    if strength <= 5.0:
+                        lf_multiplier = (strength / 5.0) * lf_at_5
+                        hf_multiplier = (strength / 5.0) * hf_at_5
+                    else:
+                        t = (strength - 5.0) / 5.0
+                        lf_multiplier = lf_at_5 + (2.6 - lf_at_5) * t
+                        hf_multiplier = hf_at_5 + (4.0 - hf_at_5) * t
+                    
+                    lf_multiplier = min(2.6, lf_multiplier)
+                    hf_multiplier = min(4.0, hf_multiplier)
+                else:
+                    # Align Xbox Rumble to other modes' Xbox Rumble
+                    target_lf_mult = (strength / 5.0) * 2.0
+                    target_hf_scale = (strength / 5.0) * 1.0
+                    
+                    target_lf_mult *= (2.6 / 2.6)
+                    target_hf_scale *= (2.0 / 2.0)
+                    
+                    lf_multiplier = min(2.6, target_lf_mult)
+                    hf_multiplier = min(2.0, target_hf_scale)
             else:
-                lf_multiplier = min(0.84, lf_multiplier)
-                hf_multiplier = min(1.12, hf_multiplier)
+                if rumble_mode == "Switch":
+                    if strength <= 5.0:
+                        lf_multiplier = (strength / 5.0) * 0.504
+                        hf_multiplier = (strength / 5.0) * 0.336
+                    else:
+                        t = (strength - 5.0) / 5.0
+                        lf_multiplier = 0.504 + (0.84 - 0.504) * t
+                        hf_multiplier = 0.336 + (0.56 - 0.336) * t
+                    lf_multiplier = min(0.84, lf_multiplier)
+                    hf_multiplier = min(0.56, hf_multiplier)
+                else:
+                    # Align Xbox Rumble for Joy-Con using the same ratio (LF: 1.0x, HF: 0.5x) compared to standard modes
+                    target_lf_mult = (strength / 5.0) * 2.0
+                    target_hf_scale = (strength / 5.0) * 1.0
+                    
+                    target_lf_mult *= 1.0
+                    target_hf_scale *= 0.5
+                    
+                    lf_multiplier = min(0.84, target_lf_mult)
+                    hf_multiplier = min(0.56, target_hf_scale)
         elif rumble_mode == "Switch":
             if is_pro:
                 if strength <= 5.0:
@@ -863,7 +922,10 @@ class Controller:
 
             # Apply limits from 0.7.1 to prevent physical hardware limitations from being exceeded
             if is_pro:
-                lf_multiplier = min(2.6, target_lf_mult) # 2.6 = 2.0 * 1.3
+                # Synchronize with Switch1 maximums
+                target_lf_mult *= (2.6 / 2.6)
+                target_hf_scale *= (2.0 / 2.0)
+                lf_multiplier = min(2.6, target_lf_mult)
                 hf_multiplier = min(2.0, target_hf_scale)
             else:
                 lf_multiplier = min(0.84, target_lf_mult) # 0.84 is the Joy-Con LF upper limit (based on S=7)
@@ -877,8 +939,7 @@ class Controller:
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             is_switch1 = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch1"
 
-            # In Switch 1 mode, rumble is always natively Switch format, regardless of the global rumble_mode setting.
-            is_pure_switch_rumble = is_switch1 or rumble_mode == "Switch"
+            is_pure_switch_rumble = rumble_mode == "Switch"
 
             if ignore_freq_scaling or (is_pure_switch_rumble and not is_switch1):
                 scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
@@ -892,20 +953,43 @@ class Controller:
                     
                     if is_switch1 and is_pro:
                         # Artificial Frequency Expander: Switch OS compresses Pro Controller frequencies.
-                        # We stretch the high frequencies upwards to restore the crisp Joy-Con feel on Gen 2 Pro.
-                        if scaled_hf_freq > 80:
-                            scaled_hf_freq = min(511, int(80 + (scaled_hf_freq - 80) * 1.5))
-                            
-                        # Optional: Slightly expand the LF range downwards for deeper bass
-                        if scaled_lf_freq < 80:
-                            scaled_lf_freq = max(1, int(80 - (80 - scaled_lf_freq) * 1.2))
+                        # Map 0-24% frequency evenly to 0-100% (0-511). Cap at 511.
+                        scaled_hf_freq = min(511, int(scaled_hf_freq * 4.167))
+                        
+                        # Map 98% LF (approx 501) to Xbox Rumble LF (0x0e1 / 225) to deepen bass within limits
+                        if scaled_lf_freq <= 501:
+                            scaled_lf_freq = 0x0e1
+                        else:
+                            scaled_lf_freq = min(511, int(0x0e1 + ((scaled_lf_freq - 501) / 10.0) * (511 - 0x0e1)))
+                    elif is_switch1 and not is_pro:
+                        # Joy-Con Frequency:
+                        # HF: Map 0-73% frequency evenly to 0-100% (0-511). Cap at 511.
+                        scaled_hf_freq = min(511, int(scaled_hf_freq * 1.369863))
+                        
+                        # LF: Map 0-100% (0-511) evenly to the new 0-100% output range (225-511). Cap at 511.
+                        scaled_lf_freq = 225 + (scaled_lf_freq / 511.0) * (511 - 225)
+                        scaled_lf_freq = min(511, max(225, int(scaled_lf_freq)))
                 else:
-                    # Frequency scaling formula based on 0.6.6 for non-Switch rumble modes
-                    new_min_lf = 0.5 * v.lf_freq + 0.5
-                    temp_lf_freq = new_min_lf + (v.lf_freq - new_min_lf) * freq_factor_lf
+                    # 1. First apply the frequency expansion mask (if Pro)
+                    if is_pro:
+                        expanded_lf_freq = v.lf_freq
+                        expanded_hf_freq = v.hf_freq
+                        
+                        # Map 98% LF (approx 501) to Xbox Rumble LF (0x0e1 / 225) to deepen bass within limits
+                        if expanded_lf_freq <= 501:
+                            expanded_lf_freq = 0x0e1
+                        else:
+                            expanded_lf_freq = min(511, int(0x0e1 + ((expanded_lf_freq - 501) / 10.0) * (511 - 0x0e1)))
+                    else:
+                        expanded_lf_freq = v.lf_freq
+                        expanded_hf_freq = v.hf_freq
+                        
+                    # 2. Then apply the Xbox Rumble frequency reduction mask on top of the expanded frequencies
+                    new_min_lf = 0.5 * expanded_lf_freq + 0.5
+                    temp_lf_freq = new_min_lf + (expanded_lf_freq - new_min_lf) * freq_factor_lf
 
-                    new_min_hf = 0.5 * v.hf_freq + 0.5
-                    temp_hf_freq = new_min_hf + (v.hf_freq - new_min_hf) * freq_factor_hf
+                    new_min_hf = 0.5 * expanded_hf_freq + 0.5
+                    temp_hf_freq = new_min_hf + (expanded_hf_freq - new_min_hf) * freq_factor_hf
 
                     # Clamped actual output frequencies
                     scaled_lf_freq = min(511, max(1, int(temp_lf_freq)))
@@ -915,53 +999,58 @@ class Controller:
                 lf_mask = 1.0
 
                 # Determine if the target is mid-high frequency simulating small motor (using original frequency v.hf_freq)
-                if v.hf_freq > 0:
-                    if is_switch1 and is_pro:
-                        # Temporarily remove Pro Controller strength mask in Switch 1 emu mode
-                        hf_mask = 1.0
+                if v.hf_freq > 0 and not (not is_pro and is_switch1 and is_pure_switch_rumble):
+                    # Calculate the dynamic range limits of the high-frequency channel
+                    # Upper limit (for max hf_freq = 511) when slider is at maximum F=10 (non-stretching):
+                    freq_factor_hf_at_10 = 4.0 / 9.0
+                    max_hf_freq = min(511, max(1, int(256.0 + 255.0 * freq_factor_hf_at_10)))
+                    # Lower limit is the current output low frequency (scaled_lf_freq)
+                    min_hf_freq = scaled_lf_freq
+
+                    denom = max(1.0, max_hf_freq - min_hf_freq)
+                    hf_mapped = 1.0 + ((scaled_hf_freq - min_hf_freq) / denom) * 9.0
+                    hf_mapped = min(10.0, max(1.0, hf_mapped))
+
+                    # Calculate base mask values at Strength=5 (F=1 -> 0.25, F=5 -> 0.1, F=10 -> 0.24 for Pro; F=1 -> 0.19, F=5 -> 0.095, F=10 -> 0.06 for Joy-Con)
+                    if is_pro:
+                        if hf_mapped <= 5.0:
+                            mask_at_5 = 0.25 - 0.0375 * (hf_mapped - 1.0)
+                        else:
+                            mask_at_5 = 0.1 + 0.028 * (hf_mapped - 5.0)
                     else:
-                        # Calculate the dynamic range limits of the high-frequency channel
-                        # Upper limit (for max hf_freq = 511) when slider is at maximum F=10 (non-stretching):
-                        freq_factor_hf_at_10 = 4.0 / 9.0
-                        max_hf_freq = min(511, max(1, int(256.0 + 255.0 * freq_factor_hf_at_10)))
-                        # Lower limit is the current output low frequency (scaled_lf_freq)
-                        min_hf_freq = scaled_lf_freq
-
-                        denom = max(1.0, max_hf_freq - min_hf_freq)
-                        hf_mapped = 1.0 + ((scaled_hf_freq - min_hf_freq) / denom) * 9.0
-                        hf_mapped = min(10.0, max(1.0, hf_mapped))
-
-                        # Calculate base mask values at Strength=5 (F=1 -> 0.25, F=5 -> 0.1, F=10 -> 0.24 for Pro; F=1 -> 0.19, F=5 -> 0.095, F=10 -> 0.06 for Joy-Con)
-                        if is_pro:
-                            if hf_mapped <= 5.0:
-                                mask_at_5 = 0.25 - 0.0375 * (hf_mapped - 1.0)
-                            else:
-                                mask_at_5 = 0.1 + 0.028 * (hf_mapped - 5.0)
+                        if hf_mapped <= 5.0:
+                            mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
                         else:
-                            if hf_mapped <= 5.0:
-                                mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
-                            else:
-                                mask_at_5 = 0.095 + 0.00164 * (hf_mapped - 5.0)
+                            mask_at_5 = 0.095 + 0.00164 * (hf_mapped - 5.0)
 
-                        # Calculate target mask values at Strength=10 (F=1 -> 0.34375, F=5 -> 0.1375, F=10 -> 0.33 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
-                        if is_pro:
-                            if hf_mapped <= 5.0:
-                                mask_at_10 = 0.34375 - 0.0515625 * (hf_mapped - 1.0)
-                            else:
-                                mask_at_10 = 0.1375 + 0.0385 * (hf_mapped - 5.0)
+                    # Calculate target mask values at Strength=10 (F=1 -> 0.34375, F=5 -> 0.1375, F=10 -> 0.33 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
+                    if is_pro:
+                        if hf_mapped <= 5.0:
+                            mask_at_10 = 0.34375 - 0.0515625 * (hf_mapped - 1.0)
                         else:
-                            if hf_mapped <= 5.0:
-                                mask_at_10 = 0.391875 - 0.048984375 * (hf_mapped - 1.0)
-                            else:
-                                mask_at_10 = 0.1959375 + 0.0088125 * (hf_mapped - 5.0)
+                            mask_at_10 = 0.1375 + 0.0385 * (hf_mapped - 5.0)
+                    else:
+                        if hf_mapped <= 5.0:
+                            mask_at_10 = 0.391875 - 0.048984375 * (hf_mapped - 1.0)
+                        else:
+                            mask_at_10 = 0.1959375 + 0.0088125 * (hf_mapped - 5.0)
 
-                        # Linearly interpolate mask between Strength=5 and Strength=10 curves
-                        if strength >= 5:
-                            t = (strength - 5.0) / 5.0
-                            t = min(1.0, max(0.0, t))
-                            hf_mask = mask_at_5 + (mask_at_10 - mask_at_5) * t
-                        else:
-                            hf_mask = mask_at_5
+                    # Linearly interpolate mask between Strength=5 and Strength=10 curves
+                    if strength >= 5:
+                        t = (strength - 5.0) / 5.0
+                        t = min(1.0, max(0.0, t))
+                        hf_mask = mask_at_5 + (mask_at_10 - mask_at_5) * t
+                    else:
+                        hf_mask = mask_at_5
+                        
+                    # Scale the mask for the new intensity limits
+                    if is_pro:
+                        if is_switch1 and is_pure_switch_rumble:
+                            hf_mask *= 2.0  # 4.0 / 2.0
+                        elif is_switch1 or not is_pure_switch_rumble:
+                            hf_mask *= 1.0  # 2.0 / 2.0
+                    elif not is_pro and is_switch1:
+                        hf_mask *= 1.0
                 else:
                     hf_mask = 1.0
 
@@ -1671,7 +1760,11 @@ class Controller:
         
         if mouse_config.enabled and self.is_joycon():
             # Check if mouse coordinate data is valid to mark the controller as active IR mouse
-            ir_active = (inputData.mouse_distance != 0 and inputData.mouse_distance < 1000 and inputData.mouse_roughness < 4000)
+            _IR_THRESHOLD_MAP = {1: (1000, 4000), 2: (1500, 5000), 3: (3000, 10000)}
+            _ir_dist, _ir_rough = _IR_THRESHOLD_MAP.get(mouse_config.ir_activate_threshold, (1000, 4000))
+            ir_active = (inputData.mouse_distance != 0
+                         and inputData.mouse_distance < _ir_dist
+                         and inputData.mouse_roughness < _ir_rough)
 
             if ir_active:
                 self.jc_mouse_active = True 

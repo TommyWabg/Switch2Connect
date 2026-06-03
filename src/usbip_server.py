@@ -1111,9 +1111,20 @@ class USBIPJoyConServer(USBIPServer):
         length = data[15]
         reply_data = [data[11], data[12], 0x00, 0x00, length]
         spi = [0xFF] * length
-        stick_calib = [0x00, 0x08, 0x80, 0x00, 0x07, 0x70, 0x00, 0x07, 0x70]
+
+        # Factory stick calibration (9 bytes, 3x 12-bit pairs packed little-endian):
+        #   [max_offset_x/y][center_x/y][min_offset_x/y]
+        # center = 2048 (0x800) → [0x00, 0x08, 0x80]  matches float_to_12bit(0.0)
+        # max_offset = min_offset = 816 (0x330) → [0x30, 0x03, 0x33]  symmetric, realistic Joy-Con value
+        # Verify: 0x30 | ((0x03 & 0x0F) << 8) = 0x330 = 816 ✓
+        #         (0x03 >> 4) | (0x33 << 4) = 0x330 = 816 ✓
+        stick_calib = [
+            0x30, 0x03, 0x33,  # max offset (816, 816)
+            0x00, 0x08, 0x80,  # center     (2048, 2048)
+            0x30, 0x03, 0x33,  # min offset (816, 816)
+        ]
         stick_params = [
-            0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+            0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
         ]
 
@@ -1132,9 +1143,14 @@ class USBIPJoyConServer(USBIPServer):
         elif addr == 0x6098:
             spi = (stick_params + [0xFF]*20)[:length]
         elif addr == 0x8010:
-            spi = ([0xB2, 0xA1] + stick_calib + [0xFF]*20)[:length]
+            # Return invalid magic (0xFF 0xFF) → Eden/Yuzu fall back to factory calibration (0x603D).
+            # Previously returned 0xB2 0xA1 (valid) with factory-format data, but User Cal uses
+            # a different field order (Center first) vs Factory Cal (Max Offset first), causing
+            # Eden to compute center=(1792,1792) instead of (2048,2048) → diagonal lock bug.
+            spi = ([0xFF] * length)
         elif addr == 0x801B:
-            spi = ([0xB2, 0xA1] + stick_calib + [0xFF]*20)[:length]
+            # Same fix as 0x8010 for the right stick user calibration.
+            spi = ([0xFF] * length)
         elif addr == 0x6020:
             spi = ([0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01,
                     0x00, 0x40, 0x00, 0x40, 0x00, 0x40,

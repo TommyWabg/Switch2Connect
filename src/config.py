@@ -123,6 +123,7 @@ class MouseConfig:
     enabled: bool
     sensitivity: float
     scroll_sensitivity: float
+    ir_activate_threshold: int
     joycon_l_buttons: MouseButtonConfig
     joycon_r_buttons: MouseButtonConfig
 
@@ -130,6 +131,7 @@ class MouseConfig:
         self.enabled = config_dict.get("enabled", False)
         self.sensitivity = config_dict.get("sensitivity", 1.0)
         self.scroll_sensitivity = config_dict.get("scroll_sensitivity", 1.0)
+        self.ir_activate_threshold = int(config_dict.get("ir_activate_threshold", 1))
         buttons_config = config_dict.get("buttons", {})
         self.joycon_l_buttons = MouseButtonConfig(buttons_config.get("left_joycon", {}), default_left="L", default_right="ZL")
         self.joycon_r_buttons = MouseButtonConfig(buttons_config.get("right_joycon", {}), default_left="R", default_right="ZR")
@@ -438,7 +440,8 @@ class Config:
             'button_remaps': self.button_remaps,
             'mouse': {
                 'enabled': self.mouse_config.enabled,
-                'sensitivity': self.mouse_config.sensitivity
+                'sensitivity': self.mouse_config.sensitivity,
+                'ir_activate_threshold': self.mouse_config.ir_activate_threshold,
             }
         }
         
