@@ -49,7 +49,7 @@ button_remaps:
     abxy_mode: Switch
     c_mapping: Calibration
     capt_mapping: Default
-    gc_trigger_mode: 100% at Bump
+    gc_trigger_mode: Hair Trigger
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
@@ -68,7 +68,7 @@ button_remaps:
     abxy_mode: Switch
     c_mapping: Default
     capt_mapping: Default
-    gc_trigger_mode: 100% at Bump
+    gc_trigger_mode: Hair Trigger
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
@@ -147,6 +147,7 @@ merged_gyro_side:
   E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
   enabled: true
+  ir_activate_threshold: 1
   sensitivity: 4.0
 open_when_startup: false
 rumble_mode: Xbox
@@ -162,6 +163,7 @@ stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
+ui_scale: 1.0
 usbip_sim_mode: Switch1
 vibration_frequency: 10
 vibration_strength: 5
@@ -170,6 +172,6 @@ vibration_strength_xbox: 5
 vigembus_installed: true
 vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
-window_height: 1140
+window_height: 1120
 window_width: 1240
 winuhid_sim_mode: PS5
