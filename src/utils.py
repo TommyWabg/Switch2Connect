@@ -217,3 +217,8 @@ def disable_power_throttling():
         return res != 0
     except Exception:
         return False
+change_profile_callback = None
+def trigger_change_profile():
+    if change_profile_callback:
+        change_profile_callback()
+

@@ -42,7 +42,7 @@ SWITCH_BUTTONS = {
 }
 
 BACK_BUTTON_OPTIONS = [
-    "Default", "Custom", "Gyro", "Calibration", "Sys Manager", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
+    "Default", "Custom", "Gyro", "Calibration", "Sys Manager", "Change Profile", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR"
 ]
@@ -236,70 +236,66 @@ class Config:
 
         self.mouse_config = MouseConfig(config.get("mouse", {}))
         # Define categories and defaults for button remaps
-        self.button_remaps = config.get("button_remaps", {}) or {}
+        self.active_profile = config.get("active_profile", "Default")
+        self.profiles = config.get("profiles", {})
         
-        # Backward compatibility migration from 'ps' to 'ps4' and 'ps5'
-        if "ps" in self.button_remaps:
-            import copy
-            if "ps4" not in self.button_remaps:
-                self.button_remaps["ps4"] = copy.deepcopy(self.button_remaps["ps"])
-            if "ps5" not in self.button_remaps:
-                self.button_remaps["ps5"] = copy.deepcopy(self.button_remaps["ps"])
-            self.button_remaps.pop("ps", None)
-
+        # Migration from old button_remaps
+        old_button_remaps = config.get("button_remaps", {})
+        if old_button_remaps and not self.profiles:
+            self.profiles["Profile 1"] = old_button_remaps.copy()
+            self.profiles["Default"] = {}
+            self.active_profile = "Profile 1"
+            
+        if not self.profiles:
+            self.profiles["Default"] = {}
+            
+        if self.active_profile not in self.profiles:
+            self.active_profile = list(self.profiles.keys())[0] if self.profiles else "Default"
+            if self.active_profile not in self.profiles:
+                self.profiles[self.active_profile] = {}
+        
         categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
         old_hold_mode = config.get("joycon_hold_mode", {}) or {}
-        default_mappings = {
-            "gl_mapping": "Default",
-            "gr_mapping": "Gyro",
-            "c_mapping": "Default",
-            "slr_mapping": "Gyro",
-            "srl_mapping": "Default",
-            "sll_mapping": "Default",
-            "srr_mapping": "Default",
-            "home_mapping": "Default",
-            "capt_mapping": "PrtSc",
-            "abxy_mode": "Xbox",
-            "rumble_mode": "Xbox",
-            "vibration_strength_xbox": 5,
-            "vibration_strength_switch": 5,
-            "vibration_frequency": 10,
-            "gc_trigger_mode": "100% at Bump"
-        }
         
-        # Populate each category, falling back to top-level key or default
-        for cat in categories:
-            if cat not in self.button_remaps:
-                self.button_remaps[cat] = {}
-            if "joycon_hold_mode" not in self.button_remaps[cat]:
-                self.button_remaps[cat]["joycon_hold_mode"] = old_hold_mode.copy()
-            for key, def_val in default_mappings.items():
-                if key not in self.button_remaps[cat]:
-                    old_cat_data = config.get("button_remaps", {}).get(cat, {})
-                    # For backward compatibility, check top-level config first
-                    if key == "abxy_mode":
-                        top_level_def = "Switch" if cat in ("switch1", "switch2") else "Xbox"
-                        val = config.get("abxy_mode", top_level_def)
-                    elif key == "rumble_mode":
-                        top_level_def = "Switch" if cat in ("switch1", "switch2") else "Xbox"
-                        val = config.get("rumble_mode", top_level_def)
-                    elif key == "vibration_strength_xbox":
-                        val = old_cat_data.get("vibration_strength", config.get("vibration_strength_xbox", config.get("vibration_strength", def_val)))
-                    elif key == "vibration_strength_switch":
-                        val = old_cat_data.get("vibration_strength", config.get("vibration_strength_switch", config.get("vibration_strength", def_val)))
-                    elif key == "vibration_frequency":
-                        val = config.get("vibration_frequency", def_val)
-                    elif key == "capt_mapping":
-                        default_capt = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
-                        val = config.get("capt_mapping", default_capt)
-                        if val in ("None", "CAPT", "Default", "Capture"):
-                            val = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
-                    else:
-                        val = config.get(key, def_val)
-                    
-                    if key == "rumble_mode" and val == "PC":
-                        val = "Xbox"
-                    self.button_remaps[cat][key] = val
+        # Populate each category for all profiles
+        for prof_name, prof_data in self.profiles.items():
+            if "ps" in prof_data:
+                import copy
+                if "ps4" not in prof_data: prof_data["ps4"] = copy.deepcopy(prof_data["ps"])
+                if "ps5" not in prof_data: prof_data["ps5"] = copy.deepcopy(prof_data["ps"])
+                prof_data.pop("ps", None)
+
+            for cat in categories:
+                if cat not in prof_data:
+                    prof_data[cat] = {}
+                if "joycon_hold_mode" not in prof_data[cat]:
+                    prof_data[cat]["joycon_hold_mode"] = old_hold_mode.copy()
+                for key, def_val in self.get_default_category_dict(cat).items():
+                    if key not in prof_data[cat]:
+                        old_cat_data = old_button_remaps.get(cat, {})
+                        if key == "abxy_mode":
+                            top_level_def = "Switch" if cat in ("switch1", "switch2") else "Xbox"
+                            val = config.get("abxy_mode", top_level_def)
+                        elif key == "rumble_mode":
+                            top_level_def = "Switch" if cat in ("switch1", "switch2") else "Xbox"
+                            val = config.get("rumble_mode", top_level_def)
+                        elif key == "vibration_strength_xbox":
+                            val = old_cat_data.get("vibration_strength", config.get("vibration_strength_xbox", config.get("vibration_strength", def_val)))
+                        elif key == "vibration_strength_switch":
+                            val = old_cat_data.get("vibration_strength", config.get("vibration_strength_switch", config.get("vibration_strength", def_val)))
+                        elif key == "vibration_frequency":
+                            val = config.get("vibration_frequency", def_val)
+                        elif key == "capt_mapping":
+                            default_capt = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
+                            val = config.get("capt_mapping", default_capt)
+                            if val in ("None", "CAPT", "Default", "Capture"):
+                                val = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
+                        else:
+                            val = config.get(key, def_val)
+                        
+                        if key == "rumble_mode" and val == "PC":
+                            val = "Xbox"
+                        prof_data[cat][key] = val
         
         self.gyro_mode = config.get("gyro_mode", "World")
         self.gyro_sensitivity = float(config.get("gyro_sensitivity", 0.3))
@@ -386,6 +382,107 @@ class Config:
         # abxy_mode, rumble_mode, vibration_strength, vibration_frequency are now properties managed per Emu Mode category
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
+
+    @property
+    def button_remaps(self):
+        return self.profiles[self.active_profile]
+
+    def add_profile(self, name):
+        if name and name not in self.profiles:
+            import copy
+            self.profiles[name] = copy.deepcopy(self.profiles[self.active_profile])
+            self.active_profile = name
+            self.save_config()
+            return True
+        return False
+
+    def rename_profile(self, new_name):
+        if new_name and new_name not in self.profiles:
+            self.profiles[new_name] = self.profiles.pop(self.active_profile)
+            self.active_profile = new_name
+            self.save_config()
+            return True
+        return False
+
+    def delete_profile(self):
+        if len(self.profiles) > 1:
+            self.profiles.pop(self.active_profile)
+            self.active_profile = list(self.profiles.keys())[0]
+            self.save_config()
+            return True
+        return False
+
+    def get_default_category_dict(self, cat):
+        # Specific default values matching user's exact current config for each Emu Mode
+        defaults = {
+            "ps4": {
+                "abxy_mode": "Xbox", "c_mapping": "Calibration", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
+                "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
+                "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "ps5": {
+                "abxy_mode": "Xbox", "c_mapping": "Default", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
+                "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
+                "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "xbox": {
+                "abxy_mode": "Xbox", "c_mapping": "Calibration", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "Default", "gr_mapping": "Default",
+                "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
+                "slr_mapping": "Default", "srl_mapping": "Default", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 10, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "switch1": {
+                "abxy_mode": "Switch", "c_mapping": "Calibration", "capt_mapping": "Default",
+                "gc_trigger_mode": "Hair Trigger", "gl_mapping": "Default", "gr_mapping": "Default",
+                "home_mapping": "Default", "rumble_mode": "Switch", "sll_mapping": "Default",
+                "slr_mapping": "Default", "srl_mapping": "Default", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "switch2": {
+                "abxy_mode": "Switch", "c_mapping": "Default", "capt_mapping": "Default",
+                "gc_trigger_mode": "Hair Trigger", "gl_mapping": "Default", "gr_mapping": "Default",
+                "home_mapping": "Default", "rumble_mode": "Switch", "sll_mapping": "Default",
+                "slr_mapping": "GR", "srl_mapping": "GL", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            }
+        }
+        return defaults.get(cat, defaults["xbox"]).copy()
+
+    def get_default_profile_dict(self):
+        categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
+        prof_data = {}
+        for cat in categories:
+            prof_data[cat] = self.get_default_category_dict(cat)
+            prof_data[cat]["joycon_hold_mode"] = {}
+        return prof_data
+
+    def reset_profile_to_default(self, name):
+        if name in self.profiles:
+            self.profiles[name] = self.get_default_profile_dict()
+            self.save_config()
+            return True
+        return False
+
+    def reset_category_to_default(self, name, cat):
+        if name in self.profiles and cat in self.profiles[name]:
+            old_hold_mode = self.profiles[name][cat].get("joycon_hold_mode", {})
+            self.profiles[name][cat] = self.get_default_category_dict(cat)
+            self.profiles[name][cat]["joycon_hold_mode"] = old_hold_mode
+            self.save_config()
+            return True
+        return False
+
+    def switch_profile(self, name):
+        if name in self.profiles:
+            self.active_profile = name
+            self.save_config()
+            return True
+        return False
         
     def save_config(self):
         # Snapshot config values in the calling thread
@@ -437,7 +534,8 @@ class Config:
             'gc_trigger_mode': self.gc_trigger_mode,
             'joycon_hold_mode': self.joycon_hold_mode,
             'merged_gyro_side': self.merged_gyro_side,
-            'button_remaps': self.button_remaps,
+            'active_profile': self.active_profile,
+            'profiles': self.profiles,
             'mouse': {
                 'enabled': self.mouse_config.enabled,
                 'sensitivity': self.mouse_config.sensitivity,

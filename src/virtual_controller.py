@@ -996,7 +996,7 @@ class VirtualController:
             ly = inputData.left_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1] * 0.25,  -inputData.gyroscope[0] * 0.25,  inputData.gyroscope[2] * 0.25
+                gx, gy, gz =  inputData.gyroscope[1],  -inputData.gyroscope[0],  inputData.gyroscope[2]
                 ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
             else: # Horizontal
                 gx, gy, gz =  inputData.gyroscope[0], inputData.gyroscope[1],  inputData.gyroscope[2]
@@ -1010,10 +1010,10 @@ class VirtualController:
             ry = inputData.right_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1] * 0.25, inputData.gyroscope[0] * 0.25, -inputData.gyroscope[2] * 0.25
+                gx, gy, gz =  inputData.gyroscope[1] * 0.8719, inputData.gyroscope[0] * 0.8719, -inputData.gyroscope[2] * 0.8719
                 ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz = -inputData.gyroscope[0], inputData.gyroscope[1], -inputData.gyroscope[2]
+                gx, gy, gz = -inputData.gyroscope[0] * 0.8719, inputData.gyroscope[1] * 0.8719, -inputData.gyroscope[2] * 0.8719
                 ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
                 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:

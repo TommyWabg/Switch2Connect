@@ -868,7 +868,8 @@ class CalibrationOverlay:
         # We do not auto-close on Gyro completion because it has instructions waiting for Mag start
         is_final_complete = "magnetometer calibration complete" in message.lower()
         is_cancelled = "cancelled" in message.lower()
-        if is_final_complete or is_cancelled:
+        is_profile = "profile" in title.lower()
+        if is_final_complete or is_cancelled or is_profile:
             self.close_timer = self.root.after(3000, self.close)
 
     def _create_window(self):
@@ -1010,6 +1011,9 @@ class ControllerWindow:
         self.power_listener = PowerListener(self.handle_power_event)
         self.last_width = CONFIG.window_width
         self.last_height = CONFIG.window_height
+        
+        import utils
+        utils.change_profile_callback = self.on_cycle_profile
 
     def check_vigembus_installation(self, save=True):
         installed = is_vigembus_installed()
@@ -1730,7 +1734,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering size)
         default_w = int(1240 * resolution_ratio)
-        default_h = int(1120 * resolution_ratio)
+        default_h = int(1200 * resolution_ratio)
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
@@ -2456,6 +2460,27 @@ class ControllerWindow:
         self.ir_activate_scale = tk.Scale(row_mouse, from_=1, to=3, resolution=1, orient=tk.HORIZONTAL, length=int(80 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_ir_activate_threshold)
         self.ir_activate_scale.set(CONFIG.mouse_config.ir_activate_threshold); self.ir_activate_scale.pack(side=tk.LEFT)
 
+        row_profile = tk.Frame(self.settings_frame, bg=background_color)
+        row_profile.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
+        tk.Label(row_profile, text="Profile:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        
+        self.profile_combo = ttk.Combobox(row_profile, values=self.get_sorted_profiles(), state="readonly", font=scale_font(("Arial", 12, "bold")), width=15)
+        self.profile_combo.set(CONFIG.active_profile)
+        self.profile_combo.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
+        
+        self.add_profile_btn = tk.Button(row_profile, text="Add", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_add_profile)
+        self.add_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
+        self.rename_profile_btn = tk.Button(row_profile, text="Rename", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_rename_profile)
+        self.rename_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        
+        self.reset_profile_btn = tk.Button(row_profile, text="Reset", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_reset_profile)
+        self.reset_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
+        self.del_profile_btn = tk.Button(row_profile, text="Delete", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_delete_profile)
+        self.del_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
         row_shared = tk.Frame(self.settings_frame, bg=background_color); row_shared.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(row_shared, text="Shared Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("home", "Home:"), ("capt", "Capture:"), ("c", "Chat:")]:
@@ -2520,12 +2545,16 @@ class ControllerWindow:
         GCTriggerCalibrationWizard(self.root, gc_controller)
 
     def update_driver_type_setting(self, val):
-        # 1. 先讀檔
-        CONFIG.load_config()
+        # 1. 讀取 (Removed load_config to prevent async save race condition)
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
         old_sim_mode = getattr(CONFIG, "simulation_mode", "Xbox One")
+        
+        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = val
+            
         if old_driver == val:
+            CONFIG.save_config()
             return
             
         # Check driver installation BEFORE updating CONFIG or recreating controllers!
@@ -2602,13 +2631,19 @@ class ControllerWindow:
                 import gc
                 gc.collect()
                 import time
-                time.sleep(0.5)
+                end_t = time.time() + 0.5
+                while time.time() < end_t:
+                    self.root.update()
+                    time.sleep(0.01)
                 
                 # Pass 2: Recreate them under the new driver/mode sequentially
                 for i, vc in enumerate(self.current_controllers):
                     if vc is not None:
                         if i > 0:
-                            time.sleep(0.2)
+                            end_t2 = time.time() + 0.2
+                            while time.time() < end_t2:
+                                self.root.update()
+                                time.sleep(0.01)
                         with vc.state_lock:
                             vc.mode = CONFIG.simulation_mode
                             if vc.mode == "Switch1":
@@ -2741,11 +2776,15 @@ class ControllerWindow:
         # No need to restart discovery, controllers can read the setting dynamically or on reconnect
 
     def update_sim_mode_setting(self, val):
-        # 1. 先讀檔
-        CONFIG.load_config()
+        # 1. 讀取 (Removed load_config to prevent async save race condition)
         
         old_mode = getattr(CONFIG, "simulation_mode", "Xbox One")
+        
+        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = val
+        
         if old_mode == val:
+            CONFIG.save_config()
             return
             
         CONFIG.simulation_mode = val
@@ -2851,6 +2890,278 @@ class ControllerWindow:
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
 
+    def custom_askstring(self, title, prompt, initialvalue=""):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=background_color)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        w = int(350 * scaling_factor)
+        h = int(150 * scaling_factor)
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (w // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (h // 2)
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+        
+        tk.Label(dialog, text=prompt, font=scale_font(("Arial", 12, "bold")), bg=background_color, fg=text_color).pack(pady=(int(15*scaling_factor), int(5*scaling_factor)))
+        
+        entry = tk.Entry(dialog, font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", insertbackground="white", justify="center")
+        entry.pack(padx=int(20*scaling_factor), fill=tk.X)
+        if initialvalue:
+            entry.insert(0, initialvalue)
+            entry.select_range(0, tk.END)
+        
+        result = [None]
+        def on_ok(event=None):
+            result[0] = entry.get()
+            dialog.destroy()
+        def on_cancel(event=None):
+            dialog.destroy()
+            
+        entry.bind("<Return>", on_ok)
+        entry.bind("<Escape>", on_cancel)
+        
+        btn_frame = tk.Frame(dialog, bg=background_color)
+        btn_frame.pack(pady=int(15*scaling_factor))
+        tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_ok).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_cancel).pack(side=tk.LEFT, padx=5)
+        
+        entry.focus_set()
+        self.root.wait_window(dialog)
+        return result[0]
+
+    def custom_messagebox(self, title, message, type="info"):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=background_color)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        w = int(350 * scaling_factor)
+        h = int(150 * scaling_factor)
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (w // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (h // 2)
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+        
+        tk.Label(dialog, text=message, font=scale_font(("Arial", 12, "bold")), bg=background_color, fg=text_color, wraplength=int(310*scaling_factor), justify="center").pack(pady=(int(20*scaling_factor), int(10*scaling_factor)), expand=True)
+        
+        result = [None]
+        btn_frame = tk.Frame(dialog, bg=background_color)
+        btn_frame.pack(pady=(0, int(15*scaling_factor)))
+        
+        def set_res(res):
+            result[0] = res
+            dialog.destroy()
+            
+        if type == "yesno":
+            tk.Button(btn_frame, text="Yes", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text="No", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
+        else:
+            tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack()
+            
+        dialog.bind("<Return>", lambda e: set_res(True))
+        if type == "yesno":
+            dialog.bind("<Escape>", lambda e: set_res(False))
+        else:
+            dialog.bind("<Escape>", lambda e: set_res(True))
+            
+        self.root.wait_window(dialog)
+        return result[0]
+
+    def get_sorted_profiles(self):
+        import re
+        def sort_key(s):
+            tokens = re.findall(r'[a-zA-Z]+|\d+|[^a-zA-Z\d]+', s)
+            key = []
+            for t in tokens:
+                if t.isalpha():
+                    key.append((0, t.lower()))
+                elif t.isdigit():
+                    key.append((1, int(t)))
+                else:
+                    key.append((2, t))
+            return key
+        return sorted(list(CONFIG.profiles.keys()), key=sort_key)
+
+    def on_cycle_profile(self):
+        if not hasattr(CONFIG, 'active_profile') or not CONFIG.profiles:
+            return
+            
+        # Execute on main thread to avoid Tkinter threading errors
+        if threading.current_thread() != threading.main_thread():
+            self.root.after(0, self.on_cycle_profile)
+            return
+
+        sorted_profiles = self.get_sorted_profiles()
+        if not sorted_profiles: return
+        
+        # Initialize pending profile if not set
+        if not hasattr(self, 'pending_profile') or not self.pending_profile:
+            self.pending_profile = CONFIG.active_profile
+            
+        try:
+            curr_idx = sorted_profiles.index(self.pending_profile)
+            next_idx = (curr_idx + 1) % len(sorted_profiles)
+        except ValueError:
+            next_idx = 0
+            
+        self.pending_profile = sorted_profiles[next_idx]
+        
+        # Show notification immediately
+        import utils
+        utils.show_notification("Profile Switched", f"Current Profile: {self.pending_profile}")
+        
+        # Cancel any pending apply timer
+        if hasattr(self, 'profile_apply_timer') and self.profile_apply_timer:
+            self.root.after_cancel(self.profile_apply_timer)
+            
+        # Set timer to actually apply the profile after 1 second of inactivity
+        self.profile_apply_timer = self.root.after(1000, self.apply_pending_profile)
+        
+    def apply_pending_profile(self):
+        self.profile_apply_timer = None
+        if not hasattr(self, 'pending_profile') or not self.pending_profile:
+            return
+            
+        if self.pending_profile == getattr(CONFIG, 'active_profile', ""):
+            return # No change
+            
+        # 1. Save current profile settings
+        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "Xbox One")
+
+        # 2. Apply switch
+        if CONFIG.switch_profile(self.pending_profile):
+            self.profile_combo.set(self.pending_profile)
+            self.apply_profile_switch()
+            
+        self.pending_profile = None
+
+    def apply_profile_switch(self):
+        new_profile_name = getattr(CONFIG, 'active_profile', "")
+        if not new_profile_name or new_profile_name not in CONFIG.profiles:
+            return
+            
+        new_driver = CONFIG.profiles[new_profile_name].get("driver_type")
+        if not new_driver:
+            new_driver = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[new_profile_name]["driver_type"] = new_driver
+            
+        new_emu = CONFIG.profiles[new_profile_name].get("simulation_mode")
+        if not new_emu:
+            new_emu = getattr(CONFIG, "simulation_mode", "Xbox One")
+            CONFIG.profiles[new_profile_name]["simulation_mode"] = new_emu
+            
+        CONFIG.save_config()
+
+        driver_changed = getattr(CONFIG, "driver_type", "") != new_driver
+        emu_changed = getattr(CONFIG, "simulation_mode", "") != new_emu
+        
+        # Pre-set the target driver's default to avoid double recreation in update_driver_type_setting
+        if new_driver == "ViGEmBus":
+            CONFIG.vigembus_sim_mode = new_emu
+        elif new_driver == "USBIP":
+            CONFIG.usbip_sim_mode = new_emu
+        else:
+            CONFIG.winuhid_sim_mode = new_emu
+
+        # 2. 切換至新的profile的Driver
+        if driver_changed:
+            if getattr(self, 'driver_switch', None):
+                self.driver_switch.set_value(new_driver)
+            self.update_driver_type_setting(new_driver)
+            
+        # 3. 切換至新的profile的Emu Mode (If driver changed, it was already applied, but we ensure UI is updated)
+        if not driver_changed and emu_changed:
+            if getattr(self, 'sim_mode_switch', None):
+                self.sim_mode_switch.set_value(new_emu)
+            self.update_sim_mode_setting(new_emu)
+        elif getattr(self, 'sim_mode_switch', None):
+            self.sim_mode_switch.set_value(new_emu)
+
+        # 4. 切換至新的profile的custom buttons與其他設定
+        self.refresh_ui_for_profile()
+
+    def on_profile_selected(self, event):
+        if hasattr(self, 'profile_apply_timer') and self.profile_apply_timer:
+            self.root.after_cancel(self.profile_apply_timer)
+            self.profile_apply_timer = None
+        self.pending_profile = None
+        
+        selected_profile = self.profile_combo.get()
+        if not selected_profile or selected_profile == getattr(CONFIG, "active_profile", ""):
+            return
+            
+        # 1. 紀錄當下設定、Driver與Emu Mode至原本的profile
+        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "Xbox One")
+
+        if CONFIG.switch_profile(selected_profile):
+            self.apply_profile_switch()
+
+    def on_add_profile(self):
+        i = 1
+        while f"Profile {i}" in CONFIG.profiles:
+            i += 1
+        new_name = f"Profile {i}"
+        
+        # 1. 紀錄當下設定、Driver與Emu Mode至原本的profile
+        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "Xbox One")
+            
+        if CONFIG.add_profile(new_name):
+            self.profile_combo['values'] = self.get_sorted_profiles()
+            self.profile_combo.set(CONFIG.active_profile)
+            self.apply_profile_switch()
+
+    def on_rename_profile(self):
+        current_name = CONFIG.active_profile
+        new_name = self.custom_askstring("Rename Profile", f"Rename '{current_name}' to:", initialvalue=current_name)
+        if new_name and new_name != current_name:
+            if new_name in CONFIG.profiles:
+                self.custom_messagebox("Error", f"Profile '{new_name}' already exists.", type="error")
+            else:
+                if CONFIG.rename_profile(new_name):
+                    self.profile_combo['values'] = self.get_sorted_profiles()
+                    self.profile_combo.set(CONFIG.active_profile)
+
+    def on_reset_profile(self):
+        current_name = CONFIG.active_profile
+        if self.custom_messagebox("Reset Profile", f"Are you sure you want to reset profile '{current_name}'?", type="yesno"):
+            if CONFIG.reset_profile_to_default(current_name):
+                # We can just apply the profile switch to reload everything from CONFIG.profiles
+                self.apply_profile_switch()
+                
+    def on_delete_profile(self):
+        if len(CONFIG.profiles) <= 1:
+            self.custom_messagebox("Delete Profile", "Cannot delete the last profile.", type="warning")
+            return
+            
+        current_name = CONFIG.active_profile
+        if self.custom_messagebox("Delete Profile", f"Are you sure you want to delete profile '{current_name}'?", type="yesno"):
+            if CONFIG.delete_profile():
+                self.profile_combo['values'] = self.get_sorted_profiles()
+                self.profile_combo.set(CONFIG.active_profile)
+                # Since the old profile is deleted, we just apply the new profile directly
+                self.apply_profile_switch()
+
+    def refresh_ui_for_profile(self):
+        self.layout_switch.set_value(CONFIG.abxy_mode)
+        self.rumble_mode_switch.set_value(getattr(CONFIG, "rumble_mode", "Xbox"))
+        self.update_rumble_mode_ui(getattr(CONFIG, "rumble_mode", "Xbox"))
+        self.vibration_strength_scale.set(CONFIG.vibration_strength)
+        self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
+        self._refresh_mapping_comboboxes()
+        if hasattr(self, 'gc_trigger_combo'):
+            current_val = getattr(CONFIG, "gc_trigger_mode", "100% at Bump")
+            try:
+                idx = self.gc_trigger_values.index(current_val)
+                self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
+            except ValueError:
+                self.gc_trigger_combo.set(self.gc_trigger_labels[1])
 
     def on_setting_changed(self, event=None):
         def get_mapping(key):
@@ -2874,18 +3185,7 @@ class ControllerWindow:
         CONFIG.srr_mapping = get_mapping("srr")
         if hasattr(self, 'gc_trigger_combo'):
             pass # Value is already saved by the Combobox command
-        try:
-            with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
-            data['abxy_mode'] = CONFIG.abxy_mode  
-            data['rumble_mode'] = CONFIG.rumble_mode
-            data['vibration_strength'] = CONFIG.vibration_strength
-            data['vibration_frequency'] = CONFIG.vibration_frequency
-            data['vibration_strength_xbox'] = CONFIG.button_remaps.get(CONFIG.get_current_category(), {}).get("vibration_strength_xbox", 5)
-            data['vibration_strength_switch'] = CONFIG.button_remaps.get(CONFIG.get_current_category(), {}).get("vibration_strength_switch", 5)
-            for k in ['home_mapping','capt_mapping','gl_mapping','gr_mapping','c_mapping','sll_mapping','srl_mapping','slr_mapping','srr_mapping']: data[k] = getattr(CONFIG, k)
-            data['button_remaps'] = CONFIG.button_remaps
-            with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)
-        except Exception as e: logger.error(f"Failed to save settings: {e}")
+        CONFIG.save_config()
         self.root.focus_set()
 
     def update(self, controllers_info):

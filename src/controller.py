@@ -24,7 +24,7 @@ from utils import (
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
     convert_mac_string_to_value, vector_normalize, vector_cross, vector_dot,
     quaternion_multiply, quaternion_normalize, quaternion_rotate_vector,
-    quaternion_from_vectors, show_notification, force_ui_update
+    quaternion_from_vectors, show_notification, force_ui_update, trigger_change_profile
 )
 
 logging.basicConfig(
@@ -1228,6 +1228,7 @@ class Controller:
             trigger_game_bar = False
             trigger_hdr_toggle = False
             trigger_sys_manager = False
+            trigger_change_profile_btn = False
 
             mapping_pairs = [
                 # (is_pressed, action, original_bit, default_action, btn_id)
@@ -1311,6 +1312,7 @@ class Controller:
                     elif resolved == "Game Bar": trigger_game_bar = True
                     elif resolved == "HDR Toggle": trigger_hdr_toggle = True
                     elif resolved == "Sys Manager": trigger_sys_manager = True
+                    elif resolved == "Change Profile": trigger_change_profile_btn = True
                     elif resolved is None:
                         inputData.buttons |= original_bit
                     elif resolved in SWITCH_BUTTONS:
@@ -1469,6 +1471,10 @@ class Controller:
                 win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0) # Shift up
                 win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0) # Ctrl up
             self.prev_sys_manager = trigger_sys_manager
+
+            if trigger_change_profile_btn and not getattr(self, 'prev_change_profile_btn', False):
+                trigger_change_profile()
+            self.prev_change_profile_btn = trigger_change_profile_btn
 
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
