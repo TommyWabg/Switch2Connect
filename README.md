@@ -22,7 +22,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
   * **Adjustable Soft Deadzone Slider:** Added a slider for adjusting soft deadzone value for passthrough gyro data. (Soft deadzone subtracts the active deadzone value from the input magnitude. Output begins smoothly from `0.0` right at the threshold boundary, eliminating step-jump discontinuities.)
 * **Gyro Calibration:** **Calibrate Gyro** button for calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
-* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, print screen, or standard buttons.
+* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, print screen, change profile, system manager, standard buttons, or record custom input.
 * **Advanced Custom Input Remapping:** Introduced a powerful new "Custom" mapping feature. Users can now record and assign any complex combination of keyboard keys, mouse clicks, or controller buttons to a single input. This flexible system supports both "Tap" (fires the recorded sequence momentarily) and "Hold" (sustains the sequence for as long as the button is pressed) modes.
   * Click the dropdown menu and select the "Custom" option.
   * Press and hold your desired combination of keyboard keys, mouse clicks, and/or controller buttons simultaneously.
@@ -30,6 +30,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
   * Click the adjacent toggle button to switch between **Tap** (triggers the sequence once) and **Hold** (keeps the sequence pressed as long as you hold the controller button).
   * Click the **X** button to remove custom input and fall back to the default.
 * **Categorized Button Mapping Profiles:** Segregated custom button mapping and rumble configurations into three independent target categories: **Xbox**, **PS4**, **PS5**, and **Switch 2**. Remap profiles are now saved and loaded automatically based on the active emulation mode.
+* **Custom Mapping Profile System:** Implemented a profile management system. Users can create, rename, delete, and switch between multiple configurations. Each profile persistently stores button mappings, emulation mode, and driver settings.
 * **Joy-con Mouse Toggle:** A new dedicated switch in the GUI to enable or disable the Joy-con mouse mode. This prevents accidental cursor movement during gameplay.
 * **Dynamic Split & Merge System:** The new **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Added V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
