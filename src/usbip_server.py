@@ -748,7 +748,7 @@ class USBIPJoyConServer(USBIPServer):
         reply_data = b""
         
         if ep == 0: # Control
-            reply_data = self._handle_control_request(setup, transfer_length)
+            reply_data = self._handle_control_request(setup, transfer_length, out_data)
             actual_length = len(reply_data)
         elif ep == 1: # HID
             if direction == 1: # IN
@@ -839,7 +839,7 @@ class USBIPJoyConServer(USBIPServer):
         except Exception:
             pass
 
-    def _handle_control_request(self, setup, transfer_length):
+    def _handle_control_request(self, setup, transfer_length, out_data=b""):
         req_type, request, value, index, length = struct.unpack("<BBHHH", setup)
         logger.info(f"Joy-Con Control Request: req_type={req_type:#04x}, req={request:#04x}, value={value:#06x}, index={index:#06x}, len={length}")
         
@@ -961,7 +961,14 @@ class USBIPJoyConServer(USBIPServer):
         if request == 0x00 and req_type in (0x80, 0x81, 0x82):
             return struct.pack("<H", 0x0001)[:length]
             
-        if req_type in (0x00, 0x01, 0x21) and request in (0x09, 0x0a, 0x0b):
+        if req_type == 0x21 and request == 0x09:
+            # HID SET_REPORT (class, host-to-device) — route payload through output report handler.
+            # Steam sends 0x80 handshake commands (and subcommands) this way.
+            if len(out_data) > 0:
+                logger.info(f"Joy-Con SET_REPORT via EP0: {out_data[:8].hex()}")
+                self._handle_output_report(out_data)
+            return b""
+        if req_type in (0x00, 0x01, 0x21) and request in (0x0a, 0x0b):
             return b""
 
         # Vendor-specific MS OS Descriptors (device-to-host) — enables WinUSB for Interface 1
@@ -1028,7 +1035,50 @@ class USBIPJoyConServer(USBIPServer):
         if len(data) < 2:
             return
         report_id = data[0]
-        if report_id == 0x01 and len(data) >= 11:
+        if report_id == 0x80:
+            # USB handshake commands sent by Steam/hid-nintendo to initialize the controller.
+            # These arrive on EP1 OUT and require an 81 xx response on EP1 IN.
+            subcmd = data[1] if len(data) > 1 else 0x00
+            logger.info(f"Joy-Con USB Handshake: 80 {subcmd:02x}")
+            if subcmd == 0x01:
+                # Request MAC address — reply with 81 01 + device type byte + 6-byte MAC (MSB first)
+                reply = bytearray(10)
+                reply[0] = 0x81
+                reply[1] = 0x01
+                # device type: 1=Joy-Con L, 2=Joy-Con R, 3=Pro Controller
+                if self.device_type == "L":
+                    reply[2] = 0x00
+                    reply[3] = 0x03  # Joy-Con L type byte used by hid-nintendo
+                elif self.device_type == "R":
+                    reply[2] = 0x00
+                    reply[3] = 0x03  # Joy-Con R type byte
+                else:
+                    reply[2] = 0x00
+                    reply[3] = 0x03  # Pro Controller
+                if self.mac_bytes:
+                    # mac_bytes is LSB-first; reply wants MSB-first (big-endian)
+                    reply[4:10] = self.mac_bytes[::-1]
+                self._enqueue_handshake_reply(bytes(reply))
+            elif subcmd == 0x02:
+                # Handshake — just ACK
+                reply = bytes([0x81, 0x02])
+                self._enqueue_handshake_reply(reply)
+            elif subcmd == 0x03:
+                # Set high-speed — just ACK
+                reply = bytes([0x81, 0x03])
+                self._enqueue_handshake_reply(reply)
+            elif subcmd == 0x04:
+                # Force USB (disable Bluetooth timeout) — just ACK
+                reply = bytes([0x81, 0x04])
+                self._enqueue_handshake_reply(reply)
+            elif subcmd == 0x05:
+                # Clear to send — no reply needed
+                pass
+            else:
+                # Unknown 0x80 sub-command — send generic ACK
+                reply = bytes([0x81, subcmd])
+                self._enqueue_handshake_reply(reply)
+        elif report_id == 0x01 and len(data) >= 11:
             if self.on_rumble_callback:
                 self.on_rumble_callback(data)
             subcmd = data[10]
@@ -1037,7 +1087,23 @@ class USBIPJoyConServer(USBIPServer):
             if self.on_rumble_callback:
                 self.on_rumble_callback(data)
 
+
+    def _enqueue_handshake_reply(self, reply_bytes):
+        """Put a USB handshake reply (0x81 xx) into the high-priority subcmd_reply_queue
+        so it is sent on the next EP1 IN URB before any regular input state."""
+        logger.info(f"Joy-Con USB Handshake REPLY: {reply_bytes.hex()}")
+        if self.subcmd_reply_queue.full():
+            try:
+                self.subcmd_reply_queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self.subcmd_reply_queue.put_nowait(reply_bytes)
+        except queue.Full:
+            pass
+
     def _dispatch_subcommand(self, subcmd, data):
+
         reply = None
         if subcmd == 0x00:
             reply = self._build_subcommand_reply(0x00)
@@ -1113,15 +1179,19 @@ class USBIPJoyConServer(USBIPServer):
         spi = [0xFF] * length
 
         # Factory stick calibration (9 bytes, 3x 12-bit pairs packed little-endian):
-        #   [max_offset_x/y][center_x/y][min_offset_x/y]
-        # center = 2048 (0x800) → [0x00, 0x08, 0x80]  matches float_to_12bit(0.0)
-        # max_offset = min_offset = 816 (0x330) → [0x30, 0x03, 0x33]  symmetric, realistic Joy-Con value
-        # Verify: 0x30 | ((0x03 & 0x0F) << 8) = 0x330 = 816 ✓
-        #         (0x03 >> 4) | (0x33 << 4) = 0x330 = 816 ✓
-        stick_calib = [
-            0x30, 0x03, 0x33,  # max offset (816, 816)
+        # center = 2048 (0x800) -> [0x00, 0x08, 0x80]
+        # max_offset = min_offset = 2047 (0x7FF) -> [0xFF, 0xF7, 0x7F]  (Exactly matches our 0-4095 input range)
+        # Left Stick layout: Max, Center, Min
+        stick_calib_l = [
+            0xFF, 0xF7, 0x7F,  # max offset (2047, 2047)
             0x00, 0x08, 0x80,  # center     (2048, 2048)
-            0x30, 0x03, 0x33,  # min offset (816, 816)
+            0xFF, 0xF7, 0x7F,  # min offset (2047, 2047)
+        ]
+        # Right Stick layout: Center, Min, Max
+        stick_calib_r = [
+            0x00, 0x08, 0x80,  # center     (2048, 2048)
+            0xFF, 0xF7, 0x7F,  # min offset (2047, 2047)
+            0xFF, 0xF7, 0x7F,  # max offset (2047, 2047)
         ]
         stick_params = [
             0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1131,9 +1201,9 @@ class USBIPJoyConServer(USBIPServer):
         if addr == 0x6050:
             spi = ([0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])[:length]
         elif addr == 0x603D:
-            spi = (stick_calib + [0xFF]*20)[:length]
+            spi = (stick_calib_l + [0xFF]*20)[:length]
         elif addr == 0x6046:
-            spi = (stick_calib + [0xFF]*20)[:length]
+            spi = (stick_calib_r + [0xFF]*20)[:length]
         elif addr == 0x6080:
             val = 0xF1 if self.device_type == "L" else (0x0F if self.device_type == "R" else 0x00)
             sensor_calib = [0x5E, 0x01, 0x00, 0x00, val, 0x0F if self.device_type == "L" else (0xF0 if self.device_type == "R" else 0x00)]

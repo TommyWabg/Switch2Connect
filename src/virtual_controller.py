@@ -320,7 +320,28 @@ class VirtualController:
             import os
             import subprocess
             
-            # 1. First detach and stop any existing servers
+            # 1. Explicitly detach all Switch1 sub-ports (server_port_l/r/pro) by their
+            #    stored bus_id/host_ip, then stop the servers.
+            for suffix in ('_l', '_r', '_pro'):
+                port_attr = f'server_port{suffix}'
+                bus_attr  = f'bus_id{suffix}'
+                host_attr = f'host_ip{suffix}'
+                svr_attr  = f'usbip_server{suffix}'
+                svr = getattr(self, svr_attr, None)
+                if svr is not None:
+                    stored_port = getattr(self, port_attr, None)
+                    if stored_port is not None:
+                        try:
+                            detach_usbip_device(stored_port)
+                        except Exception:
+                            pass
+                    try:
+                        svr.stop()
+                    except Exception:
+                        pass
+                    setattr(self, svr_attr, None)
+            
+            # 2. Stop any top-level Switch2 server that might still be alive
             self.cleanup_vg_controller()
             
             # Force GC to release sockets/files
@@ -328,30 +349,61 @@ class VirtualController:
             time.sleep(0.5)
             
             if self.mode == "Switch2":
-                try:
-                    bus_id = self.bus_id
-                    mac_address = None
-                    if self.controllers:
-                        mac_address = self.controllers[0].device.address
-                    # Start local USBIP server on slot-specific port and bus_id
-                    self.usbip_server = USBIPServer(host=self.host_ip, port=server_port, on_rumble_callback=self._usbip_rumble_callback, bus_id=bus_id, mac_address=mac_address)
-                    self.usbip_server.start()
-                    
-                    # Run usbip attach subprocess
-                    usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                
+                # Try to start the Switch2 server; if port is occupied, allocate a fresh one.
+                started = False
+                for attempt in range(2):
+                    try:
+                        bus_id = self.bus_id
+                        host_ip = self.host_ip
+                        mac_address = self.controllers[0].device.address if self.controllers else None
+                        
+                        if attempt > 0:
+                            # Re-allocate a fresh (host, bus_id, port) triple
+                            host_ip, bus_id, server_port = USBIPAllocator.allocate()
+                            self.host_ip   = host_ip
+                            self.bus_id    = bus_id
+                            self.server_port = server_port
+                            logger.warning(f"Switch2 port conflict for Player {self.player_number}; retrying on {host_ip}:{server_port} bus={bus_id}")
+                        
+                        detach_usbip_device(server_port)
+                        time.sleep(0.1)
+                        
+                        self.usbip_server = USBIPServer(
+                            host=host_ip, port=server_port,
+                            on_rumble_callback=self._usbip_rumble_callback,
+                            bus_id=bus_id, mac_address=mac_address
+                        )
+                        self.usbip_server.start()
+                        started = True
+                        break
+                    except Exception as e:
+                        logger.error(f"Failed to start Switch2 USBIP Server (attempt {attempt+1}): {e}")
+                        if self.usbip_server is not None:
+                            try:
+                                self.usbip_server.stop()
+                            except Exception:
+                                pass
+                            self.usbip_server = None
+                
+                if started:
                     if os.path.exists(usbip_exe):
                         try:
                             detach_usbip_device(server_port)
-                            # Give Windows PnP manager a moment to process the detach before attaching
                             time.sleep(0.2)
-                            subprocess.Popen([usbip_exe, "-t", str(self.server_port), "attach", "-r", self.host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
-                            logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on port {server_port}")
+                            subprocess.Popen(
+                                [usbip_exe, "-t", str(server_port), "attach", "-r", self.host_ip, "-b", self.bus_id],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                            )
+                            logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on {self.host_ip}:{server_port} bus={self.bus_id}")
                         except Exception as e:
                             logger.error(f"Failed to attach USBIP device: {e}")
                     else:
                         logger.error(f"usbip.exe not found at {usbip_exe}!")
-                except Exception as e:
-                    logger.error(f"Failed to initialize USBIP Server: {e}")
+                else:
+                    logger.error(f"Switch2 USBIP Server for Player {self.player_number} could not be started after retries.")
             else: # Switch1
                 from usbip_server import USBIPJoyConLServer, USBIPJoyConRServer, USBIPProControllerServer
                 self.usbip_server_l = None
@@ -944,7 +996,7 @@ class VirtualController:
             ly = inputData.left_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1],  -inputData.gyroscope[0],  inputData.gyroscope[2]
+                gx, gy, gz =  inputData.gyroscope[1] * 0.25,  -inputData.gyroscope[0] * 0.25,  inputData.gyroscope[2] * 0.25
                 ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
             else: # Horizontal
                 gx, gy, gz =  inputData.gyroscope[0], inputData.gyroscope[1],  inputData.gyroscope[2]
@@ -958,7 +1010,7 @@ class VirtualController:
             ry = inputData.right_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1], inputData.gyroscope[0], -inputData.gyroscope[2]
+                gx, gy, gz =  inputData.gyroscope[1] * 0.25, inputData.gyroscope[0] * 0.25, -inputData.gyroscope[2] * 0.25
                 ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
             else: # Horizontal
                 gx, gy, gz = -inputData.gyroscope[0], inputData.gyroscope[1], -inputData.gyroscope[2]
