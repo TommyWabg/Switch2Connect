@@ -13,6 +13,7 @@ import ctypes
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
 from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, get_driver_path
+from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
 from utils import set_startup, disable_power_throttling
@@ -266,7 +267,7 @@ CONTROLLER_UPDATED_EVENT = '<<ControllersUpdated>>'
 pending_merge_vc_index = None
 
 class ToggleSwitch(tk.Frame):
-    def __init__(self, parent, labels, values, initial_value, command, bg_color):
+    def __init__(self, parent, labels, values, initial_value, command, bg_color, widths=None):
         super().__init__(parent, bg=bg_color)
         self.labels = labels  
         self.values = values  
@@ -279,7 +280,8 @@ class ToggleSwitch(tk.Frame):
             frame = tk.Frame(self, bg=bg_color)
             frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
             
-            btn = tk.Button(frame, text=label, width=8, font=scale_font(("Arial", 12, "bold")),
+            w = widths[i] if widths else 8
+            btn = tk.Button(frame, text=label, width=w, font=scale_font(("Arial", 12, "bold")),
                             bd=0, relief=tk.FLAT, highlightthickness=0,
                             command=lambda idx=i: self._on_click(idx))
             btn.pack(padx=0, pady=0) # Base state: no padding
@@ -1734,7 +1736,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering size)
         default_w = int(1240 * resolution_ratio)
-        default_h = int(1200 * resolution_ratio)
+        default_h = int(1220 * resolution_ratio)
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
@@ -1963,6 +1965,24 @@ class ControllerWindow:
         )
         self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 2.0))
         self.deadzone_scale.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+        
+        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor), sticky="e")
+        self.passthrough_mode_switch = ToggleSwitch(self.comp_frame, labels=["Default", "Cemuhook"], values=["Default", "Cemuhook"], 
+initial_value=getattr(CONFIG, "gyro_passthrough_mode", "Default"), command=self.update_passthrough_mode, 
+bg_color=background_color, widths=[8, 10])
+        self.passthrough_mode_switch.grid(row=1, column=1, columnspan=2, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor), sticky="w")
+        
+        if getattr(CONFIG, "gyro_passthrough_mode", "Default") == "Cemuhook":
+            cemuhook_server.start()
+
+    def update_passthrough_mode(self, mode):
+        CONFIG.gyro_passthrough_mode = mode
+        CONFIG.save_config()
+        if mode == "Cemuhook":
+            cemuhook_server.start()
+        else:
+            cemuhook_server.stop()
+        logger.info(f"Gyro Passthrough Mode updated to {mode}")
 
     def init_gyro_settings_panel(self):
         self.gyro_frame = tk.LabelFrame(self.root, text=" Built-in Gyro ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
@@ -3162,6 +3182,16 @@ class ControllerWindow:
                 self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
             except ValueError:
                 self.gc_trigger_combo.set(self.gc_trigger_labels[1])
+                
+        # Update Gyro Passthrough Mode as the last step
+        if hasattr(self, 'passthrough_mode_switch'):
+            current_passthrough = getattr(CONFIG, "gyro_passthrough_mode", "Default")
+            self.passthrough_mode_switch.set_value(current_passthrough)
+            try:
+                idx = self.passthrough_mode_switch.values.index(current_passthrough)
+                self.update_passthrough_mode(current_passthrough)
+            except ValueError:
+                pass
 
     def on_setting_changed(self, event=None):
         def get_mapping(key):

@@ -949,6 +949,54 @@ class VirtualController:
                 elif controller.is_joycon_right(): buttonsConfig = CONFIG.single_joycon_r_config
                 else: buttonsConfig = CONFIG.procon_config
 
+            if getattr(CONFIG, "gyro_passthrough_mode", "Default") == "Cemuhook":
+                import cemuhook_udp
+                from discoverer import VIRTUAL_CONTROLLERS
+                
+                if self.mode == "Switch1":
+                    send_cemuhook = True
+                else:
+                    send_cemuhook = getattr(controller, 'gyro_active', False)
+                
+                if send_cemuhook:
+                        model = 3 if (controller.is_joycon_left() or controller.is_joycon_right()) else 2
+                        mac_bytes = bytes.fromhex(controller.device.address.replace(':', '').replace('-', ''))
+                        
+                        hold_mode = getattr(self, "hold_mode", "Vertical")
+                        
+                        # 1. 統一為標準的 V mode 物理軸向
+                        # 根據實測，Joy-Con 2 (左/右) 與 Pro Controller 的原始 IMU 座標系完全一致
+                        # 皆需要反轉三軸的重力向量 (X, Y, Z)，才能在 Yuzu 等模擬器中得到正確的旋轉方向與重力向量
+                        base_gyro = (inputData.gyroscope[0], -inputData.gyroscope[1], -inputData.gyroscope[2])
+                        base_accel = (-inputData.accelerometer[0], -inputData.accelerometer[1], -inputData.accelerometer[2])
+
+                        # 2. 如果使用者選擇水平握持 (H mode)，套用對應的 90 度旋轉
+                        if hold_mode == "Horizontal" and not controller.is_pro_controller():
+                            if controller.is_joycon_right():
+                                # 右手把：水平時 SL/SR 朝上，相當於順時針旋轉 90 度
+                                emu_gyro = (-base_gyro[1], base_gyro[0], base_gyro[2])
+                                emu_accel = (-base_accel[1], base_accel[0], base_accel[2])
+                            else:
+                                # 左手把：水平時 SL/SR 朝上，相當於逆時針旋轉 90 度
+                                emu_gyro = (base_gyro[1], -base_gyro[0], base_gyro[2])
+                                emu_accel = (base_accel[1], -base_accel[0], base_accel[2])
+                        else:
+                            # 垂直握持 (V mode)
+                            emu_gyro = base_gyro
+                            emu_accel = base_accel
+
+                        # 3. 將物理軸向轉換為 DS4 軸向 (Cemuhook 要求標準 DS4 軸向)
+                        # DS4 軸向定義為 Pitch (X), Yaw (Z), -Roll (Y)
+                        ds4_gyro = (emu_gyro[0], emu_gyro[2], -emu_gyro[1])
+                        ds4_accel = (emu_accel[0], emu_accel[2], -emu_accel[1])
+
+                        cemuhook_udp.cemuhook_server.report_controller_data(
+                            model, mac_bytes, 4, inputData, ds4_accel, ds4_gyro)
+                
+                # Zero out gyro/accel so the virtual controller driver gets no gyro
+                inputData.gyroscope = (0.0, 0.0, 0.0)
+                inputData.accelerometer = (0.0, 0.0, 0.0)
+
             if self.mode == "PS4":
                 self.update_as_ps4(inputData, buttons, controller)
             elif self.mode == "PS5":
@@ -996,10 +1044,10 @@ class VirtualController:
             ly = inputData.left_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1],  -inputData.gyroscope[0],  inputData.gyroscope[2]
+                gx, gy, gz =  inputData.gyroscope[1] * 0.8719 * 0.5 *0.75,  -inputData.gyroscope[0] * 0.8719 * 0.5 *0.75,  inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
                 ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz =  inputData.gyroscope[0], inputData.gyroscope[1],  inputData.gyroscope[2]
+                gx, gy, gz =  inputData.gyroscope[0] * 0.8719 * 0.5 *0.75, inputData.gyroscope[1] * 0.8719 * 0.5 *0.75,  inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
                 ax, ay, az =  inputData.accelerometer[0], inputData.accelerometer[1],  inputData.accelerometer[2]
                 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
@@ -1010,10 +1058,10 @@ class VirtualController:
             ry = inputData.right_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1] * 0.8719, inputData.gyroscope[0] * 0.8719, -inputData.gyroscope[2] * 0.8719
+                gx, gy, gz =  inputData.gyroscope[1] * 0.8719 * 0.5 *0.75, inputData.gyroscope[0] * 0.8719 * 0.5 *0.75, -inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
                 ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz = -inputData.gyroscope[0] * 0.8719, inputData.gyroscope[1] * 0.8719, -inputData.gyroscope[2] * 0.8719
+                gx, gy, gz = -inputData.gyroscope[0] * 0.8719 * 0.5 *0.75, inputData.gyroscope[1] * 0.8719 * 0.5 *0.75, -inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
                 ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
                 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:

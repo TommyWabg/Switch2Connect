@@ -257,6 +257,12 @@ class Config:
         categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
         old_hold_mode = config.get("joycon_hold_mode", {}) or {}
         
+        # Migrate old root level gyro_passthrough_mode to active profile
+        old_gyro_passthrough = config.get("gyro_passthrough_mode")
+        if old_gyro_passthrough is not None and self.active_profile in self.profiles:
+            if "gyro_passthrough_mode" not in self.profiles[self.active_profile]:
+                self.profiles[self.active_profile]["gyro_passthrough_mode"] = old_gyro_passthrough
+        
         # Populate each category for all profiles
         for prof_name, prof_data in self.profiles.items():
             if "ps" in prof_data:
@@ -312,6 +318,10 @@ class Config:
         self.mag_calibration_data = config.get("mag_calibration_data", {}) or {}
         self.gc_trigger_calibration_data = config.get("gc_trigger_calibration_data", {}) or {}
         self.merged_gyro_side = config.get("merged_gyro_side", {}) or {}
+        
+        # Persistent Cemuhook pad_id mapping
+        self.cemuhook_mac_to_pad = config.get("cemuhook_mac_to_pad", {}) or {}
+        self.cemuhook_pad_overwrite_idx = int(config.get("cemuhook_pad_overwrite_idx", 0))
         
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
@@ -455,7 +465,7 @@ class Config:
 
     def get_default_profile_dict(self):
         categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
-        prof_data = {}
+        prof_data = {"gyro_passthrough_mode": "Default"}
         for cat in categories:
             prof_data[cat] = self.get_default_category_dict(cat)
             prof_data[cat]["joycon_hold_mode"] = {}
@@ -483,6 +493,15 @@ class Config:
             self.save_config()
             return True
         return False
+        
+    @property
+    def gyro_passthrough_mode(self):
+        return self.profiles.get(self.active_profile, {}).get("gyro_passthrough_mode", "Default")
+
+    @gyro_passthrough_mode.setter
+    def gyro_passthrough_mode(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["gyro_passthrough_mode"] = value
         
     def save_config(self):
         # Snapshot config values in the calling thread
@@ -534,6 +553,8 @@ class Config:
             'gc_trigger_mode': self.gc_trigger_mode,
             'joycon_hold_mode': self.joycon_hold_mode,
             'merged_gyro_side': self.merged_gyro_side,
+            'cemuhook_mac_to_pad': self.cemuhook_mac_to_pad,
+            'cemuhook_pad_overwrite_idx': self.cemuhook_pad_overwrite_idx,
             'active_profile': self.active_profile,
             'profiles': self.profiles,
             'mouse': {
