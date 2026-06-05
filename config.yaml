@@ -125,7 +125,7 @@ cemuhook_mac_to_pad:
   E0EFBFEFCCBD: 1
   E0EFBFF00E17: 0
 cemuhook_pad_overwrite_idx: 0
-driver_installed: true
+driver_installed: false
 driver_type: WinUHid
 gc_trigger_calibration_data: {}
 gc_trigger_mode: 100% at Max
