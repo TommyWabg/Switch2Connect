@@ -130,7 +130,7 @@ driver_type: WinUHid
 gc_trigger_calibration_data: {}
 gc_trigger_mode: 100% at Max
 gl_mapping: PS_L_Touch
-gr_mapping: Gyro
+gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
 gyro_bias_l:
 - -2.310126582278481
@@ -144,9 +144,7 @@ gyro_mode: World
 gyro_passthrough_mode: Cemuhook
 gyro_sensitivity: 4.0
 home_mapping: Default
-joycon_hold_mode: &id001
-  E0:EF:BF:EF:CC:BD: Vertical
-  E0:EF:BF:F0:0E:17: Vertical
+joycon_hold_mode: &id001 {}
 mag_calibration_data:
   E0:EF:BF:81:06:9F:
   - 157.0
@@ -171,9 +169,7 @@ profiles:
       gl_mapping: PS_L_Touch
       gr_mapping: PS_R_Touch
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
@@ -189,7 +185,7 @@ profiles:
       capt_mapping: Default
       gc_trigger_mode: 100% at Max
       gl_mapping: PS_L_Touch
-      gr_mapping: Gyro
+      gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: *id001
       rumble_mode: Xbox
@@ -210,9 +206,7 @@ profiles:
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Horizontal
+      joycon_hold_mode: {}
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: Default
@@ -229,9 +223,7 @@ profiles:
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: GR
@@ -249,9 +241,7 @@ profiles:
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: Default
