@@ -266,6 +266,82 @@ button_gray = "#4B4B4B"
 CONTROLLER_UPDATED_EVENT = '<<ControllersUpdated>>'
 pending_merge_vc_index = None
 
+class FocusOutline:
+    def __init__(self, root):
+        self.root = root
+        self.lines = [tk.Frame(root, bg="white") for _ in range(4)]
+        self.active = False
+        self.target_widget = None
+
+    def update(self, widget):
+        if not widget or not widget.winfo_exists():
+            self.hide()
+            return
+            
+        self.target_widget = widget
+        try:
+            w = widget.winfo_width()
+            h = widget.winfo_height()
+            
+            pad = 2
+            t = 2 # thickness
+            
+            is_toggle_switch = False
+            is_standard_btn = False
+            is_dropdown_or_slider = False
+            
+            try:
+                if isinstance(widget, (ttk.Combobox, tk.Scale)):
+                    is_dropdown_or_slider = True
+                elif isinstance(widget, tk.Button):
+                    if hasattr(widget.master, 'master') and hasattr(widget.master.master, 'buttons'):
+                        is_toggle_switch = True
+                    else:
+                        is_standard_btn = True
+            except:
+                pass
+            
+            if is_dropdown_or_slider:
+                shift = 0
+            elif is_toggle_switch:
+                shift = 1
+            elif is_standard_btn:
+                shift = 2
+            else:
+                shift = 0
+            
+            start_x = -pad - t - shift
+            start_y = -pad - t - shift
+            
+            right_x = w + pad - shift
+            bottom_y = h + pad - shift
+            
+            self.lines[0].place(in_=widget, x=start_x, y=start_y, width=w+2*pad+2*t, height=t)
+            self.lines[1].place(in_=widget, x=start_x, y=bottom_y, width=w+2*pad+2*t, height=t)
+            self.lines[2].place(in_=widget, x=start_x, y=start_y, width=t, height=h+2*pad+2*t)
+            self.lines[3].place(in_=widget, x=right_x, y=start_y, width=t, height=h+2*pad+2*t)
+            
+            for line in self.lines:
+                line.lift()
+            self.active = True
+        except Exception:
+            self.hide()
+            
+    def hide(self):
+        if self.active:
+            for line in self.lines:
+                line.place_forget()
+            self.active = False
+            self.target_widget = None
+
+    def refresh(self):
+        if self.target_widget:
+            self.update(self.target_widget)
+
+
+
+
+
 class ToggleSwitch(tk.Frame):
     def __init__(self, parent, labels, values, initial_value, command, bg_color, widths=None):
         super().__init__(parent, bg=bg_color)
@@ -460,20 +536,33 @@ class PlayerInfoBlock:
 
     def _on_gyro_side_toggled(self, val):
         if self.current_vc is not None:
-            self.current_vc.active_gyro_side = val
-            if not self.current_vc.is_single() and len(self.current_vc.controllers) == 2:
-                left_mac = None
-                right_mac = None
-                for c in self.current_vc.controllers:
-                    if c.is_joycon_left():
-                        left_mac = c.device.address
-                    elif c.is_joycon_right():
-                        right_mac = c.device.address
-                if left_mac and right_mac:
-                    key = f"{left_mac}+{right_mac}"
-                    CONFIG.merged_gyro_side[key] = val
+            djg_enabled = getattr(CONFIG, "djg_enabled", False)
+            djg_mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+            
+            if djg_enabled and djg_mode != "Switch Gyro Side":
+                if val == "Left":
+                    self.current_vc.djg_left_active = not getattr(self.current_vc, 'djg_left_active', True)
+                elif val == "Right":
+                    self.current_vc.djg_right_active = not getattr(self.current_vc, 'djg_right_active', True)
+            else:
+                self.current_vc.active_gyro_side = val
+                if djg_mode == "Switch Gyro Side":
+                    CONFIG.djg_dominant_side = val
                     CONFIG.save_config()
-            self.window.update(list(VIRTUAL_CONTROLLERS))
+                
+                if not self.current_vc.is_single() and len(self.current_vc.controllers) == 2:
+                    left_mac = None
+                    right_mac = None
+                    for c in self.current_vc.controllers:
+                        if c.is_joycon_left():
+                            left_mac = c.device.address
+                        elif c.is_joycon_right():
+                            right_mac = c.device.address
+                    if left_mac and right_mac:
+                        key = f"{left_mac}+{right_mac}"
+                        CONFIG.merged_gyro_side[key] = val
+                        CONFIG.save_config()
+            self.window.force_refresh_player_slots()
 
     def _update_controller_image(self):
         if self.current_vc is None: return
@@ -758,7 +847,10 @@ class PlayerInfoBlock:
     
                 self.gyro_frame_l.place(relx=0.04, rely=0.5, anchor=tk.W)
                 self.gyro_frame_r.place(relx=0.96, rely=0.5, anchor=tk.E)
-                if virtualController.active_gyro_side == "Left":
+                if getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") != "Switch Gyro Side":
+                    self.gyro_frame_l.config(bg=highlight_color if getattr(virtualController, 'djg_left_active', True) else button_gray)
+                    self.gyro_frame_r.config(bg=highlight_color if getattr(virtualController, 'djg_right_active', True) else button_gray)
+                elif virtualController.active_gyro_side == "Left":
                     self.gyro_frame_l.config(bg=highlight_color)
                     self.gyro_frame_r.config(bg=button_gray)
                 else:
@@ -1016,6 +1108,7 @@ class ControllerWindow:
         
         import utils
         utils.change_profile_callback = self.on_cycle_profile
+        utils.force_ui_update_callback = self.force_refresh_player_slots
 
     def check_vigembus_installation(self, save=True):
         installed = is_vigembus_installed()
@@ -1735,8 +1828,8 @@ class ControllerWindow:
         self.root.title("Switch2 Controllers")
         
         # 3. Handle window geometry & minsize (remembering size)
-        default_w = int(1240 * resolution_ratio)
-        default_h = int(1220 * resolution_ratio)
+        default_w = int(1460 * resolution_ratio)
+        default_h = int(1270 * resolution_ratio)
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
@@ -1876,6 +1969,7 @@ class ControllerWindow:
 
         self.init_settings_panel()
         self.init_compensation_panel()
+        self.init_djg_panel()
         self.init_gyro_settings_panel()
         self.init_auto_disconnect_panel()
 
@@ -1920,6 +2014,384 @@ class ControllerWindow:
 
         self.update([None])
 
+        def get_focusable_widgets(parent, lst=None):
+            if lst is None:
+                lst = []
+            if parent.winfo_ismapped():
+                if isinstance(parent, (tk.Button, ttk.Combobox, tk.Scale, tk.Entry, tk.Checkbutton, tk.Radiobutton)):
+                    try:
+                        if parent.cget('state') != 'disabled' and parent.cget('state') != tk.DISABLED:
+                            lst.append(parent)
+                    except:
+                        lst.append(parent)
+                for child in parent.winfo_children():
+                    get_focusable_widgets(child, lst)
+            return lst
+            
+        def spatial_navigate(current_widget, direction):
+            widgets = get_focusable_widgets(self.root)
+            if not widgets: return
+            
+            if not current_widget or current_widget not in widgets:
+                widgets[0].focus_set()
+                return
+
+            cx = current_widget.winfo_rootx() + current_widget.winfo_width() / 2
+            cy = current_widget.winfo_rooty() + current_widget.winfo_height() / 2
+
+            candidates = []
+            for w in widgets:
+                if w == current_widget: continue
+                wx = w.winfo_rootx() + w.winfo_width() / 2
+                wy = w.winfo_rooty() + w.winfo_height() / 2
+                dx = wx - cx
+                dy = wy - cy
+                
+                # Filter candidates by strictly checking direction
+                if direction == "UP" and dy >= -5: continue
+                if direction == "DOWN" and dy <= 5: continue
+                if direction == "LEFT" and dx >= -5: continue
+                if direction == "RIGHT" and dx <= 5: continue
+                
+                candidates.append((w, dx, dy))
+                
+            if not candidates: return
+            
+            best_widget = None
+            
+            if direction in ("UP", "DOWN"):
+                # Sort by vertical distance first to find the closest row
+                candidates.sort(key=lambda item: abs(item[2]))
+                min_dy = abs(candidates[0][2])
+                # Filter candidates that belong to this closest row (within 15px)
+                row_candidates = [c for c in candidates if abs(abs(c[2]) - min_dy) < 15]
+                # Within this row, pick the one with smallest horizontal distance
+                row_candidates.sort(key=lambda item: abs(item[1]))
+                best_widget = row_candidates[0][0]
+                
+            else: # LEFT, RIGHT
+                # For Left/Right, prefer staying on the same row.
+                candidates.sort(key=lambda item: abs(item[2]))
+                same_row_candidates = [c for c in candidates if abs(c[2]) < 15]
+                
+                if same_row_candidates:
+                    same_row_candidates.sort(key=lambda item: abs(item[1]))
+                    best_widget = same_row_candidates[0][0]
+                else:
+                    # If nothing on the same row, find the next closest column overall
+                    candidates.sort(key=lambda item: abs(item[1]))
+                    min_dx = abs(candidates[0][1])
+                    col_candidates = [c for c in candidates if abs(abs(c[1]) - min_dx) < 15]
+                    col_candidates.sort(key=lambda item: abs(item[2]))
+                    best_widget = col_candidates[0][0]
+
+            if best_widget:
+                if isinstance(best_widget, tk.Button):
+                    # For standard buttons, remove native focus to hide the dashed outline
+                    # but manually trigger the outline so it remains visually targeted.
+                    self.root.focus_set()
+                    try:
+                        self.focus_outline.update(best_widget)
+                    except: pass
+                else:
+                    best_widget.focus_set()
+
+        self.focus_outline = FocusOutline(self.root)
+
+        def on_mouse_click(e):
+            if getattr(self, 'ui_navigation_active', False):
+                self.ui_navigation_active = False
+                if hasattr(self, 'focus_outline'):
+                    self.focus_outline.hide()
+                    
+        self.root.bind_all("<Button-1>", on_mouse_click, add='+')
+
+        def on_global_focus_in(e):
+            if getattr(self, 'ui_navigation_active', False):
+                if isinstance(e.widget, (tk.Button, ttk.Combobox, tk.Scale, tk.Entry, tk.Checkbutton, tk.Radiobutton)):
+                    self.focus_outline.update(e.widget)
+
+        self.root.bind_all("<FocusIn>", on_global_focus_in)
+        
+        def poll_ui_navigation():
+            if not getattr(self, 'root', None) or not self.root.winfo_exists():
+                return
+            
+            self.root.after(50, poll_ui_navigation)
+            
+            if getattr(self, 'recording_controllers', False):
+                return
+
+            def safe_focus_get():
+                try:
+                    return self.root.focus_get()
+                except KeyError:
+                    return None
+
+            # Check if OS active window is our app
+            try:
+                import win32process
+                import os
+                import ctypes
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid != os.getpid():
+                    return
+            except:
+                pass
+
+                
+            if self.root.state() != 'normal' and self.root.state() != 'zoomed':
+                return
+                
+            from config import SWITCH_BUTTONS
+            import time
+            current_time = time.time()
+            
+            if not hasattr(self, 'nav_last_move_time'): self.nav_last_move_time = 0
+            if not hasattr(self, 'nav_last_click_time'): self.nav_last_click_time = 0
+            if not hasattr(self, 'nav_last_cancel_time'): self.nav_last_cancel_time = 0
+            if not hasattr(self, 'ui_navigation_active'): self.ui_navigation_active = False
+            if not hasattr(self, 'debug_print_count'): self.debug_print_count = 0
+                
+            if not hasattr(self, 'nav_last_right_time'): self.nav_last_right_time = 0
+                
+            nav_dir = None
+            right_nav_dir = None
+            click_pressed = False
+            cancel_pressed = False
+            
+            up_mask = SWITCH_BUTTONS.get("UP", 0x00020000)
+            down_mask = SWITCH_BUTTONS.get("DOWN", 0x00010000)
+            left_mask = SWITCH_BUTTONS.get("LEFT", 0x00080000)
+            right_mask = SWITCH_BUTTONS.get("RIGHT", 0x00040000)
+            a_mask = SWITCH_BUTTONS.get("A", 0x00000008) # Physical A button (Right)
+            b_mask = SWITCH_BUTTONS.get("B", 0x00000004) # Physical B button (Down)
+            
+            from config import CONFIG
+            if getattr(CONFIG, 'abxy_mode', 'Switch') == 'Xbox':
+                click_mask = b_mask
+                cancel_mask = a_mask
+            else:
+                click_mask = a_mask
+                cancel_mask = b_mask
+            
+            vcs = getattr(self, 'current_controllers', [])
+            
+            for vc in vcs:
+                if vc is None: continue
+                for c in vc.controllers:
+                    last_data = getattr(c, 'last_input_data', None)
+                    if last_data:
+                        lx, ly = last_data.left_stick
+                        if lx > 0.5: nav_dir = "RIGHT"
+                        elif lx < -0.5: nav_dir = "LEFT"
+                        elif ly > 0.5: nav_dir = "UP"
+                        elif ly < -0.5: nav_dir = "DOWN"
+                        
+                        rx, ry = last_data.right_stick
+                        if rx > 0.5: right_nav_dir = "RIGHT"
+                        elif rx < -0.5: right_nav_dir = "LEFT"
+                        elif ry > 0.5: right_nav_dir = "UP"
+                        elif ry < -0.5: right_nav_dir = "DOWN"
+                    
+                    buttons = getattr(c, 'raw_buttons', 0)
+                    if buttons & up_mask: nav_dir = "UP"
+                    if buttons & down_mask: nav_dir = "DOWN"
+                    if buttons & left_mask: nav_dir = "LEFT"
+                    if buttons & right_mask: nav_dir = "RIGHT"
+                    if buttons & click_mask: click_pressed = True
+                    if buttons & cancel_mask: cancel_pressed = True
+                        
+            if nav_dir or click_pressed or cancel_pressed or right_nav_dir:
+                
+                # Definitively check if we are currently inside an open combobox popdown via Tcl
+                popdown_is_open = False
+                popdown = None
+                listbox = None
+                cb = None
+                
+                if hasattr(self, 'focus_outline') and self.focus_outline.target_widget:
+                    cb = self.focus_outline.target_widget
+                    if isinstance(cb, ttk.Combobox):
+                        try:
+                            popdown = self.root.tk.call('ttk::combobox::PopdownWindow', cb)
+                            if self.root.tk.call('winfo', 'exists', popdown) and self.root.tk.call('winfo', 'ismapped', popdown):
+                                popdown_is_open = True
+                                listbox = f"{popdown}.f.l"
+                        except Exception:
+                            pass
+
+                if popdown_is_open and listbox:
+                    try:
+                        # Both Right Stick and Left Stick (D-Pad) can navigate the list
+                        if right_nav_dir in ("UP", "DOWN") or nav_dir in ("UP", "DOWN"):
+                            if current_time - self.nav_last_right_time > 0.2:
+                                self.nav_last_right_time = current_time
+                                self.nav_last_move_time = current_time
+                                try:
+                                    size = int(self.root.tk.call(listbox, 'size'))
+                                    if size > 0:
+                                        selected = self.root.tk.call(listbox, 'curselection')
+                                        if not selected:
+                                            curr = 0
+                                        else:
+                                            curr = int(selected[0]) if isinstance(selected, (tuple, list)) else int(selected)
+                                            
+                                        if right_nav_dir == "UP" or nav_dir == "UP":
+                                            curr -= 1
+                                        else:
+                                            curr += 1
+                                            
+                                        if curr < 0: curr = 0
+                                        if curr >= size: curr = size - 1
+                                        
+                                        self.root.tk.call(listbox, 'selection', 'clear', 0, 'end')
+                                        self.root.tk.call(listbox, 'selection', 'set', curr)
+                                        self.root.tk.call(listbox, 'activate', curr)
+                                        self.root.tk.call(listbox, 'see', curr)
+                                except Exception as listbox_e:
+                                    import logging
+                                    logging.getLogger(__name__).error(f"Listbox nav error: {listbox_e}")
+                        elif click_pressed and current_time - self.nav_last_click_time > 0.3:
+                            self.nav_last_click_time = current_time
+                            self.nav_last_cancel_time = current_time # Sync to prevent A/B swap bounce
+                            self.root.tk.call('event', 'generate', listbox, '<Return>')
+                        elif cancel_pressed and current_time - self.nav_last_cancel_time > 0.3:
+                            self.nav_last_cancel_time = current_time
+                            self.nav_last_click_time = current_time # Sync to prevent A/B swap bounce
+                            self.root.tk.call('event', 'generate', listbox, '<Escape>')
+                            
+                        # Prevent spatial navigation from taking place while menu is open
+                        nav_dir = None
+                        click_pressed = False
+                        cancel_pressed = False
+                        right_nav_dir = None
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).error(f"Dropdown error: {e}")
+
+            if nav_dir or click_pressed or cancel_pressed:
+                import logging
+                logging.getLogger(__name__).info(f"Input detected: dir={nav_dir}, click={click_pressed}, cancel={cancel_pressed}")
+
+            if cancel_pressed and self.ui_navigation_active and current_time - self.nav_last_cancel_time > 0.3:
+                self.nav_last_cancel_time = current_time
+                self.nav_last_click_time = current_time # Sync
+                self.ui_navigation_active = False
+                if hasattr(self, 'focus_outline'):
+                    self.focus_outline.hide()
+                self.root.focus_set()
+
+            if nav_dir and current_time - self.nav_last_move_time > 0.2:
+                self.nav_last_move_time = current_time
+                self.ui_navigation_active = True
+                focused = safe_focus_get()
+                if (not focused or focused == self.root) and hasattr(self, 'focus_outline') and self.focus_outline.target_widget:
+                    focused = self.focus_outline.target_widget
+                
+                if click_pressed and (isinstance(focused, tk.Scale) or getattr(focused, 'is_time_entry', False)):
+                    if getattr(focused, 'is_time_entry', False):
+                        try:
+                            val = int(focused.get() or 0)
+                            if nav_dir in ("UP", "RIGHT"):
+                                val += 1
+                            else:
+                                val -= 1
+                            if val < 0: val = 0
+                            focused.delete(0, tk.END)
+                            focused.insert(0, str(val))
+                            if hasattr(self, 'on_auto_disconnect_time_changed'):
+                                self.on_auto_disconnect_time_changed()
+                        except: pass
+                    else:
+                        try:
+                            val = float(focused.get())
+                            res = float(focused.cget('resolution')) or 1.0
+                            if nav_dir in ("UP", "RIGHT"):
+                                val += res
+                            else:
+                                val -= res
+                            focused.set(val)
+                        except: pass
+                else:
+                    spatial_navigate(focused, nav_dir)
+                
+            if right_nav_dir and self.ui_navigation_active and current_time - self.nav_last_right_time > 0.2:
+                self.nav_last_right_time = current_time
+                focused = safe_focus_get()
+                if (not focused or focused == self.root) and hasattr(self, 'focus_outline') and self.focus_outline.target_widget:
+                    focused = self.focus_outline.target_widget
+                
+                if focused:
+                    if getattr(focused, 'is_time_entry', False):
+                        try:
+                            val = int(focused.get() or 0)
+                            if right_nav_dir in ("UP", "RIGHT"):
+                                val += 1
+                            else:
+                                val -= 1
+                            if val < 0: val = 0
+                            focused.delete(0, tk.END)
+                            focused.insert(0, str(val))
+                            if hasattr(self, 'on_auto_disconnect_time_changed'):
+                                self.on_auto_disconnect_time_changed()
+                        except: pass
+                    elif isinstance(focused, tk.Scale):
+                        try:
+                            val = float(focused.get())
+                            res = float(focused.cget('resolution')) or 1.0
+                            if right_nav_dir in ("UP", "RIGHT"):
+                                val += res
+                            else:
+                                val -= res
+                            focused.set(val)
+                        except: pass
+                    elif isinstance(focused, ttk.Combobox):
+                        try:
+                            vals = focused['values']
+                            if vals:
+                                try:
+                                    idx = vals.index(focused.get())
+                                except ValueError:
+                                    idx = 0
+                                if right_nav_dir in ("UP", "LEFT"):
+                                    idx = (idx - 1) % len(vals)
+                                else:
+                                    idx = (idx + 1) % len(vals)
+                                focused.set(vals[idx])
+                                focused.event_generate("<<ComboboxSelected>>")
+                        except: pass
+                
+            if click_pressed and self.ui_navigation_active and current_time - self.nav_last_click_time > 0.3:
+                self.nav_last_click_time = current_time
+                self.nav_last_cancel_time = current_time # Sync
+                focused = safe_focus_get()
+                if (not focused or focused == self.root) and hasattr(self, 'focus_outline') and self.focus_outline.target_widget:
+                    focused = self.focus_outline.target_widget
+                    
+                if focused:
+                    if isinstance(focused, ttk.Combobox):
+                        focused.focus_set() # Regain native focus before trying to open popdown
+                        focused.event_generate('<Down>')
+                    elif isinstance(focused, tk.Entry) and getattr(focused, 'is_custom_recording_entry', False):
+                        if callable(getattr(focused, 'restart_custom_recording_fn', None)):
+                            focused.restart_custom_recording_fn()
+                    elif hasattr(focused, 'invoke') and callable(getattr(focused, 'invoke')):
+                        try:
+                            focused.invoke()
+                        except:
+                            pass
+                    else:
+                        try:
+                            focused.event_generate('<space>')
+                            focused.event_generate('<Return>')
+                        except:
+                            pass
+                            
+        poll_ui_navigation()
+
+
     def on_configure(self, event):
         if event.widget == self.root:
             try:
@@ -1933,7 +2405,7 @@ class ControllerWindow:
                 pass
 
     def init_compensation_panel(self):
-        self.comp_frame = tk.LabelFrame(self.root, text=" Gyro Passthrough ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.comp_frame = tk.LabelFrame(self.root, text=" Gyro Passthrough For 3rd Party Apps ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.comp_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
         tk.Label(self.comp_frame, text="9-axis Assist:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
@@ -1943,7 +2415,13 @@ class ControllerWindow:
         self.steam_roll_comp_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "steam_roll_compensation", False), command=self.update_steam_roll_comp_setting, bg_color=background_color)
         self.steam_roll_comp_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
 
-        tk.Label(self.comp_frame, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        self.passthrough_mode_switch = ToggleSwitch(self.comp_frame, labels=["Default", "Cemuhook"], values=["Default", "Cemuhook"], 
+initial_value=getattr(CONFIG, "gyro_passthrough_mode", "Default"), command=self.update_passthrough_mode, 
+bg_color=background_color, widths=[8, 10])
+        self.passthrough_mode_switch.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+
+        tk.Label(self.comp_frame, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=9, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.deadzone_scale = tk.Scale(
             self.comp_frame,
             from_=0.0,
@@ -1964,13 +2442,7 @@ class ControllerWindow:
             command=self.update_virtual_gyro_soft_deadzone_setting
         )
         self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 2.0))
-        self.deadzone_scale.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
-        
-        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor), sticky="e")
-        self.passthrough_mode_switch = ToggleSwitch(self.comp_frame, labels=["Default", "Cemuhook"], values=["Default", "Cemuhook"], 
-initial_value=getattr(CONFIG, "gyro_passthrough_mode", "Default"), command=self.update_passthrough_mode, 
-bg_color=background_color, widths=[8, 10])
-        self.passthrough_mode_switch.grid(row=1, column=1, columnspan=2, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor), sticky="w")
+        self.deadzone_scale.grid(row=0, column=10, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
         
         if getattr(CONFIG, "gyro_passthrough_mode", "Default") == "Cemuhook":
             cemuhook_server.start()
@@ -1984,8 +2456,80 @@ bg_color=background_color, widths=[8, 10])
             cemuhook_server.stop()
         logger.info(f"Gyro Passthrough Mode updated to {mode}")
 
+    def init_djg_panel(self):
+        self.djg_frame = tk.LabelFrame(self.root, text=" Dual Joy-con Gyro (DJG) ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.djg_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
+        
+        tk.Label(self.djg_frame, text="DJG:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
+        self.djg_enabled_switch = ToggleSwitch(self.djg_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "djg_enabled", False), command=self.update_djg_enabled_setting, bg_color=background_color)
+        self.djg_enabled_switch.grid(row=0, column=1, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+        
+        tk.Label(self.djg_frame, text="Dominant Side:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        self.djg_dominant_switch = ToggleSwitch(self.djg_frame, labels=["Left", "Right"], values=["Left", "Right"], initial_value=getattr(CONFIG, "djg_dominant_side", "Left"), command=self.update_djg_dominant_setting, bg_color=background_color)
+        self.djg_dominant_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+        
+        tk.Label(self.djg_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        
+        self.djg_mode_var = tk.StringVar(value=getattr(CONFIG, "djg_mode", "Single Side Toggle"))
+        djg_modes = ["Single Side Toggle", "Switch Dominant Side", "Switch Gyro Side"]
+        
+        # Calculate max width for dropdown
+        max_mode_len = max(len(m) for m in djg_modes)
+        
+        self.djg_mode_combo = ttk.Combobox(self.djg_frame, textvariable=self.djg_mode_var, values=djg_modes, state="readonly", font=scale_font(("Arial", 12, "bold")), width=max_mode_len, justify="center")
+        self.djg_mode_combo.grid(row=0, column=7, padx=int(5 * scaling_factor), sticky="w")
+        self.djg_mode_combo.bind("<<ComboboxSelected>>", lambda e: self.update_djg_mode_setting(self.djg_mode_var.get()))
+
+        tk.Label(self.djg_frame, text="Activation:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=8, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        self.djg_activation_switch = ToggleSwitch(self.djg_frame, labels=["Hold", "Toggle"], values=["Hold", "Toggle"], initial_value=getattr(CONFIG, "djg_activation", "Toggle"), command=self.update_djg_activation_setting, bg_color=background_color)
+        self.djg_activation_switch.grid(row=0, column=9, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+
+    def update_djg_activation_setting(self, val):
+        CONFIG.djg_activation = val
+        CONFIG.save_config()
+        logger.info(f"DJG Activation: {val}")
+
+    def update_djg_mode_setting(self, val):
+        CONFIG.djg_mode = val
+        CONFIG.save_config()
+        logger.info(f"DJG Mode: {val}")
+        self.force_refresh_player_slots()
+
+
+    def update_djg_enabled_setting(self, val):
+        CONFIG.djg_enabled = val
+        CONFIG.save_config()
+        logger.info(f"DJG Enabled: {val}")
+        if not val:
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc:
+                    vc.active_gyro_side = getattr(CONFIG, "djg_dominant_side", "Left")
+        self.force_refresh_player_slots()
+
+    def update_djg_dominant_setting(self, val):
+        CONFIG.djg_dominant_side = val
+        CONFIG.save_config()
+        logger.info(f"DJG Dominant Side: {val}")
+        if not getattr(CONFIG, "djg_enabled", False):
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc:
+                    vc.active_gyro_side = val
+        else:
+            mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+            if mode == "Switch Dominant Side":
+                for vc in VIRTUAL_CONTROLLERS:
+                    if vc:
+                        vc.djg_left_active = True
+                        vc.djg_right_active = True
+            elif mode == "Switch Gyro Side":
+                for vc in VIRTUAL_CONTROLLERS:
+                    if vc:
+                        vc.active_gyro_side = val
+        self.force_refresh_player_slots()
+
+
     def init_gyro_settings_panel(self):
-        self.gyro_frame = tk.LabelFrame(self.root, text=" Built-in Gyro ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.gyro_frame = tk.LabelFrame(self.root, text=" Built-in Gyro Mouse ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.gyro_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         tk.Label(self.gyro_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
         self.gyro_mode_switch = ToggleSwitch(self.gyro_frame, labels=["9-Axis", "6-Axis", "Steering"], values=["World", "Yaw", "Roll"], initial_value=CONFIG.gyro_mode, command=self.update_mode_setting, bg_color=background_color)
@@ -2050,18 +2594,21 @@ bg_color=background_color, widths=[8, 10])
         self.day_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
         self.day_entry.insert(0, str(getattr(CONFIG, "auto_disconnect_days", 0)))
         self.day_entry.grid(row=0, column=3, padx=int(2 * scaling_factor))
+        self.day_entry.is_time_entry = True
         tk.Label(self.auto_disconnect_frame, text="Day", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=4, padx=(0, int(10 * scaling_factor)), sticky="w")
         
         # Hour Entry
         self.hour_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
         self.hour_entry.insert(0, str(getattr(CONFIG, "auto_disconnect_hours", 0)))
         self.hour_entry.grid(row=0, column=5, padx=int(2 * scaling_factor))
+        self.hour_entry.is_time_entry = True
         tk.Label(self.auto_disconnect_frame, text="Hour", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(0, int(10 * scaling_factor)), sticky="w")
         
         # Minute Entry
         self.minute_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
         self.minute_entry.insert(0, str(getattr(CONFIG, "auto_disconnect_minutes", 0)))
         self.minute_entry.grid(row=0, column=7, padx=int(2 * scaling_factor))
+        self.minute_entry.is_time_entry = True
         tk.Label(self.auto_disconnect_frame, text="Minute", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=8, padx=(0, int(10 * scaling_factor)), sticky="w")
         
         # Bind events
@@ -2106,13 +2653,8 @@ bg_color=background_color, widths=[8, 10])
 
     def update_steam_roll_comp_setting(self, val):
         CONFIG.steam_roll_compensation = val
-        try:
-            with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f: data = yaml.safe_load(f) or {}
-            data['steam_roll_compensation'] = val
-            with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, default_flow_style=False)
-            logger.info(f"Roll Compensation: {val}")
-        except Exception as e:
-            logger.error(f"Failed to save steam roll compensation setting: {e}")
+        CONFIG.save_config()
+        logger.info(f"Roll Compensation: {val}")
 
     def update_virtual_gyro_soft_deadzone_setting(self, val):
         val = float(val)
@@ -2216,6 +2758,7 @@ bg_color=background_color, widths=[8, 10])
         recorded_seq = set()
         self.recording_controllers = True
         self.recorded_controller_buttons = set()
+        self.waiting_for_controller_release = True
 
         def end_recording():
             self.recording_controllers = False
@@ -2260,6 +2803,8 @@ bg_color=background_color, widths=[8, 10])
 
         def check_release():
             if not pressed_keys and not getattr(self, 'controller_buttons_pressed', False):
+                if not recorded_seq and not self.recorded_controller_buttons:
+                    return
                 end_recording()
 
         def on_key_press(e):
@@ -2302,6 +2847,10 @@ bg_color=background_color, widths=[8, 10])
         
         def on_focus_out(e):
             if e.widget == self.root and getattr(self, 'recording_controllers', False):
+                try:
+                    if self.root.focus_get():
+                        return
+                except: pass
                 import ctypes
                 import win32con
                 vk_map = {}
@@ -2319,6 +2868,7 @@ bg_color=background_color, widths=[8, 10])
                 end_recording()
         self.root.bind("<FocusOut>", on_focus_out)
         
+
         def poll_controller():
             if not getattr(self, 'recording_controllers', False):
                 return
@@ -2332,14 +2882,19 @@ bg_color=background_color, widths=[8, 10])
                     raw = getattr(c, 'raw_buttons', 0)
                     if raw:
                         any_pressed = True
-                        for bit, btn_name in reverse_map.items():
-                            if raw & bit:
-                                self.recorded_controller_buttons.add(f"BTN_{btn_name}")
+                        if not getattr(self, 'waiting_for_controller_release', False):
+                            for bit, btn_name in reverse_map.items():
+                                if raw & bit:
+                                    self.recorded_controller_buttons.add(f"BTN_{btn_name}")
             
-            self.controller_buttons_pressed = any_pressed
-            if not any_pressed and self.recorded_controller_buttons and not pressed_keys:
-                end_recording()
-                return
+            if getattr(self, 'waiting_for_controller_release', False):
+                if not any_pressed:
+                    self.waiting_for_controller_release = False
+            else:
+                self.controller_buttons_pressed = any_pressed
+                if not any_pressed and self.recorded_controller_buttons and not pressed_keys:
+                    end_recording()
+                    return
             self.root.after(50, poll_controller)
             
         poll_controller()
@@ -2372,6 +2927,9 @@ bg_color=background_color, widths=[8, 10])
         
         entry = tk.Entry(custom_frame, font=scale_font(("Arial", 12, "bold")), width=11, justify="center", bg=button_gray, fg="white", readonlybackground=button_gray, insertbackground="white", bd=0, highlightthickness=0)
         entry.pack(side=tk.LEFT, fill=tk.Y)
+        entry.is_custom_recording_entry = True
+        entry.restart_custom_recording_fn = lambda: self.start_custom_recording(key, entry, combo, custom_frame, mode_var)
+        entry.bind("<Button-1>", lambda e: entry.restart_custom_recording_fn())
         
         def on_close():
             custom_frame.pack_forget()
@@ -2379,6 +2937,10 @@ bg_color=background_color, widths=[8, 10])
             combo.set("Default")
             setattr(CONFIG, f"{key}_mapping", "Default")
             self.on_setting_changed()
+            if hasattr(self, 'focus_outline') and getattr(self.focus_outline, 'target_widget', None) == close_btn:
+                try:
+                    self.focus_outline.update(combo)
+                except: pass
 
         close_btn = tk.Button(custom_frame, text="X", bg="#ff4444", fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=on_close)
         close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
@@ -2446,7 +3008,7 @@ bg_color=background_color, widths=[8, 10])
         else:
             sim_options = ["Xbox One", "PS4", "PS5"]
             
-        self.sim_mode_switch = ToggleSwitch(row_global, sim_options, sim_options, getattr(CONFIG, "simulation_mode", "Xbox One"), self.update_sim_mode_setting, background_color)
+        self.sim_mode_switch = ToggleSwitch(row_global, sim_options, sim_options, getattr(CONFIG, "simulation_mode", "PS5"), self.update_sim_mode_setting, background_color)
         self.sim_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Layout
@@ -2568,7 +3130,7 @@ bg_color=background_color, widths=[8, 10])
         # 1. 讀取 (Removed load_config to prevent async save race condition)
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
-        old_sim_mode = getattr(CONFIG, "simulation_mode", "Xbox One")
+        old_sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
         
         if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
             CONFIG.profiles[CONFIG.active_profile]["driver_type"] = val
@@ -2723,6 +3285,8 @@ bg_color=background_color, widths=[8, 10])
         self.force_refresh_player_slots()
  
     def force_refresh_player_slots(self):
+        if hasattr(self, 'djg_dominant_switch'):
+            self.djg_dominant_switch.set_value(getattr(CONFIG, "djg_dominant_side", "Left"))
         if hasattr(self, 'current_controllers'):
             if getattr(self, 'players_info', None) is not None:
                 for p in self.players_info:
@@ -2798,7 +3362,7 @@ bg_color=background_color, widths=[8, 10])
     def update_sim_mode_setting(self, val):
         # 1. 讀取 (Removed load_config to prevent async save race condition)
         
-        old_mode = getattr(CONFIG, "simulation_mode", "Xbox One")
+        old_mode = getattr(CONFIG, "simulation_mode", "PS5")
         
         if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
             CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = val
@@ -3049,7 +3613,7 @@ bg_color=background_color, widths=[8, 10])
         # 1. Save current profile settings
         if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
             CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
-            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "Xbox One")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
 
         # 2. Apply switch
         if CONFIG.switch_profile(self.pending_profile):
@@ -3070,7 +3634,7 @@ bg_color=background_color, widths=[8, 10])
             
         new_emu = CONFIG.profiles[new_profile_name].get("simulation_mode")
         if not new_emu:
-            new_emu = getattr(CONFIG, "simulation_mode", "Xbox One")
+            new_emu = getattr(CONFIG, "simulation_mode", "PS5")
             CONFIG.profiles[new_profile_name]["simulation_mode"] = new_emu
             
         CONFIG.save_config()
@@ -3116,7 +3680,7 @@ bg_color=background_color, widths=[8, 10])
         # 1. 紀錄當下設定、Driver與Emu Mode至原本的profile
         if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
             CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
-            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "Xbox One")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
 
         if CONFIG.switch_profile(selected_profile):
             self.apply_profile_switch()
@@ -3130,7 +3694,7 @@ bg_color=background_color, widths=[8, 10])
         # 1. 紀錄當下設定、Driver與Emu Mode至原本的profile
         if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
             CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
-            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "Xbox One")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
             
         if CONFIG.add_profile(new_name):
             self.profile_combo['values'] = self.get_sorted_profiles()
@@ -3183,7 +3747,7 @@ bg_color=background_color, widths=[8, 10])
             except ValueError:
                 self.gc_trigger_combo.set(self.gc_trigger_labels[1])
                 
-        # Update Gyro Passthrough Mode as the last step
+        # Update Gyro Passthrough Mode
         if hasattr(self, 'passthrough_mode_switch'):
             current_passthrough = getattr(CONFIG, "gyro_passthrough_mode", "Default")
             self.passthrough_mode_switch.set_value(current_passthrough)
@@ -3192,6 +3756,31 @@ bg_color=background_color, widths=[8, 10])
                 self.update_passthrough_mode(current_passthrough)
             except ValueError:
                 pass
+                
+        # Update Horizon Lock
+        if hasattr(self, 'steam_roll_comp_switch'):
+            self.steam_roll_comp_switch.set_value(getattr(CONFIG, "steam_roll_compensation", False))
+                
+        # Update DJG Settings as the last step
+        if hasattr(self, 'djg_enabled_switch'):
+            djg_enabled = getattr(CONFIG, "djg_enabled", False)
+            self.djg_enabled_switch.set_value(djg_enabled)
+            self.update_djg_enabled_setting(djg_enabled)
+            
+        if hasattr(self, 'djg_dominant_switch'):
+            djg_dominant = getattr(CONFIG, "djg_dominant_side", "Left")
+            self.djg_dominant_switch.set_value(djg_dominant)
+            self.update_djg_dominant_setting(djg_dominant)
+            
+        if hasattr(self, 'djg_mode_combo'):
+            djg_mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+            self.djg_mode_var.set(djg_mode)
+            self.update_djg_mode_setting(djg_mode)
+            
+        if hasattr(self, 'djg_activation_switch'):
+            djg_activation = getattr(CONFIG, "djg_activation", "Toggle")
+            self.djg_activation_switch.set_value(djg_activation)
+            self.update_djg_activation_setting(djg_activation)
 
     def on_setting_changed(self, event=None):
         def get_mapping(key):
@@ -3223,6 +3812,9 @@ bg_color=background_color, widths=[8, 10])
             self.main_frame = tk.Frame(self.root, bg=background_color); self.main_frame.pack(pady=(10, 5), fill=tk.Y)
             self.players_info = None
         self.current_controllers = controllers_info
+        
+        if hasattr(self, 'djg_dominant_switch'):
+            self.djg_dominant_switch.set_value(getattr(CONFIG, "djg_dominant_side", "Left"))
         
         # Check if the driver type has been changed/fallback under the hood
         active_driver = getattr(CONFIG, "driver_type", "WinUHid")

@@ -213,7 +213,15 @@ class VirtualController:
         self.hold_mode = "Vertical"
         self.active_gyro_side = "Right"
         
-        self.mode = getattr(CONFIG, "simulation_mode", "Xbox One")
+        self.djg_last_dom_gyro_on = False
+        self.djg_last_sub_gyro_on = False
+        self.djg_accel_offset = [0.0, 0.0, 0.0]
+        self.djg_cached_gyro = {'Left': [0.0, 0.0, 0.0], 'Right': [0.0, 0.0, 0.0]}
+        self.djg_cached_accel = {'Left': [0.0, 0.0, 0.0], 'Right': [0.0, 0.0, 0.0]}
+        self.djg_left_active = True
+        self.djg_right_active = True
+        
+        self.mode = getattr(CONFIG, "simulation_mode", "PS5")
         self.driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         if self.mode == "Switch1":
             self.hold_mode = "Vertical"
@@ -228,6 +236,143 @@ class VirtualController:
         self.running = True
         self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
         self.update_thread.start()
+
+    def handle_djg_trigger(self, controller, pressed=True):
+        activation = getattr(CONFIG, "djg_activation", "Toggle")
+        if activation == "Toggle" and not pressed:
+            return
+            
+        mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+        if mode == "Single Side Toggle":
+            if controller.is_joycon_left():
+                self.djg_left_active = not self.djg_left_active
+            else:
+                self.djg_right_active = not self.djg_right_active
+        elif mode == "Switch Dominant Side":
+            current = getattr(CONFIG, "djg_dominant_side", "Left")
+            CONFIG.djg_dominant_side = "Right" if current == "Left" else "Left"
+            CONFIG.save_config()
+            self.djg_left_active = True
+            self.djg_right_active = True
+        elif mode == "Switch Gyro Side":
+            current = getattr(CONFIG, "djg_dominant_side", "Left")
+            new_side = "Right" if current == "Left" else "Left"
+            self.active_gyro_side = new_side
+            CONFIG.djg_dominant_side = new_side
+            CONFIG.save_config()
+            
+        import utils
+        if hasattr(utils, 'force_ui_update_callback') and utils.force_ui_update_callback:
+            utils.force_ui_update_callback()
+
+    def gyro_fusion_callback(self, inputData: ControllerInputData, controller):
+        with self.state_lock:
+            if getattr(controller, 'is_calibrating', False) or getattr(controller, 'is_mag_calibrating', False):
+                controller._skip_gyro_mouse = False
+                return
+
+            if len(self.controllers) == 2 and getattr(CONFIG, "djg_enabled", False):
+                djg_dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                djg_sub_side = "Right" if djg_dom_side == "Left" else "Left"
+                
+                side = "Left" if controller.is_joycon_left() else "Right"
+                self.djg_cached_gyro[side] = inputData.gyroscope
+                self.djg_cached_accel[side] = inputData.accelerometer
+                
+                dom_c = next((c for c in self.controllers if (c.is_joycon_left() and djg_dom_side == "Left") or (c.is_joycon_right() and djg_dom_side == "Right")), None)
+                sub_c = next((c for c in self.controllers if (c.is_joycon_left() and djg_sub_side == "Left") or (c.is_joycon_right() and djg_sub_side == "Right")), None)
+                
+                dom_on = getattr(dom_c, 'gyro_active', True) if dom_c else False
+                sub_on = getattr(sub_c, 'gyro_active', True) if sub_c else False
+                
+                # Check skip gyro mouse flag
+                if dom_on and sub_on:
+                    if (controller.is_joycon_left() and djg_sub_side == "Left") or (controller.is_joycon_right() and djg_sub_side == "Right"):
+                        controller._skip_gyro_mouse = True
+                    else:
+                        controller._skip_gyro_mouse = False
+                else:
+                    controller._skip_gyro_mouse = False
+                
+                if self.djg_last_dom_gyro_on and not dom_on and sub_on:
+                    dom_accel = self.djg_cached_accel[djg_dom_side]
+                    sub_accel = self.djg_cached_accel[djg_sub_side]
+                    self.djg_accel_offset = [
+                        dom_accel[0] - sub_accel[0],
+                        dom_accel[1] - sub_accel[1],
+                        dom_accel[2] - sub_accel[2]
+                    ]
+                elif not self.djg_last_dom_gyro_on and dom_on and sub_on:
+                    dom_accel = self.djg_cached_accel[djg_dom_side]
+                    sub_accel = self.djg_cached_accel[djg_sub_side]
+                    self.djg_accel_offset = [
+                        (sub_accel[0] + self.djg_accel_offset[0]) - dom_accel[0],
+                        (sub_accel[1] + self.djg_accel_offset[1]) - dom_accel[1],
+                        (sub_accel[2] + self.djg_accel_offset[2]) - dom_accel[2]
+                    ]
+                
+                self.djg_last_dom_gyro_on = dom_on
+                self.djg_last_sub_gyro_on = sub_on
+                
+                fused_gyro = [0.0, 0.0, 0.0]
+                fused_accel = [0.0, 0.0, 0.0]
+                
+                dom_bias = dom_c.gyro_bias if dom_c else (0.0, 0.0, 0.0)
+                sub_bias = sub_c.gyro_bias if sub_c else (0.0, 0.0, 0.0)
+                my_bias = controller.gyro_bias
+                
+                if dom_on and sub_on:
+                    dom_g = self.djg_cached_gyro[djg_dom_side]
+                    sub_g = self.djg_cached_gyro[djg_sub_side]
+                    dom_a = self.djg_cached_accel[djg_dom_side]
+                    
+                    import math
+                    dom_adj = [dom_g[i] - dom_bias[i] for i in range(3)]
+                    sub_adj = [sub_g[i] - sub_bias[i] for i in range(3)]
+                    dom_mag = math.sqrt(dom_adj[0]**2 + dom_adj[1]**2 + dom_adj[2]**2)
+                    
+                    scale = 0.0
+                    if dom_mag > 30.0:
+                        scale = min(1.0, (dom_mag - 30.0) / 30.0)
+                    
+                    for i in range(3):
+                        if (dom_adj[i] > 0 and sub_adj[i] > 0) or (dom_adj[i] < 0 and sub_adj[i] < 0):
+                            sub_scaled = sub_adj[i] * scale
+                            if abs(sub_scaled) > abs(dom_adj[i]):
+                                sub_scaled = dom_adj[i]
+                            fused_adj = dom_adj[i] + sub_scaled
+                        else:
+                            fused_adj = dom_adj[i]
+                        
+                        fused_gyro[i] = fused_adj + my_bias[i]
+                        fused_accel[i] = dom_a[i] + self.djg_accel_offset[i]
+                elif dom_on:
+                    dom_g = self.djg_cached_gyro[djg_dom_side]
+                    dom_a = self.djg_cached_accel[djg_dom_side]
+                    for i in range(3):
+                        dom_adj = dom_g[i] - dom_bias[i]
+                        fused_gyro[i] = dom_adj + my_bias[i]
+                        fused_accel[i] = dom_a[i] + self.djg_accel_offset[i]
+                elif sub_on:
+                    sub_g = self.djg_cached_gyro[djg_sub_side]
+                    sub_a = self.djg_cached_accel[djg_sub_side]
+                    for i in range(3):
+                        sub_adj = sub_g[i] - sub_bias[i]
+                        fused_gyro[i] = sub_adj + my_bias[i]
+                        fused_accel[i] = sub_a[i]
+                else:
+                    for i in range(3):
+                        fused_gyro[i] = my_bias[i]
+                        fused_accel[i] = 0.0
+                
+                for i in range(3):
+                    if abs(self.djg_accel_offset[i]) > 0.1:
+                        self.djg_accel_offset[i] *= 0.99
+                    else:
+                        self.djg_accel_offset[i] = 0.0
+
+                inputData.gyroscope = tuple(fused_gyro)
+                inputData.accelerometer = tuple(fused_accel)
 
     def cleanup_vg_controller(self):
         for suffix in ('', '_l', '_r', '_pro'):
@@ -812,7 +957,14 @@ class VirtualController:
                 is_switch_layout = (CONFIG.abxy_mode == "Switch")
             
             if len(self.controllers) == 2 or controller.is_pro_controller():
-                controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
+                if getattr(CONFIG, "djg_enabled", False):
+                    mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+                    if mode == "Switch Gyro Side":
+                        controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
+                    else:
+                        controller.gyro_active = (controller.is_joycon_left() and getattr(self, 'djg_left_active', True)) or (controller.is_joycon_right() and getattr(self, 'djg_right_active', True))
+                else:
+                    controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
                 controller.hold_mode = "Vertical"
             else:
                 controller.gyro_active = True
@@ -826,7 +978,11 @@ class VirtualController:
 
             if is_merged:
                 # Sync Gyro Trigger
-                shared_gyro = any(getattr(c, '_own_gyro_trigger', False) for c in self.controllers)
+                if getattr(CONFIG, "djg_enabled", False):
+                    shared_gyro = getattr(controller, '_own_gyro_trigger', False)
+                else:
+                    shared_gyro = any(getattr(c, '_own_gyro_trigger', False) for c in self.controllers)
+                    
                 # Sync ZR/ZL for Gyro Mouse clicks
                 shared_zr = any(getattr(c, '_own_zr_pressed', False) for c in self.controllers)
                 shared_zl = any(getattr(c, '_own_zl_pressed', False) for c in self.controllers)
@@ -841,7 +997,10 @@ class VirtualController:
                         shared_rs = inputData.right_stick if c == controller else getattr(c, '_last_rs', (0.0, 0.0))
 
                 for c in self.controllers:
-                    c._shared_gyro_trigger = shared_gyro
+                    if getattr(CONFIG, "djg_enabled", False):
+                        c._shared_gyro_trigger = getattr(c, '_own_gyro_trigger', False)
+                    else:
+                        c._shared_gyro_trigger = shared_gyro
                     c._shared_zr_pressed = shared_zr
                     c._shared_zl_pressed = shared_zl
                     c._shared_steer_value = shared_steer
@@ -854,7 +1013,10 @@ class VirtualController:
                 # Only for Hold mode; Toggle mode naturally syncs via shared trigger
                 if getattr(CONFIG, 'gyro_activation_mode', 'Hold') == 'Hold':
                     for c in self.controllers:
-                        c.gyro_mouse_enabled = shared_gyro
+                        if getattr(CONFIG, "djg_enabled", False):
+                            c.gyro_mouse_enabled = getattr(c, '_own_gyro_trigger', False)
+                        else:
+                            c.gyro_mouse_enabled = shared_gyro
             else:
                 # If not merged, ensure we don't use a stale shared steer value
                 controller._shared_steer_value = getattr(controller, '_own_steer_value', 0.0)
@@ -948,6 +1110,10 @@ class VirtualController:
                 if controller.is_joycon_left(): buttonsConfig = CONFIG.single_joycon_l_config
                 elif controller.is_joycon_right(): buttonsConfig = CONFIG.single_joycon_r_config
                 else: buttonsConfig = CONFIG.procon_config
+                
+            if is_merged and getattr(CONFIG, "djg_enabled", False):
+                pass
+
 
             if getattr(CONFIG, "gyro_passthrough_mode", "Default") == "Cemuhook":
                 import cemuhook_udp
@@ -955,8 +1121,21 @@ class VirtualController:
                 
                 if self.mode == "Switch1":
                     send_cemuhook = True
+                elif len(self.controllers) == 1:
+                    send_cemuhook = True
                 else:
-                    send_cemuhook = getattr(controller, 'gyro_active', False)
+                    send_cemuhook = False
+                    if getattr(CONFIG, "djg_enabled", False):
+                        dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                        if controller.is_joycon_left() and dom_side == "Left":
+                            send_cemuhook = True
+                        elif controller.is_joycon_right() and dom_side == "Right":
+                            send_cemuhook = True
+                    else:
+                        if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                            send_cemuhook = True
+                        elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                            send_cemuhook = True
                 
                 if send_cemuhook:
                         model = 3 if (controller.is_joycon_left() or controller.is_joycon_right()) else 2
@@ -1021,6 +1200,7 @@ class VirtualController:
                 input_report_callback(inputData, controller)
 
         controller.set_input_report_callback(wrapped_callback)
+        controller.gyro_fusion_callback = self.gyro_fusion_callback
 
 
     def _build_switch1_report(self, inputData: ControllerInputData, buttons: int, controller, device_type: str):
@@ -1316,7 +1496,20 @@ class VirtualController:
                     self.last_rx = float_to_byte(inputData.right_stick[0])
                     self.last_ry = float_to_byte(-inputData.right_stick[1])
                     
-                if getattr(controller, 'gyro_active', False):
+                is_passthrough_source = False
+                if getattr(CONFIG, "djg_enabled", False):
+                    dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                    if controller.is_joycon_left() and dom_side == "Left":
+                        is_passthrough_source = True
+                    elif controller.is_joycon_right() and dom_side == "Right":
+                        is_passthrough_source = True
+                else:
+                    if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                        is_passthrough_source = True
+                    elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                        is_passthrough_source = True
+                        
+                if is_passthrough_source:
                     self.last_gx = inputData.gyroscope[0]
                     self.last_gy = inputData.gyroscope[2]
                     self.last_gz = -inputData.gyroscope[1]
@@ -1481,7 +1674,20 @@ class VirtualController:
                 self.last_rx = float_to_byte(inputData.right_stick[0])
                 self.last_ry = float_to_byte(-inputData.right_stick[1])
                 
-            if getattr(controller, 'gyro_active', False):
+            is_passthrough_source = False
+            if getattr(CONFIG, "djg_enabled", False):
+                dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                if controller.is_joycon_left() and dom_side == "Left":
+                    is_passthrough_source = True
+                elif controller.is_joycon_right() and dom_side == "Right":
+                    is_passthrough_source = True
+            else:
+                if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                    is_passthrough_source = True
+                elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                    is_passthrough_source = True
+                    
+            if is_passthrough_source:
                 self.last_gx = inputData.gyroscope[0]
                 self.last_gy = inputData.gyroscope[2]
                 self.last_gz = -inputData.gyroscope[1]
@@ -2186,7 +2392,7 @@ class VirtualController:
         if controller.is_joycon():
             joycon_mappings = [
                 getattr(CONFIG, "home_mapping", "Default"),
-                getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"),
+                getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc"),
                 getattr(CONFIG, "c_mapping", "Default"),
                 getattr(CONFIG, "sll_mapping", "Default"),
                 getattr(CONFIG, "srl_mapping", "Default"),

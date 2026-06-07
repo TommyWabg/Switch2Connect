@@ -1176,8 +1176,7 @@ class USBIPJoyConServer(USBIPServer):
         addr = data[11] | (data[12] << 8)
         length = data[15]
         reply_data = [data[11], data[12], 0x00, 0x00, length]
-        spi = [0xFF] * length
-
+        
         # Factory stick calibration (9 bytes, 3x 12-bit pairs packed little-endian):
         # center = 2048 (0x800) -> [0x00, 0x08, 0x80]
         # max_offset = min_offset = 2047 (0x7FF) -> [0xFF, 0xF7, 0x7F]  (Exactly matches our 0-4095 input range)
@@ -1198,34 +1197,40 @@ class USBIPJoyConServer(USBIPServer):
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
         ]
 
-        if addr == 0x6050:
-            spi = ([0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])[:length]
-        elif addr == 0x603D:
-            spi = (stick_calib_l + [0xFF]*20)[:length]
-        elif addr == 0x6046:
-            spi = (stick_calib_r + [0xFF]*20)[:length]
-        elif addr == 0x6080:
-            val = 0xF1 if self.device_type == "L" else (0x0F if self.device_type == "R" else 0x00)
-            sensor_calib = [0x5E, 0x01, 0x00, 0x00, val, 0x0F if self.device_type == "L" else (0xF0 if self.device_type == "R" else 0x00)]
-            spi = (sensor_calib + stick_params + stick_params + [0xFF]*20)[:length]
-        elif addr == 0x6086:
-            spi = (stick_params + [0xFF]*20)[:length]
-        elif addr == 0x6098:
-            spi = (stick_params + [0xFF]*20)[:length]
-        elif addr == 0x8010:
-            # Return invalid magic (0xFF 0xFF) → Eden/Yuzu fall back to factory calibration (0x603D).
-            # Previously returned 0xB2 0xA1 (valid) with factory-format data, but User Cal uses
-            # a different field order (Center first) vs Factory Cal (Max Offset first), causing
-            # Eden to compute center=(1792,1792) instead of (2048,2048) → diagonal lock bug.
-            spi = ([0xFF] * length)
-        elif addr == 0x801B:
-            # Same fix as 0x8010 for the right stick user calibration.
-            spi = ([0xFF] * length)
-        elif addr == 0x6020:
-            spi = ([0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01,
-                    0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
-                    0x19, 0x00, 0xDD, 0xFF, 0xDC, 0xFF,
-                    0x3B, 0x34, 0x3B, 0x34, 0x3B, 0x34])[:length]
+        if 0x6000 <= addr < 0x6100:
+            spi_memory = [0xFF] * 0x100
+            
+            # 0x6020: IMU calibration
+            imu_calib = [0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
+                         0x19, 0x00, 0xDD, 0xFF, 0xDC, 0xFF, 0x3B, 0x34, 0x3B, 0x34, 0x3B, 0x34]
+            spi_memory[0x20:0x20+len(imu_calib)] = imu_calib
+
+            # 0x603D: Left Stick calibration
+            spi_memory[0x3D:0x3D+len(stick_calib_l)] = stick_calib_l
+
+            # 0x6046: Right Stick calibration
+            spi_memory[0x46:0x46+len(stick_calib_r)] = stick_calib_r
+
+            # 0x6050: Color data
+            color_data = [0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+            spi_memory[0x50:0x50+len(color_data)] = color_data
+
+            # 0x6080: Sensor parameters
+            val = 0xF1 if getattr(self, "device_type", "Pro") == "L" else (0x0F if getattr(self, "device_type", "Pro") == "R" else 0x00)
+            sensor_calib = [0x5E, 0x01, 0x00, 0x00, val, 0x0F if getattr(self, "device_type", "Pro") == "L" else (0xF0 if getattr(self, "device_type", "Pro") == "R" else 0x00)]
+            spi_memory[0x80:0x80+len(sensor_calib)] = sensor_calib
+            spi_memory[0x86:0x86+len(stick_params)] = stick_params
+            spi_memory[0x98:0x98+len(stick_params)] = stick_params
+
+            offset = addr - 0x6000
+            spi = spi_memory[offset:offset+length]
+            if len(spi) < length:
+                spi += [0xFF] * (length - len(spi))
+        elif addr == 0x8010 or addr == 0x801B:
+            # User calibration invalid magic -> fallback to factory calibration (0x603D / 0x6046).
+            spi = [0xFF] * length
+        else:
+            spi = [0xFF] * length
 
         reply_data += spi
         return self._build_subcommand_reply(0x10, ack=0x90, reply_data=reply_data)

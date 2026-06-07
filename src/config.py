@@ -42,7 +42,7 @@ SWITCH_BUTTONS = {
 }
 
 BACK_BUTTON_OPTIONS = [
-    "Default", "Custom", "Gyro", "Calibration", "Sys Manager", "Change Profile", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
+    "Default", "Custom", "Gyro", "DJG", "Calibration", "Sys Manager", "Change Profile", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR"
 ]
@@ -263,6 +263,12 @@ class Config:
             if "gyro_passthrough_mode" not in self.profiles[self.active_profile]:
                 self.profiles[self.active_profile]["gyro_passthrough_mode"] = old_gyro_passthrough
         
+        # Migrate old root level steam_roll_compensation to active profile
+        old_steam_roll = config.get("steam_roll_compensation")
+        if old_steam_roll is not None and self.active_profile in self.profiles:
+            if "steam_roll_compensation" not in self.profiles[self.active_profile]:
+                self.profiles[self.active_profile]["steam_roll_compensation"] = old_steam_roll
+        
         # Populate each category for all profiles
         for prof_name, prof_data in self.profiles.items():
             if "ps" in prof_data:
@@ -326,7 +332,6 @@ class Config:
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
         self.stabilized_gyro = config.get("stabilized_gyro", False)
-        self.steam_roll_compensation = config.get("steam_roll_compensation", False)
         val = config.get("virtual_gyro_soft_deadzone", 2.0)
         if isinstance(val, bool):
             self.virtual_gyro_soft_deadzone = 2.0 if val else 0.0
@@ -337,7 +342,7 @@ class Config:
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
         
-        self.simulation_mode = config.get("simulation_mode", "Xbox One")
+        self.simulation_mode = config.get("simulation_mode", "PS5")
         if self.simulation_mode == "Switch 2 Pro":
             self.simulation_mode = "Switch2"
             
@@ -465,7 +470,16 @@ class Config:
 
     def get_default_profile_dict(self):
         categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
-        prof_data = {"gyro_passthrough_mode": "Default"}
+        prof_data = {
+            "driver_type": "WinUHid",
+            "simulation_mode": "PS5",
+            "gyro_passthrough_mode": "Default", 
+            "steam_roll_compensation": False,
+            "djg_enabled": False, 
+            "djg_dominant_side": "Right", 
+            "djg_mode": "Switch Dominant Side",
+            "djg_activation": "Hold"
+        }
         for cat in categories:
             prof_data[cat] = self.get_default_category_dict(cat)
             prof_data[cat]["joycon_hold_mode"] = {}
@@ -502,6 +516,51 @@ class Config:
     def gyro_passthrough_mode(self, value):
         if self.active_profile in self.profiles:
             self.profiles[self.active_profile]["gyro_passthrough_mode"] = value
+
+    @property
+    def steam_roll_compensation(self):
+        return self.profiles.get(self.active_profile, {}).get("steam_roll_compensation", False)
+
+    @steam_roll_compensation.setter
+    def steam_roll_compensation(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["steam_roll_compensation"] = value
+
+    @property
+    def djg_enabled(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_enabled", False)
+
+    @djg_enabled.setter
+    def djg_enabled(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_enabled"] = value
+
+    @property
+    def djg_dominant_side(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_dominant_side", "Left")
+
+    @djg_dominant_side.setter
+    def djg_dominant_side(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_dominant_side"] = value
+            
+    @property
+    def djg_mode(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_mode", "Single Side Toggle")
+
+    @djg_mode.setter
+    def djg_mode(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_mode"] = value
+
+    @property
+    def djg_activation(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_activation", "Toggle")
+
+    @djg_activation.setter
+    def djg_activation(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_activation"] = value
         
     def save_config(self):
         # Snapshot config values in the calling thread
@@ -528,7 +587,6 @@ class Config:
             'open_when_startup': self.open_when_startup,
             'start_minimized': self.start_minimized,
             'stabilized_gyro': self.stabilized_gyro,
-            'steam_roll_compensation': self.steam_roll_compensation,
             'virtual_gyro_soft_deadzone': self.virtual_gyro_soft_deadzone,
             'abxy_mode': self.abxy_mode,
             'gl_mapping': self.gl_mapping,
@@ -633,7 +691,7 @@ class Config:
         self.button_remaps[cat]["vibration_frequency"] = int(val)
 
     def get_current_category(self):
-        mode = getattr(self, "simulation_mode", "Xbox One")
+        mode = getattr(self, "simulation_mode", "PS5")
         if mode == "Switch2":
             return "switch2"
         elif mode == "Switch1":

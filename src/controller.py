@@ -837,7 +837,7 @@ class Controller:
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
 
-        is_switch1 = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch1"
+        is_switch1 = getattr(CONFIG, "simulation_mode", "PS5") == "Switch1"
 
         rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
 
@@ -937,7 +937,7 @@ class Controller:
         freq_factor_hf = (freq_setting - 1) * 4 / 81.0
 
         def scale_and_clamp(v: VibrationData) -> VibrationData:
-            is_switch1 = getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch1"
+            is_switch1 = getattr(CONFIG, "simulation_mode", "PS5") == "Switch1"
 
             is_pure_switch_rumble = rumble_mode == "Switch"
 
@@ -1205,6 +1205,7 @@ class Controller:
                 self._last_dt = dt
 
                 ax, ay, az = inputData.accelerometer
+                self.true_accel = (ax, ay, az)
                 mx, my, mz = inputData.magnometer
                 self._mahony_update(gyro_x, gyro_y, gyro_z, ax, ay, az, mx, my, mz, dt)
 
@@ -1223,6 +1224,7 @@ class Controller:
             inputData.buttons &= ~(0x03307030)
 
             trigger_gyro = False
+            trigger_djg = False
             trigger_screenshot = False
             trigger_key_c = False
             trigger_game_bar = False
@@ -1235,8 +1237,8 @@ class Controller:
                 (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None, "gl"),
                 (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None, "gr"),
                 (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home", "home"),
-                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "Xbox One") in ("Switch1", "Switch2") else "PrtSc", "capt"),
-                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "Xbox One") == "Switch2" else "Mute", "c"),
+                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc", "capt"),
+                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "PS5") == "Switch2" else "Mute", "c"),
                 (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None, "sll"),
                 (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None, "srl"),
                 (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None, "slr"),
@@ -1303,6 +1305,7 @@ class Controller:
                 
                 if is_pressed and not (isinstance(resolved, str) and resolved.startswith("Custom")):
                     if resolved == "Gyro": trigger_gyro = True
+                    elif resolved == "DJG": trigger_djg = True
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
                     elif resolved == "PrtSc": trigger_screenshot = True
                     elif resolved == "Chat":
@@ -1416,7 +1419,7 @@ class Controller:
             inputData.buttons &= ~0x0F
             
             abxy_mode = getattr(CONFIG, "abxy_mode", "Xbox")
-            is_switch_emu = getattr(CONFIG, "simulation_mode", "Xbox One") in ["Switch2", "Switch1"]
+            is_switch_emu = getattr(CONFIG, "simulation_mode", "PS5") in ["Switch2", "Switch1"]
             if is_switch_emu:
                 should_swap = (abxy_mode == "Xbox")
             else:
@@ -1479,6 +1482,9 @@ class Controller:
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
 
+            if getattr(self, 'gyro_fusion_callback', None):
+                self.gyro_fusion_callback(inputData, self)
+
             if getattr(self, 'is_calibrating', False) or getattr(self, 'is_mag_calibrating', False):
                 self.simulate_gyro_mouse(inputData, False, False, False)
             else:
@@ -1493,6 +1499,11 @@ class Controller:
                 
                 self.simulate_gyro_mouse(inputData, effective_gyro_trigger, effective_zr, effective_zl)
 
+            if trigger_djg != getattr(self, 'prev_djg', False):
+                vc = getattr(self, 'virtual_controller', None)
+                if vc is not None:
+                    vc.handle_djg_trigger(self, pressed=trigger_djg)
+            self.prev_djg = trigger_djg
 
             # If Steam roll compensation is enabled, apply built-in anti-roll projection to gyroscope and accelerometer
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
@@ -1850,6 +1861,7 @@ class Controller:
             self.previous_mouse_state = None
 
     def simulate_gyro_mouse(self, inputData: ControllerInputData, trigger_pressed: bool = False, zr_pressed: bool = False, zl_pressed: bool = False):
+
         if getattr(self, 'is_calibrating', False):
             if time.perf_counter() < self.calibration_end_time:
                 self.calibration_samples_gyro.append(inputData.gyroscope)
@@ -1905,15 +1917,25 @@ class Controller:
             inputData.accelerometer = (0.0, 0.0, 0.0)
             return
 
-        if not getattr(self, 'gyro_active', True):
-            # Reset all speed states to prevent drift when switching Gyro sides
+        current_gyro_active = getattr(self, 'gyro_active', True)
+        if current_gyro_active and not getattr(self, 'prev_gyro_active', True):
+            if hasattr(self, 'true_accel'):
+                self._reset_orientation_from_accel(*self.true_accel)
+            else:
+                ax_t, ay_t, az_t = inputData.accelerometer
+                self._reset_orientation_from_accel(ax_t, ay_t, az_t)
+        self.prev_gyro_active = current_gyro_active
+
+        if getattr(self, '_skip_gyro_mouse', False) or not current_gyro_active:
+            if hasattr(self, 'gyro_moving_envelope'):
+                self.gyro_moving_envelope *= 0.88
+                
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
             self.current_vx = 0.0
             self.current_vy = 0.0
             self.interp_residual_x = 0.0
             self.interp_residual_y = 0.0
-            self.gyro_mouse_enabled = False
             return
 
         activation_mode = getattr(CONFIG, "gyro_activation_mode", "Toggle")
@@ -2020,7 +2042,10 @@ class Controller:
         if activation_mode == "Hold":
             if trigger_pressed and not getattr(self, 'gr_was_pressed', False):
                 # Reset orientation on activation to prevent jumps
-                self._reset_orientation_from_accel(ax, ay, az)
+                if hasattr(self, 'true_accel'):
+                    self._reset_orientation_from_accel(*self.true_accel)
+                else:
+                    self._reset_orientation_from_accel(ax, ay, az)
                 self.gyro_start_time = time.perf_counter()
                 self.gyro_steering_origin_accel = (ax, ay, az)
             self.gyro_mouse_enabled = trigger_pressed
@@ -2029,7 +2054,10 @@ class Controller:
                 self.gyro_mouse_enabled = not self.gyro_mouse_enabled
                 if self.gyro_mouse_enabled:
                     # Reset orientation on activation to prevent jumps
-                    self._reset_orientation_from_accel(ax, ay, az)
+                    if hasattr(self, 'true_accel'):
+                        self._reset_orientation_from_accel(*self.true_accel)
+                    else:
+                        self._reset_orientation_from_accel(ax, ay, az)
                     self.gyro_start_time = time.perf_counter()
                     self.gyro_steering_origin_accel = (ax, ay, az)
                 
