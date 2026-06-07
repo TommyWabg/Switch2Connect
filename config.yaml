@@ -108,17 +108,17 @@ button_remaps:
 c_mapping: Default
 calibration_data:
   E0:EF:BF:81:06:9F:
-  - 5.480891719745223
-  - -16.515923566878982
-  - 0.2070063694267516
+  - 5.821538461538461
+  - -15.510769230769231
+  - 0.06769230769230769
   E0:EF:BF:EF:CC:BD:
-  - 1.996742671009772
-  - -12.153094462540716
-  - 9.345276872964169
+  - 2.2965299684542586
+  - -10.583596214511042
+  - 9.832807570977918
   E0:EF:BF:F0:0E:17:
-  - -2.310126582278481
-  - 1.120253164556962
-  - 3.6487341772151898
+  - -2.1635220125786163
+  - -0.16037735849056603
+  - 3.1352201257861636
 capt_mapping: Default
 cemuhook_mac_to_pad:
   E0EFBF81069F: 2
@@ -131,15 +131,15 @@ gc_trigger_calibration_data: {}
 gc_trigger_mode: 100% at Max
 gl_mapping: PS_L_Touch
 gr_mapping: PS_R_Touch
-gyro_activation_mode: Hold
+gyro_activation_mode: Toggle
 gyro_bias_l:
-- -2.310126582278481
-- 1.120253164556962
-- 3.6487341772151898
+- -2.1635220125786163
+- -0.16037735849056603
+- 3.1352201257861636
 gyro_bias_r:
-- 1.996742671009772
-- -12.153094462540716
-- 9.345276872964169
+- 5.821538461538461
+- -15.510769230769231
+- 0.06769230769230769
 gyro_mode: World
 gyro_passthrough_mode: Cemuhook
 gyro_sensitivity: 4.0
@@ -150,15 +150,125 @@ mag_calibration_data:
   - 157.0
   - 73.5
   - -6.0
+  E0:EF:BF:EF:CC:BD:
+  - -330.5
+  - -11.0
+  - -445.5
+  E0:EF:BF:F0:0E:17:
+  - -179.5
+  - 231.5
+  - -264.0
 merged_gyro_side:
-  E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Left
+  E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
   enabled: true
   ir_activate_threshold: 1
   sensitivity: 4.0
 open_when_startup: false
 profiles:
+  DJG Demo:
+    djg_activation: Hold
+    djg_dominant_side: Right
+    djg_enabled: true
+    djg_mode: Switch Dominant Side
+    driver_type: WinUHid
+    gyro_passthrough_mode: Default
+    ps4:
+      abxy_mode: Xbox
+      c_mapping: Calibration
+      capt_mapping: Default
+      gc_trigger_mode: 100% at Max
+      gl_mapping: PS_L_Touch
+      gr_mapping: PS_R_Touch
+      home_mapping: Default
+      joycon_hold_mode: {}
+      rumble_mode: Xbox
+      sll_mapping: Default
+      slr_mapping: PS_R_Touch
+      srl_mapping: PS_L_Touch
+      srr_mapping: Change Profile
+      vibration_frequency: 10
+      vibration_strength: 5
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
+    ps5:
+      abxy_mode: Xbox
+      c_mapping: Default
+      capt_mapping: Default
+      gc_trigger_mode: 100% at Max
+      gl_mapping: PS_L_Touch
+      gr_mapping: PS_R_Touch
+      home_mapping: Default
+      joycon_hold_mode: {}
+      rumble_mode: Xbox
+      sll_mapping: PS_L_Touch
+      slr_mapping: DJG
+      srl_mapping: DJG
+      srr_mapping: PS_R_Touch
+      vibration_frequency: 10
+      vibration_strength: 5
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
+    simulation_mode: PS5
+    steam_roll_compensation: true
+    switch1:
+      abxy_mode: Switch
+      c_mapping: Calibration
+      capt_mapping: Default
+      gc_trigger_mode: Hair Trigger
+      gl_mapping: Default
+      gr_mapping: Default
+      home_mapping: Default
+      joycon_hold_mode: {}
+      rumble_mode: Switch
+      sll_mapping: Default
+      slr_mapping: Default
+      srl_mapping: Default
+      srr_mapping: Change Profile
+      vibration_frequency: 10
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
+    switch2:
+      abxy_mode: Switch
+      c_mapping: Default
+      capt_mapping: Default
+      gc_trigger_mode: Hair Trigger
+      gl_mapping: Default
+      gr_mapping: Default
+      home_mapping: Default
+      joycon_hold_mode: {}
+      rumble_mode: Switch
+      sll_mapping: Default
+      slr_mapping: GR
+      srl_mapping: GL
+      srr_mapping: Change Profile
+      vibration_frequency: 10
+      vibration_strength: 5
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
+    xbox:
+      abxy_mode: Xbox
+      c_mapping: Calibration
+      capt_mapping: Default
+      gc_trigger_mode: 100% at Max
+      gl_mapping: Default
+      gr_mapping: Default
+      home_mapping: Default
+      joycon_hold_mode: {}
+      rumble_mode: Xbox
+      sll_mapping: Default
+      slr_mapping: Default
+      srl_mapping: Default
+      srr_mapping: Change Profile
+      vibration_frequency: 10
+      vibration_strength: 10
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
   Default:
+    djg_activation: Hold
+    djg_dominant_side: Right
+    djg_enabled: false
+    djg_mode: Switch Dominant Side
     driver_type: WinUHid
     gyro_passthrough_mode: Default
     ps4:
@@ -198,6 +308,7 @@ profiles:
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
     simulation_mode: PS5
+    steam_roll_compensation: false
     switch1:
       abxy_mode: Switch
       c_mapping: Calibration
@@ -252,6 +363,10 @@ profiles:
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
   Switch 1 Emulator:
+    djg_activation: Hold
+    djg_dominant_side: Right
+    djg_enabled: false
+    djg_mode: Switch Dominant Side
     driver_type: USBIP
     gyro_passthrough_mode: Cemuhook
     ps4:
@@ -262,9 +377,7 @@ profiles:
       gl_mapping: PS_L_Touch
       gr_mapping: PS_R_Touch
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
@@ -280,11 +393,9 @@ profiles:
       capt_mapping: Default
       gc_trigger_mode: 100% at Max
       gl_mapping: PS_L_Touch
-      gr_mapping: Gyro
+      gr_mapping: PS_R_Touch
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
@@ -295,6 +406,7 @@ profiles:
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
     simulation_mode: Switch1
+    steam_roll_compensation: false
     switch1:
       abxy_mode: Switch
       c_mapping: Calibration
@@ -303,9 +415,7 @@ profiles:
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Horizontal
+      joycon_hold_mode: {}
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: Default
@@ -322,9 +432,7 @@ profiles:
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: GR
@@ -342,9 +450,7 @@ profiles:
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
-      joycon_hold_mode:
-        E0:EF:BF:EF:CC:BD: Vertical
-        E0:EF:BF:F0:0E:17: Vertical
+      joycon_hold_mode: {}
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: Default
@@ -376,6 +482,6 @@ vibration_strength_xbox: 5
 vigembus_installed: true
 vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
-window_height: 1220
-window_width: 1240
+window_height: 1270
+window_width: 1460
 winuhid_sim_mode: PS5
