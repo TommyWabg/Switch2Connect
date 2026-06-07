@@ -22,7 +22,21 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
   * **Adjustable Soft Deadzone Slider:** Added a slider for adjusting soft deadzone value for passthrough gyro data. (Soft deadzone subtracts the active deadzone value from the input magnitude. Output begins smoothly from `0.0` right at the threshold boundary, eliminating step-jump discontinuities.)
 * **Gyro Calibration:** **Calibrate Gyro** button for calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
-* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, print screen, change profile, system manager, standard buttons, or record custom input.
+* **Dual Joy-con Gyro (DJG):** Introduced a gyro fusion system that combines motion data from both Left and Right Joy-cons when used as a merged pair. This system designates a "Dominant" side for spatial orientation and uses the "Sub" side as an accelerator for larger movements. A magnitude threshold of 30 is applied to the sub side. It contributes to acceleration only when the dominant side exceeds this threshold. Sub side acceleration is strictly capped to a maximum of 2x the dominant movement.
+  * Navigate to the **Dual Joy-con Gyro (DJG)** panel.
+  * Click the **DJG** toggle to **ON** to enable the fusion engine.
+  * Set the **Dominant Side** to **Left** or **Right**. The dominant side acts as the primary reference for direction and gravity, while the sub side provides acceleration.
+* **DJG Trigger Mapping:** Added a dedicated "DJG" option to the Extra Button Mapping settings.
+  * Assign the "DJG" action to any available extra button to serve as the hardware trigger for DJG features.
+  * Pressing this mapped button during gameplay will execute the action defined by the current DJG Control Mode and DJG Activation settings.
+* **DJG Control Modes:** Three modes to dictate how the mapped DJG trigger button behaves during gameplay.
+  * **Single Side Toggle:** Toggle the gyro tracking of a single Joy-con on or off independently.
+  * **Switch Dominant Side:** Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced active upon switching.
+  * **Switch Gyro Side:** Turn off the current gyro and activate the opposite Joy-con's gyro exclusively. The Dominant Side setting syncs automatically.
+* **DJG Activation Types:** Trigger behavior options to support different input styles.
+  * **Toggle:** Switch the DJG state once per button press.
+  * **Hold:** Switch the DJG state when the button is pressed, and revert to the original state when the button is released.
+* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, dual Joy-con gyro trigger, print screen, change profile, system manager, standard buttons, or record custom input.
 * **Advanced Custom Input Remapping:** Introduced a powerful new "Custom" mapping feature. Users can now record and assign any complex combination of keyboard keys, mouse clicks, or controller buttons to a single input. This flexible system supports both "Tap" (fires the recorded sequence momentarily) and "Hold" (sustains the sequence for as long as the button is pressed) modes.
   * Click the dropdown menu and select the "Custom" option.
   * Press and hold your desired combination of keyboard keys, mouse clicks, and/or controller buttons simultaneously.
