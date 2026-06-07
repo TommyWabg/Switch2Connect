@@ -2183,17 +2183,19 @@ class ControllerWindow:
                 for c in vc.controllers:
                     last_data = getattr(c, 'last_input_data', None)
                     if last_data:
-                        lx, ly = last_data.left_stick
-                        if lx > 0.5: nav_dir = "RIGHT"
-                        elif lx < -0.5: nav_dir = "LEFT"
-                        elif ly > 0.5: nav_dir = "UP"
-                        elif ly < -0.5: nav_dir = "DOWN"
+                        if not getattr(c, 'is_joycon_right', lambda: False)():
+                            lx, ly = last_data.left_stick
+                            if lx > 0.5: nav_dir = "RIGHT"
+                            elif lx < -0.5: nav_dir = "LEFT"
+                            elif ly > 0.5: nav_dir = "UP"
+                            elif ly < -0.5: nav_dir = "DOWN"
                         
-                        rx, ry = last_data.right_stick
-                        if rx > 0.5: right_nav_dir = "RIGHT"
-                        elif rx < -0.5: right_nav_dir = "LEFT"
-                        elif ry > 0.5: right_nav_dir = "UP"
-                        elif ry < -0.5: right_nav_dir = "DOWN"
+                        if not getattr(c, 'is_joycon_left', lambda: False)():
+                            rx, ry = last_data.right_stick
+                            if rx > 0.5: right_nav_dir = "RIGHT"
+                            elif rx < -0.5: right_nav_dir = "LEFT"
+                            elif ry > 0.5: right_nav_dir = "UP"
+                            elif ry < -0.5: right_nav_dir = "DOWN"
                     
                     buttons = getattr(c, 'raw_buttons', 0)
                     if buttons & up_mask: nav_dir = "UP"
