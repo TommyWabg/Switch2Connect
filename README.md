@@ -67,6 +67,9 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Run at Startup:** Added a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
 * **Hide to system tray:** Added the ability to minimize the application to the Windows system tray.
+* **Controller UI Navigation:** Implemented UI navigation using the left joystick or D-pad. The currently selected UI element is indicated by a white outline. The outline automatically hides upon detecting mouse clicks anywhere within the application or pressing B button on the controller.
+  * **UI Component Interaction:** Added controller support for interacting with UI elements. Pressing the 'A' button clicks buttons or opens dropdown menus, while the 'B' button closes open dropdown menus without applying changes.
+  * **Slider and Time Input Adjustment:** Enabled adjustment of sliders and auto-disconnect time input fields using the right joystick. Alternatively, holding the 'A' button while using the left joystick modifies the values without triggering spatial navigation.
 * **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
 
 ## System Requirements
