@@ -363,6 +363,7 @@ profiles:
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
   Switch 1 Emulator:
+    cemuhook_sensitivity: 1
     djg_activation: Hold
     djg_dominant_side: Right
     djg_enabled: false
