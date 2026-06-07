@@ -473,7 +473,8 @@ class Config:
         prof_data = {
             "driver_type": "WinUHid",
             "simulation_mode": "PS5",
-            "gyro_passthrough_mode": "Default", 
+            "gyro_passthrough_mode": "Default",
+            "cemuhook_sensitivity": 1,
             "steam_roll_compensation": False,
             "djg_enabled": False, 
             "djg_dominant_side": "Right", 
@@ -525,6 +526,15 @@ class Config:
     def steam_roll_compensation(self, value):
         if self.active_profile in self.profiles:
             self.profiles[self.active_profile]["steam_roll_compensation"] = value
+
+    @property
+    def cemuhook_sensitivity(self):
+        return self.profiles.get(self.active_profile, {}).get("cemuhook_sensitivity", 1)
+
+    @cemuhook_sensitivity.setter
+    def cemuhook_sensitivity(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["cemuhook_sensitivity"] = int(value)
 
     @property
     def djg_enabled(self):

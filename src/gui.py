@@ -2417,13 +2417,7 @@ class ControllerWindow:
         self.steam_roll_comp_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "steam_roll_compensation", False), command=self.update_steam_roll_comp_setting, bg_color=background_color)
         self.steam_roll_comp_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
 
-        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
-        self.passthrough_mode_switch = ToggleSwitch(self.comp_frame, labels=["Default", "Cemuhook"], values=["Default", "Cemuhook"], 
-initial_value=getattr(CONFIG, "gyro_passthrough_mode", "Default"), command=self.update_passthrough_mode, 
-bg_color=background_color, widths=[8, 10])
-        self.passthrough_mode_switch.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
-
-        tk.Label(self.comp_frame, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=9, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.comp_frame, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.deadzone_scale = tk.Scale(
             self.comp_frame,
             from_=0.0,
@@ -2444,10 +2438,48 @@ bg_color=background_color, widths=[8, 10])
             command=self.update_virtual_gyro_soft_deadzone_setting
         )
         self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 2.0))
-        self.deadzone_scale.grid(row=0, column=10, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+        self.deadzone_scale.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+
+        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="e")
+        self.passthrough_mode_switch = ToggleSwitch(self.comp_frame, labels=["Default", "Cemuhook"], values=["Default", "Cemuhook"], 
+initial_value=getattr(CONFIG, "gyro_passthrough_mode", "Default"), command=self.update_passthrough_mode, 
+bg_color=background_color, widths=[8, 10])
+        self.passthrough_mode_switch.grid(row=1, column=1, columnspan=2, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="w")
+
+        self.sens_label = tk.Label(self.comp_frame, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")))
+        self.cemuhook_sens_scale = tk.Scale(
+            self.comp_frame,
+            from_=1,
+            to=5,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            length=int(120 * scaling_factor),
+            bg=background_color,
+            fg=text_color,
+            troughcolor=button_gray,
+            activebackground=highlight_color,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief=tk.FLAT,
+            sliderlength=int(15 * scaling_factor),
+            width=int(15 * scaling_factor),
+            font=scale_font(("Arial", 12, "bold")),
+            command=self.update_cemuhook_sensitivity
+        )
+        self.cemuhook_sens_scale.set(getattr(CONFIG, "cemuhook_sensitivity", 1))
         
+        self.update_sens_visibility(getattr(CONFIG, "gyro_passthrough_mode", "Default"))
+
         if getattr(CONFIG, "gyro_passthrough_mode", "Default") == "Cemuhook":
             cemuhook_server.start()
+
+    def update_sens_visibility(self, mode):
+        if mode == "Cemuhook":
+            self.sens_label.grid(row=1, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(5 * scaling_factor), 0), sticky="e")
+            self.cemuhook_sens_scale.grid(row=1, column=4, columnspan=2, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="w")
+        else:
+            self.sens_label.grid_forget()
+            self.cemuhook_sens_scale.grid_forget()
 
     def update_passthrough_mode(self, mode):
         CONFIG.gyro_passthrough_mode = mode
@@ -2456,7 +2488,14 @@ bg_color=background_color, widths=[8, 10])
             cemuhook_server.start()
         else:
             cemuhook_server.stop()
+        self.update_sens_visibility(mode)
         logger.info(f"Gyro Passthrough Mode updated to {mode}")
+
+    def update_cemuhook_sensitivity(self, val):
+        val = int(float(val))
+        CONFIG.cemuhook_sensitivity = val
+        CONFIG.save_config()
+        logger.info(f"Cemuhook Sensitivity updated to {val}")
 
     def init_djg_panel(self):
         self.djg_frame = tk.LabelFrame(self.root, text=" Dual Joy-con Gyro (DJG) ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
@@ -3762,6 +3801,10 @@ bg_color=background_color, widths=[8, 10])
         # Update Horizon Lock
         if hasattr(self, 'steam_roll_comp_switch'):
             self.steam_roll_comp_switch.set_value(getattr(CONFIG, "steam_roll_compensation", False))
+                
+        # Update Cemuhook Sensitivity
+        if hasattr(self, 'cemuhook_sens_scale'):
+            self.cemuhook_sens_scale.set(getattr(CONFIG, "cemuhook_sensitivity", 1))
                 
         # Update DJG Settings as the last step
         if hasattr(self, 'djg_enabled_switch'):

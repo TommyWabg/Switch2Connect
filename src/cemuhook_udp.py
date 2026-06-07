@@ -358,10 +358,16 @@ class CemuHookUDPServer:
         # 根據實測反推的完美經驗值倍率：
         # Joy-Con: 0.0535 (修正了前一版 0.0523 導致的 350度 些微不足)
         # Pro Controller: 0.061
-        gyr_multiplier = 0.0535 if model == 3 else 0.061
-        gyr_pitch = ds4_gyro[0] * gyr_multiplier
-        gyr_yaw   = ds4_gyro[1] * gyr_multiplier
-        gyr_roll  = ds4_gyro[2] * gyr_multiplier
+        base_gyr_multiplier = 0.0535 if model == 3 else 0.061
+        
+        # 套用來自介面的 Cemuhook Sensitivity (1~5階，5階時對應 480/360 倍)
+        # 應使用者要求，只影響左右水平旋轉 (Yaw)
+        cemuhook_sens = getattr(CONFIG, "cemuhook_sensitivity", 1)
+        cemuhook_mult = 1.0 + (cemuhook_sens - 1.0) * (1.0 / 12.0)
+        
+        gyr_pitch = ds4_gyro[0] * base_gyr_multiplier
+        gyr_yaw   = ds4_gyro[1] * base_gyr_multiplier * cemuhook_mult
+        gyr_roll  = ds4_gyro[2] * base_gyr_multiplier
         
         # Cemuhook expects Pitch, Yaw, Roll
         output.extend(struct.pack('<f', gyr_pitch))
