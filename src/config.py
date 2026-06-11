@@ -254,7 +254,7 @@ class Config:
             if self.active_profile not in self.profiles:
                 self.profiles[self.active_profile] = {}
         
-        categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
+        categories = ["xbox", "ps4", "ps5_winuhid", "ps5_usbip", "switch1", "switch2"]
         old_hold_mode = config.get("joycon_hold_mode", {}) or {}
         
         # Migrate old root level gyro_passthrough_mode to active profile
@@ -276,6 +276,12 @@ class Config:
                 if "ps4" not in prof_data: prof_data["ps4"] = copy.deepcopy(prof_data["ps"])
                 if "ps5" not in prof_data: prof_data["ps5"] = copy.deepcopy(prof_data["ps"])
                 prof_data.pop("ps", None)
+                
+            if "ps5" in prof_data:
+                import copy
+                if "ps5_winuhid" not in prof_data: prof_data["ps5_winuhid"] = copy.deepcopy(prof_data["ps5"])
+                if "ps5_usbip" not in prof_data: prof_data["ps5_usbip"] = copy.deepcopy(prof_data["ps5"])
+                prof_data.pop("ps5", None)
 
             for cat in categories:
                 if cat not in prof_data:
@@ -295,6 +301,8 @@ class Config:
                             val = old_cat_data.get("vibration_strength", config.get("vibration_strength_xbox", config.get("vibration_strength", def_val)))
                         elif key == "vibration_strength_switch":
                             val = old_cat_data.get("vibration_strength", config.get("vibration_strength_switch", config.get("vibration_strength", def_val)))
+                        elif key == "vibration_strength_ps5":
+                            val = old_cat_data.get("vibration_strength", config.get("vibration_strength_ps5", config.get("vibration_strength", def_val)))
                         elif key == "vibration_frequency":
                             val = config.get("vibration_frequency", def_val)
                         elif key == "capt_mapping":
@@ -437,12 +445,19 @@ class Config:
                 "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
                 "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
             },
-            "ps5": {
+            "ps5_winuhid": {
                 "abxy_mode": "Xbox", "c_mapping": "Default", "capt_mapping": "Default",
                 "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
                 "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
                 "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
-                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5, "vibration_strength_ps5": 10
+            },
+            "ps5_usbip": {
+                "abxy_mode": "Xbox", "c_mapping": "Default", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
+                "home_mapping": "Default", "rumble_mode": "PS5", "sll_mapping": "Default",
+                "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 10, "vibration_strength_switch": 5, "vibration_strength_xbox": 5, "vibration_strength_ps5": 10
             },
             "xbox": {
                 "abxy_mode": "Xbox", "c_mapping": "Calibration", "capt_mapping": "Default",
@@ -469,7 +484,7 @@ class Config:
         return defaults.get(cat, defaults["xbox"]).copy()
 
     def get_default_profile_dict(self):
-        categories = ["xbox", "ps4", "ps5", "switch1", "switch2"]
+        categories = ["xbox", "ps4", "ps5_winuhid", "ps5_usbip", "switch1", "switch2"]
         prof_data = {
             "driver_type": "WinUHid",
             "simulation_mode": "PS5",
@@ -591,6 +606,7 @@ class Config:
             'vibration_strength': self.vibration_strength,
             'vibration_strength_xbox': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_xbox", 5),
             'vibration_strength_switch': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_switch", 5),
+            'vibration_strength_ps5': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_ps5", 10),
             'vibration_frequency': self.vibration_frequency,
             'rumble_mode': self.rumble_mode,
             'simulation_mode': self.simulation_mode,
@@ -709,7 +725,11 @@ class Config:
         elif mode == "PS4":
             return "ps4"
         elif mode == "PS5":
-            return "ps5"
+            driver = getattr(self, "driver_type", "WinUHid")
+            if driver == "USBIP":
+                return "ps5_usbip"
+            else:
+                return "ps5_winuhid"
         else:
             return "xbox"
 

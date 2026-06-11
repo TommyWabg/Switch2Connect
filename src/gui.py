@@ -1829,7 +1829,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering size)
         default_w = int(1460 * resolution_ratio)
-        default_h = int(1270 * resolution_ratio)
+        default_h = int(1320 * resolution_ratio)
         w = default_w
         h = default_h
         self.root.geometry(f"{w}x{h}+50+50")
@@ -2796,7 +2796,7 @@ bg_color=background_color, widths=[8, 10])
         entry.focus_set()
         
         pressed_keys = set()
-        recorded_seq = set()
+        recorded_seq = []
         self.recording_controllers = True
         self.recorded_controller_buttons = set()
         self.waiting_for_controller_release = True
@@ -2809,22 +2809,24 @@ bg_color=background_color, widths=[8, 10])
             self.root.unbind("<ButtonRelease>")
             self.root.unbind("<MouseWheel>")
             self.root.unbind("<FocusOut>")
-            raw_seq = list(recorded_seq) + list(self.recorded_controller_buttons)
+            raw_seq = recorded_seq
             
-            normalized_seq = set()
+            normalized_seq = []
             for k in raw_seq:
                 if k in ("VK_CONTROL", "VK_CONTROL_L", "VK_CONTROL_R", "VK_LCONTROL", "VK_RCONTROL"):
-                    normalized_seq.add("VK_CONTROL")
+                    nk = "VK_CONTROL"
                 elif k in ("VK_SHIFT", "VK_SHIFT_L", "VK_SHIFT_R", "VK_LSHIFT", "VK_RSHIFT"):
-                    normalized_seq.add("VK_SHIFT")
+                    nk = "VK_SHIFT"
                 elif k in ("VK_MENU", "VK_ALT", "VK_ALT_L", "VK_ALT_R", "VK_LMENU", "VK_RMENU"):
-                    normalized_seq.add("VK_MENU")
+                    nk = "VK_MENU"
                 elif k in ("VK_WIN", "VK_LWIN", "VK_RWIN", "VK_WIN_L", "VK_WIN_R"):
-                    normalized_seq.add("VK_LWIN")
+                    nk = "VK_LWIN"
                 else:
-                    normalized_seq.add(k)
+                    nk = k
+                if nk not in normalized_seq:
+                    normalized_seq.append(nk)
                     
-            final_seq = sorted(list(normalized_seq))
+            final_seq = normalized_seq
             
             if not final_seq:
                 custom_frame.pack_forget()
@@ -2851,7 +2853,8 @@ bg_color=background_color, widths=[8, 10])
         def on_key_press(e):
             vk = e.keysym.upper()
             pressed_keys.add(f"VK_{vk}")
-            recorded_seq.add(f"VK_{vk}")
+            if f"VK_{vk}" not in recorded_seq:
+                recorded_seq.append(f"VK_{vk}")
             return "break"
 
         def on_key_release(e):
@@ -2864,7 +2867,8 @@ bg_color=background_color, widths=[8, 10])
         def on_mouse_press(e):
             btn = f"MB_{e.num}"
             pressed_keys.add(btn)
-            recorded_seq.add(btn)
+            if btn not in recorded_seq:
+                recorded_seq.append(btn)
             return "break"
 
         def on_mouse_release(e):
@@ -2876,7 +2880,8 @@ bg_color=background_color, widths=[8, 10])
 
         def on_mouse_wheel(e):
             dir_str = "UP" if e.delta > 0 else "DOWN"
-            recorded_seq.add(f"MW_{dir_str}")
+            if f"MW_{dir_str}" not in recorded_seq:
+                recorded_seq.append(f"MW_{dir_str}")
             self.root.after(100, check_release)
             return "break"
 
@@ -2903,9 +2908,11 @@ bg_color=background_color, widths=[8, 10])
                 for vk in range(8, 255):
                     if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
                         if vk in vk_map:
-                            recorded_seq.add(f"VK_{vk_map[vk]}")
+                            if f"VK_{vk_map[vk]}" not in recorded_seq:
+                                recorded_seq.append(f"VK_{vk_map[vk]}")
                         elif (65 <= vk <= 90) or (48 <= vk <= 57):
-                            recorded_seq.add(f"VK_{chr(vk)}")
+                            if f"VK_{chr(vk)}" not in recorded_seq:
+                                recorded_seq.append(f"VK_{chr(vk)}")
                 end_recording()
         self.root.bind("<FocusOut>", on_focus_out)
         
@@ -2927,6 +2934,8 @@ bg_color=background_color, widths=[8, 10])
                             for bit, btn_name in reverse_map.items():
                                 if raw & bit:
                                     self.recorded_controller_buttons.add(f"BTN_{btn_name}")
+                                    if f"BTN_{btn_name}" not in recorded_seq:
+                                        recorded_seq.append(f"BTN_{btn_name}")
             
             if getattr(self, 'waiting_for_controller_release', False):
                 if not any_pressed:
@@ -3045,7 +3054,7 @@ bg_color=background_color, widths=[8, 10])
         if initial_driver == "ViGEmBus":
             sim_options = ["Xbox360", "PS4"]
         elif initial_driver == "USBIP":
-            sim_options = ["Switch1", "Switch2"]
+            sim_options = ["Switch1", "Switch2", "PS5"]
         else:
             sim_options = ["Xbox One", "PS4", "PS5"]
             
@@ -3061,6 +3070,7 @@ bg_color=background_color, widths=[8, 10])
         tk.Label(row_vibration, text="Rumble Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
         self.rumble_mode_switch = ToggleSwitch(row_vibration, ["Xbox", "Switch"], ["Xbox", "Switch"], getattr(CONFIG, "rumble_mode", "Xbox"), self.update_rumble_mode_setting, background_color)
         self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        self.update_dynamic_rumble_mode_options()
 
         tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         self.vibration_strength_scale = tk.Scale(row_vibration, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_strength)
@@ -3235,9 +3245,11 @@ bg_color=background_color, widths=[8, 10])
         if val == "ViGEmBus":
             self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
         elif val == "USBIP":
-            self.sim_mode_switch.update_options(["Switch1", "Switch2"], ["Switch1", "Switch2"], CONFIG.simulation_mode)
+            self.sim_mode_switch.update_options(["Switch1", "Switch2", "PS5"], ["Switch1", "Switch2", "PS5"], CONFIG.simulation_mode)
         else:
             self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
+            
+        self.update_dynamic_rumble_mode_options()
             
         # Apply the driver change to all running virtual controllers immediately
         success = True
@@ -3294,9 +3306,9 @@ bg_color=background_color, widths=[8, 10])
             if old_driver == "ViGEmBus":
                 self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], old_sim_mode)
             elif old_driver == "USBIP":
-                self.sim_mode_switch.update_options(["Switch2"], ["Switch2"], old_sim_mode)
+                self.sim_mode_switch.update_options(["Switch1", "Switch2", "PS5"], ["Switch1", "Switch2", "PS5"], old_sim_mode)
             else:
-                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5", "Switch1"], ["Xbox One", "PS4", "PS5", "Switch1"], old_sim_mode)
+                self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], old_sim_mode)
                 
             # Recreate controllers under old config
             if hasattr(self, 'current_controllers'):
@@ -3448,6 +3460,7 @@ bg_color=background_color, widths=[8, 10])
         else:
             # 存檔
             CONFIG.save_config()
+            self.update_dynamic_rumble_mode_options()
             
         self._refresh_mapping_comboboxes()
         self.force_refresh_player_slots()
@@ -3489,8 +3502,30 @@ bg_color=background_color, widths=[8, 10])
         self.vibration_strength_scale.set(CONFIG.vibration_strength)
         self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
 
+    def update_dynamic_rumble_mode_options(self):
+        if not hasattr(self, 'rumble_mode_switch'):
+            return
+            
+        driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
+        
+        current_rumble = getattr(CONFIG, "rumble_mode", "Xbox")
+        if current_rumble == "Switch":
+            current_rumble = "PS5" # Automatically migrate name in memory
+            CONFIG.rumble_mode = "PS5"
+            CONFIG.save_config()
+            
+        if driver_type == "USBIP" and sim_mode == "PS5":
+            self.rumble_mode_switch.update_options(["Xbox", "PS5"], ["Xbox", "PS5"], current_rumble)
+        else:
+            if current_rumble == "PS5":
+                current_rumble = "Switch"
+                CONFIG.rumble_mode = "Switch"
+                CONFIG.save_config()
+            self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
+
     def update_rumble_mode_ui(self, mode):
-        if mode == "Switch":
+        if mode in ["Switch", "PS5"]:
             self.vibration_frequency_label.pack_forget()
             self.vibration_frequency_scale.pack_forget()
         else:
@@ -3877,7 +3912,7 @@ bg_color=background_color, widths=[8, 10])
             if active_driver == "ViGEmBus":
                 self.sim_mode_switch.update_options(["Xbox360", "PS4"], ["Xbox360", "PS4"], CONFIG.simulation_mode)
             elif active_driver == "USBIP":
-                self.sim_mode_switch.update_options(["Switch1", "Switch2"], ["Switch1", "Switch2"], CONFIG.simulation_mode)
+                self.sim_mode_switch.update_options(["Switch1", "Switch2", "PS5"], ["Switch1", "Switch2", "PS5"], CONFIG.simulation_mode)
             else:
                 self.sim_mode_switch.update_options(["Xbox One", "PS4", "PS5"], ["Xbox One", "PS4", "PS5"], CONFIG.simulation_mode)
         # A slot is only "connected" if the VirtualController exists AND has physical controllers

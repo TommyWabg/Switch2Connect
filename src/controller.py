@@ -589,13 +589,28 @@ class Controller:
                 try:
                     if hasattr(wd_bluetooth, 'BluetoothLEPreferredConnectionParameters'):
                         params = wd_bluetooth.BluetoothLEPreferredConnectionParameters.throughput_optimized
-                        device = getattr(self.client._backend, "_requester", None)
-                        if device:
-                            if hasattr(device, 'request_preferred_connection_parameters_async'):
-                                await device.request_preferred_connection_parameters_async(params)
-                            elif hasattr(device, 'request_preferred_connection_parameters'):
-                                device.request_preferred_connection_parameters(params)
-                            logger.info(f"ThroughputOptimized applied for {self.device.address}")
+                        native_device = getattr(self.client, "_device", None)
+                        if native_device is None and hasattr(self.client, "_backend"):
+                            native_device = getattr(self.client._backend, "_device", None)
+                        if native_device is None and hasattr(self.client, "_backend"):
+                            native_device = getattr(self.client._backend, "_requester", None)
+
+                        if native_device and (hasattr(native_device, 'request_preferred_connection_parameters_async') or hasattr(native_device, 'request_preferred_connection_parameters')):
+                            request_result = None
+                            if hasattr(native_device, 'request_preferred_connection_parameters_async'):
+                                request_result = await native_device.request_preferred_connection_parameters_async(params)
+                            elif hasattr(native_device, 'request_preferred_connection_parameters'):
+                                request_result = native_device.request_preferred_connection_parameters(params)
+                                
+                            status_val = getattr(request_result, 'status', getattr(request_result, 'Status', request_result))
+                            try:
+                                status_name = status_val.name if hasattr(status_val, 'name') else str(status_val)
+                            except Exception:
+                                status_name = str(status_val)
+                                
+                            logger.info(f"Controller {self.device.address}: 7.5ms Request Result Status: {status_name}")
+                        else:
+                            logger.warning(f"Could not extract valid WinRT BluetoothLEDevice for {self.device.address}, optimization skipped.")
                     else:
                         logger.info("ThroughputOptimized not available on this Windows version.")
                 except Exception as e:
@@ -667,9 +682,33 @@ class Controller:
                     logger.warning(f"Notify failed, retry {attempt+1}: {e}")
                     await asyncio.sleep(2.0)
 
+            if is_sw2_device:
+                logger.info(f"Running SW2 Device specific init sequence for {self.device.address}")
+                sw2_init_commands = [
+                    (0x03, 0x0d, b"\x01\x00\xff\xff\xff\xff\xff\xff"),
+                    (0x07, 0x01, b""),
+                    (0x16, 0x01, b""),
+                    (0x15, 0x03, b"\x00"),
+                    (0x0c, 0x02, b"\x2f\x00\x00\x00"),
+                    (0x11, 0x03, b""),
+                    (0x0a, 0x08, b"\x01\xff\xff\xff\xff\xff\xff\xff\xff\x35\x00\x46\x00\x00\x00\x00\x00\x00\x00\x00"),
+                    (0x0c, 0x04, b"\x2f\x00\x00\x00"),
+                    (0x03, 0x0a, b"\x09\x00\x00\x00"),
+                    (0x10, 0x01, b""),
+                    (0x01, 0x0c, b""),
+                    (0x01, 0x01, b"\x00\x00\x00\x00"),
+                    (0x09, 0x07, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                ]
+                for cmd_id, subcmd_id, data in sw2_init_commands:
+                    try:
+                        await self.write_command(cmd_id, subcmd_id, data)
+                        await asyncio.sleep(0.01)
+                    except Exception as e:
+                        logger.warning(f"SW2 Init command {cmd_id:02x}:{subcmd_id:02x} failed: {e}")
+
             self.controller_info = await self.read_controller_info()
             
-            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID or is_sw2_device:
+            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
                 logger.info(f"Setting GameCube Input Mode to 0x30 (Format 3) for {self.device.address}")
                 try:
                     set_input_mode_cmd = bytearray([
@@ -704,7 +743,7 @@ class Controller:
             
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
                 await self.enableFeatures(0x27)
-            else:
+            elif not is_sw2_device:
                 await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
 
             self.interp_running = True
@@ -832,7 +871,7 @@ class Controller:
                 
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
-    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False):
+    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None):
         strength = getattr(CONFIG, "vibration_strength", 5)
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
@@ -875,13 +914,13 @@ class Controller:
                 if rumble_mode == "Switch":
                     if strength <= 5.0:
                         lf_multiplier = (strength / 5.0) * 0.504
-                        hf_multiplier = (strength / 5.0) * 0.336
+                        hf_multiplier = (strength / 5.0) * 0.672
                     else:
                         t = (strength - 5.0) / 5.0
                         lf_multiplier = 0.504 + (0.84 - 0.504) * t
-                        hf_multiplier = 0.336 + (0.56 - 0.336) * t
+                        hf_multiplier = 0.672 + (0.8 - 0.672) * t
                     lf_multiplier = min(0.84, lf_multiplier)
-                    hf_multiplier = min(0.56, hf_multiplier)
+                    hf_multiplier = min(0.8, hf_multiplier)
                 else:
                     # Align Xbox Rumble for Joy-Con using the same ratio (LF: 1.0x, HF: 0.5x) compared to standard modes
                     target_lf_mult = (strength / 5.0) * 2.0
@@ -963,8 +1002,8 @@ class Controller:
                             scaled_lf_freq = min(511, int(0x0e1 + ((scaled_lf_freq - 501) / 10.0) * (511 - 0x0e1)))
                     elif is_switch1 and not is_pro:
                         # Joy-Con Frequency:
-                        # HF: Map 0-73% frequency evenly to 0-100% (0-511). Cap at 511.
-                        scaled_hf_freq = min(511, int(scaled_hf_freq * 1.369863))
+                        # HF: Map 0-73% frequency evenly to 0-95% (0-485) to prevent overly sharp sounds. Cap at 485.
+                        scaled_hf_freq = min(485, int(scaled_hf_freq * 1.369863))
                         
                         # LF: Map 0-100% (0-511) evenly to the new 0-100% output range (225-511). Cap at 511.
                         scaled_lf_freq = 225 + (scaled_lf_freq / 511.0) * (511 - 225)
@@ -1082,7 +1121,17 @@ class Controller:
                 uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
                     VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
                 )
-                payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
+                
+                if self.is_pro_controller() and vibration_r1 is not None:
+                    v1_r = scale_and_clamp(vibration_r1)
+                    v2_r = scale_and_clamp(vibration_r2)
+                    v3_r = scale_and_clamp(vibration_r3)
+                    motor_vibrations_r = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + v1_r.get_bytes() + v2_r.get_bytes() + v3_r.get_bytes()
+                    # The Pro controller expects Right side data first, then Left side data
+                    # (Standard Nintendo Switch protocol expects Right Rumble then Left Rumble)
+                    payload = b'\x00' + motor_vibrations_r + motor_vibrations
+                else:
+                    payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
             
             await self.client.write_gatt_char(uuid_to_use, payload, response=False)
         except Exception as e:
@@ -1615,27 +1664,44 @@ class Controller:
                             self._zero_count = 0
                             vc.rumble_force_clear = False
                         
-                        v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
+                        v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
+                        v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
                         
-                        if not getattr(self, '_rumble_task_running', False):
+                        if self.is_pro_controller():
+                            is_zero = is_zero_l and is_zero_r
+                        elif self.is_joycon_left():
+                            is_zero = is_zero_l
+                        else:
+                            is_zero = is_zero_r
+                        
+                        now_time = time.perf_counter()
+                        last_send = getattr(self, '_last_rumble_send_time', 0)
+                        
+                        if not getattr(self, '_rumble_task_running', False) and (now_time - last_send >= 0.015 or is_zero):
                             
-                            async def safe_send(v1_c, v2_c, v3_c):
+                            async def safe_send(v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r):
                                 self._rumble_task_running = True
+                                self._last_rumble_send_time = time.perf_counter()
                                 try:
-                                    await self.set_vibration(v1_c, v2_c, v3_c)
+                                    if self.is_pro_controller():
+                                        await self.set_vibration(v1_c_l, v2_c_l, v3_c_l, False, v1_c_r, v2_c_r, v3_c_r)
+                                    elif self.is_joycon_left():
+                                        await self.set_vibration(v1_c_l, v2_c_l, v3_c_l)
+                                    else:
+                                        await self.set_vibration(v1_c_r, v2_c_r, v3_c_r)
                                 finally:
                                     self._rumble_task_running = False
 
                             if is_zero:
                                 if not getattr(self, 'rumble_stopped', False):
                                     self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                    asyncio.get_running_loop().create_task(safe_send(v1, v2, v3))
+                                    asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
                                     if self._zero_count >= 3:
                                         self.rumble_stopped = True
                             else:
                                 self.rumble_stopped = False
                                 self._zero_count = 0
-                                asyncio.get_running_loop().create_task(safe_send(v1, v2, v3))
+                                asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
             
             except Exception as e:
                 logger.debug(f"Sync rumble failed: {e}")

@@ -27,10 +27,11 @@ USBIP_CMD_UNLINK = 0x00000002
 USBIP_RET_UNLINK = 0x00000004
 
 class USBIPServer:
-    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
+    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None, on_audio_data_callback=None):
         self.host = host
         self.port = port
         self.on_rumble_callback = on_rumble_callback
+        self.on_audio_data_callback = on_audio_data_callback
         self.bus_id = bus_id
         
         # Extract devnum from bus_id
@@ -62,6 +63,7 @@ class USBIPServer:
         
         # State queue for inputs and bulk responses
         self.input_queue = queue.Queue(maxsize=1)
+        self.subcmd_reply_queue = queue.Queue(maxsize=4)
         self.bulk_response_queue = queue.Queue()
         self.pending_in_urbs = queue.Queue()
         self.last_state = bytearray(64)
@@ -83,6 +85,7 @@ class USBIPServer:
         self.server_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.in_thread = threading.Thread(target=self._in_urb_loop, daemon=True)
         self.server_thread.start()
+        self.in_thread.start()
         logger.info(f"USBIP Server started on {self.host}:{self.port}")
 
     def stop(self):
@@ -165,7 +168,7 @@ class USBIPServer:
                     logger.warning(f"Unknown OP_REQ code: {code:#x}")
                     break
         except Exception as e:
-            logger.error(f"Error in client handler: {e}")
+            logger.exception("Error in client handler")
         finally:
             if self.on_rumble_callback:
                 try:
@@ -247,8 +250,16 @@ class USBIPServer:
                     break
                 
                 transfer_flags, transfer_length, start_frame, num_packets, interval, setup = struct.unpack(
-                    "!IIIII 8s", submit_payload
+                    "!Iiiii 8s", submit_payload
                 )
+                
+                iso_descriptors = b""
+                if num_packets > 0:
+                    try:
+                        iso_descriptors = self._recvexact(sock, num_packets * 16)
+                    except ConnectionError as e:
+                        logger.info(f"Data loop exit reading ISO descriptors: {e}")
+                        break
                 
                 out_data = b""
                 if direction == 0 and transfer_length > 0: # OUT transfer (host -> device)
@@ -260,7 +271,7 @@ class USBIPServer:
                         break
                 
                 # Handle the USB Request
-                self._handle_submit(sock, seqnum, devid, direction, ep, transfer_length, setup, out_data)
+                self._handle_submit(sock, seqnum, devid, direction, ep, transfer_length, setup, out_data, start_frame, num_packets, iso_descriptors)
                 
             elif command == USBIP_CMD_UNLINK:
                 # Read UNLINK specific payload: EXACTLY 28 bytes
@@ -280,21 +291,23 @@ class USBIPServer:
                 logger.warning(f"Unknown USBIP Command: {command:#010x}")
                 break
 
-    def _handle_submit(self, sock, seqnum, devid, direction, ep, transfer_length, setup, out_data):
+    def _handle_submit(self, sock, seqnum, devid, direction, ep, transfer_length, setup, out_data, start_frame=0, num_packets=0, iso_descriptors=b""):
         status = 0
         actual_length = 0
         reply_data = b""
         
         if ep == 0: # Control Endpoint
-            reply_data = self._handle_control_request(setup, transfer_length)
+            reply_data = self._handle_control_request(setup, transfer_length, out_data)
             actual_length = len(reply_data)
-        elif ep == 1: # HID Interface Endpoint
+            if direction == 0 and len(out_data) > 0:
+                actual_length = len(out_data)
+        elif ep == 1 or ep == 4: # HID Interface Endpoint (ep 1 for Switch, ep 4 for DualSense)
             if direction == 1: # IN (Read input state)
                 now = time.perf_counter()
-                elapsed = now - getattr(self, 'last_ep1_in_time', 0)
+                elapsed = now - getattr(self, 'last_ep_in_time', 0)
                 if elapsed < 0.004:
                     time.sleep(0.004 - elapsed)
-                self.last_ep1_in_time = time.perf_counter()
+                self.last_ep_in_time = time.perf_counter()
                 
                 try:
                     reply_data = self.input_queue.get_nowait()
@@ -302,12 +315,18 @@ class USBIPServer:
                     with self.lock:
                         reply_data = bytes(self.last_state)
                 actual_length = len(reply_data)
-            else: # OUT (Rumble output report)
+            else: # OUT
+                logger.info(f"EP1 OUT: length={len(out_data)} bytes")
+                if len(out_data) > 0:
+                    if getattr(self, 'on_audio_data_callback', None):
+                        self.on_audio_data_callback(out_data)
+                    actual_length = len(out_data)
+        elif ep == 3: # DualSense OUT Endpoint
+            if direction == 0: # OUT (Rumble output report)
                 if len(out_data) > 0:
                     if self.on_rumble_callback:
                         self.on_rumble_callback(out_data)
                     actual_length = len(out_data)
-        elif ep == 2: # WinUSB Bulk Interface Endpoint
             if direction == 1: # IN
                 try:
                     reply_data = self.bulk_response_queue.get_nowait()
@@ -323,16 +342,28 @@ class USBIPServer:
             status = -1
             
         ret_header = struct.pack(
-            "!IIIII i IIII 8s",
+            "!IIIII i IiiI 8s",
             USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
-            0, 0, 0, b"\x00" * 8
+            start_frame, num_packets, 0, b"\x00" * 8
         )
         
+        reply_iso_descriptors = b""
+        if num_packets > 0 and len(iso_descriptors) == num_packets * 16:
+            # Reconstruct iso_descriptors with actual_length = length for OUT transfers
+            for i in range(num_packets):
+                chunk = iso_descriptors[i*16:(i+1)*16]
+                offset, length, act_len, pkt_status = struct.unpack("!IIII", chunk)
+                if direction == 0 or direction == 1: # OUT or IN
+                    act_len = length
+                reply_iso_descriptors += struct.pack("!IIII", offset, length, act_len, pkt_status)
+        
         with self.send_lock:
+            payload = ret_header
+            if num_packets > 0:
+                payload += reply_iso_descriptors
             if direction == 1 and actual_length > 0:
-                sock.sendall(ret_header + reply_data)
-            else:
-                sock.sendall(ret_header)
+                payload += reply_data
+            sock.sendall(payload)
 
     def _in_urb_loop(self):
         """專門處理 IN URB 的背景執行緒，以智慧限速消除 Burst (防止 dt=0)，同時避免延遲堆疊"""
@@ -359,7 +390,7 @@ class USBIPServer:
         status = 0
         reply_data = b""
         
-        if ep == 1:
+        if ep == 1 or ep == 4:
             try:
                 reply_data = self.subcmd_reply_queue.get_nowait()
             except queue.Empty:
@@ -385,9 +416,9 @@ class USBIPServer:
             pass
 
 
-    def _handle_control_request(self, setup, transfer_length):
+    def _handle_control_request(self, setup, transfer_length, out_data=b""):
         req_type, request, value, index, length = struct.unpack("<BBHHH", setup)
-        logger.info(f"Control Request: req_type={req_type:#04x}, req={request:#04x}, value={value:#06x}, index={index:#06x}, len={length}")
+        logger.info(f"Control Request: req_type={req_type:#04x}, req={request:#04x}, value={value:#06x}, index={index:#06x}, len={length}, out_data_len={len(out_data)}")
         
         # Standard Device-to-Host Get Descriptor
         if req_type == 0x80 and request == 0x06:
@@ -545,8 +576,13 @@ class USBIPServer:
 
         # Class requests (handled but no data returned)
         if req_type in (0x00, 0x01, 0x21) and request in (0x09, 0x0a, 0x0b):
-            req_names = {0x09: "SetConfiguration", 0x0a: "SetIdle", 0x0b: "SetInterface"}
+            req_names = {0x09: "SetReport" if req_type == 0x21 else "SetConfiguration", 0x0a: "SetIdle", 0x0b: "SetInterface"}
             logger.info(f"  -> {req_names.get(request, f'ClassReq {request:#x}')} (no data)")
+            if req_type == 0x21 and request == 0x09: # SET_REPORT
+                report_id = value & 0xff
+                if (report_id == 0x10 or report_id == 0x01) and len(out_data) > 0:
+                    if self.on_rumble_callback:
+                        self.on_rumble_callback(out_data)
             return b""
 
         logger.warning(f"  -> UNHANDLED: req_type={req_type:#04x}, req={request:#04x}, value={value:#06x}, index={index:#06x}, len={length}")
@@ -653,7 +689,7 @@ JOYCON_REPORT_DESC = bytes.fromhex(
     "0509190129101500250175019510810205010939150025077504950181420509"
     "7504950181010501093009310933093416000027ffff00007510950481020601"
     "ff85010901750895319102851009107508953191028511091175089531910285"
-    "120912750895319102c0"
+    "120912750895319102858009807508953f9102858109817508953f8102858209827508953f9102c0"
 )
 
 
@@ -697,7 +733,6 @@ class USBIPJoyConServer(USBIPServer):
 
     def start(self):
         super().start()
-        self.in_thread.start()
         
     def update_state(self, state_bytes):
         """JoyCon override: 不遞增 seq_num（由 EP1 IN 真正送出時遞增）"""
@@ -742,7 +777,7 @@ class USBIPJoyConServer(USBIPServer):
         
         sock.sendall(reply_header + dev_desc + iface0 + iface1)
 
-    def _handle_submit(self, sock, seqnum, devid, direction, ep, transfer_length, setup, out_data):
+    def _handle_submit(self, sock, seqnum, devid, direction, ep, transfer_length, setup, out_data, start_frame=0, num_packets=0, iso_descriptors=b""):
         status = 0
         actual_length = 0
         reply_data = b""
@@ -784,16 +819,27 @@ class USBIPJoyConServer(USBIPServer):
             status = -1
             
         ret_header = struct.pack(
-            "!IIIII i IIII 8s",
+            "!IIIII i IiiI 8s",
             USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
-            0, 0, 0, b"\x00" * 8
+            start_frame, num_packets, 0, b"\x00" * 8
         )
         
+        reply_iso_descriptors = b""
+        if num_packets > 0 and len(iso_descriptors) == num_packets * 16:
+            for i in range(num_packets):
+                chunk = iso_descriptors[i*16:(i+1)*16]
+                offset, length, act_len, pkt_status = struct.unpack("!IIII", chunk)
+                if direction == 0: # OUT
+                    act_len = length
+                reply_iso_descriptors += struct.pack("!IIII", offset, length, act_len, pkt_status)
+        
         with self.send_lock:
+            payload = ret_header
+            if num_packets > 0:
+                payload += reply_iso_descriptors
             if direction == 1 and actual_length > 0:
-                sock.sendall(ret_header + reply_data)
-            else:
-                sock.sendall(ret_header)
+                payload += reply_data
+            sock.sendall(payload)
 
     def _process_deferred_in_urb(self, sock, seqnum, devid, direction, ep):
         status = 0
@@ -929,7 +975,7 @@ class USBIPJoyConServer(USBIPServer):
                     desc = struct.pack("<BB", 2 + len(s), 3) + s
                 elif desc_idx == 2: # iProduct
                     if self.device_type == "Pro":
-                        name = "Pro Controller"
+                        name = "Nintendo Switch Pro Controller"
                     else:
                         name = "Joy-Con (L)" if self.device_type == "L" else "Joy-Con (R)"
                     s = name.encode("utf-16le")
@@ -1040,44 +1086,41 @@ class USBIPJoyConServer(USBIPServer):
             # These arrive on EP1 OUT and require an 81 xx response on EP1 IN.
             subcmd = data[1] if len(data) > 1 else 0x00
             logger.info(f"Joy-Con USB Handshake: 80 {subcmd:02x}")
+            reply = bytearray(64)
+            reply[0] = 0x81
+            reply[1] = subcmd
+            
             if subcmd == 0x01:
                 # Request MAC address — reply with 81 01 + device type byte + 6-byte MAC (MSB first)
-                reply = bytearray(10)
-                reply[0] = 0x81
-                reply[1] = 0x01
                 # device type: 1=Joy-Con L, 2=Joy-Con R, 3=Pro Controller
                 if self.device_type == "L":
                     reply[2] = 0x00
-                    reply[3] = 0x03  # Joy-Con L type byte used by hid-nintendo
+                    reply[3] = 0x01
                 elif self.device_type == "R":
                     reply[2] = 0x00
-                    reply[3] = 0x03  # Joy-Con R type byte
+                    reply[3] = 0x02
                 else:
                     reply[2] = 0x00
-                    reply[3] = 0x03  # Pro Controller
+                    reply[3] = 0x03
                 if self.mac_bytes:
                     # mac_bytes is LSB-first; reply wants MSB-first (big-endian)
                     reply[4:10] = self.mac_bytes[::-1]
                 self._enqueue_handshake_reply(bytes(reply))
             elif subcmd == 0x02:
                 # Handshake — just ACK
-                reply = bytes([0x81, 0x02])
-                self._enqueue_handshake_reply(reply)
+                self._enqueue_handshake_reply(bytes(reply))
             elif subcmd == 0x03:
                 # Set high-speed — just ACK
-                reply = bytes([0x81, 0x03])
-                self._enqueue_handshake_reply(reply)
+                self._enqueue_handshake_reply(bytes(reply))
             elif subcmd == 0x04:
                 # Force USB (disable Bluetooth timeout) — just ACK
-                reply = bytes([0x81, 0x04])
-                self._enqueue_handshake_reply(reply)
+                self._enqueue_handshake_reply(bytes(reply))
             elif subcmd == 0x05:
                 # Clear to send — no reply needed
                 pass
             else:
                 # Unknown 0x80 sub-command — send generic ACK
-                reply = bytes([0x81, subcmd])
-                self._enqueue_handshake_reply(reply)
+                self._enqueue_handshake_reply(bytes(reply))
         elif report_id == 0x01 and len(data) >= 11:
             if self.on_rumble_callback:
                 self.on_rumble_callback(data)

@@ -29,9 +29,15 @@ import gc
 from controller import Controller, ControllerInputData, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
+from usbip_dualsense_server import USBIPDualSenseServer
 from utils import USBIPAllocator
+from dualsense_structs import DualSenseInputReport01
+from dualsense_haptic import DualSenseHapticProcessor
 
 logger = logging.getLogger(__name__)
+
+MAC_TO_USBIP = {}
+
 
 def get_ds4_dpad(up, down, left, right):
     if up and right: return DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTHEAST
@@ -73,7 +79,10 @@ def detach_usbip_device(server_port: int):
                 port_num_str = port_match.group(1)
                 if f":{server_port}" in port_block or f"/{bus_id}" in port_block:
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with server port {server_port} (bus_id: {bus_id})")
-                    subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    try:
+                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Timeout while detaching USBIP port {port_num_str}. Process may be hung.")
     except Exception as e:
         logger.error(f"Error detaching USBIP device for port {server_port}: {e}")
 
@@ -108,7 +117,10 @@ def detach_all_usbip_devices():
                         break
                 if should_detach:
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with a virtual controller slot")
-                    subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    try:
+                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Timeout while detaching USBIP port {port_num_str}. Process may be hung.")
     except Exception as e:
         logger.error(f"Error detaching all USBIP devices: {e}")
 
@@ -161,9 +173,6 @@ class VirtualController:
             mac = self.controllers[0].device.address
             
             global MAC_TO_USBIP
-            if 'MAC_TO_USBIP' not in globals():
-                MAC_TO_USBIP = {}
-                
             if mac in MAC_TO_USBIP:
                 self.host_ip, self.bus_id, self.server_port = MAC_TO_USBIP[mac]
             else:
@@ -171,6 +180,8 @@ class VirtualController:
                 MAC_TO_USBIP[mac] = (self.host_ip, self.bus_id, self.server_port)
         else:
             self.host_ip, self.bus_id, self.server_port = USBIPAllocator.allocate()
+
+        self.haptic_processor = DualSenseHapticProcessor(self._haptic_callback)
                     
         self.previous_buttons_left = 0x00000000
         self.previous_buttons_right = 0x00000000
@@ -196,10 +207,13 @@ class VirtualController:
         
         # Thread-safe target vibration state, change event, and task reference
         self.vibration_lock = threading.Lock()
-        self.target_vibration = VibrationData(lf_amp=0, hf_amp=0)
-        self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
-        self.frame_vibrations = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
-        self.vibration_dirty = False
+        self.target_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+        self.target_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+        self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+        self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+        self.frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        # We already have vibration_dirty_l and vibration_dirty_r defined above
         self.vibration_changed_event = None
         self.active_vibration_task = None
         self.cycle_start_time = 0.0
@@ -515,12 +529,14 @@ class VirtualController:
                         detach_usbip_device(server_port)
                         time.sleep(0.1)
                         
-                        self.usbip_server = USBIPServer(
+                        self.usbip_server = USBIPDualSenseServer(
                             host=host_ip, port=server_port,
-                            on_rumble_callback=self._usbip_rumble_callback,
-                            bus_id=bus_id, mac_address=mac_address
+                            on_rumble_callback=self._dualsense_rumble_callback,
+                            bus_id=bus_id, mac_address=mac_address,
+                            on_audio_data_callback=self._usbip_audio_callback
                         )
                         self.usbip_server.start()
+                        threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
                         started = True
                         break
                     except Exception as e:
@@ -625,6 +641,10 @@ class VirtualController:
                         logger.warning("GC Controller is temporarily excluded in Switch1 emulation mode")
 
             class MockGamepad:
+                def __init__(self):
+                    class MockClient:
+                        is_connected = True
+                    self.client = MockClient()
                 def register_notification(self, callback_function):
                     pass
                 def unregister_notification(self):
@@ -636,7 +656,68 @@ class VirtualController:
             self.vg_controller = MockGamepad()
             self.driver_type = "USBIP"
         else:
-            if driver_type == "ViGEmBus":
+            if driver_type == "USBIP" and self.mode == "PS5":
+                import os
+                import subprocess
+                import time
+                from usbip_dualsense_server import USBIPDualSenseServer
+                
+                mac_address = self.controllers[0].device.address if self.controllers else None
+                host_ip, bus_id, port = USBIPAllocator.allocate()
+                self.server_port = port
+                self.bus_id = bus_id
+                self.host_ip = host_ip
+                try:
+                    detach_usbip_device(port)
+                except Exception:
+                    pass
+                
+                self.usbip_server = USBIPDualSenseServer(
+                    host=host_ip, port=port,
+                    on_rumble_callback=lambda d, p=port: self._dualsense_rumble_callback(d, side="Pro"),
+                    bus_id=bus_id, mac_address=mac_address,
+                    on_audio_data_callback=self._usbip_audio_callback
+                )
+                self.usbip_server.start()
+                threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
+                
+                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+                if os.path.exists(usbip_exe):
+                    time.sleep(0.2)
+                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+                    logger.info(f"Attached virtual DualSense for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                else:
+                    logger.error(f"usbip.exe not found at {usbip_exe}!")
+
+                class MockDualSenseGamepad:
+                    def __init__(self, vc):
+                        self.vc = vc
+                        class MockClient:
+                            is_connected = True
+                        self.client = MockClient()
+                    def register_notification(self, callback_function):
+                        pass
+                    def unregister_notification(self):
+                        pass
+                    def update(self):
+                        if hasattr(self.vc, 'usbip_server') and self.vc.usbip_server:
+                            self.vc.usbip_server.update_input(bytes(self.report))
+                    def close(self):
+                        pass
+
+                self.vg_controller = MockDualSenseGamepad(self)
+                self.vg_controller.report = DualSenseInputReport01()
+                self.vg_controller.report.ReportId = 0x01
+                self.vg_controller.report.LeftStickX = 128
+                self.vg_controller.report.LeftStickY = 128
+                self.vg_controller.report.RightStickX = 128
+                self.vg_controller.report.RightStickY = 128
+                self.vg_controller.report.PowerPercent = 10  # 100%
+                self.vg_controller.report.PowerState = 2     # Normal
+                self.vg_controller.report.PluggedHeadphones = 1
+                self.vg_controller.report.PluggedMic = 1
+                self.driver_type = "USBIP"
+            elif driver_type == "ViGEmBus":
                 try:
                     vigem = get_vigem()
                     if self.mode == "PS4":
@@ -681,8 +762,9 @@ class VirtualController:
                     self.report.LeftStickY = 128
                     self.report.RightStickX = 128
                     self.report.RightStickY = 128
-                    self.report.BatteryPercent = 10
+                    self.report.BatteryPercent = 8
                     self.report.BatteryState = 2
+                    self.report.Reserved3[0] = 0x08
                     logger.info("Switched to virtual PS5 controller via WinUHid")
 
                 else:
@@ -758,41 +840,63 @@ class VirtualController:
             slot = 2
 
         with self.vibration_lock:
-            raw_lf = self.frame_vibrations[slot].lf_amp + lf_val
-            raw_hf = self.frame_vibrations[slot].hf_amp + hf_val
+            # ViGEmBus XInput rumble (Mix to both L and R controllers)
+            raw_lf = self.frame_vibrations_l[slot].lf_amp + lf_val
+            raw_hf = self.frame_vibrations_r[slot].hf_amp + hf_val
             
+            # Use non-linear scaling for summation to prevent clipping
             if raw_lf <= 560:
-                self.frame_vibrations[slot].lf_amp = int(raw_lf)
+                lf_res = int(raw_lf)
             else:
-                self.frame_vibrations[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf - 560) / 240))
+                lf_res = int(560 + 240 * math.tanh((raw_lf - 560) / 240))
                 
             if raw_hf <= 560:
-                self.frame_vibrations[slot].hf_amp = int(raw_hf)
+                hf_res = int(raw_hf)
             else:
-                self.frame_vibrations[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf - 560) / 240))
+                hf_res = int(560 + 240 * math.tanh((raw_hf - 560) / 240))
             
-            self.latest_vibration.lf_amp = lf_val
-            self.latest_vibration.hf_amp = hf_val
+            self.frame_vibrations_l[slot].lf_amp = lf_res
+            self.frame_vibrations_l[slot].hf_amp = hf_res
+            self.frame_vibrations_r[slot].lf_amp = lf_res
+            self.frame_vibrations_r[slot].hf_amp = hf_res
             
-            self.vibration_dirty = True
+            self.latest_vibration_l.lf_amp = lf_val
+            self.latest_vibration_l.hf_amp = hf_val
+            self.latest_vibration_r.lf_amp = lf_val
+            self.latest_vibration_r.hf_amp = hf_val
+            
+            self.vibration_dirty_l = True
+            self.vibration_dirty_r = True
 
     def get_current_vibration_frames(self, is_left=True):
         if self.mode == "Switch1":
             with self.vibration_lock:
                 vibs = self.switch_vibrations_left if is_left else self.switch_vibrations_right
                 
-                v1 = VibrationData(
-                    lf_freq=vibs[0].lf_freq, lf_amp=vibs[0].lf_amp, lf_en_tone=vibs[0].lf_en_tone,
-                    hf_freq=vibs[0].hf_freq, hf_amp=vibs[0].hf_amp, hf_en_tone=vibs[0].hf_en_tone
-                )
-                v2 = VibrationData(
-                    lf_freq=vibs[1].lf_freq, lf_amp=vibs[1].lf_amp, lf_en_tone=vibs[1].lf_en_tone,
-                    hf_freq=vibs[1].hf_freq, hf_amp=vibs[1].hf_amp, hf_en_tone=vibs[1].hf_en_tone
-                )
-                v3 = VibrationData(
-                    lf_freq=vibs[2].lf_freq, lf_amp=vibs[2].lf_amp, lf_en_tone=vibs[2].lf_en_tone,
-                    hf_freq=vibs[2].hf_freq, hf_amp=vibs[2].hf_amp, hf_en_tone=vibs[2].hf_en_tone
-                )
+                # Switch hardware timeout (Watchdog): Stop vibrating if no packet is received for 150ms
+                # (Setting this too low will cause stuttering in games that send rumble at 50ms intervals)
+                current_time = time.perf_counter()
+                last_time = getattr(self, 'last_rumble_received_time', 0)
+                
+                if current_time - last_time > 0.150:
+                    v1 = VibrationData()
+                    v2 = VibrationData()
+                    v3 = VibrationData()
+                    self.switch_vibrations_left = [VibrationData() for _ in range(3)]
+                    self.switch_vibrations_right = [VibrationData() for _ in range(3)]
+                else:
+                    v1 = VibrationData(
+                        lf_freq=vibs[0].lf_freq, lf_amp=vibs[0].lf_amp, lf_en_tone=vibs[0].lf_en_tone,
+                        hf_freq=vibs[0].hf_freq, hf_amp=vibs[0].hf_amp, hf_en_tone=vibs[0].hf_en_tone
+                    )
+                    v2 = VibrationData(
+                        lf_freq=vibs[1].lf_freq, lf_amp=vibs[1].lf_amp, lf_en_tone=vibs[1].lf_en_tone,
+                        hf_freq=vibs[1].hf_freq, hf_amp=vibs[1].hf_amp, hf_en_tone=vibs[1].hf_en_tone
+                    )
+                    v3 = VibrationData(
+                        lf_freq=vibs[2].lf_freq, lf_amp=vibs[2].lf_amp, lf_en_tone=vibs[2].lf_en_tone,
+                        hf_freq=vibs[2].hf_freq, hf_amp=vibs[2].hf_amp, hf_en_tone=vibs[2].hf_en_tone
+                    )
                 
                 if is_left:
                     self.vibration_dirty_l = False
@@ -803,31 +907,45 @@ class VirtualController:
             return v1, v2, v3, is_zero
 
         with self.vibration_lock:
-            if self.vibration_dirty:
-                v1 = VibrationData(lf_amp=self.frame_vibrations[0].lf_amp, hf_amp=self.frame_vibrations[0].hf_amp)
-                v2 = VibrationData(lf_amp=self.frame_vibrations[1].lf_amp, hf_amp=self.frame_vibrations[1].hf_amp)
-                v3 = VibrationData(lf_amp=self.frame_vibrations[2].lf_amp, hf_amp=self.frame_vibrations[2].hf_amp)
+            if is_left:
+                target_vibration = self.target_vibration_l
+                latest_vibration = self.latest_vibration_l
+                frame_vibrations = self.frame_vibrations_l
+                vibration_dirty = self.vibration_dirty_l
+            else:
+                target_vibration = self.target_vibration_r
+                latest_vibration = self.latest_vibration_r
+                frame_vibrations = self.frame_vibrations_r
+                vibration_dirty = self.vibration_dirty_r
+                
+            if vibration_dirty:
+                v1 = VibrationData(lf_amp=frame_vibrations[0].lf_amp, hf_amp=frame_vibrations[0].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                v2 = VibrationData(lf_amp=frame_vibrations[1].lf_amp, hf_amp=frame_vibrations[1].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                v3 = VibrationData(lf_amp=frame_vibrations[2].lf_amp, hf_amp=frame_vibrations[2].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
                 
                 if v1.lf_amp == 0 and v1.hf_amp == 0:
-                    v1.lf_amp, v1.hf_amp = self.latest_vibration.lf_amp, self.latest_vibration.hf_amp
+                    v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
                 if v2.lf_amp == 0 and v2.hf_amp == 0:
                     v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
                 if v3.lf_amp == 0 and v3.hf_amp == 0:
                     v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
 
-                for f in self.frame_vibrations:
+                for f in frame_vibrations:
                     f.lf_amp = 0
                     f.hf_amp = 0
-                self.vibration_dirty = False
+                
+                if is_left:
+                    self.vibration_dirty_l = False
+                else:
+                    self.vibration_dirty_r = False
                 self.cycle_start_time = time.perf_counter()
             else:
-                v1 = VibrationData(lf_amp=self.latest_vibration.lf_amp, hf_amp=self.latest_vibration.hf_amp)
-                v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
-                v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
-                self.cycle_start_time = time.perf_counter()
-
-        is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
-        return v1, v2, v3, is_zero
+                v1 = VibrationData(lf_amp=latest_vibration.lf_amp, hf_amp=latest_vibration.hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
+                v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
+                
+            is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+            return v1, v2, v3, is_zero
 
     async def init_added_controller(self, controller: Controller):
         controller.virtual_controller = self
@@ -896,6 +1014,10 @@ class VirtualController:
             
             if self.vg_controller is None:
                 class MockGamepad:
+                    def __init__(self):
+                        class MockClient:
+                            is_connected = True
+                        self.client = MockClient()
                     def register_notification(self, callback_function):
                         pass
                     def unregister_notification(self):
@@ -1576,12 +1698,17 @@ class VirtualController:
         hat_x = -1 if left else (1 if right else 0)
         hat_y = -1 if up else (1 if down else 0)
         
-        if mode == "PS4":
-            if winuhid._winuhid_devs:
-                winuhid._winuhid_devs.WinUHidPS4SetHatState(ctypes.byref(report), hat_x, hat_y)
-        else:
-            if winuhid._winuhid_devs:
-                winuhid._winuhid_devs.WinUHidPS5SetHatState(ctypes.byref(report), hat_x, hat_y)
+        hat_val = 8
+        if hat_x == 0 and hat_y == -1: hat_val = 0
+        elif hat_x == 1 and hat_y == -1: hat_val = 1
+        elif hat_x == 1 and hat_y == 0: hat_val = 2
+        elif hat_x == 1 and hat_y == 1: hat_val = 3
+        elif hat_x == 0 and hat_y == 1: hat_val = 4
+        elif hat_x == -1 and hat_y == 1: hat_val = 5
+        elif hat_x == -1 and hat_y == 0: hat_val = 6
+        elif hat_x == -1 and hat_y == -1: hat_val = 7
+        
+        report.Hat = hat_val
 
         # 3. Touchpad
         capt = bool(buttons & SWITCH_BUTTONS.get("CAPT", 0))
@@ -1620,7 +1747,9 @@ class VirtualController:
         else:
             report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
             report.RightTrigger = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
-
+        
+        if mode == "PS5":
+            report.SequenceNumber = (report.SequenceNumber + 1) & 0xFF
         # 5. Joysticks Routing
         if not hasattr(self, 'last_lx'):
             self.last_lx = 128; self.last_ly = 128
@@ -1706,12 +1835,27 @@ class VirtualController:
 
         # 6. Gyro/Accel raw signed short assignments
         def clamp_short(val): return max(-32768, min(32767, int(val)))
-        report.GyroX = clamp_short(self.last_gx)
-        report.GyroY = clamp_short(self.last_gy)
-        report.GyroZ = clamp_short(self.last_gz)
-        report.AccelX = clamp_short(self.last_ax)
-        report.AccelY = clamp_short(self.last_ay)
-        report.AccelZ = clamp_short(self.last_az)
+        if mode == "PS5":
+            report.AngularVelocityX = clamp_short(self.last_gx)   # Pitch <- gyroscope[0]
+            report.AngularVelocityY = clamp_short(self.last_gz)   # Yaw   <- -gyroscope[1] (was Roll, swap with gz)
+            report.AngularVelocityZ = clamp_short(self.last_gy)   # Roll  <- gyroscope[2]  (was Yaw, swap with gy)
+            report.AccelerometerX = clamp_short(self.last_ax)
+            report.AccelerometerY = clamp_short(self.last_ay)
+            report.AccelerometerZ = clamp_short(self.last_az)
+            # SensorTimestamp: DualSense reports in ~0.33us ticks (3MHz clock).
+            # EA and strict DualSense games validate this increments monotonically.
+            # At 250Hz USB polling, each frame = 4000us = ~12000 ticks.
+            now_us = int(time.perf_counter() * 1_000_000) & 0xFFFFFFFF
+            report.SensorTimestamp = (now_us * 3) & 0xFFFFFFFF  # Convert us -> 3MHz ticks
+            # UNK_COUNTER: IMU packet sequence counter, increments each frame.
+            report.UNK_COUNTER = (getattr(report, 'UNK_COUNTER', 0) + 1) & 0xFFFFFFFF
+        else:
+            report.GyroX = clamp_short(self.last_gx)
+            report.GyroY = clamp_short(self.last_gy)
+            report.GyroZ = clamp_short(self.last_gz)
+            report.AccelX = clamp_short(self.last_ax)
+            report.AccelY = clamp_short(self.last_ay)
+            report.AccelZ = clamp_short(self.last_az)
 
     def _set_touch_state(self, report, touch_index, touch_down, touch_x, touch_y, mode, is_new_touch=False):
         if mode == "PS4":
@@ -2174,6 +2318,264 @@ class VirtualController:
                     logger.error(f"Failed to re-init remaining controller after split/remove: {e}")
             return False
 
+    def _dualsense_rumble_callback(self, out_data, side="Pro"):
+        if len(out_data) < 2:
+            return
+            
+        if out_data[0] == 0x01:
+            # Basic Rumble Report (ID=0x01)
+            # Format: [0x01, RightMotor, LeftMotor]
+            if len(out_data) >= 3:
+                right_motor_weak = out_data[1]
+                left_motor_strong = out_data[2]
+                
+                lf_amp = int((left_motor_strong / 255.0) * 1000)
+                hf_amp = int((right_motor_weak / 255.0) * 1000)
+                
+                with self.vibration_lock:
+                    self.latest_vibration_l.lf_amp = lf_amp
+                    self.latest_vibration_l.hf_amp = hf_amp
+                    self.latest_vibration_r.lf_amp = lf_amp
+                    self.latest_vibration_r.hf_amp = hf_amp
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+            return
+
+        elif out_data[0] == 0x11:
+                # Custom High-Fidelity Rumble Report (ID=0x11)
+            # Format: [0x11, RightIntensity, LeftIntensity]
+            if len(out_data) >= 3:
+                right_intensity = out_data[1]
+                left_intensity = out_data[2]
+                
+                left_amp = int((left_intensity / 255.0) * 1000)
+                right_amp = int((right_intensity / 255.0) * 1000)
+                
+                with self.vibration_lock:
+                    # True Stereo Separation for 0x11
+                    self.latest_vibration_l.lf_amp = left_amp
+                    self.latest_vibration_l.hf_amp = left_amp
+                    self.latest_vibration_r.lf_amp = right_amp
+                    self.latest_vibration_r.hf_amp = right_amp
+                    
+                    rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+                    if rumble_mode in ["Switch", "PS5"]:
+                        # HD Rumble: apply the optimal punchy frequencies
+                        self.latest_vibration_l.lf_freq = 0x112
+                        self.latest_vibration_l.hf_freq = 0x187
+                        self.latest_vibration_r.lf_freq = 0x112
+                        self.latest_vibration_r.hf_freq = 0x187
+                    else:
+                        # Xbox Rumble: fallback to generic frequencies
+                        self.latest_vibration_l.lf_freq = 0x0e1
+                        self.latest_vibration_l.hf_freq = 0x1e1
+                        self.latest_vibration_r.lf_freq = 0x0e1
+                        self.latest_vibration_r.hf_freq = 0x1e1
+                        
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+            return
+                
+        elif out_data[0] == 0x02:
+            # Standard USB Rumble Report (Extended)
+            # Switch 2 processes vibration by slicing byte arrays directly instead of ctypes.
+            # Using direct indexing is much faster and prevents dropping packets in the high-frequency Audio Haptic / Rumble loop.
+            if len(out_data) >= 5:
+                # If audio haptics are active, ignore standard rumble to prevent conflict!
+                import time
+                if hasattr(self, 'haptic_processor') and time.time() - self.haptic_processor.last_update_time < 0.2:
+                    self.last_rumble_received_time = time.perf_counter()
+                    return
+
+                # Byte 3 is Right Motor (Weak), Byte 4 is Left Motor (Strong)
+                right_motor_weak = out_data[3]
+                left_motor_strong = out_data[4]
+                
+                lf_amp = int((left_motor_strong / 255.0) * 1000)
+                hf_amp = int((right_motor_weak / 255.0) * 1000)
+                
+                with self.vibration_lock:
+                    # For Xbox Rumble, we MIX to both controllers (L and R get identical signals)
+                    self.latest_vibration_l.lf_amp = lf_amp
+                    self.latest_vibration_l.hf_amp = hf_amp
+                    self.latest_vibration_r.lf_amp = lf_amp
+                    self.latest_vibration_r.hf_amp = hf_amp
+                    
+                    rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+                    if rumble_mode in ["Switch", "PS5"]:
+                        # HD Rumble: apply the optimal punchy frequencies
+                        self.latest_vibration_l.lf_freq = 0x112
+                        self.latest_vibration_l.hf_freq = 0x187
+                        self.latest_vibration_r.lf_freq = 0x112
+                        self.latest_vibration_r.hf_freq = 0x187
+                    else:
+                        # Xbox Rumble: fallback to generic frequencies
+                        self.latest_vibration_l.lf_freq = 0x0e1
+                        self.latest_vibration_l.hf_freq = 0x1e1
+                        self.latest_vibration_r.lf_freq = 0x0e1
+                        self.latest_vibration_r.hf_freq = 0x1e1
+                        
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
+                    
+                # We can skip the LED/Audio flags check here to save time,
+                # as they are processed synchronously in the main _process_output_report thread
+                # with rate limiting. This callback focuses purely on minimizing latency for vibration packets.
+                
+        self.last_rumble_received_time = time.perf_counter()
+        return
+
+    def _wasapi_loopback_thread(self):
+        # Disabled: We now perfectly capture the raw 4-channel audio stream from the USB Isochronous OUT endpoint directly.
+        # Running WASAPI concurrently causes double-processing and audio sample interleaving which ruins haptics.
+        return
+        
+        try:
+            import soundcard as sc
+            import numpy as np
+        except ImportError:
+            logger.error("soundcard or numpy not installed, WASAPI loopback disabled")
+            return
+            
+        try:
+            logger.info("Starting WASAPI loopback for DualSense Audio...")
+            time.sleep(2)
+            
+            logger.info("Waiting for DualSense Audio to be activated by Windows/Game...")
+            
+            while getattr(self, 'usbip_server', None) is not None:
+                audio_active = getattr(self.usbip_server, 'audio_active', False)
+                if not audio_active:
+                    time.sleep(0.5)
+                    continue
+                    
+                try:
+                    microphones = sc.all_microphones(include_loopback=True)
+                    mic_names = [m.name for m in microphones]
+                    
+                    speaker = None
+                    for m in microphones:
+                        # We ONLY want the loopback device, not the physical microphone IN endpoint
+                        if "麥克風" in m.name or "MICROPHONE" in m.name.upper():
+                            continue
+                        # Filter for Speaker devices or loopback (if applicable)
+                        if "SPEAKER" in m.name.upper() or "喇叭" in m.name or "揚聲器" in m.name or "USB" in m.name.upper() or "DUALSENSE" in m.name.upper() or "WIRELESS" in m.name.upper() or "音訊" in m.name:
+                            try:
+                                with m.recorder(samplerate=48000) as test_mic:
+                                    speaker = m
+                                    break
+                            except Exception as e:
+                                if "DUALSENSE" in m.name.upper():
+                                    logger.error(f"WASAPI: Found {m.name} but failed to open: {e}")
+                                continue
+                                
+                    if speaker is None:
+                        logger.warning(f"WASAPI: Could not find any suitable USB speaker among {mic_names}")
+                        time.sleep(2)
+                        continue
+
+                    with speaker.recorder(samplerate=48000) as mic:
+                        logger.info(f"WASAPI: Successfully bound to speaker: {speaker.name} ({speaker.channels} channels, 48000 Hz), starting capture...")
+                        if speaker.channels < 4:
+                            logger.error("WASAPI: CRITICAL WARNING - Speaker is NOT 4 channels! Haptics will not work! Please set it to Quadraphonic in Windows Sound Control Panel!")
+                            
+                        while getattr(self, 'usbip_server', None) is not None:
+                            audio_active = getattr(self.usbip_server, 'audio_active', False)
+                            if not audio_active:
+                                logger.info("WASAPI: Audio streaming stopped, releasing capture...")
+                                if hasattr(self, 'haptic_processor'):
+                                    self.haptic_processor.reset()
+                                time.sleep(0.1)
+                                break
+                                
+                            data = mic.record(numframes=480) # 10ms at 48000Hz
+                            if len(data) > 0:
+                                # Ensure data is 4 channels by padding if necessary
+                                if data.shape[1] < 4:
+                                    pad = np.zeros((data.shape[0], 4 - data.shape[1]), dtype=data.dtype)
+                                    data = np.concatenate((data, pad), axis=1)
+                                elif data.shape[1] > 4:
+                                    data = data[:, :4]
+                                    
+                                data_int16 = (data * 32767).astype(np.int16)
+                                byte_data = data_int16.tobytes()
+                                self._usbip_audio_callback(byte_data)
+                except Exception as e:
+                    logger.error(f"WASAPI Loopback Exception: {e}")
+                    time.sleep(1)
+        except Exception as e:
+            logger.error(f"WASAPI Thread FATAL ERROR: {e}")
+
+    def _usbip_audio_callback(self, data):
+        """Handle 4-channel audio stream from DualSense USBIP ep=1 OUT"""
+        if len(data) > 0 and hasattr(self, 'haptic_processor'):
+            self.haptic_processor.process_audio_packet(data)
+
+    def _haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS"):
+        def mix_freq(low, high, intensity):
+            return int(low + ((high - low) * intensity + 127) // 255)
+
+        max_intensity = max(left_intensity, right_intensity)
+
+        if mode == "TICK":
+            hf_freq = mix_freq(0x1c8, 0x1f2, max_intensity)
+            lf_freq = mix_freq(0x0c8, 0x0e8, max_intensity)
+            hf_amp_pct = 100
+            lf_amp_pct = 28
+        elif mode == "PUNCH":
+            hf_freq = mix_freq(0x158, 0x198, max_intensity)
+            lf_freq = mix_freq(0x0a8, 0x0d8, max_intensity)
+            hf_amp_pct = 68
+            lf_amp_pct = 100
+        elif mode == "TEXTURE":
+            hf_freq = mix_freq(0x1a8, 0x1f8, max_intensity)
+            lf_freq = mix_freq(0x0f0, 0x130, max_intensity)
+            hf_amp_pct = 100
+            lf_amp_pct = 42
+        elif mode == "SILENCE":
+            hf_freq = 0
+            lf_freq = 0
+            hf_amp_pct = 0
+            lf_amp_pct = 0
+        else: # CONTINUOUS
+            hf_freq = mix_freq(0x180, 0x1a0, max_intensity)
+            lf_freq = mix_freq(0x0d0, 0x100, max_intensity)
+            hf_amp_pct = 100
+            lf_amp_pct = 100
+
+        # Note: We now properly separate Left and Right into their respective L/R states
+        left_lf_amp = int((left_intensity / 255.0) * 1000 * (lf_amp_pct / 100.0))
+        left_hf_amp = int((left_intensity / 255.0) * 1000 * (hf_amp_pct / 100.0))
+        
+        right_lf_amp = int((right_intensity / 255.0) * 1000 * (lf_amp_pct / 100.0))
+        right_hf_amp = int((right_intensity / 255.0) * 1000 * (hf_amp_pct / 100.0))
+        
+        slot = int((time.perf_counter() - self.cycle_start_time) / 0.005) % 3
+
+        with self.vibration_lock:
+            self.frame_vibrations_l[slot].lf_amp = left_lf_amp
+            self.frame_vibrations_l[slot].hf_amp = left_hf_amp
+            self.frame_vibrations_l[slot].lf_freq = lf_freq
+            self.frame_vibrations_l[slot].hf_freq = hf_freq
+            
+            self.frame_vibrations_r[slot].lf_amp = right_lf_amp
+            self.frame_vibrations_r[slot].hf_amp = right_hf_amp
+            self.frame_vibrations_r[slot].lf_freq = lf_freq
+            self.frame_vibrations_r[slot].hf_freq = hf_freq
+            
+            self.latest_vibration_l.lf_amp = left_lf_amp
+            self.latest_vibration_l.hf_amp = left_hf_amp
+            self.latest_vibration_l.lf_freq = lf_freq
+            self.latest_vibration_l.hf_freq = hf_freq
+            
+            self.latest_vibration_r.lf_amp = right_lf_amp
+            self.latest_vibration_r.hf_amp = right_hf_amp
+            self.latest_vibration_r.lf_freq = lf_freq
+            self.latest_vibration_r.hf_freq = hf_freq
+            
+            self.vibration_dirty_l = True
+            self.vibration_dirty_r = True
+
     def _usbip_rumble_callback(self, out_data, side="Left"):
         # Disconnect active-push: bytearray(64) from usbip_server means connection dropped
         # In this case out_data[0] == 0x00, so we handle it separately to clear rumble state.
@@ -2264,20 +2666,25 @@ class VirtualController:
                         self.switch_vibrations_right = [v1_right, v1_right, v1_right]
                         self.vibration_dirty_l = True
                         self.vibration_dirty_r = True
+            
+            self.last_rumble_received_time = time.perf_counter()
             return
 
         if out_data[0] != 0x02:
             # Explicitly clear all rumble state on disconnect (or unknown packet)
             with self.vibration_lock:
-                self.frame_vibrations = [VibrationData() for _ in range(3)]
+                self.frame_vibrations_l = [VibrationData() for _ in range(3)]
+                self.frame_vibrations_r = [VibrationData() for _ in range(3)]
                 for i in range(3):
                     self.slot_inputs[i].clear()
                     self.slot_inputs[i].append((0x0e1, 0, 0x1e1, 0))
-                self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+                self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+                self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
                 for i in range(3):
                     self.slot_inputs_right[i].clear()
                     self.slot_inputs_right[i].append((0x0e1, 0, 0x1e1, 0))
-                self.vibration_dirty = True
+                self.vibration_dirty_l = True
+                self.vibration_dirty_r = True
                 self.rumble_force_clear = True  # Signal controller.py to reset rumble_stopped
             # Reset watchdog so it does NOT fire immediately after this clear
             self.last_rumble_received_time = time.perf_counter()
@@ -2346,14 +2753,20 @@ class VirtualController:
                 v3.lf_freq = XBOX_LF_FREQ; v3.hf_freq = XBOX_HF_FREQ
 
             with self.vibration_lock:
-                self.frame_vibrations = [v1, v2, v3]
-                self.latest_vibration = v3
-                self.vibration_dirty = True
+                self.frame_vibrations_l = [v1, v2, v3]
+                self.frame_vibrations_r = [v1, v2, v3]
+                self.latest_vibration_l = v3
+                self.latest_vibration_r = v3
+                self.vibration_dirty_l = True
+                self.vibration_dirty_r = True
         else:
             with self.vibration_lock:
-                self.frame_vibrations = [VibrationData() for _ in range(3)]
-                self.latest_vibration = VibrationData()
-                self.vibration_dirty = True
+                self.frame_vibrations_l = [VibrationData() for _ in range(3)]
+                self.frame_vibrations_r = [VibrationData() for _ in range(3)]
+                self.latest_vibration_l = VibrationData()
+                self.latest_vibration_r = VibrationData()
+                self.vibration_dirty_l = True
+                self.vibration_dirty_r = True
 
     def update_as_switch2_pro(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         state = bytearray(64)
