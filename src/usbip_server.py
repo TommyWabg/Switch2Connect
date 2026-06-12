@@ -301,7 +301,7 @@ class USBIPServer:
             actual_length = len(reply_data)
             if direction == 0 and len(out_data) > 0:
                 actual_length = len(out_data)
-        elif ep == 1 or ep == 4: # HID Interface Endpoint (ep 1 for Switch, ep 4 for DualSense)
+        elif ep == 1: # HID Interface Endpoint
             if direction == 1: # IN (Read input state)
                 now = time.perf_counter()
                 elapsed = now - getattr(self, 'last_ep_in_time', 0)
@@ -315,18 +315,12 @@ class USBIPServer:
                     with self.lock:
                         reply_data = bytes(self.last_state)
                 actual_length = len(reply_data)
-            else: # OUT
-                logger.info(f"EP1 OUT: length={len(out_data)} bytes")
-                if len(out_data) > 0:
-                    if getattr(self, 'on_audio_data_callback', None):
-                        self.on_audio_data_callback(out_data)
-                    actual_length = len(out_data)
-        elif ep == 3: # DualSense OUT Endpoint
-            if direction == 0: # OUT (Rumble output report)
+            else: # OUT (Rumble output report)
                 if len(out_data) > 0:
                     if self.on_rumble_callback:
                         self.on_rumble_callback(out_data)
                     actual_length = len(out_data)
+        elif ep == 2: # Switch 2 vendor bulk interface
             if direction == 1: # IN
                 try:
                     reply_data = self.bulk_response_queue.get_nowait()
@@ -390,7 +384,7 @@ class USBIPServer:
         status = 0
         reply_data = b""
         
-        if ep == 1 or ep == 4:
+        if ep == 1:
             try:
                 reply_data = self.subcmd_reply_queue.get_nowait()
             except queue.Empty:
@@ -530,7 +524,7 @@ class USBIPServer:
                 return desc[:length]
             
             elif desc_type == 0x22: # HID Report Descriptor (from Interface descriptor request context)
-                # Vendor-defined: report 0x09 = 64-byte input, report 0x02 = 64-byte output
+                # Vendor-defined: report 0x05 = 64-byte input, report 0x02 = 64-byte output
                 report_desc = SWITCH_PRO_REPORT_DESCRIPTOR
                 logger.info(f"  -> HID Report Descriptor ({len(report_desc)} bytes)")
                 return report_desc[:length]

@@ -914,13 +914,13 @@ class Controller:
                 if rumble_mode == "Switch":
                     if strength <= 5.0:
                         lf_multiplier = (strength / 5.0) * 0.504
-                        hf_multiplier = (strength / 5.0) * 0.672
+                        hf_multiplier = (strength / 5.0) * 0.336
                     else:
                         t = (strength - 5.0) / 5.0
                         lf_multiplier = 0.504 + (0.84 - 0.504) * t
-                        hf_multiplier = 0.672 + (0.8 - 0.672) * t
+                        hf_multiplier = 0.336 + (0.56 - 0.336) * t
                     lf_multiplier = min(0.84, lf_multiplier)
-                    hf_multiplier = min(0.8, hf_multiplier)
+                    hf_multiplier = min(0.56, hf_multiplier)
                 else:
                     # Align Xbox Rumble for Joy-Con using the same ratio (LF: 1.0x, HF: 0.5x) compared to standard modes
                     target_lf_mult = (strength / 5.0) * 2.0
@@ -931,7 +931,7 @@ class Controller:
                     
                     lf_multiplier = min(0.84, target_lf_mult)
                     hf_multiplier = min(0.56, target_hf_scale)
-        elif rumble_mode == "Switch":
+        elif rumble_mode in ("Switch", "PS5"):
             if is_pro:
                 if strength <= 5.0:
                     lf_multiplier = (strength / 5.0)
@@ -978,7 +978,7 @@ class Controller:
         def scale_and_clamp(v: VibrationData) -> VibrationData:
             is_switch1 = getattr(CONFIG, "simulation_mode", "PS5") == "Switch1"
 
-            is_pure_switch_rumble = rumble_mode == "Switch"
+            is_pure_switch_rumble = rumble_mode in ("Switch", "PS5")
 
             if ignore_freq_scaling or (is_pure_switch_rumble and not is_switch1):
                 scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
@@ -1002,8 +1002,8 @@ class Controller:
                             scaled_lf_freq = min(511, int(0x0e1 + ((scaled_lf_freq - 501) / 10.0) * (511 - 0x0e1)))
                     elif is_switch1 and not is_pro:
                         # Joy-Con Frequency:
-                        # HF: Map 0-73% frequency evenly to 0-95% (0-485) to prevent overly sharp sounds. Cap at 485.
-                        scaled_hf_freq = min(485, int(scaled_hf_freq * 1.369863))
+                        # HF: Map 0-73% frequency evenly to 0-100% (0-511). Cap at 511.
+                        scaled_hf_freq = min(511, int(scaled_hf_freq * 1.369863))
                         
                         # LF: Map 0-100% (0-511) evenly to the new 0-100% output range (225-511). Cap at 511.
                         scaled_lf_freq = 225 + (scaled_lf_freq / 511.0) * (511 - 225)
@@ -1024,6 +1024,7 @@ class Controller:
                         expanded_hf_freq = v.hf_freq
                         
                     # 2. Then apply the Xbox Rumble frequency reduction mask on top of the expanded frequencies
+
                     new_min_lf = 0.5 * expanded_lf_freq + 0.5
                     temp_lf_freq = new_min_lf + (expanded_lf_freq - new_min_lf) * freq_factor_lf
 
@@ -1663,45 +1664,69 @@ class Controller:
                             self.rumble_stopped = False
                             self._zero_count = 0
                             vc.rumble_force_clear = False
-                        
-                        v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
-                        v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
-                        
-                        if self.is_pro_controller():
-                            is_zero = is_zero_l and is_zero_r
-                        elif self.is_joycon_left():
-                            is_zero = is_zero_l
-                        else:
-                            is_zero = is_zero_r
-                        
-                        now_time = time.perf_counter()
-                        last_send = getattr(self, '_last_rumble_send_time', 0)
-                        
-                        if not getattr(self, '_rumble_task_running', False) and (now_time - last_send >= 0.015 or is_zero):
-                            
-                            async def safe_send(v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r):
-                                self._rumble_task_running = True
-                                self._last_rumble_send_time = time.perf_counter()
-                                try:
-                                    if self.is_pro_controller():
-                                        await self.set_vibration(v1_c_l, v2_c_l, v3_c_l, False, v1_c_r, v2_c_r, v3_c_r)
-                                    elif self.is_joycon_left():
-                                        await self.set_vibration(v1_c_l, v2_c_l, v3_c_l)
-                                    else:
-                                        await self.set_vibration(v1_c_r, v2_c_r, v3_c_r)
-                                finally:
-                                    self._rumble_task_running = False
 
-                            if is_zero:
-                                if not getattr(self, 'rumble_stopped', False):
-                                    self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                    asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
-                                    if self._zero_count >= 3:
-                                        self.rumble_stopped = True
+                        use_dualsense_stereo = (
+                            getattr(vc, 'mode', None) == "PS5" and
+                            getattr(vc, 'driver_type', None) == "USBIP"
+                        )
+
+                        if not use_dualsense_stereo:
+                            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
+
+                            if not getattr(self, '_rumble_task_running', False):
+
+                                async def safe_send_single(v1_c, v2_c, v3_c):
+                                    self._rumble_task_running = True
+                                    try:
+                                        await self.set_vibration(v1_c, v2_c, v3_c)
+                                    finally:
+                                        self._rumble_task_running = False
+
+                                if is_zero:
+                                    if not getattr(self, 'rumble_stopped', False):
+                                        self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                        asyncio.get_running_loop().create_task(safe_send_single(v1, v2, v3))
+                                        if self._zero_count >= 3:
+                                            self.rumble_stopped = True
+                                else:
+                                    self.rumble_stopped = False
+                                    self._zero_count = 0
+                                    asyncio.get_running_loop().create_task(safe_send_single(v1, v2, v3))
+                        else:
+                            v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
+                            v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
+                            
+                            if self.is_pro_controller():
+                                is_zero = is_zero_l and is_zero_r
+                            elif self.is_joycon_left():
+                                is_zero = is_zero_l
                             else:
-                                self.rumble_stopped = False
-                                self._zero_count = 0
-                                asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
+                                is_zero = is_zero_r
+                            
+                            if not getattr(self, '_rumble_task_running', False):
+                                
+                                async def safe_send(v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r):
+                                    self._rumble_task_running = True
+                                    try:
+                                        if self.is_pro_controller():
+                                            await self.set_vibration(v1_c_l, v2_c_l, v3_c_l, False, v1_c_r, v2_c_r, v3_c_r)
+                                        elif self.is_joycon_left():
+                                            await self.set_vibration(v1_c_l, v2_c_l, v3_c_l)
+                                        else:
+                                            await self.set_vibration(v1_c_r, v2_c_r, v3_c_r)
+                                    finally:
+                                        self._rumble_task_running = False
+
+                                if is_zero:
+                                    if not getattr(self, 'rumble_stopped', False):
+                                        self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                        asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
+                                        if self._zero_count >= 3:
+                                            self.rumble_stopped = True
+                                else:
+                                    self.rumble_stopped = False
+                                    self._zero_count = 0
+                                    asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
             
             except Exception as e:
                 logger.debug(f"Sync rumble failed: {e}")

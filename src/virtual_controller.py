@@ -29,7 +29,6 @@ import gc
 from controller import Controller, ControllerInputData, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
-from usbip_dualsense_server import USBIPDualSenseServer
 from utils import USBIPAllocator
 from dualsense_structs import DualSenseInputReport01
 from dualsense_haptic import DualSenseHapticProcessor
@@ -125,6 +124,7 @@ def detach_all_usbip_devices():
         logger.error(f"Error detaching all USBIP devices: {e}")
 
 RUMBLE_WRITE_INTERVAL = 0.015
+SWITCH_RUMBLE_TIMEOUT = 0.150
 MAC_TO_PORT = {}
 
 def get_or_assign_port_for_mac(mac):
@@ -213,7 +213,10 @@ class VirtualController:
         self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
         self.frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
         self.frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
-        # We already have vibration_dirty_l and vibration_dirty_r defined above
+        self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+        self.frame_vibrations = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.vibration_dirty = False
+        self.last_rumble_active_time = 0.0
         self.vibration_changed_event = None
         self.active_vibration_task = None
         self.cycle_start_time = 0.0
@@ -247,6 +250,11 @@ class VirtualController:
         
         self.state_lock = threading.RLock()
         self._disconnect_lock = asyncio.Lock()
+        
+        # Adaptive Trigger State Tracking (for Weapon mode recoil kicks)
+        self.trigger_r_prev_force = 0
+        self.trigger_l_prev_force = 0
+        
         self.running = True
         self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
         self.update_thread.start()
@@ -529,14 +537,12 @@ class VirtualController:
                         detach_usbip_device(server_port)
                         time.sleep(0.1)
                         
-                        self.usbip_server = USBIPDualSenseServer(
+                        self.usbip_server = USBIPServer(
                             host=host_ip, port=server_port,
-                            on_rumble_callback=self._dualsense_rumble_callback,
-                            bus_id=bus_id, mac_address=mac_address,
-                            on_audio_data_callback=self._usbip_audio_callback
+                            on_rumble_callback=self._usbip_rumble_callback,
+                            bus_id=bus_id, mac_address=mac_address
                         )
                         self.usbip_server.start()
-                        threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
                         started = True
                         break
                     except Exception as e:
@@ -840,33 +846,23 @@ class VirtualController:
             slot = 2
 
         with self.vibration_lock:
-            # ViGEmBus XInput rumble (Mix to both L and R controllers)
-            raw_lf = self.frame_vibrations_l[slot].lf_amp + lf_val
-            raw_hf = self.frame_vibrations_r[slot].hf_amp + hf_val
-            
+            raw_lf = self.frame_vibrations[slot].lf_amp + lf_val
+            raw_hf = self.frame_vibrations[slot].hf_amp + hf_val
+
             # Use non-linear scaling for summation to prevent clipping
             if raw_lf <= 560:
-                lf_res = int(raw_lf)
+                self.frame_vibrations[slot].lf_amp = int(raw_lf)
             else:
-                lf_res = int(560 + 240 * math.tanh((raw_lf - 560) / 240))
-                
+                self.frame_vibrations[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf - 560) / 240))
+
             if raw_hf <= 560:
-                hf_res = int(raw_hf)
+                self.frame_vibrations[slot].hf_amp = int(raw_hf)
             else:
-                hf_res = int(560 + 240 * math.tanh((raw_hf - 560) / 240))
-            
-            self.frame_vibrations_l[slot].lf_amp = lf_res
-            self.frame_vibrations_l[slot].hf_amp = hf_res
-            self.frame_vibrations_r[slot].lf_amp = lf_res
-            self.frame_vibrations_r[slot].hf_amp = hf_res
-            
-            self.latest_vibration_l.lf_amp = lf_val
-            self.latest_vibration_l.hf_amp = hf_val
-            self.latest_vibration_r.lf_amp = lf_val
-            self.latest_vibration_r.hf_amp = hf_val
-            
-            self.vibration_dirty_l = True
-            self.vibration_dirty_r = True
+                self.frame_vibrations[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf - 560) / 240))
+
+            self.latest_vibration.lf_amp = lf_val
+            self.latest_vibration.hf_amp = hf_val
+            self.vibration_dirty = True
 
     def get_current_vibration_frames(self, is_left=True):
         if self.mode == "Switch1":
@@ -878,7 +874,7 @@ class VirtualController:
                 current_time = time.perf_counter()
                 last_time = getattr(self, 'last_rumble_received_time', 0)
                 
-                if current_time - last_time > 0.150:
+                if current_time - last_time > SWITCH_RUMBLE_TIMEOUT:
                     v1 = VibrationData()
                     v2 = VibrationData()
                     v3 = VibrationData()
@@ -907,43 +903,83 @@ class VirtualController:
             return v1, v2, v3, is_zero
 
         with self.vibration_lock:
-            if is_left:
-                target_vibration = self.target_vibration_l
-                latest_vibration = self.latest_vibration_l
-                frame_vibrations = self.frame_vibrations_l
-                vibration_dirty = self.vibration_dirty_l
-            else:
-                target_vibration = self.target_vibration_r
-                latest_vibration = self.latest_vibration_r
-                frame_vibrations = self.frame_vibrations_r
-                vibration_dirty = self.vibration_dirty_r
-                
-            if vibration_dirty:
-                v1 = VibrationData(lf_amp=frame_vibrations[0].lf_amp, hf_amp=frame_vibrations[0].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
-                v2 = VibrationData(lf_amp=frame_vibrations[1].lf_amp, hf_amp=frame_vibrations[1].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
-                v3 = VibrationData(lf_amp=frame_vibrations[2].lf_amp, hf_amp=frame_vibrations[2].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
-                
+            use_dualsense_stereo = self.mode == "PS5" and self.driver_type == "USBIP"
+
+            if use_dualsense_stereo:
+                if is_left:
+                    latest_vibration = self.latest_vibration_l
+                    frame_vibrations = self.frame_vibrations_l
+                    vibration_dirty = self.vibration_dirty_l
+                else:
+                    latest_vibration = self.latest_vibration_r
+                    frame_vibrations = self.frame_vibrations_r
+                    vibration_dirty = self.vibration_dirty_r
+
+                if vibration_dirty:
+                    v1 = VibrationData(lf_amp=frame_vibrations[0].lf_amp, hf_amp=frame_vibrations[0].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                    v2 = VibrationData(lf_amp=frame_vibrations[1].lf_amp, hf_amp=frame_vibrations[1].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                    v3 = VibrationData(lf_amp=frame_vibrations[2].lf_amp, hf_amp=frame_vibrations[2].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+
+                    if v1.lf_amp == 0 and v1.hf_amp == 0:
+                        v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
+                    if v2.lf_amp == 0 and v2.hf_amp == 0:
+                        v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                    if v3.lf_amp == 0 and v3.hf_amp == 0:
+                        v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+
+                    for f in frame_vibrations:
+                        f.lf_amp = 0
+                        f.hf_amp = 0
+
+                    if is_left:
+                        self.vibration_dirty_l = False
+                    else:
+                        self.vibration_dirty_r = False
+                    self.cycle_start_time = time.perf_counter()
+                else:
+                    v1 = VibrationData(lf_amp=latest_vibration.lf_amp, hf_amp=latest_vibration.hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                    v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
+                    v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
+
+                is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+                return v1, v2, v3, is_zero
+
+            if self.mode == "Switch2":
+                current_time = time.perf_counter()
+                last_active = getattr(self, 'last_rumble_active_time', 0)
+                if last_active and current_time - last_active > SWITCH_RUMBLE_TIMEOUT:
+                    self.frame_vibrations = [VibrationData() for _ in range(3)]
+                    self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+                    self.vibration_dirty = False
+                    self.cycle_start_time = current_time
+                    v1 = VibrationData()
+                    v2 = VibrationData()
+                    v3 = VibrationData()
+                    return v1, v2, v3, True
+
+            if self.vibration_dirty:
+                v1 = VibrationData(lf_amp=self.frame_vibrations[0].lf_amp, hf_amp=self.frame_vibrations[0].hf_amp)
+                v2 = VibrationData(lf_amp=self.frame_vibrations[1].lf_amp, hf_amp=self.frame_vibrations[1].hf_amp)
+                v3 = VibrationData(lf_amp=self.frame_vibrations[2].lf_amp, hf_amp=self.frame_vibrations[2].hf_amp)
+
                 if v1.lf_amp == 0 and v1.hf_amp == 0:
-                    v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
+                    v1.lf_amp, v1.hf_amp = self.latest_vibration.lf_amp, self.latest_vibration.hf_amp
                 if v2.lf_amp == 0 and v2.hf_amp == 0:
                     v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
                 if v3.lf_amp == 0 and v3.hf_amp == 0:
                     v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
 
-                for f in frame_vibrations:
+                for f in self.frame_vibrations:
                     f.lf_amp = 0
                     f.hf_amp = 0
-                
-                if is_left:
-                    self.vibration_dirty_l = False
-                else:
-                    self.vibration_dirty_r = False
+                self.vibration_dirty = False
                 self.cycle_start_time = time.perf_counter()
             else:
-                v1 = VibrationData(lf_amp=latest_vibration.lf_amp, hf_amp=latest_vibration.hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
-                v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
-                v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
-                
+                v1 = VibrationData(lf_amp=self.latest_vibration.lf_amp, hf_amp=self.latest_vibration.hf_amp)
+                v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+                v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+                self.cycle_start_time = time.perf_counter()
+
             is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
             return v1, v2, v3, is_zero
 
@@ -1744,9 +1780,26 @@ class VirtualController:
         if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             report.LeftTrigger = inputData.left_trigger
             report.RightTrigger = inputData.right_trigger
+            is_zl_pressed = inputData.left_trigger > 10
+            is_zr_pressed = inputData.right_trigger > 10
         else:
             report.LeftTrigger = 255 if (buttons & SWITCH_BUTTONS["ZL"]) else 0
             report.RightTrigger = 255 if (buttons & SWITCH_BUTTONS["ZR"]) else 0
+            is_zl_pressed = bool(buttons & SWITCH_BUTTONS["ZL"])
+            is_zr_pressed = bool(buttons & SWITCH_BUTTONS["ZR"])
+            
+        import time
+        now = time.perf_counter()
+        
+        if is_zl_pressed and not getattr(self, 'prev_zl_pressed', False):
+            if getattr(self, 'last_lt_mode', 0) not in (0x00, 0x05):
+                self.trigger_l_punch_end = now + 0.150
+        self.prev_zl_pressed = is_zl_pressed
+
+        if is_zr_pressed and not getattr(self, 'prev_zr_pressed', False):
+            if getattr(self, 'last_rt_mode', 0) not in (0x00, 0x05):
+                self.trigger_r_punch_end = now + 0.150
+        self.prev_zr_pressed = is_zr_pressed
         
         if mode == "PS5":
             report.SequenceNumber = (report.SequenceNumber + 1) & 0xFF
@@ -2332,46 +2385,83 @@ class VirtualController:
                 lf_amp = int((left_motor_strong / 255.0) * 1000)
                 hf_amp = int((right_motor_weak / 255.0) * 1000)
                 
+                dt = time.perf_counter() - self.cycle_start_time
+                slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+                slot = int(dt / slot_size) if slot_size > 0 else 0
+                if slot < 0: slot = 0
+                elif slot > 2: slot = 2
+                
+                import math
                 with self.vibration_lock:
-                    self.latest_vibration_l.lf_amp = lf_amp
-                    self.latest_vibration_l.hf_amp = hf_amp
-                    self.latest_vibration_r.lf_amp = lf_amp
-                    self.latest_vibration_r.hf_amp = hf_amp
-                    self.vibration_dirty_l = True
-                    self.vibration_dirty_r = True
-            return
+                    # Apply to Left (Xbox Rumble limit is 1000, so we use 700 + 300*tanh)
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp
+                    if raw_lf_l <= 700: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+                    else: self.frame_vibrations_l[slot].lf_amp = int(700 + 300 * math.tanh((raw_lf_l - 700) / 300))
+                    if raw_hf_l <= 700: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+                    else: self.frame_vibrations_l[slot].hf_amp = int(700 + 300 * math.tanh((raw_hf_l - 700) / 300))
+                    
+                    # Apply to Right
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp
+                    if raw_lf_r <= 700: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+                    else: self.frame_vibrations_r[slot].lf_amp = int(700 + 300 * math.tanh((raw_lf_r - 700) / 300))
+                    if raw_hf_r <= 700: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+                    else: self.frame_vibrations_r[slot].hf_amp = int(700 + 300 * math.tanh((raw_hf_r - 700) / 300))
 
         elif out_data[0] == 0x11:
-                # Custom High-Fidelity Rumble Report (ID=0x11)
+            # Custom High-Fidelity Rumble Report (ID=0x11)
             # Format: [0x11, RightIntensity, LeftIntensity]
             if len(out_data) >= 3:
-                right_intensity = out_data[1]
-                left_intensity = out_data[2]
+                right_intensity = out_data[1] # Small motor (HF)
+                left_intensity = out_data[2]  # Large motor (LF)
                 
-                left_amp = int((left_intensity / 255.0) * 1000)
-                right_amp = int((right_intensity / 255.0) * 1000)
+                lf_amp = int(800 * left_intensity / 256)
+                hf_amp = int(800 * right_intensity / 256)
                 
+                dt = time.perf_counter() - self.cycle_start_time
+                slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+                slot = int(dt / slot_size) if slot_size > 0 else 0
+                if slot < 0: slot = 0
+                elif slot > 2: slot = 2
+                
+                import math
                 with self.vibration_lock:
-                    # True Stereo Separation for 0x11
-                    self.latest_vibration_l.lf_amp = left_amp
-                    self.latest_vibration_l.hf_amp = left_amp
-                    self.latest_vibration_r.lf_amp = right_amp
-                    self.latest_vibration_r.hf_amp = right_amp
-                    
-                    rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
-                    if rumble_mode in ["Switch", "PS5"]:
-                        # HD Rumble: apply the optimal punchy frequencies
-                        self.latest_vibration_l.lf_freq = 0x112
-                        self.latest_vibration_l.hf_freq = 0x187
-                        self.latest_vibration_r.lf_freq = 0x112
-                        self.latest_vibration_r.hf_freq = 0x187
-                    else:
-                        # Xbox Rumble: fallback to generic frequencies
-                        self.latest_vibration_l.lf_freq = 0x0e1
-                        self.latest_vibration_l.hf_freq = 0x1e1
-                        self.latest_vibration_r.lf_freq = 0x0e1
-                        self.latest_vibration_r.hf_freq = 0x1e1
+                    # WinUHid perfectly aligned frequencies
+                    lf_freq = 0x0e1
+                    hf_freq = 0x1e1
                         
+                    # Apply to Left
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp
+                    if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+                    else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+                    if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+                    else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
+                    self.frame_vibrations_l[slot].lf_freq = lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = hf_freq
+                    
+                    # Apply to Right
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp
+                    if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+                    else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+                    if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+                    else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
+                    self.frame_vibrations_r[slot].lf_freq = lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = hf_freq
+
+                    self.latest_vibration_l.lf_amp = lf_amp
+                    self.latest_vibration_l.hf_amp = hf_amp
+                    self.latest_vibration_l.lf_freq = lf_freq
+                    self.latest_vibration_l.hf_freq = hf_freq
+                    
+                    self.latest_vibration_r.lf_amp = lf_amp
+                    self.latest_vibration_r.hf_amp = hf_amp
+                    self.latest_vibration_r.lf_freq = lf_freq
+                    self.latest_vibration_r.hf_freq = hf_freq
+                    
+                    self.last_rumble_active_time = time.perf_counter()
                     self.vibration_dirty_l = True
                     self.vibration_dirty_r = True
             return
@@ -2391,30 +2481,106 @@ class VirtualController:
                 right_motor_weak = out_data[3]
                 left_motor_strong = out_data[4]
                 
-                lf_amp = int((left_motor_strong / 255.0) * 1000)
-                hf_amp = int((right_motor_weak / 255.0) * 1000)
+                lf_amp = int(800 * left_motor_strong / 256)
+                hf_amp = int(800 * right_motor_weak / 256)
                 
-                with self.vibration_lock:
-                    # For Xbox Rumble, we MIX to both controllers (L and R get identical signals)
-                    self.latest_vibration_l.lf_amp = lf_amp
-                    self.latest_vibration_l.hf_amp = hf_amp
-                    self.latest_vibration_r.lf_amp = lf_amp
-                    self.latest_vibration_r.hf_amp = hf_amp
+                # Adaptive Trigger Translation (Mode 0x26 Vibration and 0x02 Weapon Recoil)
+                trigger_r_amp = 0
+                trigger_r_freq = 0x0e1
+                trigger_l_amp = 0
+                trigger_l_freq = 0x0e1
+                
+                if len(out_data) >= 33:
+                    import time
+                    now = time.perf_counter()
                     
-                    rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
-                    if rumble_mode in ["Switch", "PS5"]:
-                        # HD Rumble: apply the optimal punchy frequencies
-                        self.latest_vibration_l.lf_freq = 0x112
-                        self.latest_vibration_l.hf_freq = 0x187
-                        self.latest_vibration_r.lf_freq = 0x112
-                        self.latest_vibration_r.hf_freq = 0x187
-                    else:
-                        # Xbox Rumble: fallback to generic frequencies
-                        self.latest_vibration_l.lf_freq = 0x0e1
-                        self.latest_vibration_l.hf_freq = 0x1e1
-                        self.latest_vibration_r.lf_freq = 0x0e1
-                        self.latest_vibration_r.hf_freq = 0x1e1
+                    # Right Trigger FFB
+                    rt_mode = out_data[11]
+                    rt_payload = bytes(out_data[11:22])
+                    
+                    is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+                    trigger_amp_max = int(800 * 0.5) if is_joycon else 800
+                    
+                    # Log for debugging
+                    if rt_mode != 0:
+                        if now - getattr(self, 'last_rt_log_time', 0) > 0.5 or rt_mode != getattr(self, 'last_rt_mode', 0):
+                            logger.info(f"RT Adaptive FFB: Mode={hex(rt_mode)} Data={rt_payload[1:].hex()}")
+                            self.last_rt_log_time = now
+                            self.last_rt_mode = rt_mode
+                            
+                    # Trigger 150ms punch on payload change if physical trigger is currently held down
+                    if rt_payload != getattr(self, 'trigger_r_prev_payload', b''):
+                        self.trigger_r_prev_payload = rt_payload
+                        if getattr(self, 'prev_zr_pressed', False) and rt_mode not in (0x00, 0x05):
+                            self.trigger_r_punch_end = now + 0.150
+                            
+                    if now < getattr(self, 'trigger_r_punch_end', 0):
+                        trigger_r_amp = trigger_amp_max
+                        trigger_r_freq = 0x0e1
+
+                    # Left Trigger FFB
+                    lt_mode = out_data[22]
+                    lt_payload = bytes(out_data[22:33])
+                    
+                    # Log for debugging
+                    if lt_mode != 0:
+                        if now - getattr(self, 'last_lt_log_time', 0) > 0.5 or lt_mode != getattr(self, 'last_lt_mode', 0):
+                            logger.info(f"LT Adaptive FFB: Mode={hex(lt_mode)} Data={lt_payload[1:].hex()}")
+                            self.last_lt_log_time = now
+                            self.last_lt_mode = lt_mode
+                            
+                    # Trigger 150ms punch on payload change if physical trigger is currently held down
+                    if lt_payload != getattr(self, 'trigger_l_prev_payload', b''):
+                        self.trigger_l_prev_payload = lt_payload
+                        if getattr(self, 'prev_zl_pressed', False) and lt_mode not in (0x00, 0x05):
+                            self.trigger_l_punch_end = now + 0.150
+                    if now < getattr(self, 'trigger_l_punch_end', 0):
+                        trigger_l_amp = trigger_amp_max
+                        trigger_l_freq = 0x0e1
+                
+                dt = time.perf_counter() - self.cycle_start_time
+                slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+                slot = int(dt / slot_size) if slot_size > 0 else 0
+                if slot < 0: slot = 0
+                elif slot > 2: slot = 2
+                
+                import math
+                with self.vibration_lock:
+                    # WinUHid perfectly aligned frequencies
+                    lf_freq = 0x0e1
+                    hf_freq = 0x1e1
                         
+                    # Apply to Left (mix standard rumble with left trigger rumble)
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp + trigger_l_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp + trigger_l_amp
+                    if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+                    else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+                    if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+                    else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
+                    self.frame_vibrations_l[slot].lf_freq = trigger_l_freq if trigger_l_amp > 0 else lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = trigger_l_freq if trigger_l_amp > 0 else hf_freq
+                    
+                    # Apply to Right (mix standard rumble with right trigger rumble)
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp + trigger_r_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp + trigger_r_amp
+                    if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+                    else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+                    if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+                    else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
+                    self.frame_vibrations_r[slot].lf_freq = trigger_r_freq if trigger_r_amp > 0 else lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = trigger_r_freq if trigger_r_amp > 0 else hf_freq
+
+                    self.latest_vibration_l.lf_amp = min(1000, lf_amp + trigger_l_amp)
+                    self.latest_vibration_l.hf_amp = min(1000, hf_amp + trigger_l_amp)
+                    self.latest_vibration_l.lf_freq = trigger_l_freq if trigger_l_amp > 0 else lf_freq
+                    self.latest_vibration_l.hf_freq = trigger_l_freq if trigger_l_amp > 0 else hf_freq
+                    
+                    self.latest_vibration_r.lf_amp = min(1000, lf_amp + trigger_r_amp)
+                    self.latest_vibration_r.hf_amp = min(1000, hf_amp + trigger_r_amp)
+                    self.latest_vibration_r.lf_freq = trigger_r_freq if trigger_r_amp > 0 else lf_freq
+                    self.latest_vibration_r.hf_freq = trigger_r_freq if trigger_r_amp > 0 else hf_freq
+                    
+                    self.last_rumble_active_time = time.perf_counter()
                     self.vibration_dirty_l = True
                     self.vibration_dirty_r = True
                     
@@ -2515,21 +2681,23 @@ class VirtualController:
         def mix_freq(low, high, intensity):
             return int(low + ((high - low) * intensity + 127) // 255)
 
-        max_intensity = max(left_intensity, right_intensity)
+        # Scale intensity up to 255 for the freq mixer to preserve current freq behavior
+        max_intensity_raw = max(left_intensity, right_intensity)
+        freq_intensity = min(255, int((max_intensity_raw / 96.0) * 255.0))
 
         if mode == "TICK":
-            hf_freq = mix_freq(0x1c8, 0x1f2, max_intensity)
-            lf_freq = mix_freq(0x0c8, 0x0e8, max_intensity)
+            hf_freq = mix_freq(0x1c8, 0x1f2, freq_intensity)
+            lf_freq = mix_freq(0x0c8, 0x0e8, freq_intensity)
             hf_amp_pct = 100
             lf_amp_pct = 28
         elif mode == "PUNCH":
-            hf_freq = mix_freq(0x158, 0x198, max_intensity)
-            lf_freq = mix_freq(0x0a8, 0x0d8, max_intensity)
+            hf_freq = mix_freq(0x158, 0x198, freq_intensity)
+            lf_freq = mix_freq(0x0a8, 0x0d8, freq_intensity)
             hf_amp_pct = 68
             lf_amp_pct = 100
         elif mode == "TEXTURE":
-            hf_freq = mix_freq(0x1a8, 0x1f8, max_intensity)
-            lf_freq = mix_freq(0x0f0, 0x130, max_intensity)
+            hf_freq = mix_freq(0x1a8, 0x1f8, freq_intensity)
+            lf_freq = mix_freq(0x0f0, 0x130, freq_intensity)
             hf_amp_pct = 100
             lf_amp_pct = 42
         elif mode == "SILENCE":
@@ -2538,28 +2706,53 @@ class VirtualController:
             hf_amp_pct = 0
             lf_amp_pct = 0
         else: # CONTINUOUS
-            hf_freq = mix_freq(0x180, 0x1a0, max_intensity)
-            lf_freq = mix_freq(0x0d0, 0x100, max_intensity)
+            hf_freq = mix_freq(0x180, 0x1a0, freq_intensity)
+            lf_freq = mix_freq(0x0d0, 0x100, freq_intensity)
             hf_amp_pct = 100
             lf_amp_pct = 100
 
         # Note: We now properly separate Left and Right into their respective L/R states
-        left_lf_amp = int((left_intensity / 255.0) * 1000 * (lf_amp_pct / 100.0))
-        left_hf_amp = int((left_intensity / 255.0) * 1000 * (hf_amp_pct / 100.0))
+        # 整體強度 x2，並套用 WinUHid PS5 Xbox Rumble 高低頻震動強度上限 (800)
+        left_base_amp = min(800, int((left_intensity / 96.0) * 800.0 * 2.0))
+        right_base_amp = min(800, int((right_intensity / 96.0) * 800.0 * 2.0))
         
-        right_lf_amp = int((right_intensity / 255.0) * 1000 * (lf_amp_pct / 100.0))
-        right_hf_amp = int((right_intensity / 255.0) * 1000 * (hf_amp_pct / 100.0))
+        left_lf_amp = int(left_base_amp * (lf_amp_pct / 100.0))
+        left_hf_amp = int(left_base_amp * (hf_amp_pct / 100.0))
         
-        slot = int((time.perf_counter() - self.cycle_start_time) / 0.005) % 3
+        right_lf_amp = int(right_base_amp * (lf_amp_pct / 100.0))
+        right_hf_amp = int(right_base_amp * (hf_amp_pct / 100.0))
+        
+        is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+        if is_joycon:
+            left_lf_amp = min(left_lf_amp, 480)
+            right_lf_amp = min(right_lf_amp, 480)
+        
+        dt = time.perf_counter() - self.cycle_start_time
+        slot_size = RUMBLE_WRITE_INTERVAL / 3.0
+        slot = int(dt / slot_size) if slot_size > 0 else 0
+        if slot < 0: slot = 0
+        elif slot > 2: slot = 2
 
+        import math
         with self.vibration_lock:
-            self.frame_vibrations_l[slot].lf_amp = left_lf_amp
-            self.frame_vibrations_l[slot].hf_amp = left_hf_amp
+            # [Antigravity Fix] Applying slot-based summation for Audio Haptics
+            # Apply to Left
+            raw_lf_l = self.frame_vibrations_l[slot].lf_amp + left_lf_amp
+            raw_hf_l = self.frame_vibrations_l[slot].hf_amp + left_hf_amp
+            if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+            else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+            if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+            else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
             self.frame_vibrations_l[slot].lf_freq = lf_freq
             self.frame_vibrations_l[slot].hf_freq = hf_freq
             
-            self.frame_vibrations_r[slot].lf_amp = right_lf_amp
-            self.frame_vibrations_r[slot].hf_amp = right_hf_amp
+            # Apply to Right
+            raw_lf_r = self.frame_vibrations_r[slot].lf_amp + right_lf_amp
+            raw_hf_r = self.frame_vibrations_r[slot].hf_amp + right_hf_amp
+            if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+            else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+            if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+            else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
             self.frame_vibrations_r[slot].lf_freq = lf_freq
             self.frame_vibrations_r[slot].hf_freq = hf_freq
             
@@ -2572,7 +2765,7 @@ class VirtualController:
             self.latest_vibration_r.hf_amp = right_hf_amp
             self.latest_vibration_r.lf_freq = lf_freq
             self.latest_vibration_r.hf_freq = hf_freq
-            
+
             self.vibration_dirty_l = True
             self.vibration_dirty_r = True
 
@@ -2673,25 +2866,25 @@ class VirtualController:
         if out_data[0] != 0x02:
             # Explicitly clear all rumble state on disconnect (or unknown packet)
             with self.vibration_lock:
-                self.frame_vibrations_l = [VibrationData() for _ in range(3)]
-                self.frame_vibrations_r = [VibrationData() for _ in range(3)]
+                self.frame_vibrations = [VibrationData() for _ in range(3)]
                 for i in range(3):
                     self.slot_inputs[i].clear()
                     self.slot_inputs[i].append((0x0e1, 0, 0x1e1, 0))
-                self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
-                self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+                self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
                 for i in range(3):
                     self.slot_inputs_right[i].clear()
                     self.slot_inputs_right[i].append((0x0e1, 0, 0x1e1, 0))
-                self.vibration_dirty_l = True
-                self.vibration_dirty_r = True
+                self.vibration_dirty = True
                 self.rumble_force_clear = True  # Signal controller.py to reset rumble_stopped
+                self.last_rumble_active_time = 0
             # Reset watchdog so it does NOT fire immediately after this clear
             self.last_rumble_received_time = time.perf_counter()
             return
 
-        # Valid rumble packet: update watchdog timestamp
-        self.last_rumble_received_time = time.perf_counter()
+        # Valid packet received. Only active rumble refreshes the hold watchdog; neutral
+        # keepalives must not cut continuous rumble between active frames.
+        packet_time = time.perf_counter()
+        self.last_rumble_received_time = packet_time
             
         def is_neutral(offset):
             return (out_data[offset] == 0x87 and 
@@ -2740,6 +2933,7 @@ class VirtualController:
         rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
         
         if active:
+            self.last_rumble_active_time = packet_time
             v1 = vibration_data_from_bytes(out_data[2:7])
             v2 = vibration_data_from_bytes(out_data[7:12])
             v3 = vibration_data_from_bytes(out_data[12:17])
@@ -2753,20 +2947,16 @@ class VirtualController:
                 v3.lf_freq = XBOX_LF_FREQ; v3.hf_freq = XBOX_HF_FREQ
 
             with self.vibration_lock:
-                self.frame_vibrations_l = [v1, v2, v3]
-                self.frame_vibrations_r = [v1, v2, v3]
-                self.latest_vibration_l = v3
-                self.latest_vibration_r = v3
-                self.vibration_dirty_l = True
-                self.vibration_dirty_r = True
+                self.frame_vibrations = [v1, v2, v3]
+                self.latest_vibration = v3
+                self.vibration_dirty = True
         else:
-            with self.vibration_lock:
-                self.frame_vibrations_l = [VibrationData() for _ in range(3)]
-                self.frame_vibrations_r = [VibrationData() for _ in range(3)]
-                self.latest_vibration_l = VibrationData()
-                self.latest_vibration_r = VibrationData()
-                self.vibration_dirty_l = True
-                self.vibration_dirty_r = True
+            last_active = getattr(self, 'last_rumble_active_time', 0)
+            if not last_active or packet_time - last_active > SWITCH_RUMBLE_TIMEOUT:
+                with self.vibration_lock:
+                    self.frame_vibrations = [VibrationData() for _ in range(3)]
+                    self.latest_vibration = VibrationData()
+                    self.vibration_dirty = True
 
     def update_as_switch2_pro(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         state = bytearray(64)

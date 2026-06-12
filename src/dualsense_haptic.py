@@ -123,29 +123,23 @@ class DualSenseHapticProcessor:
         mode = choose_effect_mode()
         
         def calculate_intensity(envelope, transient):
-            # 引入非線性增益 (Non-linear gain)：提升微弱訊號的強度，並壓制過強訊號避免破音
-            # 使用 Gamma 曲線 (0.65)，讓細微的腳步聲或雨聲能轉換成足夠驅動馬達的電壓
-            normalized_env = envelope / 32768.0
-            normalized_trans = transient / 32768.0
-            
-            env_boosted = (normalized_env ** 0.65) * 255.0
-            transient_boosted = (normalized_trans ** 0.70) * 255.0
-            
-            # 將最終強度 x2 (依使用者要求)
-            value = int((env_boosted + transient_boosted) * 2.0 + 0.5)
-            return min(255, value)
+            # V5.9 Linear Curve
+            env_part = (envelope / 32768.0) * 255.0 * 1.0
+            transient_part = (transient / 32768.0) * 255.0 * 0.65
+            value = int(env_part + transient_part + 0.5)
+            return min(96, max(0, value))
 
         def apply_mode_limits(intensity, mode):
             if mode == "SILENCE" or intensity == 0:
                 return 0
             shaped = intensity
                 
-            if mode == "TICK" and shaped > 64:
-                shaped = 64
-            elif mode == "TEXTURE" and shaped < 24:
-                shaped = 24
-            elif mode == "PUNCH" and shaped < 40:
-                shaped = 40
+            if mode == "TICK" and shaped > 48:
+                shaped = 48
+            elif mode == "TEXTURE" and shaped < 18:
+                shaped = 18
+            elif mode == "PUNCH" and shaped < 32:
+                shaped = 32
             return shaped
 
         left_intensity_raw = calculate_intensity(env_l, transient_l)

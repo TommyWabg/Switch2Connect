@@ -143,6 +143,30 @@ class USBIPDualSenseServer(USBIPServer):
             # Assuming it's a DualSenseInputReport01 object
             ctypes.memmove(ctypes.addressof(self.last_state), ctypes.addressof(report), 64)
 
+    def _process_deferred_in_urb(self, sock, seqnum, devid, direction, ep):
+        """DualSense HID input is on endpoint 4; the base Nintendo server only accepts EP1."""
+        status = 0
+        reply_data = b""
+
+        if ep == 4:
+            with self.lock:
+                reply_data = bytes(self.last_state)
+        else:
+            status = -1
+
+        actual_length = len(reply_data)
+        ret_header = struct.pack(
+            "!IIIII i IIII 8s",
+            USBIP_RET_SUBMIT, seqnum, devid, direction, ep, status, actual_length,
+            0, 0, 0, b"\x00" * 8
+        )
+
+        try:
+            with self.send_lock:
+                sock.sendall(ret_header + reply_data)
+        except Exception:
+            pass
+
     def _process_output_report(self, out_data):
         if len(out_data) >= 48 and out_data[0] == 0x02:
             report = DualSenseOutputReport02.from_buffer_copy(out_data[:48])
