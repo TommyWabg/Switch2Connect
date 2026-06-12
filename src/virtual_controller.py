@@ -906,6 +906,25 @@ class VirtualController:
             use_dualsense_stereo = self.mode == "PS5" and self.driver_type == "USBIP"
 
             if use_dualsense_stereo:
+                current_time = time.perf_counter()
+                last_received = getattr(self, 'last_rumble_received_time', 0)
+                last_active = getattr(self, 'last_rumble_active_time', 0)
+                last_time = max(last_received, last_active)
+                
+                # USBIP PS5 hardware timeout (Watchdog): Stop vibrating if no packet is received for 150ms
+                if last_time and current_time - last_time > SWITCH_RUMBLE_TIMEOUT:
+                    self.frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+                    self.frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+                    self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+                    self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+                    self.vibration_dirty_l = False
+                    self.vibration_dirty_r = False
+                    self.cycle_start_time = current_time
+                    v1 = VibrationData()
+                    v2 = VibrationData()
+                    v3 = VibrationData()
+                    return v1, v2, v3, True
+
                 if is_left:
                     latest_vibration = self.latest_vibration_l
                     frame_vibrations = self.frame_vibrations_l
@@ -2768,6 +2787,7 @@ class VirtualController:
 
             self.vibration_dirty_l = True
             self.vibration_dirty_r = True
+            self.last_rumble_received_time = time.perf_counter()
 
     def _usbip_rumble_callback(self, out_data, side="Left"):
         # Disconnect active-push: bytearray(64) from usbip_server means connection dropped
