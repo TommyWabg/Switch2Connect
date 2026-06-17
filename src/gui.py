@@ -3,12 +3,13 @@ import time
 import webbrowser
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 import tkinter.font as tkFont
 import yaml
 import logging
 import asyncio
 import os
+import re
 import ctypes
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
@@ -23,6 +24,8 @@ from PIL import Image, ImageTk
 import win32gui
 import win32con
 from ctypes import wintypes
+
+APP_VERSION = "0.11.0"
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
     _fields_ = [
@@ -59,6 +62,44 @@ ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
 SEE_MASK_NOCLOSEPROCESS = 0x00000040
 WAIT_TIMEOUT = 0x00000102
 WAIT_OBJECT_0 = 0x00000000
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+ctypes.windll.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+ctypes.windll.kernel32.OpenProcess.restype = wintypes.HANDLE
+
+ctypes.windll.kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+ctypes.windll.kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+ctypes.windll.user32.GetForegroundWindow.argtypes = []
+ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
+
+def normalize_app_path(path):
+    if not path:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    except Exception:
+        return os.path.normcase(os.path.normpath(path))
+
+def get_exe_display_name(path):
+    if not path:
+        return "Choose App"
+    try:
+        import win32api
+        info = win32api.GetFileVersionInfo(path, "\\")
+        lang, codepage = win32api.GetFileVersionInfo(path, "\\VarFileInfo\\Translation")[0]
+        for key in ("FileDescription", "ProductName"):
+            value = win32api.GetFileVersionInfo(path, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\{key}")
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return os.path.splitext(os.path.basename(path))[0] or "Choose App"
 
 def check_driver_registry():
     import winreg
@@ -208,9 +249,65 @@ except Exception:
     screen_height = 1440
 
 # Baseline is 1440p physical height.
-resolution_ratio = (screen_height / 1440.0) * getattr(CONFIG, 'ui_scale', 1.0)
+resolution_ratio = 1.0
+window_resolution_ratio = 1.0
+scaling_factor = 1.0
+controller_frame_size = 200
+battery_height = 40
+player_row_height = 40
+player_led_width = 60
+player_led_height = 8
 
-scaling_factor = 1.2 * resolution_ratio
+def _scaled_px(base_value, minimum=1, scale=None):
+    if scale is None:
+        scale = scaling_factor
+    return max(minimum, int(base_value * scale))
+
+def _get_window_non_client_height():
+    caption_height = ctypes.windll.user32.GetSystemMetrics(4)   # SM_CYCAPTION
+    frame_height = ctypes.windll.user32.GetSystemMetrics(33)    # SM_CYFRAME
+    padded_border = ctypes.windll.user32.GetSystemMetrics(92)   # SM_CXPADDEDBORDER
+    return caption_height + (2 * frame_height) + (2 * padded_border)
+
+def _get_effective_client_height(fallback_height):
+    effective_height = fallback_height
+    try:
+        work_area = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work_area), 0):
+            work_height = work_area.bottom - work_area.top
+            effective_height = min(effective_height, max(1, work_height - _get_window_non_client_height()))
+    except Exception:
+        pass
+    return effective_height
+
+def refresh_ui_scaling(current_screen_height=None):
+    global screen_height, resolution_ratio, window_resolution_ratio, scaling_factor
+    global controller_frame_size, battery_height, player_row_height
+    global player_led_width, player_led_height
+
+    if current_screen_height:
+        screen_height = current_screen_height
+
+    window_resolution_ratio = (screen_height / 1440.0) * getattr(CONFIG, 'ui_scale', 1.0)
+
+    ui_scale = getattr(CONFIG, 'ui_scale', 1.0)
+    if screen_height >= 1440:
+        resolution_ratio = (screen_height / 1440.0) * ui_scale
+    else:
+        effective_height = _get_effective_client_height(screen_height)
+        try:
+            baseline_height = max(1, 1440 - _get_window_non_client_height())
+        except Exception:
+            baseline_height = 1440
+        resolution_ratio = (effective_height / baseline_height) * ui_scale
+    scaling_factor = 1.2 * resolution_ratio
+    controller_frame_size = _scaled_px(200)
+    battery_height = _scaled_px(40)
+    player_row_height = _scaled_px(40)
+    player_led_width = _scaled_px(60)
+    player_led_height = _scaled_px(8)
+
+refresh_ui_scaling()
 
 def scale_font(font_tuple):
     if not font_tuple:
@@ -251,9 +348,6 @@ class PowerListener:
         if msg == win32con.WM_POWERBROADCAST:
             self.callback(wparam)
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
-
-controller_frame_size = int(200 * resolution_ratio)
-battery_height = int(40 * resolution_ratio)
 
 # Current Color Scheme (Space Gray / Cyan Accent)
 background_color = "#2D2D2D"
@@ -357,7 +451,7 @@ class ToggleSwitch(tk.Frame):
             frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
             
             w = widths[i] if widths else 8
-            btn = tk.Button(frame, text=label, width=w, font=scale_font(("Arial", 12, "bold")),
+            btn = tk.Button(frame, text=label, width=w, font=scale_font(("Arial", 11, "bold")),
                             bd=0, relief=tk.FLAT, highlightthickness=0,
                             command=lambda idx=i: self._on_click(idx))
             btn.pack(padx=0, pady=0) # Base state: no padding
@@ -414,7 +508,7 @@ class ToggleSwitch(tk.Frame):
             frame = tk.Frame(self, bg=self.bg_color)
             frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
             
-            btn = tk.Button(frame, text=label, width=8, font=scale_font(("Arial", 12, "bold")),
+            btn = tk.Button(frame, text=label, width=8, font=scale_font(("Arial", 11, "bold")),
                             bd=0, relief=tk.FLAT, highlightthickness=0,
                             command=lambda idx=i: self._on_click(idx))
             btn.pack(padx=0, pady=0) # Base state: no padding
@@ -695,8 +789,11 @@ class PlayerInfoBlock:
                 img = Image.open(get_resource(path))
                 if w is None or h is None:
                     orig_w, orig_h = img.size
-                    w = int(orig_w * sf)
-                    h = int(orig_h * sf)
+                    w = _scaled_px(orig_w, scale=sf)
+                    h = _scaled_px(orig_h, scale=sf)
+                else:
+                    w = max(1, int(w))
+                    h = max(1, int(h))
                 img = img.resize((w, h), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
                 return ImageTk.PhotoImage(img)
             except Exception as e:
@@ -715,12 +812,15 @@ class PlayerInfoBlock:
         self.procontroller2 = load_img("images/procontroller2.png")
         self.gamecubecontroller = load_img("images/nsogamecubecontroller.png")
         
-        bat_w, bat_h = int(28 * sf), int(14 * sf)
+        bat_w, bat_h = _scaled_px(28, scale=sf), _scaled_px(14, scale=sf)
         self.battery_h = load_img("images/battery_h.png", bat_w, bat_h)
         self.battery_m = load_img("images/battery_m.png", bat_w, bat_h)
         self.battery_l = load_img("images/battery_l.png", bat_w, bat_h)
         
-        self.player_leds = {nb: load_img(f"images/player{nb}.png") for nb in range(1,5)}
+        self.player_leds = {
+            nb: load_img(f"images/player{nb}.png", player_led_width, player_led_height)
+            for nb in range(1,5)
+        }
 
     def clearControllerInfo(self):
         for attr in ['controller_label', 'player_led_label', 'close_btn', 'split_btn', 'split_frame', 'merge_btn', 'merge_frame', 'mode_switch', 'gyro_btn_l', 'gyro_btn_r', 'gyro_frame_l', 'gyro_frame_r', 'vibrate_btn', 'vibrate_frame', 'player_row', 'battery_label', 'battery_label2', 'mag_btn_single', 'mag_frame_single', 'mag_btn_l', 'mag_frame_l', 'mag_btn_r', 'mag_frame_r']:
@@ -743,7 +843,7 @@ class PlayerInfoBlock:
         self._update_controller_image()
 
         if not getattr(self, 'close_btn', None):
-            self.close_btn = tk.Button(self.controllers_frame, text="✖", bg=block_color, fg="#FFFFFF", bd=0, 
+            self.close_btn = tk.Button(self.controllers_frame, text="X", bg=block_color, fg="#FFFFFF", bd=0, 
                                        relief=tk.FLAT, highlightthickness=0,
                                        font=scale_font(("Arial", 14, "bold")), activebackground="#ff4444", activeforeground="white", 
                                        command=self._on_close_clicked)
@@ -911,7 +1011,7 @@ class PlayerInfoBlock:
                 if getattr(self, 'mode_switch', None): self.mode_switch.place_forget()
 
         if not getattr(self, 'player_row', None):
-            self.player_row = tk.Frame(self.main_frame, bg=player_number_bg_color, width=controller_frame_size, height=int(40 * scaling_factor))
+            self.player_row = tk.Frame(self.main_frame, bg=player_number_bg_color, width=controller_frame_size, height=player_row_height)
             self.player_row.pack_propagate(False)
             self.player_led_label = tk.Label(self.player_row, bg=player_number_bg_color)
             self.vibrate_frame = tk.Frame(self.player_row, bg=button_gray)
@@ -983,7 +1083,7 @@ class CalibrationOverlay:
         frame = tk.Frame(self.window, bg="#1c1c1e", highlightbackground="#3a3a3c", highlightthickness=2, bd=0)
         frame.pack(fill="both", expand=True)
         
-        self.lbl_title = tk.Label(frame, text="Switch 2 Controller", fg="#0a84ff", bg="#1c1c1e", font=scale_font(("Segoe UI", 12, "bold")))
+        self.lbl_title = tk.Label(frame, text="Switch 2 Controller", fg="#0a84ff", bg="#1c1c1e", font=scale_font(("Segoe UI", 11, "bold")))
         self.lbl_title.pack(anchor="w", padx=int(20 * scaling_factor), pady=(int(12 * scaling_factor), int(2 * scaling_factor)))
         
         self.lbl_msg = tk.Label(frame, text="", fg="#ffffff", bg="#1c1c1e", font=scale_font(("Segoe UI", 11)), justify="left", wraplength=int(460 * scaling_factor))
@@ -1105,10 +1205,830 @@ class ControllerWindow:
         self.power_listener = PowerListener(self.handle_power_event)
         self.last_width = CONFIG.window_width
         self.last_height = CONFIG.window_height
+        self.last_x = CONFIG.window_x
+        self.last_y = CONFIG.window_y
+        self.last_foreground_app_path = None
+        self.app_profile_poll_suspended = False
+        self.app_profile_switching = False
+        self.esp32s3_bridge_status = None
+        self.esp32s3_detected = False
+        self._esp32s3_refresh_running = False
+        self._esp32s3_auto_firmware_running = False
+        self._esp32s3_auto_firmware_attempted = set()
+        self._esp32s3_current_seen = False
+        # Mirrors esp32s3_detected as seen by the periodic status timer. Must be kept
+        # in sync whenever detection state is set elsewhere (startup / post-flash
+        # resume), otherwise the timer misreads the first poll as a fresh plug-in
+        # event and needlessly restarts the discoverer, dropping a live controller.
+        self._esp32s3_was_detected = False
+        # True while a firmware flash + replug window is in progress. While set, the
+        # periodic status timer must NOT open the COM port, otherwise it collides
+        # with esptool during the flash and holds the port open during the replug,
+        # forcing the user to restart the app to clear the occupancy.
+        self._esp32s3_firmware_busy = False
         
         import utils
         utils.change_profile_callback = self.on_cycle_profile
         utils.force_ui_update_callback = self.force_refresh_player_slots
+
+    def refresh_esp32s3_status(self):
+        try:
+            try:
+                from usb_serial_bridge import detect_bridge
+                status = detect_bridge()
+                self.esp32s3_bridge_status = status
+            except Exception:
+                self.esp32s3_bridge_status = None
+            self.esp32s3_detected = bool(self.esp32s3_bridge_status and self.esp32s3_bridge_status.board_present)
+        except Exception as e:
+            logger.debug(f"ESP32-S3 status refresh failed: {e}")
+            self.esp32s3_bridge_status = None
+            self.esp32s3_detected = False
+        self.update_driver_buttons_visibility()
+        return self.esp32s3_bridge_status
+
+    def refresh_esp32s3_status_async(self):
+        if getattr(self, '_esp32s3_refresh_running', False) or getattr(self, 'is_quitting', False):
+            return
+        # Never probe the COM port while a firmware flash / replug is in progress —
+        # doing so collides with esptool and re-occupies the port during replug.
+        if getattr(self, '_esp32s3_firmware_busy', False):
+            return
+        self._esp32s3_refresh_running = True
+
+        def worker():
+            status = None
+            detected = False
+            try:
+                from usb_serial_bridge import detect_bridge
+                status = detect_bridge()
+                detected = bool(status and status.board_present)
+            except Exception as e:
+                logger.debug(f"ESP32-S3 async status refresh failed: {e}")
+
+            def apply_status():
+                self._esp32s3_refresh_running = False
+                if getattr(self, 'is_quitting', False):
+                    return
+                was_current = self._esp32s3_current_seen
+                was_detected = getattr(self, '_esp32s3_was_detected', False)
+
+                # If the bridge was recently ready and the new probe returns
+                # "no firmware" (board still physically present), this is almost
+                # certainly a transient PermissionError because the discoverer's
+                # shared_client is holding the COM port open. Discarding the
+                # result keeps Boot-mode detection confined to the firmware-flash
+                # UI and prevents it from disrupting any connection logic.
+                # Exception: OTG-only boards have no CDC serial port for the
+                # discoverer to hold open, so a firmware_installed=False probe
+                # on OTG is a genuine boot+reset event and must not be discarded.
+                if (was_current
+                        and status
+                        and getattr(status, 'board_present', False)
+                        and not getattr(status, 'firmware_installed', False)
+                        and not getattr(status, 'otg_only', False)):
+                    return  # transient probe failure — keep previous state
+
+                self.esp32s3_bridge_status = status
+                self.esp32s3_detected = detected
+                self._esp32s3_was_detected = detected
+                self._esp32s3_current_seen = bool(status and getattr(status, "bridge_ready", False))
+                self.update_driver_buttons_visibility()
+                self.maybe_auto_update_esp32s3_firmware(status)
+                discoverer_running = bool(
+                    getattr(self, 'discoverer_thread', None)
+                    and self.discoverer_thread
+                    and self.discoverer_thread.is_alive()
+                )
+                # Never tear down a live bridge session: if a controller is already
+                # connected, a restart would disconnect it. A transient status-probe
+                # timeout can briefly drop bridge_ready and make it look like the
+                # bridge "just became ready" again on the next poll — restarting then
+                # would kick the user's controller mid-use.
+                has_live_controllers = any(
+                    vc is not None for vc in getattr(self, 'current_controllers', []) or []
+                )
+
+                # Restart discoverer if bridge became ready OR if board was just plugged
+                # in — but only when no controller is currently connected.
+                if (((self._esp32s3_current_seen and not was_current) or (detected and not was_detected))
+                        and discoverer_running and not has_live_controllers):
+                    logger.info("ESP32-S3 state changed. Restarting discoverer...")
+                    # Pause this 5 s status timer while the discoverer (re)opens the
+                    # bridge COM port. Otherwise a transient detect_bridge probe from a
+                    # later tick races the discoverer's persistent open on the freshly
+                    # hot-plugged port and one side gets "port occupied" — which is why
+                    # plugging the ESP32-S3 in AFTER launch failed but before launch
+                    # worked. Resume probing once the open window has passed.
+                    self._esp32s3_firmware_busy = True
+
+                    def _hotplug_restart():
+                        try:
+                            self.start_discoverer_thread()
+                        finally:
+                            self.root.after(4000, lambda: setattr(self, '_esp32s3_firmware_busy', False))
+
+                    self.root.after(100, _hotplug_restart)
+
+            try:
+                self.root.after(0, apply_status)
+            except RuntimeError:
+                self._esp32s3_refresh_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def maybe_auto_update_esp32s3_firmware(self, status, on_complete=None):
+        # Never auto-flash via OTG: esptool requires manual BOOT button hold on native USB
+        if getattr(status, "otg_only", False):
+            return False
+        if (
+            not status
+            or not getattr(status, "board_present", False)
+            or not getattr(status, "firmware_update_required", False)
+            or not getattr(status, "status_text", "")
+            or not getattr(status, "firmware_version", "")
+            or getattr(self, "_esp32s3_auto_firmware_running", False)
+            or getattr(self, "is_quitting", False)
+        ):
+            return False
+
+        serial_port = getattr(status, "serial_port", None)
+        if not serial_port:
+            logger.warning("ESP32-S3 firmware update is required, but CH343 flashing port was not detected.")
+            return False
+
+        attempt_key = (
+            serial_port.port,
+            getattr(status, "firmware_version", ""),
+            getattr(status, "firmware_mode", ""),
+            getattr(status, "expected_version", ""),
+        )
+        if attempt_key in self._esp32s3_auto_firmware_attempted:
+            return False
+        self._esp32s3_auto_firmware_attempted.add(attempt_key)
+        self._esp32s3_auto_firmware_running = True
+
+        discoverer_was_running = bool(
+            getattr(self, 'discoverer_thread', None)
+            and self.discoverer_thread
+            and self.discoverer_thread.is_alive()
+        )
+        if discoverer_was_running:
+            self.stop_discoverer_thread()
+
+        def completed(ok):
+            self._esp32s3_auto_firmware_running = False
+
+            def resume():
+                # Reopen the port only after the device re-enumerates post-replug.
+                self._esp32s3_firmware_busy = False
+                self.start_discoverer_thread()
+
+            if on_complete:
+                self._esp32s3_firmware_busy = False
+                self.refresh_esp32s3_status_async()
+                on_complete(ok)
+            elif ok or discoverer_was_running:
+                if ok:
+                    # Keep the COM port free while the user replugs; resume once current.
+                    self.root.after(1000, lambda: self.wait_for_current_esp32s3_then(resume))
+                else:
+                    self._esp32s3_firmware_busy = False
+                    self.refresh_esp32s3_status_async()
+                    self.root.after(0, self.start_discoverer_thread)
+            else:
+                self._esp32s3_firmware_busy = False
+                self.refresh_esp32s3_status_async()
+
+        logger.info(
+            "ESP32-S3 firmware update required: current version=%s mode=%s expected=%s",
+            getattr(status, "firmware_version", ""),
+            getattr(status, "firmware_mode", ""),
+            getattr(status, "expected_version", ""),
+        )
+        self.run_esp32s3_firmware_task("install", auto=True, status=status, on_complete=completed)
+        return True
+
+    def wait_for_current_esp32s3_then(self, callback, attempts=24):
+        if getattr(self, "is_quitting", False):
+            return
+
+        def worker(remaining):
+            status = None
+            try:
+                from usb_serial_bridge import detect_bridge
+                status = detect_bridge()
+            except Exception as e:
+                logger.debug(f"Waiting for ESP32-S3 firmware HID failed: {e}")
+
+            def apply_status():
+                if getattr(self, "is_quitting", False):
+                    return
+                self.esp32s3_bridge_status = status
+                board_present = bool(status and getattr(status, "board_present", False))
+                self.esp32s3_detected = board_present
+                self._esp32s3_was_detected = board_present
+                self._esp32s3_current_seen = bool(status and getattr(status, "bridge_ready", False))
+                self.update_driver_buttons_visibility()
+                if self._esp32s3_current_seen or remaining <= 0:
+                    callback()
+                elif not board_present:
+                    # ESP32 fully disconnected — clear state and fall back to System BLE immediately
+                    self.esp32s3_bridge_status = None
+                    self.esp32s3_detected = False
+                    self._esp32s3_was_detected = False
+                    self.update_driver_buttons_visibility()
+                    callback()
+                else:
+                    self.root.after(500, lambda: self.wait_for_current_esp32s3_then(callback, remaining - 1))
+
+            try:
+                self.root.after(0, apply_status)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, args=(attempts,), daemon=True).start()
+
+    def run_esp32s3_firmware_task(self, action, auto=False, status=None, on_complete=None):
+        from tkinter import messagebox
+        try:
+            from usb_serial_bridge import ESP32S3_LABEL, flash_firmware
+        except Exception:
+            ESP32S3_LABEL = "ESP32-S3 CDC"
+            flash_firmware = None
+        
+        # COM Port Release Protection Mechanism
+        # Mark firmware busy BEFORE stopping discovery so the 5 s status timer can't
+        # sneak in a COM-port probe between stop and flash (which would block esptool
+        # or re-occupy the port across the replug).
+        self._esp32s3_firmware_busy = True
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+
+        # Run emergency cleanup to close all virtual controller handles
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        # Explicitly release every open serial client BEFORE flashing so esptool gets
+        # exclusive access to the COM port. The discoverer's own shutdown should have
+        # closed the shared client, but a lingering handle here is exactly what leaves
+        # the port "occupied" after install and forces an app restart.
+        try:
+            from usb_serial_bridge import close_all_clients
+            close_all_clients()
+        except Exception:
+            pass
+
+        status = status or self.refresh_esp32s3_status()
+        if not status or not status.serial_port:
+            self._esp32s3_firmware_busy = False
+            if discoverer_was_running:
+                self.start_discoverer_thread()
+            messagebox.showerror(
+                ESP32S3_LABEL,
+                "Could not find the ESP32-S3 N16R8 CH343/COM flashing port.\nConnect the flashing Type-C/CH343P port and try again."
+            )
+            return
+
+        title_map = {
+            "install": "Installing ESP32-S3 N16R8 Firmware",
+            "repair": "Repairing ESP32-S3 N16R8 Firmware",
+            "delete": "Deleting ESP32-S3 N16R8 Firmware",
+        }
+        verb_map = {
+            "install": "installing",
+            "repair": "repairing",
+            "delete": "deleting",
+        }
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title(title_map.get(action, "ESP32-S3 N16R8 Firmware"))
+        progress_win.geometry(f"{int(460 * scaling_factor)}x{int(150 * scaling_factor)}+180+180")
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+
+        label = tk.Label(
+            progress_win,
+            text=f"{ESP32S3_LABEL}: {verb_map.get(action, 'working')} firmware on {status.serial_port.port}...",
+            fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")),
+            wraplength=int(420 * scaling_factor),
+            justify=tk.CENTER
+        )
+        label.pack(pady=(int(18 * scaling_factor), int(10 * scaling_factor)), padx=int(16 * scaling_factor))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(
+            progress_win,
+            orient=tk.HORIZONTAL,
+            mode="determinate",
+            maximum=100,
+            variable=progress_var,
+            length=int(380 * scaling_factor)
+        )
+        progress_bar.pack(padx=int(24 * scaling_factor), fill=tk.X)
+
+        percent_label = tk.Label(
+            progress_win,
+            text="0%",
+            fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold"))
+        )
+        percent_label.pack(pady=(int(8 * scaling_factor), 0))
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        done = {"ok": False, "error": None}
+        progress_queue = queue.Queue()
+
+        def progress(payload):
+            progress_queue.put(("progress", payload))
+
+        def worker():
+            try:
+                flash_firmware(status.serial_port.port, mode=action, progress=progress)
+                done["ok"] = True
+            except Exception as e:
+                done["error"] = e
+                logger.exception("ESP32-S3 firmware task failed")
+            finally:
+                progress_queue.put(("done", None))
+
+        def finish():
+            if progress_win.winfo_exists():
+                progress_win.grab_release()
+                progress_win.destroy()
+
+            def resume_discovery():
+                # Clear the busy flag only once we're ready to reopen the port, so the
+                # 5 s status timer stays quiet through the whole flash + replug window.
+                self._esp32s3_firmware_busy = False
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+
+            if done["ok"]:
+                # Release the COM port so replug is clean and Windows doesn't report a stale handle.
+                try:
+                    from usb_serial_bridge import close_all_clients
+                    close_all_clients()
+                except Exception:
+                    pass
+
+                if action == "delete":
+                    # Uninstall succeeded — firmware is gone, no replug needed.
+                    messagebox.showinfo(
+                        ESP32S3_LABEL,
+                        "ESP32-S3 N16R8 firmware uninstalled successfully.",
+                    )
+                elif not auto:
+                    messagebox.showinfo(
+                        ESP32S3_LABEL,
+                        "ESP32-S3 N16R8 firmware installed successfully.\n\n"
+                        "Please replug the ESP32-S3 USB cable (unplug then reinsert) "
+                        "to complete initialization and avoid port conflicts.",
+                    )
+                else:
+                    # Auto-update path: show a brief replug reminder in a non-blocking way.
+                    messagebox.showinfo(
+                        ESP32S3_LABEL,
+                        "Firmware auto-updated. Please replug the ESP32-S3 USB cable.",
+                    )
+
+                if on_complete:
+                    # Auto-update path manages its own busy-clear + delayed restart.
+                    on_complete(done["ok"])
+                elif action == "delete":
+                    # Firmware removed: nothing to wait for, resume discovery now.
+                    self.refresh_esp32s3_status()
+                    resume_discovery()
+                else:
+                    # Manual install/repair: the user must replug. Keep the COM port
+                    # free and wait until the device re-enumerates with current
+                    # firmware before reopening it, then resume discovery. This is what
+                    # stops the "port occupied" state that previously needed an app restart.
+                    self.root.after(1500, lambda: self.wait_for_current_esp32s3_then(resume_discovery))
+            else:
+                self._esp32s3_firmware_busy = False
+                error_str = str(done["error"])
+                if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
+                    messagebox.showerror(ESP32S3_LABEL, (
+                        "Could not enter flashing mode.\n\n"
+                        "To enter Boot mode manually:\n"
+                        "  1. Hold the BOOT button\n"
+                        "  2. Tap RESET once, then release BOOT\n"
+                        "  3. Click Repair to retry"
+                    ))
+                else:
+                    messagebox.showerror(ESP32S3_LABEL, f"ESP32-S3 N16R8 firmware operation failed:\n{done['error']}")
+                self.refresh_esp32s3_status()
+                if on_complete:
+                    on_complete(done["ok"])
+                elif discoverer_was_running:
+                    self.start_discoverer_thread()
+
+        def apply_progress(payload):
+            current = float(progress_var.get())
+            percent = None
+            message = None
+            if isinstance(payload, dict):
+                if "percent" in payload:
+                    percent = float(payload["percent"])
+                elif "write_percent" in payload:
+                    percent = 25.0 + (max(0.0, min(100.0, float(payload["write_percent"]))) * 0.70)
+                message = payload.get("message")
+            else:
+                text = str(payload)
+                match = re.search(r"\((\d{1,3})\s*%\)", text)
+                if match:
+                    percent = 25.0 + (max(0.0, min(100.0, float(match.group(1)))) * 0.70)
+
+            if percent is None:
+                percent = min(95.0, current + 1.0)
+            percent = max(current, min(100.0, percent))
+            progress_var.set(percent)
+            percent_label.config(text=f"{int(percent)}%")
+            if message and progress_win.winfo_exists():
+                label.config(text=message)
+
+        def poll_progress_queue():
+            should_finish = False
+            while True:
+                try:
+                    kind, payload = progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "progress":
+                    if progress_win.winfo_exists():
+                        apply_progress(payload)
+                elif kind == "done":
+                    should_finish = True
+            if should_finish:
+                progress_var.set(100)
+                percent_label.config(text="100%")
+                finish()
+            elif progress_win.winfo_exists():
+                progress_win.after(50, poll_progress_queue)
+
+        threading.Thread(target=worker, daemon=True).start()
+        progress_win.after(50, poll_progress_queue)
+        self.root.wait_window(progress_win)
+
+    def on_esp32s3_btn_clicked(self):
+        from tkinter import messagebox
+        try:
+            from usb_serial_bridge import ESP32S3_LABEL
+        except Exception:
+            ESP32S3_LABEL = "ESP32-S3 CDC"
+
+        status = self.refresh_esp32s3_status()
+        otg_only = bool(status and getattr(status, "otg_only", False))
+        # OTG in Boot mode: firmware_installed=False means ROM bootloader is running → can flash directly
+        otg_boot_mode = otg_only and not bool(status and getattr(status, "firmware_installed", False))
+
+        if status and getattr(status, "bridge_ready", False):
+            firmware_text = f"Installed ({getattr(status, 'firmware_version', '')})"
+        elif status and getattr(status, "firmware_current", False):
+            firmware_text = f"Installed ({getattr(status, 'firmware_version', '')}, waiting for USB transport)"
+        elif status and getattr(status, "firmware_update_required", False):
+            current = getattr(status, "firmware_version", "") or "unknown"
+            expected = getattr(status, "expected_version", "") or "bundled"
+            firmware_text = f"Update required ({current} -> {expected})"
+        elif status and getattr(status, "board_present", False):
+            firmware_text = "Detected, waiting for status"
+        else:
+            firmware_text = "Not installed"
+        port_text = status.serial_port.port if status and status.serial_port else "CH343/COM not detected"
+
+        dialog_w = int(480 * scaling_factor)
+        dialog_h = int(290 * scaling_factor) if otg_only else int(250 * scaling_factor)
+        dialog = tk.Toplevel(self.root)
+        dialog.title(ESP32S3_LABEL)
+        dialog.resizable(False, False)
+        dialog.config(bg="#1E1E1E")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        # Center on main window
+        self.root.update_idletasks()
+        rx = self.root.winfo_x()
+        ry = self.root.winfo_y()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        dx = rx + (rw - dialog_w) // 2
+        dy = ry + (rh - dialog_h) // 2
+        dialog.geometry(f"{dialog_w}x{dialog_h}+{dx}+{dy}")
+
+        info_label = tk.Label(
+            dialog,
+            text=f"{ESP32S3_LABEL}\nFirmware: {firmware_text}\nFlashing port: {port_text}",
+            fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")),
+            justify=tk.LEFT,
+        )
+        info_label.pack(pady=(int(16 * scaling_factor), int(4 * scaling_factor)), padx=int(16 * scaling_factor), anchor=tk.W)
+
+        if otg_only and not otg_boot_mode:
+            # OTG with firmware running — user must manually enter Boot mode before clicking Install
+            tk.Label(
+                dialog,
+                text="OTG port detected (firmware running). Please enter Boot mode first:\n"
+                     "Hold BOOT, tap RESET once, release BOOT — then click Install.",
+                fg="#FF8800", bg="#1E1E1E",
+                font=scale_font(("Arial", 9, "bold")),
+                justify=tk.LEFT,
+                wraplength=int(440 * scaling_factor),
+            ).pack(padx=int(16 * scaling_factor), anchor=tk.W)
+        elif otg_boot_mode:
+            # OTG in ROM bootloader — ready to flash
+            tk.Label(
+                dialog,
+                text="OTG Boot mode detected — ready to install firmware.",
+                fg="#55CC55", bg="#1E1E1E",
+                font=scale_font(("Arial", 9, "bold")),
+                justify=tk.LEFT,
+            ).pack(padx=int(16 * scaling_factor), anchor=tk.W)
+
+        # Progress bar (hidden until operation starts)
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(
+            dialog, orient=tk.HORIZONTAL, mode="determinate", maximum=100,
+            variable=progress_var, length=int(380 * scaling_factor),
+        )
+        percent_label = tk.Label(dialog, text="0%", fg="white", bg="#1E1E1E",
+                                 font=scale_font(("Arial", 11, "bold")))
+
+        # Result label (hidden until done)
+        result_label = tk.Label(
+            dialog, text="", fg="lightgreen", bg="#1E1E1E",
+            font=scale_font(("Arial", 10, "bold")),
+            wraplength=int(440 * scaling_factor), justify=tk.CENTER,
+        )
+
+        # Phase 1: action selection buttons
+        sel_frame = tk.Frame(dialog, bg="#1E1E1E")
+        sel_frame.pack(pady=int(8 * scaling_factor))
+
+        def close_dialog():
+            dialog.grab_release()
+            dialog.destroy()
+
+        def choose(action):
+            if action == "delete":
+                if not messagebox.askyesno(ESP32S3_LABEL, "Erase ESP32-S3 N16R8 firmware?", parent=dialog):
+                    return
+
+            # OTG port with firmware running — cannot flash until Boot mode is entered.
+            # Show guidance in large red text; do NOT attempt to run esptool.
+            if otg_only and not otg_boot_mode and action in ("install", "repair"):
+                sel_frame.pack_forget()
+                tk.Label(
+                    dialog,
+                    text=(
+                        "ESP32 is not in Boot mode — firmware cannot be installed.\n\n"
+                        "To enter Boot mode:\n"
+                        "  1. Hold the BOOT button\n"
+                        "  2. Tap RESET once, then release BOOT\n"
+                        "  3. Wait for Status to show \"Boot\", then click Install"
+                    ),
+                    fg="#FF3333", bg="#1E1E1E",
+                    font=scale_font(("Arial", 12, "bold")),
+                    justify=tk.LEFT,
+                    wraplength=int(440 * scaling_factor),
+                ).pack(pady=int(10 * scaling_factor), padx=int(16 * scaling_factor), anchor=tk.W)
+                close_btn_frame = tk.Frame(dialog, bg=button_gray)
+                close_btn_frame.pack(pady=int(6 * scaling_factor))
+                tk.Button(
+                    close_btn_frame, text="Close", bg=button_gray, fg=text_color,
+                    bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), width=8,
+                    command=close_dialog,
+                ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+                dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+                return
+
+            # Transition: hide buttons, show progress
+            sel_frame.pack_forget()
+            progress_bar.pack(padx=int(24 * scaling_factor), fill=tk.X)
+            percent_label.pack(pady=(int(8 * scaling_factor), 0))
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            def on_flash_done(ok, message):
+                progress_bar.pack_forget()
+                percent_label.pack_forget()
+                is_boot_guidance = not ok and message.startswith("Could not enter flashing mode")
+                result_label.config(
+                    text=message,
+                    fg="lightgreen" if ok else "#FF3333",
+                    font=scale_font(("Arial", 12, "bold")) if is_boot_guidance else scale_font(("Arial", 10, "bold")),
+                )
+                result_label.pack(pady=int(8 * scaling_factor), padx=int(16 * scaling_factor))
+                close_btn_frame = tk.Frame(dialog, bg=button_gray)
+                close_btn_frame.pack(pady=int(6 * scaling_factor))
+                tk.Button(
+                    close_btn_frame, text="Close", bg=button_gray, fg=text_color,
+                    bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), width=8,
+                    command=close_dialog,
+                ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+                dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+            self._run_flash_in_dialog(action, status, dialog, info_label, progress_var, percent_label, on_flash_done)
+
+        for text, action in (("Install", "install"), ("Repair", "repair"), ("Delete", "delete")):
+            frame = tk.Frame(sel_frame, bg=button_gray)
+            frame.pack(side=tk.LEFT, padx=int(6 * scaling_factor))
+            tk.Button(
+                frame, text=text, bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
+                font=scale_font(("Arial", 10, "bold")), width=8,
+                command=lambda a=action: choose(a),
+            ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        cancel_frame = tk.Frame(sel_frame, bg=button_gray)
+        cancel_frame.pack(side=tk.LEFT, padx=int(6 * scaling_factor))
+        tk.Button(
+            cancel_frame, text="Cancel", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")), width=8, command=close_dialog,
+        ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+    def _show_boot_mode_prompt(self, label="ESP32-S3 CDC"):
+        dialog_w = int(480 * scaling_factor)
+        dialog_h = int(220 * scaling_factor)
+        dialog = tk.Toplevel(self.root)
+        dialog.title(label)
+        dialog.resizable(False, False)
+        dialog.config(bg="#1E1E1E")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.root.update_idletasks()
+        rx = self.root.winfo_x()
+        ry = self.root.winfo_y()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        dx = rx + (rw - dialog_w) // 2
+        dy = ry + (rh - dialog_h) // 2
+        dialog.geometry(f"{dialog_w}x{dialog_h}+{dx}+{dy}")
+
+        tk.Label(
+            dialog,
+            text=(
+                "ESP32-S3 is connected via OTG / native USB.\n\n"
+                "Firmware cannot be flashed automatically on this port.\n\n"
+                "To install firmware, please:\n"
+                "  1. Hold the BOOT button on the ESP32-S3 board\n"
+                "  2. Tap the RESET button once, then release BOOT\n"
+                "  3. Connect the CH343P / UART Type-C port and retry."
+            ),
+            fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 10, "bold")),
+            justify=tk.LEFT,
+            wraplength=int(440 * scaling_factor),
+        ).pack(pady=int(16 * scaling_factor), padx=int(16 * scaling_factor), anchor=tk.W)
+
+        close_frame = tk.Frame(dialog, bg=button_gray)
+        close_frame.pack(pady=int(6 * scaling_factor))
+        tk.Button(
+            close_frame, text="OK", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")), width=8,
+            command=lambda: (dialog.grab_release(), dialog.destroy()),
+        ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+    def _run_flash_in_dialog(self, action, status, dialog, info_label, progress_var, percent_label, on_done):
+        try:
+            from usb_serial_bridge import ESP32S3_LABEL, flash_firmware
+        except Exception:
+            ESP32S3_LABEL = "ESP32-S3 CDC"
+            flash_firmware = None
+
+        self._esp32s3_firmware_busy = True
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        try:
+            from usb_serial_bridge import close_all_clients
+            close_all_clients()
+        except Exception:
+            pass
+
+        if not status or not status.serial_port:
+            self._esp32s3_firmware_busy = False
+            if discoverer_was_running:
+                self.start_discoverer_thread()
+            on_done(False, "Could not find the ESP32-S3 N16R8 CH343/COM flashing port.\nConnect the flashing port and try again.")
+            return
+
+        verb_map = {"install": "Installing", "repair": "Repairing", "delete": "Deleting"}
+        if dialog.winfo_exists():
+            info_label.config(
+                text=f"{ESP32S3_LABEL}: {verb_map.get(action, 'Working')} firmware on {status.serial_port.port}..."
+            )
+
+        done = {"ok": False, "error": None}
+        progress_queue_obj = queue.Queue()
+
+        def progress(payload):
+            progress_queue_obj.put(("progress", payload))
+
+        def worker():
+            try:
+                flash_firmware(status.serial_port.port, mode=action, progress=progress)
+                done["ok"] = True
+            except Exception as e:
+                done["error"] = e
+                logger.exception("ESP32-S3 firmware task failed")
+            finally:
+                progress_queue_obj.put(("done", None))
+
+        def apply_progress(payload):
+            current = float(progress_var.get())
+            percent = None
+            if isinstance(payload, dict):
+                if "percent" in payload:
+                    percent = float(payload["percent"])
+                elif "write_percent" in payload:
+                    percent = 25.0 + (max(0.0, min(100.0, float(payload["write_percent"]))) * 0.70)
+            else:
+                text = str(payload)
+                m = re.search(r"\((\d{1,3})\s*%\)", text)
+                if m:
+                    percent = 25.0 + (max(0.0, min(100.0, float(m.group(1)))) * 0.70)
+            if percent is None:
+                percent = min(95.0, current + 1.0)
+            percent = max(current, min(100.0, percent))
+            progress_var.set(percent)
+            if dialog.winfo_exists():
+                percent_label.config(text=f"{int(percent)}%")
+
+        def finish():
+            def resume_discovery():
+                self._esp32s3_firmware_busy = False
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+
+            if done["ok"]:
+                try:
+                    from usb_serial_bridge import close_all_clients
+                    close_all_clients()
+                except Exception:
+                    pass
+                progress_var.set(100)
+                if dialog.winfo_exists():
+                    percent_label.config(text="100%")
+                if action == "delete":
+                    on_done(True, "ESP32-S3 N16R8 firmware uninstalled successfully.")
+                    self.refresh_esp32s3_status()
+                    resume_discovery()
+                else:
+                    on_done(
+                        True,
+                        "ESP32-S3 N16R8 firmware installed successfully.\n\n"
+                        "Please replug the ESP32-S3 USB cable (unplug then reinsert) "
+                        "to complete initialization and avoid port conflicts.",
+                    )
+                    self.root.after(1500, lambda: self.wait_for_current_esp32s3_then(resume_discovery))
+            else:
+                self._esp32s3_firmware_busy = False
+                error_str = str(done["error"])
+                if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
+                    on_done(False, (
+                        "Could not enter flashing mode.\n\n"
+                        "To enter Boot mode manually:\n"
+                        "  1. Hold the BOOT button\n"
+                        "  2. Tap RESET once, then release BOOT\n"
+                        "  3. Click Repair to retry"
+                    ))
+                else:
+                    on_done(False, f"ESP32-S3 N16R8 firmware operation failed:\n{done['error']}")
+                self.refresh_esp32s3_status()
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+
+        def poll():
+            should_finish = False
+            while True:
+                try:
+                    kind, payload = progress_queue_obj.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "progress":
+                    if dialog.winfo_exists():
+                        apply_progress(payload)
+                elif kind == "done":
+                    should_finish = True
+            if should_finish:
+                progress_var.set(100)
+                if dialog.winfo_exists():
+                    percent_label.config(text="100%")
+                finish()
+            elif dialog.winfo_exists():
+                dialog.after(50, poll)
+
+        threading.Thread(target=worker, daemon=True).start()
+        dialog.after(50, poll)
 
     def check_vigembus_installation(self, save=True):
         installed = is_vigembus_installed()
@@ -1177,12 +2097,12 @@ class ControllerWindow:
             self.check_vigembus_installation(save=save)
             return
 
-        # 如果yaml裡有已安裝的紀錄：開啟app時不再檢查是否有安裝，無條件開啟app
+        # 憒?yaml鋆⊥?撌脣?鋆?蝝????app???炎?交?行?摰?嚗璇辣??app
         if getattr(CONFIG, 'driver_installed', False):
             return
 
         if is_driver_installed():
-            # 如果檢查結果是已安裝，自動記錄到yaml裡
+            # 憒?瑼Ｘ蝯??臬歇摰?嚗???yaml鋆?
             CONFIG.driver_installed = True
             if save:
                 CONFIG.save_config()
@@ -1538,6 +2458,7 @@ class ControllerWindow:
         
         # First, unpack all frames from top_btn_frame to preserve order
         if hasattr(self, 'driver_frame'): self.driver_frame.pack_forget()
+        if hasattr(self, 'esp32s3_frame'): self.esp32s3_frame.pack_forget()
         if hasattr(self, 'usbip_frame'): self.usbip_frame.pack_forget()
         if hasattr(self, 'startup_frame'): self.startup_frame.pack_forget()
         if hasattr(self, 'min_frame'): self.min_frame.pack_forget()
@@ -1552,11 +2473,123 @@ class ControllerWindow:
         else:
             if hasattr(self, 'driver_frame'):
                 self.driver_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
-                
+
+        if getattr(self, 'esp32s3_detected', False) and hasattr(self, 'esp32s3_frame'):
+            esp_status = getattr(self, 'esp32s3_bridge_status', None)
+            update_needed = bool(esp_status and getattr(esp_status, 'firmware_update_required', False))
+            not_installed = bool(esp_status and not getattr(esp_status, 'firmware_installed', True))
+            otg_only = bool(esp_status and getattr(esp_status, 'otg_only', False))
+            # Orange "Install ESP32-S3 Driver" when OTG connected with wrong/missing firmware
+            if otg_only and (update_needed or not_installed):
+                btn_color = "#CC5500"
+                btn_text = "Install ESP32-S3 Driver"
+            elif update_needed:
+                btn_color = "#CC5500"
+                btn_text = "ESP32-S3: Update Available"
+            else:
+                btn_color = button_gray
+                btn_text = "ESP32-S3 N16R8 Driver"
+            if hasattr(self, 'esp32s3_frame'):
+                self.esp32s3_frame.config(bg=btn_color)
+            if hasattr(self, 'esp32s3_btn'):
+                self.esp32s3_btn.config(text=btn_text, bg=btn_color)
+            self.esp32s3_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+
         # Pack the rest of the buttons
         if hasattr(self, 'startup_frame'): self.startup_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         if hasattr(self, 'min_frame'): self.min_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         if hasattr(self, 'hide_frame'): self.hide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+
+        self.update_header_status()
+
+    def update_header_status(self):
+        if not hasattr(self, 'header_label'):
+            return
+        status = getattr(self, 'esp32s3_bridge_status', None)
+        esp32_detected = getattr(self, 'esp32s3_detected', False)
+
+        conn_method = "ESP32-S3" if esp32_detected else "System BLE"
+
+        if status and esp32_detected:
+            otg_only = getattr(status, 'otg_only', False)
+            fw_installed = getattr(status, 'firmware_installed', False)
+            was_ready = getattr(self, '_esp32_header_was_ready', False)
+            if getattr(status, 'bridge_ready', False):
+                try:
+                    import usb_serial_bridge as _usb_sb
+                    scan_active = _usb_sb.BRIDGE_SCAN_ACTIVE
+                except Exception:
+                    scan_active = True
+                if scan_active:
+                    conn_status = "Ready"
+                    status_color = "#55CC55"
+                else:
+                    conn_status = "Initializing"
+                    status_color = "#888888"
+            elif otg_only and not fw_installed:
+                if was_ready:
+                    # Firmware was running but just stopped responding → brief disconnect transition
+                    conn_status = "Disconnect"
+                    status_color = "#888888"
+                else:
+                    # OTG in ROM bootloader (no version reported) — ready for manual flash
+                    conn_status = "Boot"
+                    status_color = "#FF8800"
+            elif getattr(status, 'firmware_update_required', False):
+                conn_status = "Error"
+                status_color = "#FF4444"
+            elif getattr(status, 'board_present', False):
+                conn_status = "Initializing"
+                status_color = "#888888"
+            else:
+                conn_status = "Initializing"
+                status_color = "#888888"
+        else:
+            try:
+                from discoverer import is_system_bluetooth_available
+                bt_ok = is_system_bluetooth_available()
+            except Exception:
+                bt_ok = True
+            if bt_ok:
+                conn_status = "Ready"
+                status_color = "#55CC55"
+            else:
+                conn_status = "Disconnect"
+                status_color = "#888888"
+
+        self.header_label.config(
+            text=f"Connecting Via: {conn_method}  |  Status: {conn_status}",
+            fg=status_color,
+        )
+        # Track whether we were in bridge_ready for next poll's disconnect detection
+        self._esp32_header_was_ready = (conn_status == "Ready" and esp32_detected)
+        self._esp32_last_rendered_status = conn_status
+
+        # When transitioning to Disconnect, start fast-polling so Boot mode is detected
+        # within ~500ms instead of waiting up to 5s for the regular timer.
+        if conn_status == "Disconnect" and not getattr(self, '_esp32_fast_poll_active', False):
+            self._esp32_fast_poll_active = True
+            self._esp32_fast_poll_count = 0
+            self.root.after(500, self._esp32_fast_poll)
+
+    def _esp32_fast_poll(self):
+        """Poll at 500ms intervals after a Disconnect event until status stabilises."""
+        if getattr(self, 'is_quitting', False):
+            self._esp32_fast_poll_active = False
+            return
+
+        self.refresh_esp32s3_status_async()
+
+        count = getattr(self, '_esp32_fast_poll_count', 0) + 1
+        self._esp32_fast_poll_count = count
+
+        # Stop if the last rendered status is no longer "Disconnect", or after 30 polls (15s).
+        last_status = getattr(self, '_esp32_last_rendered_status', 'Disconnect')
+        if last_status != 'Disconnect' or count >= 30:
+            self._esp32_fast_poll_active = False
+            self._esp32_fast_poll_count = 0
+        else:
+            self.root.after(500, self._esp32_fast_poll)
 
     def update_driver_button(self):
         if not hasattr(self, 'driver_btn') or not self.driver_btn:
@@ -1801,18 +2834,14 @@ class ControllerWindow:
         except: pass
         self.root = tk.Tk()
         self.root.tk.call('tk', 'scaling', 1.3333333333333333)
-        self.root.withdraw() # Hide immediately to prevent blank window during check_driver_installation()
+        self.root.withdraw() # Hide while building the UI, then show from start().
         
-        # 2. Re-apply global scaling factors to ensure they are up to date with config
-        global scaling_factor, controller_frame_size, battery_height
-        # resolution_ratio is calculated at the top of the file
-        scaling_factor = 1.2 * resolution_ratio
-        controller_frame_size = int(200 * scaling_factor)
-        battery_height = int(40 * scaling_factor)
+        # 2. Re-apply global scaling factors using the actual Tk screen height.
+        try:
+            refresh_ui_scaling(self.root.winfo_screenheight())
+        except Exception:
+            refresh_ui_scaling()
 
-
-        self.check_driver_installation()
-        
         self.calibration_overlay = CalibrationOverlay(self.root)
         import utils
         utils.show_notification_callback = self.calibration_overlay.update
@@ -1825,15 +2854,15 @@ class ControllerWindow:
             photo = tk.PhotoImage(file=get_resource('images/icon.png'))
             self.root.wm_iconphoto(False, photo)
         except: pass
-        self.root.title("Switch2 Controllers")
+        self.root.title(f"Switch2 Controllers v{APP_VERSION}")
         
-        # 3. Handle window geometry & minsize (remembering size)
-        default_w = int(1460 * resolution_ratio)
-        default_h = int(1320 * resolution_ratio)
-        w = default_w
-        h = default_h
-        self.root.geometry(f"{w}x{h}+50+50")
-        self.root.minsize(int(1240 * resolution_ratio), int(920 * resolution_ratio))
+        # 3. Handle window geometry & minsize (remembering position)
+        default_w = int(1260 * window_resolution_ratio)
+        default_h = int(1290 * window_resolution_ratio)
+        x = CONFIG.window_x if CONFIG.window_x is not None else 50
+        y = CONFIG.window_y if CONFIG.window_y is not None else 50
+        self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
+        self.root.minsize(default_w, default_h)
         self.root.config(bg=background_color, padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.root.bind("<Configure>", self.on_configure)
         
@@ -1848,12 +2877,11 @@ class ControllerWindow:
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(ctypes.c_int(0xFFFFFF)), 4)  # Title text color (White)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)         # Immersive dark mode
             
-            # Get expected outer dimensions corresponding to 1330x990 client size
+            # Get expected outer dimensions corresponding to client size
             rect = win32gui.GetWindowRect(hwnd)
             self.expected_outer_w = rect[2] - rect[0]
             self.expected_outer_h = rect[3] - rect[1]
 
-            # Structures for window sizing message interception
             class POINT(ctypes.Structure):
                 _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
@@ -1907,7 +2935,7 @@ class ControllerWindow:
             
             # Force the geometry, minsize, and scaling factor back to defaults to overwrite any initial scaling applied during update()
             self.root.tk.call('tk', 'scaling', 1.3333333333333333)
-            self.root.geometry(f"{default_w}x{default_h}+50+50")
+            self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
             self.root.minsize(default_w, default_h)
             self.root.update()
         except Exception as e:
@@ -1926,7 +2954,7 @@ class ControllerWindow:
                         bordercolor=button_gray,
                         darkcolor=button_gray,
                         lightcolor=button_gray,
-                        font=scale_font(("Arial", 12, "bold")))
+                        font=scale_font(("Arial", 11, "bold")))
         style.map("TCombobox", 
                   fieldbackground=[('readonly', button_gray)],
                   background=[('readonly', button_gray), ('active', button_gray), ('pressed', button_gray)],
@@ -1939,7 +2967,7 @@ class ControllerWindow:
         self.root.option_add("*TCombobox*Listbox.foreground", "white")
         self.root.option_add("*TCombobox*Listbox.selectBackground", highlight_color)
         self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
-        self.root.option_add("*TCombobox*Listbox.font", scale_font(("Arial", 12, "bold")))
+        self.root.option_add("*TCombobox*Listbox.font", scale_font(("Arial", 11, "bold")))
         self.root.option_add("*TCombobox*Listbox.borderwidth", 0)
         self.root.option_add("*TCombobox*Listbox.highlightthickness", 0)
         self.root.option_add("*TCombobox*Listbox.relief", "flat")
@@ -1967,6 +2995,20 @@ class ControllerWindow:
             logger.error(f"Failed to load/scale pairing hint image: {e}")
             self.pairing_hint_image = tk.PhotoImage(file=get_resource("images/pairing_hint.png"))
 
+        # Header bar — connection method + status (packed at TOP before content panels)
+        self.header_frame = tk.Frame(self.root, bg=background_color, height=int(24 * scaling_factor))
+        self.header_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(2 * scaling_factor)))
+        self.header_frame.pack_propagate(False)
+        self.header_label = tk.Label(
+            self.header_frame,
+            text="Connecting Via: System BLE  |  Status: Ready",
+            fg="#888888",
+            bg=background_color,
+            font=scale_font(("Arial", 9, "bold")),
+            anchor=tk.E,
+        )
+        self.header_label.pack(side=tk.RIGHT, padx=int(12 * scaling_factor), fill=tk.Y)
+
         self.init_settings_panel()
         self.init_compensation_panel()
         self.init_djg_panel()
@@ -1986,6 +3028,20 @@ class ControllerWindow:
         self.usbip_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
         self.usbip_btn = tk.Button(self.usbip_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.on_usbip_btn_clicked)
         self.usbip_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        # ESP32-S3 N16R8 Firmware Button
+        self.esp32s3_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
+        self.esp32s3_btn = tk.Button(
+            self.esp32s3_frame,
+            text="ESP32-S3 N16R8 Driver",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")),
+            command=self.on_esp32s3_btn_clicked
+        )
+        self.esp32s3_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         # Startup Button
         self.startup_frame = tk.Frame(self.top_btn_frame, bg=highlight_color if CONFIG.open_when_startup else button_gray)
@@ -2011,6 +3067,7 @@ class ControllerWindow:
 
         self.update_driver_button()
         self.update_usbip_button()
+        self.update_driver_buttons_visibility()
 
         self.update([None])
 
@@ -2400,24 +3457,28 @@ class ControllerWindow:
                 if self.root.state() == 'normal':
                     w = self.root.winfo_width()
                     h = self.root.winfo_height()
+                    rx = self.root.winfo_x()
+                    ry = self.root.winfo_y()
                     if w > 100 and h > 100:
                         self.last_width = w
                         self.last_height = h
+                        self.last_x = rx
+                        self.last_y = ry
             except Exception:
                 pass
 
     def init_compensation_panel(self):
-        self.comp_frame = tk.LabelFrame(self.root, text=" Gyro Passthrough For 3rd Party Apps ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.comp_frame = tk.LabelFrame(self.root, text=" Gyro Passthrough For 3rd Party Apps ", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.comp_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
-        tk.Label(self.comp_frame, text="9-axis Assist:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
+        tk.Label(self.comp_frame, text="9-axis Assist:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
         self.stabilized_gyro_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "stabilized_gyro", False), command=self.update_stabilized_gyro_setting, bg_color=background_color)
         self.stabilized_gyro_switch.grid(row=0, column=1, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
-        tk.Label(self.comp_frame, text="Horizon Lock:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.comp_frame, text="Horizon Lock:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.steam_roll_comp_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "steam_roll_compensation", False), command=self.update_steam_roll_comp_setting, bg_color=background_color)
         self.steam_roll_comp_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
 
-        tk.Label(self.comp_frame, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.comp_frame, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.deadzone_scale = tk.Scale(
             self.comp_frame,
             from_=0.0,
@@ -2434,19 +3495,19 @@ class ControllerWindow:
             sliderrelief=tk.FLAT,
             sliderlength=int(15 * scaling_factor),
             width=int(15 * scaling_factor),
-            font=scale_font(("Arial", 12, "bold")),
+            font=scale_font(("Arial", 11, "bold")),
             command=self.update_virtual_gyro_soft_deadzone_setting
         )
         self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 2.0))
         self.deadzone_scale.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
 
-        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="e")
+        tk.Label(self.comp_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="e")
         self.passthrough_mode_switch = ToggleSwitch(self.comp_frame, labels=["Default", "Cemuhook"], values=["Default", "Cemuhook"], 
 initial_value=getattr(CONFIG, "gyro_passthrough_mode", "Default"), command=self.update_passthrough_mode, 
 bg_color=background_color, widths=[8, 10])
         self.passthrough_mode_switch.grid(row=1, column=1, columnspan=2, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="w")
 
-        self.sens_label = tk.Label(self.comp_frame, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")))
+        self.sens_label = tk.Label(self.comp_frame, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
         self.cemuhook_sens_scale = tk.Scale(
             self.comp_frame,
             from_=1,
@@ -2463,7 +3524,7 @@ bg_color=background_color, widths=[8, 10])
             sliderrelief=tk.FLAT,
             sliderlength=int(15 * scaling_factor),
             width=int(15 * scaling_factor),
-            font=scale_font(("Arial", 12, "bold")),
+            font=scale_font(("Arial", 11, "bold")),
             command=self.update_cemuhook_sensitivity
         )
         self.cemuhook_sens_scale.set(getattr(CONFIG, "cemuhook_sensitivity", 1))
@@ -2498,18 +3559,18 @@ bg_color=background_color, widths=[8, 10])
         logger.info(f"Cemuhook Sensitivity updated to {val}")
 
     def init_djg_panel(self):
-        self.djg_frame = tk.LabelFrame(self.root, text=" Dual Joy-con Gyro (DJG) ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.djg_frame = tk.LabelFrame(self.root, text=" Dual Joy-con Gyro (DJG) ", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.djg_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
-        tk.Label(self.djg_frame, text="DJG:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
+        tk.Label(self.djg_frame, text="DJG:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
         self.djg_enabled_switch = ToggleSwitch(self.djg_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "djg_enabled", False), command=self.update_djg_enabled_setting, bg_color=background_color)
         self.djg_enabled_switch.grid(row=0, column=1, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
         
-        tk.Label(self.djg_frame, text="Dominant Side:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.djg_frame, text="Dominant Side:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.djg_dominant_switch = ToggleSwitch(self.djg_frame, labels=["Left", "Right"], values=["Left", "Right"], initial_value=getattr(CONFIG, "djg_dominant_side", "Left"), command=self.update_djg_dominant_setting, bg_color=background_color)
         self.djg_dominant_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
         
-        tk.Label(self.djg_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.djg_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         
         self.djg_mode_var = tk.StringVar(value=getattr(CONFIG, "djg_mode", "Single Side Toggle"))
         djg_modes = ["Single Side Toggle", "Switch Dominant Side", "Switch Gyro Side"]
@@ -2517,13 +3578,30 @@ bg_color=background_color, widths=[8, 10])
         # Calculate max width for dropdown
         max_mode_len = max(len(m) for m in djg_modes)
         
-        self.djg_mode_combo = ttk.Combobox(self.djg_frame, textvariable=self.djg_mode_var, values=djg_modes, state="readonly", font=scale_font(("Arial", 12, "bold")), width=max_mode_len, justify="center")
+        self.djg_mode_combo = ttk.Combobox(self.djg_frame, textvariable=self.djg_mode_var, values=djg_modes, state="readonly", font=scale_font(("Arial", 11, "bold")), width=max_mode_len, justify="center")
         self.djg_mode_combo.grid(row=0, column=7, padx=int(5 * scaling_factor), sticky="w")
         self.djg_mode_combo.bind("<<ComboboxSelected>>", lambda e: self.update_djg_mode_setting(self.djg_mode_var.get()))
 
-        tk.Label(self.djg_frame, text="Activation:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=8, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.djg_frame, text="Activation:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=8, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.djg_activation_switch = ToggleSwitch(self.djg_frame, labels=["Hold", "Toggle"], values=["Hold", "Toggle"], initial_value=getattr(CONFIG, "djg_activation", "Toggle"), command=self.update_djg_activation_setting, bg_color=background_color)
         self.djg_activation_switch.grid(row=0, column=9, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
+
+        self._update_djg_panel_visibility()
+
+    def _update_djg_panel_visibility(self):
+        if not hasattr(self, 'djg_frame'):
+            return
+        if getattr(CONFIG, 'simulation_mode', '') == "Switch1":
+            self.djg_frame.pack_forget()
+        else:
+            if not self.djg_frame.winfo_ismapped():
+                # Re-insert between comp_frame and gyro_frame to restore original position
+                self.djg_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor),
+                                    after=self.comp_frame)
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
     def update_djg_activation_setting(self, val):
         CONFIG.djg_activation = val
@@ -2570,13 +3648,13 @@ bg_color=background_color, widths=[8, 10])
 
 
     def init_gyro_settings_panel(self):
-        self.gyro_frame = tk.LabelFrame(self.root, text=" Built-in Gyro Mouse ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.gyro_frame = tk.LabelFrame(self.root, text=" Built-in Gyro Mouse ", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.gyro_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(self.gyro_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
+        tk.Label(self.gyro_frame, text="Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
         self.gyro_mode_switch = ToggleSwitch(self.gyro_frame, labels=["9-Axis", "6-Axis", "Steering"], values=["World", "Yaw", "Roll"], initial_value=CONFIG.gyro_mode, command=self.update_mode_setting, bg_color=background_color)
         self.gyro_mode_switch.grid(row=0, column=1, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
-        tk.Label(self.gyro_frame, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
-        self.sens_scale = tk.Scale(self.gyro_frame, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.on_gyro_setting_changed)
+        tk.Label(self.gyro_frame, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        self.sens_scale = tk.Scale(self.gyro_frame, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
         self.sens_scale.set(CONFIG.gyro_sensitivity)
         self.sens_scale.grid(row=0, column=4)
 
@@ -2585,10 +3663,10 @@ bg_color=background_color, widths=[8, 10])
 
         self.calib_frame = tk.Frame(self.gyro_calib_group_frame, bg=button_gray)
         self.calib_frame.pack(side=tk.LEFT)
-        self.calibrate_btn = tk.Button(self.calib_frame, text="Calibrate Gyro", command=self.on_calibrate_clicked, bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")))
+        self.calibrate_btn = tk.Button(self.calib_frame, text="Calibrate Gyro", command=self.on_calibrate_clicked, bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")))
         self.calibrate_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
-        self.calib_hint_label = tk.Label(self.gyro_calib_group_frame, text="Keep controller stationary\nbefore calibrating.", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), justify=tk.LEFT)
+        self.calib_hint_label = tk.Label(self.gyro_calib_group_frame, text="Keep controller stationary\nbefore calibrating.", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), justify=tk.LEFT)
         self.calib_hint_label.pack(side=tk.LEFT, padx=int(10 * scaling_factor))
 
         mag_hint_frame = tk.Frame(self.gyro_frame, bg=background_color)
@@ -2596,35 +3674,35 @@ bg_color=background_color, widths=[8, 10])
         
         l1 = tk.Frame(mag_hint_frame, bg=background_color)
         l1.pack(side=tk.TOP, anchor="w")
-        tk.Label(l1, text="Calibrate Mag (Mag Cal): Move controller in a", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT)
+        tk.Label(l1, text="Calibrate Mag (Mag Cal): Move controller in a", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT)
 
         l2 = tk.Frame(mag_hint_frame, bg=background_color)
         l2.pack(side=tk.TOP, anchor="w")
         
-        lnk = tk.Label(l2, text="'figure 8'", bg=background_color, fg=highlight_color, font=scale_font(("Arial", 12, "bold", "underline")), cursor="hand2")
+        lnk = tk.Label(l2, text="'figure 8'", bg=background_color, fg=highlight_color, font=scale_font(("Arial", 11, "bold", "underline")), cursor="hand2")
         lnk.pack(side=tk.LEFT)
         lnk.bind("<Button-1>", lambda e: (logger.info(f"Opening YouTube link via webbrowser..."), webbrowser.open("https://youtu.be/J_cZnPcW-Yw?si=ID2vdzURiOph8x77&t=6")))
         
-        tk.Label(l2, text=" pattern during calibration.", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT)
+        tk.Label(l2, text=" pattern during calibration.", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT)
 
-        tk.Label(self.gyro_frame, text="Activation:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
+        tk.Label(self.gyro_frame, text="Activation:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
         self.gyro_act_switch = ToggleSwitch(self.gyro_frame, labels=["Toggle", "Hold"], values=["Toggle", "Hold"], initial_value=CONFIG.gyro_activation_mode, command=self.update_act_setting, bg_color=background_color)
         self.gyro_act_switch.grid(row=1, column=1, columnspan=2, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
-        tk.Label(self.gyro_frame, text="Stick Assist:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=1, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.stick_scale = tk.Scale(self.gyro_frame, from_=0, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.on_gyro_setting_changed)
+        tk.Label(self.gyro_frame, text="Stick Assist:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
+        self.stick_scale = tk.Scale(self.gyro_frame, from_=0, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
         self.stick_scale.set(getattr(CONFIG, "stick_mouse_sensitivity", 5.0))
         self.stick_scale.grid(row=1, column=4, columnspan=1, pady=(int(10 * scaling_factor), 0), sticky="w")
 
 
     def init_auto_disconnect_panel(self):
-        self.auto_disconnect_frame = tk.LabelFrame(self.root, text=" Auto Disconnect ", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        self.auto_disconnect_frame = tk.LabelFrame(self.root, text=" Auto Disconnect ", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.auto_disconnect_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
-        tk.Label(self.auto_disconnect_frame, text="Auto Disconnect:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
+        tk.Label(self.auto_disconnect_frame, text="Auto Disconnect:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
         self.auto_disconnect_switch = ToggleSwitch(self.auto_disconnect_frame, labels=["OFF", "Inactive", "Absolute"], values=["OFF", "Inactive", "Absolute"], initial_value=getattr(CONFIG, "auto_disconnect_mode", "OFF"), command=self.update_auto_disconnect_mode, bg_color=background_color)
         self.auto_disconnect_switch.grid(row=0, column=1, padx=int(5 * scaling_factor), sticky="w")
         
-        tk.Label(self.auto_disconnect_frame, text="Disconnect after:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        tk.Label(self.auto_disconnect_frame, text="Disconnect after:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         
         # Validation to only allow digits in time entries
         def validate_numeric(char):
@@ -2632,25 +3710,25 @@ bg_color=background_color, widths=[8, 10])
         vcmd = (self.root.register(validate_numeric), '%S')
         
         # Day Entry
-        self.day_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
+        self.day_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
         self.day_entry.insert(0, str(getattr(CONFIG, "auto_disconnect_days", 0)))
         self.day_entry.grid(row=0, column=3, padx=int(2 * scaling_factor))
         self.day_entry.is_time_entry = True
-        tk.Label(self.auto_disconnect_frame, text="Day", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=4, padx=(0, int(10 * scaling_factor)), sticky="w")
+        tk.Label(self.auto_disconnect_frame, text="Day", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=4, padx=(0, int(10 * scaling_factor)), sticky="w")
         
         # Hour Entry
-        self.hour_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
+        self.hour_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
         self.hour_entry.insert(0, str(getattr(CONFIG, "auto_disconnect_hours", 0)))
         self.hour_entry.grid(row=0, column=5, padx=int(2 * scaling_factor))
         self.hour_entry.is_time_entry = True
-        tk.Label(self.auto_disconnect_frame, text="Hour", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=6, padx=(0, int(10 * scaling_factor)), sticky="w")
+        tk.Label(self.auto_disconnect_frame, text="Hour", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=6, padx=(0, int(10 * scaling_factor)), sticky="w")
         
         # Minute Entry
-        self.minute_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 12, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
+        self.minute_entry = tk.Entry(self.auto_disconnect_frame, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
         self.minute_entry.insert(0, str(getattr(CONFIG, "auto_disconnect_minutes", 0)))
         self.minute_entry.grid(row=0, column=7, padx=int(2 * scaling_factor))
         self.minute_entry.is_time_entry = True
-        tk.Label(self.auto_disconnect_frame, text="Minute", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).grid(row=0, column=8, padx=(0, int(10 * scaling_factor)), sticky="w")
+        tk.Label(self.auto_disconnect_frame, text="Minute", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=8, padx=(0, int(10 * scaling_factor)), sticky="w")
         
         # Bind events
         self.day_entry.bind("<KeyRelease>", self.on_auto_disconnect_time_changed)
@@ -2950,11 +4028,11 @@ bg_color=background_color, widths=[8, 10])
         poll_controller()
 
     def create_mapping_widget(self, parent, key, label_text):
-        tk.Label(parent, text=label_text, bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(parent, text=label_text, bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
         container = tk.Frame(parent, bg=background_color)
         container.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
         
-        combo = ttk.Combobox(container, values=BACK_BUTTON_OPTIONS, font=scale_font(("Arial", 12, "bold")), state="readonly", width=11, justify="center")
+        combo = ttk.Combobox(container, values=BACK_BUTTON_OPTIONS, font=scale_font(("Arial", 11, "bold")), state="readonly", width=11, justify="center")
         
         custom_frame = tk.Frame(container, bg=background_color)
         
@@ -2975,7 +4053,7 @@ bg_color=background_color, widths=[8, 10])
         mode_btn = tk.Button(custom_frame, text="Hold", bg=button_gray, fg="white", font=scale_font(("Arial", 9, "bold")), bd=0, relief=tk.FLAT, command=toggle_mode, width=4)
         mode_btn.pack(side=tk.LEFT, padx=(0, int(2 * scaling_factor)), fill=tk.Y)
         
-        entry = tk.Entry(custom_frame, font=scale_font(("Arial", 12, "bold")), width=11, justify="center", bg=button_gray, fg="white", readonlybackground=button_gray, insertbackground="white", bd=0, highlightthickness=0)
+        entry = tk.Entry(custom_frame, font=scale_font(("Arial", 11, "bold")), width=11, justify="center", bg=button_gray, fg="white", readonlybackground=button_gray, insertbackground="white", bd=0, highlightthickness=0)
         entry.pack(side=tk.LEFT, fill=tk.Y)
         entry.is_custom_recording_entry = True
         entry.restart_custom_recording_fn = lambda: self.start_custom_recording(key, entry, combo, custom_frame, mode_var)
@@ -3043,12 +4121,12 @@ bg_color=background_color, widths=[8, 10])
         row_global = tk.Frame(self.settings_frame, bg=background_color); row_global.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
         
         # Driver Switch
-        tk.Label(row_global, text="Driver:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_global, text="Driver:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
         self.driver_switch = ToggleSwitch(row_global, ["WinUHid", "ViGEmBus", "USBIP"], ["WinUHid", "ViGEmBus", "USBIP"], getattr(CONFIG, "driver_type", "WinUHid"), self.update_driver_type_setting, background_color)
         self.driver_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Emu Mode
-        tk.Label(row_global, text="Emu Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_global, text="Emu Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         
         initial_driver = getattr(CONFIG, "driver_type", "WinUHid")
         if initial_driver == "ViGEmBus":
@@ -3062,85 +4140,90 @@ bg_color=background_color, widths=[8, 10])
         self.sim_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Layout
-        tk.Label(row_global, text="Layout:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_global, text="Layout:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         self.layout_switch = ToggleSwitch(row_global, ["Xbox", "Switch"], ["Xbox", "Switch"], CONFIG.abxy_mode, self.update_layout_setting, background_color)
         self.layout_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         row_vibration = tk.Frame(self.settings_frame, bg=background_color); row_vibration.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_vibration, text="Rumble Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_vibration, text="Rumble Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
         self.rumble_mode_switch = ToggleSwitch(row_vibration, ["Xbox", "Switch"], ["Xbox", "Switch"], getattr(CONFIG, "rumble_mode", "Xbox"), self.update_rumble_mode_setting, background_color)
         self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.update_dynamic_rumble_mode_options()
 
-        tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
-        self.vibration_strength_scale = tk.Scale(row_vibration, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_strength)
+        tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        self.vibration_strength_scale = tk.Scale(row_vibration, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_vibration_strength)
         self.vibration_strength_scale.set(getattr(CONFIG, "vibration_strength", 5))
         self.vibration_strength_scale.pack(side=tk.LEFT)
 
-        self.vibration_frequency_label = tk.Label(row_vibration, text="Frequency:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold")))
-        self.vibration_frequency_scale = tk.Scale(row_vibration, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_vibration_frequency)
+        self.vibration_frequency_label = tk.Label(row_vibration, text="Frequency:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.vibration_frequency_scale = tk.Scale(row_vibration, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_vibration_frequency)
         self.vibration_frequency_scale.set(getattr(CONFIG, "vibration_frequency", 10))
         self.update_rumble_mode_ui(getattr(CONFIG, "rumble_mode", "Xbox"))
 
         row_mouse = tk.Frame(self.settings_frame, bg=background_color); row_mouse.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_mouse, text="Joy-con Mouse:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_mouse, text="Joy-con Mouse:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
         self.mouse_switch = ToggleSwitch(row_mouse, ["ON", "OFF"], [True, False], CONFIG.mouse_config.enabled, self.update_mouse_setting, background_color)
         self.mouse_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
-        tk.Label(row_mouse, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.mouse_sens_scale = tk.Scale(row_mouse, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_mouse_sensitivity)
+        tk.Label(row_mouse, text="Sensitivity:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        self.mouse_sens_scale = tk.Scale(row_mouse, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_mouse_sensitivity)
         self.mouse_sens_scale.set(CONFIG.mouse_config.sensitivity); self.mouse_sens_scale.pack(side=tk.LEFT)
-        tk.Label(row_mouse, text="Activate Threshold:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.ir_activate_scale = tk.Scale(row_mouse, from_=1, to=3, resolution=1, orient=tk.HORIZONTAL, length=int(80 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 12, "bold")), command=self.update_ir_activate_threshold)
+        tk.Label(row_mouse, text="Activate Threshold:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
+        self.ir_activate_scale = tk.Scale(row_mouse, from_=1, to=3, resolution=1, orient=tk.HORIZONTAL, length=int(80 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_ir_activate_threshold)
         self.ir_activate_scale.set(CONFIG.mouse_config.ir_activate_threshold); self.ir_activate_scale.pack(side=tk.LEFT)
 
         row_profile = tk.Frame(self.settings_frame, bg=background_color)
         row_profile.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_profile, text="Profile:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        tk.Label(row_profile, text="Profile:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         
-        self.profile_combo = ttk.Combobox(row_profile, values=self.get_sorted_profiles(), state="readonly", font=scale_font(("Arial", 12, "bold")), width=15)
+        self.profile_combo = ttk.Combobox(row_profile, values=self.get_sorted_profiles(), state="readonly", font=scale_font(("Arial", 11, "bold")), width=15)
         self.profile_combo.set(CONFIG.active_profile)
         self.profile_combo.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
         
-        self.add_profile_btn = tk.Button(row_profile, text="Add", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_add_profile)
+        self.add_profile_btn = tk.Button(row_profile, text="Add", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_add_profile)
         self.add_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
-        self.rename_profile_btn = tk.Button(row_profile, text="Rename", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_rename_profile)
+        self.rename_profile_btn = tk.Button(row_profile, text="Rename", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_rename_profile)
         self.rename_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
         
-        self.reset_profile_btn = tk.Button(row_profile, text="Reset", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_reset_profile)
+        self.reset_profile_btn = tk.Button(row_profile, text="Reset", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_reset_profile)
         self.reset_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
-        self.del_profile_btn = tk.Button(row_profile, text="Delete", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_delete_profile)
+        self.del_profile_btn = tk.Button(row_profile, text="Delete", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_delete_profile)
         self.del_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
+        tk.Label(row_profile, text="Assign Current Profile To:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(5 * scaling_factor)))
+        self.assigned_apps_frame = tk.Frame(row_profile, bg=background_color)
+        self.assigned_apps_frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        self.refresh_assigned_apps_ui()
+
         row_shared = tk.Frame(self.settings_frame, bg=background_color); row_shared.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_shared, text="Shared Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        tk.Label(row_shared, text="Shared Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("home", "Home:"), ("capt", "Capture:"), ("c", "Chat:")]:
             self.create_mapping_widget(row_shared, key, label)
 
         row_pro = tk.Frame(self.settings_frame, bg=background_color); row_pro.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_pro, text="Pro Controller Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        tk.Label(row_pro, text="Pro Controller Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("gl", "GL:"), ("gr", "GR:")]:
             self.create_mapping_widget(row_pro, key, label)
 
         row_jc = tk.Frame(self.settings_frame, bg=background_color); row_jc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_jc, text="Joy-con Rail Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        tk.Label(row_jc, text="Joy-con Rail Buttons:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         for key, label in [("sll", "Left SL:"), ("srl", "Left SR:"), ("slr", "Right SL:"), ("srr", "Right SR:")]:
             self.create_mapping_widget(row_jc, key, label)
 
         row_gc = tk.Frame(self.settings_frame, bg=background_color); row_gc.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
-        tk.Label(row_gc, text="GameCube Controller:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
+        tk.Label(row_gc, text="GameCube Controller:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(5 * scaling_factor)))
         
-        self.gc_trigger_calib_btn = tk.Button(row_gc, text="Trigger Calibration", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_gc_trigger_calib_clicked)
+        self.gc_trigger_calib_btn = tk.Button(row_gc, text="Trigger Calibration", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_gc_trigger_calib_clicked)
         self.gc_trigger_calib_btn.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(10 * scaling_factor)))
 
-        tk.Label(row_gc, text="Analog Trigger 100%:", bg=background_color, fg=text_color, font=scale_font(("Arial", 12, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
+        tk.Label(row_gc, text="Analog Trigger 100%:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
         
         self.gc_trigger_labels = ["Hair Trigger", "Before Click", "Fully Clicked"]
         self.gc_trigger_values = ["Hair Trigger", "100% at Bump", "100% at Max"]
         
-        self.gc_trigger_combo = ttk.Combobox(row_gc, values=self.gc_trigger_labels, font=scale_font(("Arial", 12, "bold")), state="readonly", width=12, justify="center")
+        self.gc_trigger_combo = ttk.Combobox(row_gc, values=self.gc_trigger_labels, font=scale_font(("Arial", 11, "bold")), state="readonly", width=12, justify="center")
         
         current_val = getattr(CONFIG, "gc_trigger_mode", "100% at Bump")
         try:
@@ -3149,16 +4232,28 @@ bg_color=background_color, widths=[8, 10])
         except ValueError:
             self.gc_trigger_combo.set(self.gc_trigger_labels[1])
             
+        self.gc_click_map_frame = tk.Frame(row_gc, bg=background_color)
+        self.create_mapping_widget(self.gc_click_map_frame, "gc_l_click", "L Click:")
+        self.create_mapping_widget(self.gc_click_map_frame, "gc_r_click", "R Click:")
+
         def on_gc_trigger_combo_selected(event):
             selected_label = self.gc_trigger_combo.get()
             try:
                 idx = self.gc_trigger_labels.index(selected_label)
-                self.update_gc_trigger_mode_setting(self.gc_trigger_values[idx])
+                val = self.gc_trigger_values[idx]
+                self.update_gc_trigger_mode_setting(val)
+                if val == "100% at Max":
+                    self.gc_click_map_frame.pack_forget()
+                else:
+                    self.gc_click_map_frame.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), 0))
             except ValueError:
                 pass
                 
         self.gc_trigger_combo.bind("<<ComboboxSelected>>", on_gc_trigger_combo_selected)
         self.gc_trigger_combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        
+        if current_val != "100% at Max":
+            self.gc_click_map_frame.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), 0))
 
     def on_gc_trigger_calib_clicked(self):
         gc_controller = None
@@ -3178,7 +4273,7 @@ bg_color=background_color, widths=[8, 10])
         GCTriggerCalibrationWizard(self.root, gc_controller)
 
     def update_driver_type_setting(self, val):
-        # 1. 讀取 (Removed load_config to prevent async save race condition)
+        # 1. 霈??(Removed load_config to prevent async save race condition)
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
         old_sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
@@ -3331,13 +4426,14 @@ bg_color=background_color, widths=[8, 10])
                 except Exception as re_err:
                     logger.error(f"Failed to restore controllers to old driver: {re_err}")
         else:
-            # 存檔
+            # 摮?
             CONFIG.save_config()
             
         self._refresh_mapping_comboboxes()
         self.force_refresh_player_slots()
  
     def force_refresh_player_slots(self):
+        self._update_djg_panel_visibility()
         if hasattr(self, 'djg_dominant_switch'):
             self.djg_dominant_switch.set_value(getattr(CONFIG, "djg_dominant_side", "Left"))
         if hasattr(self, 'current_controllers'):
@@ -3413,7 +4509,7 @@ bg_color=background_color, widths=[8, 10])
         # No need to restart discovery, controllers can read the setting dynamically or on reconnect
 
     def update_sim_mode_setting(self, val):
-        # 1. 讀取 (Removed load_config to prevent async save race condition)
+        # 1. 霈??(Removed load_config to prevent async save race condition)
         
         old_mode = getattr(CONFIG, "simulation_mode", "PS5")
         
@@ -3458,7 +4554,7 @@ bg_color=background_color, widths=[8, 10])
             # Revert the UI switch
             self.sim_mode_switch.set_value(old_mode)
         else:
-            # 存檔
+            # 摮?
             CONFIG.save_config()
             self.update_dynamic_rumble_mode_options()
             
@@ -3563,9 +4659,9 @@ bg_color=background_color, widths=[8, 10])
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (h // 2)
         dialog.geometry(f"{w}x{h}+{x}+{y}")
         
-        tk.Label(dialog, text=prompt, font=scale_font(("Arial", 12, "bold")), bg=background_color, fg=text_color).pack(pady=(int(15*scaling_factor), int(5*scaling_factor)))
+        tk.Label(dialog, text=prompt, font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color).pack(pady=(int(15*scaling_factor), int(5*scaling_factor)))
         
-        entry = tk.Entry(dialog, font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", insertbackground="white", justify="center")
+        entry = tk.Entry(dialog, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", insertbackground="white", justify="center")
         entry.pack(padx=int(20*scaling_factor), fill=tk.X)
         if initialvalue:
             entry.insert(0, initialvalue)
@@ -3583,8 +4679,8 @@ bg_color=background_color, widths=[8, 10])
         
         btn_frame = tk.Frame(dialog, bg=background_color)
         btn_frame.pack(pady=int(15*scaling_factor))
-        tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_ok).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Cancel", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_cancel).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_ok).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_cancel).pack(side=tk.LEFT, padx=5)
         
         entry.focus_set()
         self.root.wait_window(dialog)
@@ -3603,7 +4699,7 @@ bg_color=background_color, widths=[8, 10])
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (h // 2)
         dialog.geometry(f"{w}x{h}+{x}+{y}")
         
-        tk.Label(dialog, text=message, font=scale_font(("Arial", 12, "bold")), bg=background_color, fg=text_color, wraplength=int(310*scaling_factor), justify="center").pack(pady=(int(20*scaling_factor), int(10*scaling_factor)), expand=True)
+        tk.Label(dialog, text=message, font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, wraplength=int(310*scaling_factor), justify="center").pack(pady=(int(20*scaling_factor), int(10*scaling_factor)), expand=True)
         
         result = [None]
         btn_frame = tk.Frame(dialog, bg=background_color)
@@ -3614,10 +4710,10 @@ bg_color=background_color, widths=[8, 10])
             dialog.destroy()
             
         if type == "yesno":
-            tk.Button(btn_frame, text="Yes", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="No", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text="Yes", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text="No", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
         else:
-            tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 12, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack()
+            tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack()
             
         dialog.bind("<Return>", lambda e: set_res(True))
         if type == "yesno":
@@ -3627,6 +4723,274 @@ bg_color=background_color, widths=[8, 10])
             
         self.root.wait_window(dialog)
         return result[0]
+
+    def get_profile_assigned_apps(self, profile_name):
+        profile_data = CONFIG.profiles.get(profile_name, {})
+        assigned_apps = profile_data.get("assigned_apps")
+        if isinstance(assigned_apps, list):
+            apps = []
+            for app in assigned_apps:
+                if isinstance(app, str):
+                    app = {"path": app, "name": get_exe_display_name(app)}
+                if isinstance(app, dict) and app.get("path"):
+                    apps.append({
+                        "path": app.get("path", ""),
+                        "name": app.get("name") or get_exe_display_name(app.get("path")),
+                    })
+            return apps
+
+        assigned_app = profile_data.get("assigned_app", {})
+        if isinstance(assigned_app, str) and assigned_app:
+            return [{"path": assigned_app, "name": get_exe_display_name(assigned_app)}]
+        if isinstance(assigned_app, dict) and assigned_app.get("path"):
+            return [{
+                "path": assigned_app.get("path", ""),
+                "name": assigned_app.get("name") or get_exe_display_name(assigned_app.get("path")),
+            }]
+        return []
+
+    def set_profile_assigned_apps(self, profile_name, apps):
+        if profile_name not in CONFIG.profiles:
+            return
+        normalized_seen = set()
+        normalized_apps = []
+        for app in apps:
+            app_path = app.get("path") if isinstance(app, dict) else str(app)
+            normalized_path = normalize_app_path(app_path)
+            if not normalized_path or normalized_path in normalized_seen:
+                continue
+            normalized_seen.add(normalized_path)
+            normalized_apps.append({
+                "path": os.path.normpath(app_path),
+                "name": (app.get("name") if isinstance(app, dict) else None) or get_exe_display_name(app_path),
+            })
+        CONFIG.profiles[profile_name]["assigned_apps"] = normalized_apps
+        CONFIG.profiles[profile_name].pop("assigned_app", None)
+
+    def clear_app_from_other_profiles(self, app_path, current_profile):
+        normalized_path = normalize_app_path(app_path)
+        if not normalized_path:
+            return
+        for profile_name in list(CONFIG.profiles.keys()):
+            if profile_name == current_profile:
+                continue
+            apps = self.get_profile_assigned_apps(profile_name)
+            filtered_apps = [
+                app for app in apps
+                if normalize_app_path(app.get("path")) != normalized_path
+            ]
+            if len(filtered_apps) != len(apps):
+                self.set_profile_assigned_apps(profile_name, filtered_apps)
+
+    def refresh_assigned_apps_ui(self):
+        if not hasattr(self, "assigned_apps_frame"):
+            return
+        for child in self.assigned_apps_frame.winfo_children():
+            child.destroy()
+
+        current_profile = getattr(CONFIG, "active_profile", "")
+        apps = self.get_profile_assigned_apps(current_profile)
+        if not apps:
+            choose_btn = tk.Button(
+                self.assigned_apps_frame,
+                text="Choose App",
+                font=scale_font(("Arial", 11, "bold")),
+                bg=button_gray,
+                fg="white",
+                relief=tk.FLAT,
+                bd=0,
+                padx=0,
+                pady=0,
+                highlightthickness=0,
+                command=lambda: self.on_choose_assigned_app(0),
+            )
+            choose_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0))
+            return
+
+        for index, app in enumerate(apps):
+            self.create_assigned_app_controls(index, app)
+
+        add_btn = tk.Button(
+            self.assigned_apps_frame,
+            text="Add",
+            font=scale_font(("Arial", 11, "bold")),
+            bg=button_gray,
+            fg="white",
+            relief=tk.FLAT,
+            bd=0,
+            padx=0,
+            pady=0,
+            highlightthickness=0,
+            command=self.on_add_assigned_app,
+        )
+        add_btn.pack(side=tk.LEFT, padx=(int(4 * scaling_factor), 0))
+
+    def create_assigned_app_controls(self, index, app):
+        app_name = app.get("name") if app else "Choose App"
+        choose_btn = tk.Button(
+            self.assigned_apps_frame,
+            text=app_name,
+            font=scale_font(("Arial", 11, "bold")),
+            bg=button_gray,
+            fg="white",
+            relief=tk.FLAT,
+            bd=0,
+            padx=0,
+            pady=0,
+            highlightthickness=0,
+            command=lambda idx=index: self.on_choose_assigned_app(idx),
+        )
+        choose_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0))
+
+        remove_btn = tk.Button(
+            self.assigned_apps_frame,
+            text="X",
+            bg="#ff4444",
+            fg="white",
+            font=scale_font(("Arial", 10, "bold")),
+            bd=0,
+            relief=tk.FLAT,
+            command=lambda idx=index: self.on_remove_assigned_app(idx),
+        )
+        remove_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+
+    def choose_app_path(self):
+        initial_dir = os.environ.get("ProgramFiles") or os.path.expanduser("~")
+        self.app_profile_poll_suspended = True
+        try:
+            return filedialog.askopenfilename(
+                parent=self.root,
+                title="Choose App",
+                initialdir=initial_dir,
+                filetypes=[("Applications", "*.exe"), ("All files", "*.*")],
+            )
+        finally:
+            self.app_profile_poll_suspended = False
+
+    def on_choose_assigned_app(self, index=0):
+        if not getattr(CONFIG, "active_profile", None) or CONFIG.active_profile not in CONFIG.profiles:
+            return
+
+        app_path = self.choose_app_path()
+        if not app_path:
+            return
+
+        app_name = get_exe_display_name(app_path)
+        current_profile = CONFIG.active_profile
+        apps = self.get_profile_assigned_apps(current_profile)
+        new_app = {
+            "path": os.path.normpath(app_path),
+            "name": app_name,
+        }
+
+        if index < len(apps):
+            apps[index] = new_app
+        else:
+            apps.append(new_app)
+
+        self.clear_app_from_other_profiles(app_path, current_profile)
+        self.set_profile_assigned_apps(current_profile, apps)
+        CONFIG.save_config()
+        self.refresh_assigned_apps_ui()
+
+    def on_add_assigned_app(self):
+        current_profile = getattr(CONFIG, "active_profile", "")
+        self.on_choose_assigned_app(len(self.get_profile_assigned_apps(current_profile)))
+
+    def on_remove_assigned_app(self, index):
+        current_profile = getattr(CONFIG, "active_profile", "")
+        if not current_profile or current_profile not in CONFIG.profiles:
+            return
+        apps = self.get_profile_assigned_apps(current_profile)
+        if 0 <= index < len(apps):
+            apps.pop(index)
+        self.set_profile_assigned_apps(current_profile, apps)
+        CONFIG.save_config()
+        self.refresh_assigned_apps_ui()
+
+    def get_foreground_app_path(self):
+        try:
+            import win32process
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if not hwnd:
+                return ""
+
+            _thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if not pid:
+                return ""
+
+            process_handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not process_handle:
+                return ""
+
+            try:
+                size = wintypes.DWORD(32768)
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(process_handle, 0, buffer, ctypes.byref(size)):
+                    return normalize_app_path(buffer.value)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+        except Exception as e:
+            logger.debug(f"Failed to read foreground app path: {e}")
+        return ""
+
+    def get_profile_for_app_path(self, app_path):
+        normalized_path = normalize_app_path(app_path)
+        if not normalized_path:
+            return None
+
+        for profile_name in self.get_sorted_profiles():
+            for assigned_app in self.get_profile_assigned_apps(profile_name):
+                if normalize_app_path(assigned_app.get("path")) == normalized_path:
+                    return profile_name
+        return None
+
+    def save_active_profile_runtime_settings(self):
+        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
+
+    def switch_to_profile(self, profile_name):
+        if not profile_name or profile_name == getattr(CONFIG, "active_profile", ""):
+            return False
+        if profile_name not in CONFIG.profiles:
+            return False
+
+        if hasattr(self, 'profile_apply_timer') and self.profile_apply_timer:
+            self.root.after_cancel(self.profile_apply_timer)
+            self.profile_apply_timer = None
+        self.pending_profile = None
+        self.save_active_profile_runtime_settings()
+
+        if CONFIG.switch_profile(profile_name):
+            if hasattr(self, "profile_combo"):
+                self.profile_combo.set(profile_name)
+            self.app_profile_switching = True
+            try:
+                self.apply_profile_switch()
+            finally:
+                self.app_profile_switching = False
+            return True
+        return False
+
+    def poll_assigned_app_focus(self):
+        if not getattr(self, "root", None) or getattr(self, "is_quitting", False):
+            return
+
+        try:
+            if not self.app_profile_poll_suspended and not self.app_profile_switching:
+                foreground_app_path = self.get_foreground_app_path()
+                target_profile = self.get_profile_for_app_path(foreground_app_path)
+                if target_profile and target_profile != getattr(CONFIG, "active_profile", ""):
+                    self.switch_to_profile(target_profile)
+                self.last_foreground_app_path = foreground_app_path
+        except Exception as e:
+            logger.debug(f"Assigned app focus poll failed: {e}")
+        finally:
+            try:
+                self.root.after(1000, self.poll_assigned_app_focus)
+            except Exception:
+                pass
 
     def get_sorted_profiles(self):
         import re
@@ -3686,15 +5050,7 @@ bg_color=background_color, widths=[8, 10])
         if self.pending_profile == getattr(CONFIG, 'active_profile', ""):
             return # No change
             
-        # 1. Save current profile settings
-        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
-            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
-            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
-
-        # 2. Apply switch
-        if CONFIG.switch_profile(self.pending_profile):
-            self.profile_combo.set(self.pending_profile)
-            self.apply_profile_switch()
+        self.switch_to_profile(self.pending_profile)
             
         self.pending_profile = None
 
@@ -3726,13 +5082,13 @@ bg_color=background_color, widths=[8, 10])
         else:
             CONFIG.winuhid_sim_mode = new_emu
 
-        # 2. 切換至新的profile的Driver
+        # 2. ???單?rofile?river
         if driver_changed:
             if getattr(self, 'driver_switch', None):
                 self.driver_switch.set_value(new_driver)
             self.update_driver_type_setting(new_driver)
             
-        # 3. 切換至新的profile的Emu Mode (If driver changed, it was already applied, but we ensure UI is updated)
+        # 3. ???單?rofile?mu Mode (If driver changed, it was already applied, but we ensure UI is updated)
         if not driver_changed and emu_changed:
             if getattr(self, 'sim_mode_switch', None):
                 self.sim_mode_switch.set_value(new_emu)
@@ -3740,42 +5096,30 @@ bg_color=background_color, widths=[8, 10])
         elif getattr(self, 'sim_mode_switch', None):
             self.sim_mode_switch.set_value(new_emu)
 
-        # 4. 切換至新的profile的custom buttons與其他設定
+        # 4. ???單?rofile?ustom buttons?隞身摰?
         self.refresh_ui_for_profile()
 
     def on_profile_selected(self, event):
-        if hasattr(self, 'profile_apply_timer') and self.profile_apply_timer:
-            self.root.after_cancel(self.profile_apply_timer)
-            self.profile_apply_timer = None
-        self.pending_profile = None
-        
-        selected_profile = self.profile_combo.get()
-        if not selected_profile or selected_profile == getattr(CONFIG, "active_profile", ""):
-            return
+        self.switch_to_profile(self.profile_combo.get())
             
-        # 1. 紀錄當下設定、Driver與Emu Mode至原本的profile
-        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
-            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
-            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
-
-        if CONFIG.switch_profile(selected_profile):
-            self.apply_profile_switch()
-
+        # 1. 蝝?銝身摰river?mu Mode?喳??祉?profile
     def on_add_profile(self):
         i = 1
         while f"Profile {i}" in CONFIG.profiles:
             i += 1
         new_name = f"Profile {i}"
         
-        # 1. 紀錄當下設定、Driver與Emu Mode至原本的profile
+        # 1. 蝝?銝身摰river?mu Mode?喳??祉?profile
         if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
             CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
             CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
             
         if CONFIG.add_profile(new_name):
+            self.set_profile_assigned_apps(CONFIG.active_profile, [])
             self.profile_combo['values'] = self.get_sorted_profiles()
             self.profile_combo.set(CONFIG.active_profile)
             self.apply_profile_switch()
+            self.refresh_assigned_apps_ui()
 
     def on_rename_profile(self):
         current_name = CONFIG.active_profile
@@ -3787,6 +5131,7 @@ bg_color=background_color, widths=[8, 10])
                 if CONFIG.rename_profile(new_name):
                     self.profile_combo['values'] = self.get_sorted_profiles()
                     self.profile_combo.set(CONFIG.active_profile)
+                    self.refresh_assigned_apps_ui()
 
     def on_reset_profile(self):
         current_name = CONFIG.active_profile
@@ -3794,6 +5139,7 @@ bg_color=background_color, widths=[8, 10])
             if CONFIG.reset_profile_to_default(current_name):
                 # We can just apply the profile switch to reload everything from CONFIG.profiles
                 self.apply_profile_switch()
+                self.refresh_assigned_apps_ui()
                 
     def on_delete_profile(self):
         if len(CONFIG.profiles) <= 1:
@@ -3807,6 +5153,7 @@ bg_color=background_color, widths=[8, 10])
                 self.profile_combo.set(CONFIG.active_profile)
                 # Since the old profile is deleted, we just apply the new profile directly
                 self.apply_profile_switch()
+                self.refresh_assigned_apps_ui()
 
     def refresh_ui_for_profile(self):
         self.layout_switch.set_value(CONFIG.abxy_mode)
@@ -3822,6 +5169,14 @@ bg_color=background_color, widths=[8, 10])
                 self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
             except ValueError:
                 self.gc_trigger_combo.set(self.gc_trigger_labels[1])
+                
+            if hasattr(self, 'gc_click_map_frame'):
+                if current_val == "100% at Max":
+                    self.gc_click_map_frame.pack_forget()
+                else:
+                    self.gc_click_map_frame.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), 0))
+
+        self.refresh_assigned_apps_ui()
                 
         # Update Gyro Passthrough Mode
         if hasattr(self, 'passthrough_mode_switch'):
@@ -3992,9 +5347,13 @@ bg_color=background_color, widths=[8, 10])
             if self.root and self.root.state() == 'normal':
                 w = self.root.winfo_width()
                 h = self.root.winfo_height()
+                rx = self.root.winfo_x()
+                ry = self.root.winfo_y()
                 if w > 100 and h > 100:
                     self.last_width = w
                     self.last_height = h
+                    self.last_x = rx
+                    self.last_y = ry
         except Exception:
             pass
             
@@ -4002,6 +5361,8 @@ bg_color=background_color, widths=[8, 10])
         if getattr(self, 'last_width', None) is not None and getattr(self, 'last_height', None) is not None:
             CONFIG.window_width = self.last_width
             CONFIG.window_height = self.last_height
+            CONFIG.window_x = getattr(self, 'last_x', None)
+            CONFIG.window_y = getattr(self, 'last_y', None)
             CONFIG.save_config()
             
         self.is_cleaning_up = True; self.is_quitting = True; set_shutting_down(True); self.root.withdraw()
@@ -4029,6 +5390,15 @@ bg_color=background_color, widths=[8, 10])
                         fut.result(timeout=20.0)
                     except:
                         pass
+                # Issue 5: even if there were no active virtual controllers (e.g. a
+                # controller was mid-connect), make sure the ESP32-S3 stops scanning,
+                # disables auto-connect and drops any remaining BLE links before exit,
+                # so nothing stays connected and the bridge idles until the next launch.
+                try:
+                    from usb_serial_bridge import shutdown_all_bridges
+                    shutdown_all_bridges()
+                except Exception:
+                    pass
             except: pass
             finally: self.root.after(0, lambda: (self.root.destroy(), os._exit(0)))
         threading.Thread(target=cleanup, daemon=True).start()
@@ -4122,6 +5492,59 @@ bg_color=background_color, widths=[8, 10])
                     logger.debug(f"Failed to refresh battery indicators: {e}")
             self.root.after(300000, self.start_battery_refresh_timer) # 5 minutes
 
+    def start_esp32s3_refresh_timer(self):
+        if not getattr(self, 'is_quitting', False):
+            self.refresh_esp32s3_status_async()
+            self.root.after(5000, self.start_esp32s3_refresh_timer)
+
+    def start_detection_and_discovery(self):
+        if getattr(self, '_startup_detection_done', False) or getattr(self, 'is_quitting', False):
+            return
+        self._startup_detection_done = True
+
+        def start_driver_check_and_discovery():
+            try:
+                self.check_driver_installation()
+            except Exception as e:
+                logger.debug(f"Startup driver check failed: {e}")
+            self.start_discoverer_thread()
+
+        def worker():
+            status = None
+            detected = False
+            try:
+                from usb_serial_bridge import detect_bridge
+                status = detect_bridge()
+                detected = bool(status and status.board_present)
+            except Exception as e:
+                logger.debug(f"Startup ESP32-S3 detection failed: {e}")
+
+            def apply_status():
+                if getattr(self, 'is_quitting', False):
+                    return
+                self.esp32s3_bridge_status = status
+                self.esp32s3_detected = detected
+                self._esp32s3_was_detected = detected
+                self._esp32s3_current_seen = bool(status and getattr(status, "bridge_ready", False))
+                self.update_driver_buttons_visibility()
+
+                def after_auto_update(ok):
+                    if ok:
+                        self.root.after(1000, lambda: self.wait_for_current_esp32s3_then(start_driver_check_and_discovery))
+                    else:
+                        self.root.after(0, start_driver_check_and_discovery)
+
+                if self.maybe_auto_update_esp32s3_firmware(status, on_complete=after_auto_update):
+                    return
+                start_driver_check_and_discovery()
+
+            try:
+                self.root.after(0, apply_status)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def start(self):
         self.is_quitting = False
         def callback(vcs):
@@ -4133,7 +5556,6 @@ bg_color=background_color, widths=[8, 10])
                     logger.debug(f"Ignored Tkinter event generation error: {e}")
         self.discoverer_callback = callback
         self.root.bind(CONTROLLER_UPDATED_EVENT, lambda e: self.update(self.message_queue.get()))
-        self.start_discoverer_thread()
         
         self.power_listener.start()
         
@@ -4141,9 +5563,13 @@ bg_color=background_color, widths=[8, 10])
             self.hide_to_tray()
         else:
             self.root.deiconify()
+
+        self.root.after(100, self.start_detection_and_discovery)
             
         # Start battery refresh timer (5 minutes)
         self.root.after(300000, self.start_battery_refresh_timer)
+        self.root.after(5000, self.start_esp32s3_refresh_timer)
+        self.root.after(1000, self.poll_assigned_app_focus)
             
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 
@@ -4151,3 +5577,4 @@ if __name__ == "__main__":
     disable_power_throttling()
     win = ControllerWindow()
     win.init_interface(); win.start()
+

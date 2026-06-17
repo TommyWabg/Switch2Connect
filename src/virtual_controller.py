@@ -846,23 +846,25 @@ class VirtualController:
             slot = 2
 
         with self.vibration_lock:
-            raw_lf = self.frame_vibrations[slot].lf_amp + lf_val
-            raw_hf = self.frame_vibrations[slot].hf_amp + hf_val
+            # Accumulate into the shared buffer AND both per-side (L/R) buffers with the
+            # same (mono) value. Merged Joy-Cons each consume their OWN side buffer; the
+            # old single shared consume-once buffer let whichever Joy-Con polled first
+            # clear the rumble, so the other side read latest_vibration (0 between game
+            # updates) and stopped — that is the L/R complementary alternation. A single
+            # controller just reads its own side; the unused side is harmless.
+            for buf in (self.frame_vibrations, self.frame_vibrations_l, self.frame_vibrations_r):
+                raw_lf = buf[slot].lf_amp + lf_val
+                raw_hf = buf[slot].hf_amp + hf_val
+                # Use non-linear scaling for summation to prevent clipping
+                buf[slot].lf_amp = int(raw_lf) if raw_lf <= 560 else int(560 + 240 * math.tanh((raw_lf - 560) / 240))
+                buf[slot].hf_amp = int(raw_hf) if raw_hf <= 560 else int(560 + 240 * math.tanh((raw_hf - 560) / 240))
 
-            # Use non-linear scaling for summation to prevent clipping
-            if raw_lf <= 560:
-                self.frame_vibrations[slot].lf_amp = int(raw_lf)
-            else:
-                self.frame_vibrations[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf - 560) / 240))
-
-            if raw_hf <= 560:
-                self.frame_vibrations[slot].hf_amp = int(raw_hf)
-            else:
-                self.frame_vibrations[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf - 560) / 240))
-
-            self.latest_vibration.lf_amp = lf_val
-            self.latest_vibration.hf_amp = hf_val
+            for lv in (self.latest_vibration, self.latest_vibration_l, self.latest_vibration_r):
+                lv.lf_amp = lf_val
+                lv.hf_amp = hf_val
             self.vibration_dirty = True
+            self.vibration_dirty_l = True
+            self.vibration_dirty_r = True
 
     def get_current_vibration_frames(self, is_left=True):
         if self.mode == "Switch1":
@@ -910,20 +912,6 @@ class VirtualController:
                 last_received = getattr(self, 'last_rumble_received_time', 0)
                 last_active = getattr(self, 'last_rumble_active_time', 0)
                 last_time = max(last_received, last_active)
-                
-                # USBIP PS5 hardware timeout (Watchdog): Stop vibrating if no packet is received for 150ms
-                if last_time and current_time - last_time > SWITCH_RUMBLE_TIMEOUT:
-                    self.frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
-                    self.frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
-                    self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
-                    self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
-                    self.vibration_dirty_l = False
-                    self.vibration_dirty_r = False
-                    self.cycle_start_time = current_time
-                    v1 = VibrationData()
-                    v2 = VibrationData()
-                    v3 = VibrationData()
-                    return v1, v2, v3, True
 
                 if is_left:
                     latest_vibration = self.latest_vibration_l
@@ -956,45 +944,77 @@ class VirtualController:
                         self.vibration_dirty_r = False
                     self.cycle_start_time = time.perf_counter()
                 else:
-                    v1 = VibrationData(lf_amp=latest_vibration.lf_amp, hf_amp=latest_vibration.hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                    side_last_active = getattr(self,
+                        'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
+                    lv = latest_vibration
+                    if side_last_active > 0 and time.perf_counter() - side_last_active > SWITCH_RUMBLE_TIMEOUT:
+                        lv = VibrationData()
+                    v1 = VibrationData(lf_amp=lv.lf_amp, hf_amp=lv.hf_amp, lf_freq=lv.lf_freq, hf_freq=lv.hf_freq)
                     v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
                     v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
 
                 is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
                 return v1, v2, v3, is_zero
 
+            # Read THIS controller's own side buffer. Merged L+R Joy-Cons each consume
+            # independently, so neither starves the other (the shared single-consumer
+            # buffer caused the L/R complementary alternation). A single controller just
+            # uses its own side.
+            if is_left:
+                side_frames = self.frame_vibrations_l
+                side_latest = self.latest_vibration_l
+                side_dirty = self.vibration_dirty_l
+            else:
+                side_frames = self.frame_vibrations_r
+                side_latest = self.latest_vibration_r
+                side_dirty = self.vibration_dirty_r
+
             if self.mode == "Switch2":
                 current_time = time.perf_counter()
                 last_active = getattr(self, 'last_rumble_active_time', 0)
                 if last_active and current_time - last_active > SWITCH_RUMBLE_TIMEOUT:
                     self.frame_vibrations = [VibrationData() for _ in range(3)]
+                    self.frame_vibrations_l = [VibrationData() for _ in range(3)]
+                    self.frame_vibrations_r = [VibrationData() for _ in range(3)]
                     self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
+                    self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+                    self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
                     self.vibration_dirty = False
+                    self.vibration_dirty_l = False
+                    self.vibration_dirty_r = False
                     self.cycle_start_time = current_time
                     v1 = VibrationData()
                     v2 = VibrationData()
                     v3 = VibrationData()
                     return v1, v2, v3, True
 
-            if self.vibration_dirty:
-                v1 = VibrationData(lf_amp=self.frame_vibrations[0].lf_amp, hf_amp=self.frame_vibrations[0].hf_amp)
-                v2 = VibrationData(lf_amp=self.frame_vibrations[1].lf_amp, hf_amp=self.frame_vibrations[1].hf_amp)
-                v3 = VibrationData(lf_amp=self.frame_vibrations[2].lf_amp, hf_amp=self.frame_vibrations[2].hf_amp)
+            if side_dirty:
+                v1 = VibrationData(lf_amp=side_frames[0].lf_amp, hf_amp=side_frames[0].hf_amp)
+                v2 = VibrationData(lf_amp=side_frames[1].lf_amp, hf_amp=side_frames[1].hf_amp)
+                v3 = VibrationData(lf_amp=side_frames[2].lf_amp, hf_amp=side_frames[2].hf_amp)
 
                 if v1.lf_amp == 0 and v1.hf_amp == 0:
-                    v1.lf_amp, v1.hf_amp = self.latest_vibration.lf_amp, self.latest_vibration.hf_amp
+                    v1.lf_amp, v1.hf_amp = side_latest.lf_amp, side_latest.hf_amp
                 if v2.lf_amp == 0 and v2.hf_amp == 0:
                     v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
                 if v3.lf_amp == 0 and v3.hf_amp == 0:
                     v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
 
-                for f in self.frame_vibrations:
+                for f in side_frames:
                     f.lf_amp = 0
                     f.hf_amp = 0
-                self.vibration_dirty = False
+                if is_left:
+                    self.vibration_dirty_l = False
+                else:
+                    self.vibration_dirty_r = False
                 self.cycle_start_time = time.perf_counter()
             else:
-                v1 = VibrationData(lf_amp=self.latest_vibration.lf_amp, hf_amp=self.latest_vibration.hf_amp)
+                side_last_active = getattr(self,
+                    'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
+                sl = side_latest
+                if side_last_active > 0 and time.perf_counter() - side_last_active > SWITCH_RUMBLE_TIMEOUT:
+                    sl = VibrationData()
+                v1 = VibrationData(lf_amp=sl.lf_amp, hf_amp=sl.hf_amp)
                 v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
                 v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
                 self.cycle_start_time = time.perf_counter()
@@ -1316,7 +1336,25 @@ class VirtualController:
                 
                 if send_cemuhook:
                         model = 3 if (controller.is_joycon_left() or controller.is_joycon_right()) else 2
-                        mac_bytes = bytes.fromhex(controller.device.address.replace(':', '').replace('-', ''))
+                        addr_str = (controller.device.address or "").replace(':', '').replace('-', '').upper()
+                        try:
+                            mac_bytes = bytes.fromhex(addr_str)
+                            if len(mac_bytes) != 6:
+                                raise ValueError("not a 6-byte MAC")
+                        except (ValueError, AttributeError):
+                            # device.address is a placeholder — try controller_info.mac_address
+                            # (real BLE MAC set from firmware connected event for ESP32 path)
+                            info_mac = (getattr(controller.controller_info, 'mac_address', None) or "")
+                            info_str = info_mac.replace(':', '').replace('-', '').upper()
+                            try:
+                                mac_bytes = bytes.fromhex(info_str)
+                                if len(mac_bytes) != 6:
+                                    raise ValueError()
+                            except (ValueError, AttributeError):
+                                import hashlib
+                                mac_bytes = hashlib.sha1(
+                                    (controller.device.address or "esp32").encode()
+                                ).digest()[:6]
                         
                         hold_mode = getattr(self, "hold_mode", "Vertical")
                         
@@ -1908,12 +1946,20 @@ class VirtualController:
         # 6. Gyro/Accel raw signed short assignments
         def clamp_short(val): return max(-32768, min(32767, int(val)))
         if mode == "PS5":
-            report.AngularVelocityX = clamp_short(self.last_gx)   # Pitch <- gyroscope[0]
-            report.AngularVelocityY = clamp_short(self.last_gz)   # Yaw   <- -gyroscope[1] (was Roll, swap with gz)
-            report.AngularVelocityZ = clamp_short(self.last_gy)   # Roll  <- gyroscope[2]  (was Yaw, swap with gy)
-            report.AccelerometerX = clamp_short(self.last_ax)
-            report.AccelerometerY = clamp_short(self.last_ay)
-            report.AccelerometerZ = clamp_short(self.last_az)
+            if getattr(self, 'driver_type', '') == "WinUHid":
+                report.GyroX = clamp_short(self.last_gx)
+                report.GyroY = clamp_short(self.last_gy)
+                report.GyroZ = clamp_short(self.last_gz)
+                report.AccelX = clamp_short(self.last_ax)
+                report.AccelY = clamp_short(self.last_ay)
+                report.AccelZ = clamp_short(self.last_az)
+            else:
+                report.AngularVelocityX = clamp_short(self.last_gx)   # Pitch <- gyroscope[0]
+                report.AngularVelocityY = clamp_short(self.last_gz)   # Yaw   <- -gyroscope[1] (was Roll, swap with gz)
+                report.AngularVelocityZ = clamp_short(self.last_gy)   # Roll  <- gyroscope[2]  (was Yaw, swap with gy)
+                report.AccelerometerX = clamp_short(self.last_ax)
+                report.AccelerometerY = clamp_short(self.last_ay)
+                report.AccelerometerZ = clamp_short(self.last_az)
             # SensorTimestamp: DualSense reports in ~0.33us ticks (3MHz clock).
             # EA and strict DualSense games validate this increments monotonically.
             # At 250Hz USB polling, each frame = 4000us = ~12000 ticks.
@@ -2775,19 +2821,31 @@ class VirtualController:
             self.frame_vibrations_r[slot].lf_freq = lf_freq
             self.frame_vibrations_r[slot].hf_freq = hf_freq
             
-            self.latest_vibration_l.lf_amp = left_lf_amp
-            self.latest_vibration_l.hf_amp = left_hf_amp
-            self.latest_vibration_l.lf_freq = lf_freq
-            self.latest_vibration_l.hf_freq = hf_freq
-            
-            self.latest_vibration_r.lf_amp = right_lf_amp
-            self.latest_vibration_r.hf_amp = right_hf_amp
-            self.latest_vibration_r.lf_freq = lf_freq
-            self.latest_vibration_r.hf_freq = hf_freq
+            now = time.perf_counter()
+            # Only overwrite latest when amplitude is non-zero.  If the haptic
+            # callback fires with a silent side (e.g. right=0 while left is
+            # active), writing 0 into latest_r would immediately stop the R
+            # motor on the next non-dirty read – producing the complementary
+            # L↔R alternation stutter.  Holding the last non-zero value lets
+            # the motor sustain; a per-side 150ms watchdog in
+            # get_current_vibration_frames stops it after true silence.
+            if left_lf_amp > 0 or left_hf_amp > 0:
+                self.latest_vibration_l.lf_amp = left_lf_amp
+                self.latest_vibration_l.hf_amp = left_hf_amp
+                self.latest_vibration_l.lf_freq = lf_freq
+                self.latest_vibration_l.hf_freq = hf_freq
+                self.last_haptic_l_active_time = now
+
+            if right_lf_amp > 0 or right_hf_amp > 0:
+                self.latest_vibration_r.lf_amp = right_lf_amp
+                self.latest_vibration_r.hf_amp = right_hf_amp
+                self.latest_vibration_r.lf_freq = lf_freq
+                self.latest_vibration_r.hf_freq = hf_freq
+                self.last_haptic_r_active_time = now
 
             self.vibration_dirty_l = True
             self.vibration_dirty_r = True
-            self.last_rumble_received_time = time.perf_counter()
+            self.last_rumble_received_time = now
 
     def _usbip_rumble_callback(self, out_data, side="Left"):
         # Disconnect active-push: bytearray(64) from usbip_server means connection dropped

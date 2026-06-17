@@ -39,6 +39,8 @@ SWITCH_BUTTONS = {
     "PS_L_Touch": 0x04000000,
     "PS_R_Touch": 0x08000000,
     "PS_C_Click": 0x20000000,
+    "GC_L_CLICK": 0x40000000,
+    "GC_R_CLICK": 0x80000000,
 }
 
 BACK_BUTTON_OPTIONS = [
@@ -227,6 +229,7 @@ class Config:
         self.combine_joycons = config.get("combine_joycons", True)
         self.deadzone = config.get("deadzone", 50)
         self.controller_mode = config.get("controller_mode", "Xbox")
+        self.ui_scale = float(config.get("ui_scale", 1.0))
 
         btns = config.get("buttons", {})
         self.dual_joycons_config = ButtonConfig(btns.get("dual_joycons", {}))
@@ -396,6 +399,8 @@ class Config:
         self.vigembus_installed = config.get("vigembus_installed", False)
         self.window_width = config.get("window_width", None)
         self.window_height = config.get("window_height", None)
+        self.window_x = config.get("window_x", None)
+        self.window_y = config.get("window_y", None)
         self._auto_disconnect_mode = config.get("auto_disconnect_mode", "Absolute" if config.get("auto_disconnect_enabled", False) else "OFF")
         if self._auto_disconnect_mode not in ["OFF", "Inactive", "Absolute"]:
             self._auto_disconnect_mode = "Absolute" if config.get("auto_disconnect_enabled", False) else "OFF"
@@ -478,9 +483,15 @@ class Config:
                 "gc_trigger_mode": "Hair Trigger", "gl_mapping": "Default", "gr_mapping": "Default",
                 "home_mapping": "Default", "rumble_mode": "Switch", "sll_mapping": "Default",
                 "slr_mapping": "GR", "srl_mapping": "GL", "srr_mapping": "Change Profile",
+                "gc_l_click_mapping": "Default", "gc_r_click_mapping": "Default",
                 "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
             }
         }
+        for cat_data in defaults.values():
+            if "gc_l_click_mapping" not in cat_data:
+                cat_data["gc_l_click_mapping"] = "Default"
+            if "gc_r_click_mapping" not in cat_data:
+                cat_data["gc_r_click_mapping"] = "Default"
         return defaults.get(cat, defaults["xbox"]).copy()
 
     def get_default_profile_dict(self):
@@ -494,7 +505,8 @@ class Config:
             "djg_enabled": False, 
             "djg_dominant_side": "Right", 
             "djg_mode": "Switch Dominant Side",
-            "djg_activation": "Hold"
+            "djg_activation": "Hold",
+            "assigned_apps": []
         }
         for cat in categories:
             prof_data[cat] = self.get_default_category_dict(cat)
@@ -598,6 +610,9 @@ class Config:
             'vigembus_installed': self.vigembus_installed,
             'window_width': self.window_width,
             'window_height': self.window_height,
+            'window_x': self.window_x,
+            'window_y': self.window_y,
+            'ui_scale': self.ui_scale,
             'auto_disconnect_enabled': self.auto_disconnect_enabled,
             'auto_disconnect_mode': self.auto_disconnect_mode,
             'auto_disconnect_days': self.auto_disconnect_days,
@@ -635,6 +650,8 @@ class Config:
             'mag_calibration_data': self.mag_calibration_data,
             'gc_trigger_calibration_data': self.gc_trigger_calibration_data,
             'gc_trigger_mode': self.gc_trigger_mode,
+            'gc_l_click_mapping': self.gc_l_click_mapping,
+            'gc_r_click_mapping': self.gc_r_click_mapping,
             'joycon_hold_mode': self.joycon_hold_mode,
             'merged_gyro_side': self.merged_gyro_side,
             'cemuhook_mac_to_pad': self.cemuhook_mac_to_pad,
@@ -792,6 +809,26 @@ class Config:
         cat = self.get_current_category()
         if cat not in self.button_remaps: self.button_remaps[cat] = {}
         self.button_remaps[cat]["sll_mapping"] = val
+
+    @property
+    def gc_l_click_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("gc_l_click_mapping", "Default")
+    @gc_l_click_mapping.setter
+    def gc_l_click_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["gc_l_click_mapping"] = val
+
+    @property
+    def gc_r_click_mapping(self):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get("gc_r_click_mapping", "Default")
+    @gc_r_click_mapping.setter
+    def gc_r_click_mapping(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["gc_r_click_mapping"] = val
 
     @property
     def srr_mapping(self):

@@ -32,6 +32,9 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logging.getLogger().setLevel(logging.INFO)
+# Bleak's WinRT scanner logs every received advertisement at DEBUG and is extremely
+# noisy; keep it quiet even if the root level is lowered for debugging (matches 0.10.1).
+logging.getLogger("bleak").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Controller identification info
@@ -53,6 +56,8 @@ CONTROLER_NAMES = {
     JOYCON_L_PID: "Joy-con (Left)",
     JOYCON_R_PID: "Joy-con (Right)"
 }
+
+_gc_debug_counter = 0
 
 # BLE GATT Characteristics UUID
 INPUT_REPORT_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
@@ -120,9 +125,15 @@ class StickCalibrationData:
             # Max/min are absolute offsets from center
             self.max = get_stick_xy(data[6:9])
             self.min = get_stick_xy(data[3:6])
-            
-            # Sanity check: if calibration is all zeros/FF, use defaults to prevent stuck stick
-            if (self.center == (0, 0) and self.max == (0, 0)) or (self.center == (4095, 4095) and self.max == (4095, 4095)):
+
+            # Sanity check: all-zeros/FF, OR a center far from the ~2048 mid-point,
+            # means the calibration read returned garbage (e.g. an intermittently
+            # failed bridge read). Fall back to centered defaults so the stick can't
+            # get stuck at an extreme, which shows up as continuous joystick input.
+            cx, cy = self.center
+            if ((self.center == (0, 0) and self.max == (0, 0))
+                    or (self.center == (4095, 4095) and self.max == (4095, 4095))
+                    or not (1024 <= cx <= 3072) or not (1024 <= cy <= 3072)):
                 self.center = (2048, 2048)
                 self.max = (1500, 1500)
                 self.min = (1500, 1500)
@@ -229,6 +240,13 @@ class ControllerInputData:
                 self.buttons |= 0x00800000 # ZL
             if self.right_trigger >= 128:
                 self.buttons |= 0x00000080 # ZR
+                
+            if mode != '100% at Max':
+                if b1 & 0x10: self.buttons |= 0x80000000 # R (digital click) -> GC_R_CLICK
+                if b2 & 0x10: self.buttons |= 0x40000000 # L (digital click) -> GC_L_CLICK
+            else:
+                if b1 & 0x10: self.buttons |= 0x00000080 # R (digital click) -> ZR
+                if b2 & 0x10: self.buttons |= 0x00800000 # L (digital click) -> ZL
             
             self.mouse_coords = (0, 0)
             self.mouse_roughness = 0
@@ -245,8 +263,6 @@ class ControllerInputData:
             # NSO GameCube Protocol: IMU data actually starts at offset 34 based on raw data analysis
             if len(data) >= 46:
                 global _gc_debug_counter
-                if '_gc_debug_counter' not in globals():
-                    _gc_debug_counter = 0
                 _gc_debug_counter += 1
                 if _gc_debug_counter % 125 == 0:
                     import logging
@@ -318,7 +334,7 @@ class VibrationData:
         return value.to_bytes(byteorder='little', length=5)
 
 class Controller:
-    
+
     def __init__(self, device: BLEDevice):
         self.device: BLEDevice = device
         self.client: BleakClient = None
@@ -628,12 +644,17 @@ class Controller:
 
             self.response_future = None
             def command_response_callback(sender: BleakGATTCharacteristic, data: bytearray):
-                if self.response_future and not self.response_future.done():
+                future = self.response_future
+                if future and not future.done():
                     expected = getattr(self, 'expected_command_id', None)
                     if expected is not None and len(data) > 0 and data[0] != expected:
                         logger.debug(f"Ignoring unexpected command response for cmd {data[0]}, expected {expected}")
                         return
-                    self.response_future.set_result(data)
+                    try:
+                        loop = future.get_loop()
+                        loop.call_soon_threadsafe(future.set_result, bytearray(data))
+                    except Exception:
+                        pass
             
             # Dynamic UUID discovery for SW2 Protocol (e.g. GameCube Controller)
             self.command_write_uuid = COMMAND_WRITE_UUID
@@ -689,34 +710,62 @@ class Controller:
                     (0x07, 0x01, b""),
                     (0x16, 0x01, b""),
                     (0x15, 0x03, b"\x00"),
-                    (0x0c, 0x02, b"\x2f\x00\x00\x00"),
+                    # FEATSEL: enable ONLY motion(0x04)+mouse(0x10)+magnetometer(0x80)=0x94,
+                    # matching the known-good 0.10.1 build. Enabling all features (0xFF)
+                    # turns on extra report fields that make the Joy-Con stream phantom
+                    # ZL/ZR bits, firing those triggers continuously.
+                    (0x0c, 0x02, b"\x94\x00\x00\x00"),
                     (0x11, 0x03, b""),
                     (0x0a, 0x08, b"\x01\xff\xff\xff\xff\xff\xff\xff\xff\x35\x00\x46\x00\x00\x00\x00\x00\x00\x00\x00"),
-                    (0x0c, 0x04, b"\x2f\x00\x00\x00"),
+                    (0x0c, 0x04, b"\x94\x00\x00\x00"),
                     (0x03, 0x0a, b"\x09\x00\x00\x00"),
                     (0x10, 0x01, b""),
                     (0x01, 0x0c, b""),
                     (0x01, 0x01, b"\x00\x00\x00\x00"),
                     (0x09, 0x07, b"\x01\x00\x00\x00\x00\x00\x00\x00")
                 ]
+                _sw2_consec_fail = 0
                 for cmd_id, subcmd_id, data in sw2_init_commands:
                     try:
                         await self.write_command(cmd_id, subcmd_id, data)
+                        _sw2_consec_fail = 0
                         await asyncio.sleep(0.01)
                     except Exception as e:
                         logger.warning(f"SW2 Init command {cmd_id:02x}:{subcmd_id:02x} failed: {e}")
+                        _sw2_consec_fail += 1
+                        if _sw2_consec_fail >= 3:
+                            raise Exception(
+                                f"SW2 init aborted: {_sw2_consec_fail} consecutive command failures "
+                                f"(last: {cmd_id:02x}:{subcmd_id:02x})"
+                            )
 
-            self.controller_info = await self.read_controller_info()
-            
-            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
-                logger.info(f"Setting GameCube Input Mode to 0x30 (Format 3) for {self.device.address}")
+            for _ri_attempt in range(3):
+                try:
+                    self.controller_info = await self.read_controller_info()
+                    break
+                except Exception as e:
+                    if _ri_attempt == 2:
+                        raise
+                    logger.warning(f"read_controller_info attempt {_ri_attempt + 1} failed: {e}; retrying in 0.5s")
+                    await asyncio.sleep(0.5)
+
+            # GameCube AND Joy-Con 2 need input report Format 3 (0x30), like the
+            # known-good 0.10.1 build. In the default format the Joy-Con's high
+            # status byte (and the Left's bit-23) leak into the button field as
+            # phantom ZL/ZR. Format 3 + the 0x03FFFFFF processing mask (non-GameCube)
+            # together clear them. Pro Controller 2 streams a compatible format via
+            # the SW2 init sequence and is left as-is.
+            if self.controller_info.product_id in (
+                NSO_GAMECUBE_CONTROLLER_PID, JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID
+            ):
+                logger.info(f"Setting Input Mode to 0x30 (Format 3) for {self.device.address}")
                 try:
                     set_input_mode_cmd = bytearray([
                         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x30
                     ])
                     await self.client.write_gatt_char(self.command_write_uuid, set_input_mode_cmd)
                 except Exception as e:
-                    logger.warning(f"Failed to set GameCube Input Mode: {e}")
+                    logger.warning(f"Failed to set Input Mode: {e}")
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
@@ -736,8 +785,14 @@ class Controller:
             try:
                 self.stick_calibration, self.second_stick_calibration = await self.read_calibration_data()
             except Exception as e:
-                logger.warning(f"Failed to read calibration data: {e}")
-                self.stick_calibration, self.second_stick_calibration = None, None
+                logger.warning(f"Failed to read calibration data; using centered defaults: {e}")
+                # Use centered defaults rather than None. With None the raw 0-4095 stick
+                # value is passed straight through (uncalibrated), which the rest of the
+                # pipeline reads as a stick pinned to an extreme -> continuous joystick
+                # input. A failed read happens intermittently over the bridge; centered
+                # defaults keep the stick neutral until a clean reconnect re-reads it.
+                self.stick_calibration = StickCalibrationData(b'')
+                self.second_stick_calibration = StickCalibrationData(b'')
 
             await self.enable_input_notify_callback()
             
@@ -834,6 +889,10 @@ class Controller:
 
     ### Commands & Features ###
 
+    # Subclasses (e.g. ESP32S3Controller) can override this to tolerate slower
+    # BLE round-trips through the bridge when other controllers are active.
+    COMMAND_TIMEOUT: float = 2.0
+
     async def write_command(self, command_id: int, subcommand_id: int, command_data = b''):
         self.expected_command_id = command_id
         command_buffer = command_id.to_bytes() + b"\x91\x01" + subcommand_id.to_bytes() + b"\x00" + len(command_data).to_bytes() + b"\x00\x00" + command_data
@@ -841,7 +900,7 @@ class Controller:
         write_uuid = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
         await self.client.write_gatt_char(write_uuid, command_buffer)
         try:
-            response_buffer = await asyncio.wait_for(self.response_future, timeout=2.0)
+            response_buffer = await asyncio.wait_for(self.response_future, timeout=self.COMMAND_TIMEOUT)
         except asyncio.TimeoutError:
             raise Exception(f"Command response timeout for {command_id}")
             
@@ -871,7 +930,36 @@ class Controller:
                 
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
+    def _bridge_rumble_due(self):
+        """Rate-gate continuous rumble for the ESP32-S3 bridge to the BLE connection
+        interval (~7.5ms). Non-bridge (WinRT) controllers always return True because
+        the OS BLE stack already paces their writes. Each command carries 3 frames
+        that cover the interval, so pacing here keeps low latency without flooding the
+        firmware's per-interval BLE write (which caused merge-mode rumble stutter)."""
+        if not getattr(self, 'is_esp32s3_bridge', False):
+            return True
+        now_rt = time.perf_counter()
+        if (now_rt - getattr(self, '_last_rumble_send_rt', 0.0)) >= 0.0075:
+            self._last_rumble_send_rt = now_rt
+            return True
+        return False
+
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None):
+        # --- TEMP rumble-rate diagnostic (transport-agnostic): logs how many rumble
+        # writes/sec each controller actually issues, so WinRT vs ESP32-bridge can be
+        # compared directly (same dispatch code, so this isolates rate vs timing). ---
+        try:
+            _now_r = time.perf_counter()
+            self._rumble_diag_count = getattr(self, '_rumble_diag_count', 0) + 1
+            if _now_r - getattr(self, '_rumble_diag_t0', 0.0) >= 1.0:
+                _side = 'L' if self.is_joycon_left() else ('R' if self.is_joycon_right() else 'P')
+                logger.info("RUMBLE-RATE side=%s bridge=%s rate=%d/s",
+                            _side, getattr(self, 'is_esp32s3_bridge', False), self._rumble_diag_count)
+                self._rumble_diag_count = 0
+                self._rumble_diag_t0 = _now_r
+        except Exception:
+            pass
+
         strength = getattr(CONFIG, "vibration_strength", 5)
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
@@ -1094,8 +1182,14 @@ class Controller:
                 else:
                     hf_mask = 1.0
 
-            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier * lf_mask)))
-            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier * hf_mask)))
+            gc_lf_scale = 1.0
+            gc_hf_scale = 1.0
+            if getattr(self, 'controller_info', None) and getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                gc_lf_scale = 0.5
+                gc_hf_scale = 0.1
+
+            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier * lf_mask * gc_lf_scale)))
+            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier * hf_mask * gc_hf_scale)))
             
             return VibrationData(
                 lf_freq=scaled_lf_freq,
@@ -1115,9 +1209,13 @@ class Controller:
         try:
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
                 # Use the SW2 command channel for GameCube rumble instead of hardcoded 0x0012
-                uuid_to_use = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
-                is_on = vibration.lf_amp > 0 or vibration.hf_amp > 0
-                payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01 if is_on else 0x00, 0x00, 0x00, 0x00])
+                # Use Software PWM to enable variable strength since it only supports ON/OFF natively
+                self.gc_target_amp = min(1.0, max(v1.lf_amp, v1.hf_amp) / 1023.0)
+                
+                if not getattr(self, 'gc_pwm_running', False):
+                    self.gc_pwm_running = True
+                    asyncio.create_task(self._gc_pwm_loop())
+                return
             else:
                 uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
                     VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
@@ -1139,6 +1237,54 @@ class Controller:
             logger.debug(f"Vibration write failed: {e}")
             
         self.vibration_packet_id += 1
+
+    async def _gc_pwm_loop(self):
+        last_is_on = None
+        uuid_to_use = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
+        while self.client and self.client.is_connected and getattr(self, 'interp_running', False):
+            amp = getattr(self, 'gc_target_amp', 0.0)
+            if amp <= 0.02:
+                if last_is_on is not False:
+                    last_is_on = False
+                    try:
+                        payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                        await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+                    except: pass
+                await asyncio.sleep(0.05)
+                continue
+
+            if amp >= 0.98:
+                if last_is_on is not True:
+                    last_is_on = True
+                    try:
+                        payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
+                        await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+                    except: pass
+                await asyncio.sleep(0.05)
+                continue
+
+            # Software PWM: period = 40ms (25Hz)
+            period = 0.04
+            on_time = period * amp
+            off_time = period - on_time
+            
+            if on_time > 0.005:
+                try:
+                    payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
+                    await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+                    last_is_on = True
+                except: pass
+                await asyncio.sleep(on_time)
+                
+            if off_time > 0.005:
+                try:
+                    payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+                    last_is_on = False
+                except: pass
+                await asyncio.sleep(off_time)
+                
+        self.gc_pwm_running = False
 
     async def set_leds(self, player_number: int, reversed=False):
         if player_number > 8: player_number = 8
@@ -1175,9 +1321,14 @@ class Controller:
             return None, StickCalibrationData(calibration_data_1)
         return StickCalibrationData(calibration_data_1), StickCalibrationData(calibration_data_2)
 
-    async def pair(self):
-        from utils import get_local_mac_value
-        mac_value = get_local_mac_value()
+    async def pair(self, host_mac_value=None):
+        # host_mac_value lets callers pair the controller to a host other than the
+        # local PC Bluetooth adapter — the ESP32-S3 bridge passes its own BLE MAC so
+        # the controller bonds to the bridge and reconnects to it on a button press.
+        if host_mac_value is None:
+            from utils import get_local_mac_value
+            host_mac_value = get_local_mac_value()
+        mac_value = host_mac_value
         await self.write_command(COMMAND_PAIR, SUBCOMMAND_PAIR_SET_MAC,b"\x00\x02" +  mac_value.to_bytes(6, 'little') + mac_value.to_bytes(6, 'little'))
         ltk1 = bytes([0x00, 0xea, 0xbd, 0x47, 0x13, 0x89, 0x35, 0x42, 0xc6, 0x79, 0xee, 0x07, 0xf2, 0x53, 0x2c, 0x6c, 0x31])
         await self.write_command(COMMAND_PAIR, SUBCOMMAND_PAIR_LTK1, ltk1)
@@ -1189,17 +1340,47 @@ class Controller:
         def input_report_callback(sender, data):
             if getattr(self, 'suspended', False) or getattr(self, '_is_suspending', False):
                 return
-            
+
+            # --- TEMP input-rate diagnostic: how many input reports/sec reach this
+            # controller's callback (compare WinRT vs bridge; pairs with RUMBLE-RATE). ---
+            try:
+                _now_i = time.perf_counter()
+                self._input_diag_count = getattr(self, '_input_diag_count', 0) + 1
+                if _now_i - getattr(self, '_input_diag_t0', 0.0) >= 1.0:
+                    _side_i = 'L' if self.is_joycon_left() else ('R' if self.is_joycon_right() else 'P')
+                    logger.info("INPUT-RATE side=%s bridge=%s rate=%d/s",
+                                _side_i, getattr(self, 'is_esp32s3_bridge', False), self._input_diag_count)
+                    self._input_diag_count = 0
+                    self._input_diag_t0 = _now_i
+            except Exception:
+                pass
+
             # Debug log for the first few packets to see what's being sent on wake
             if not hasattr(self, '_packet_count'): self._packet_count = 0
-            if self._packet_count < 3:
+            if self._packet_count < 5:
                 self._packet_count += 1
-                logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} first packet {self._packet_count}: {to_hex(data[3:6])}")
+                pid = getattr(self.controller_info, 'product_id', 0)
+                log_fn = logger.info if pid in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else logger.debug
+                log_fn(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} pid=0x{pid:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
                 
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
+
+            # Connection settle gate: right after (re)connection the controller can
+            # emit transient/garbage frames (or the wake button is still held), which
+            # would otherwise be forwarded as real input the instant we start
+            # listening — firing mapped actions like screenshot or spamming keys
+            # (IME freeze). Ignore input until the first neutral (no-buttons) frame
+            # arrives or a short timeout elapses, establishing a clean baseline.
+            if not getattr(self, '_input_settled', True):
+                phys_buttons = inputData.buttons & 0x03FFFFFF
+                if phys_buttons == 0 or time.time() >= getattr(self, '_input_settle_deadline', 0):
+                    self._input_settled = True
+                else:
+                    return
+
             self.last_input_data = inputData
-            
+
             # Reset inactivity timer if there is physical input change
             current_buttons = inputData.buttons & 0x03FFFFFF
             if not hasattr(self, '_prev_idle_buttons'):
@@ -1229,8 +1410,16 @@ class Controller:
             is_right = self.is_joycon_right()
             is_pro = self.is_pro_controller()
 
-            # Filter out virtual button bits and garbage bits from physical reports (retaining only valid physical bits <= 0x03FFFFFF)
-            inputData.buttons &= 0x03FFFFFF
+            # Filter out virtual/garbage bits. The top byte of a Joy-Con/Pro report is a
+            # STATUS byte (e.g. 0xE0), so bits 24-31 must be discarded (0x03FFFFFF) — as
+            # in 0.10.1 — or they leak in as phantom GC_L/R_CLICK (0x40000000/0x80000000)
+            # which the mapping turns into permanent ZL/ZR. Only the NSO GameCube
+            # controller legitimately uses bits 30/31 (its digital trigger clicks), so it
+            # keeps the wider 0xC3FFFFFF mask.
+            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
+                inputData.buttons &= 0xC3FFFFFF
+            else:
+                inputData.buttons &= 0x03FFFFFF
             self.raw_buttons = inputData.buttons
 
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
@@ -1268,7 +1457,9 @@ class Controller:
                 "SL_L": bool(inputData.buttons & 0x00200000) if is_left else False,
                 "SR_L": bool(inputData.buttons & 0x00100000) if is_left else False,
                 "SL_R": bool(inputData.buttons & 0x00000020) if is_right else False,
-                "SR_R": bool(inputData.buttons & 0x00000010) if is_right else False
+                "SR_R": bool(inputData.buttons & 0x00000010) if is_right else False,
+                "GC_L_CLICK": bool(inputData.buttons & 0x40000000),
+                "GC_R_CLICK": bool(inputData.buttons & 0x80000000)
             }
 
             inputData.buttons &= ~(0x03307030)
@@ -1282,6 +1473,9 @@ class Controller:
             trigger_sys_manager = False
             trigger_change_profile_btn = False
 
+            gc_l_click_action = "ZL" if getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max" else getattr(CONFIG, "gc_l_click_mapping", "Default")
+            gc_r_click_action = "ZR" if getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max" else getattr(CONFIG, "gc_r_click_mapping", "Default")
+
             mapping_pairs = [
                 # (is_pressed, action, original_bit, default_action, btn_id)
                 (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None, "gl"),
@@ -1293,6 +1487,8 @@ class Controller:
                 (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None, "srl"),
                 (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None, "slr"),
                 (btn_states["SR_R"], getattr(CONFIG, "srr_mapping",  "Default"), 0x00000010, None, "srr"),
+                (btn_states["GC_L_CLICK"], gc_l_click_action, 0x40000000, "ZL", "gc_l_click"),
+                (btn_states["GC_R_CLICK"], gc_r_click_action, 0x80000000, "ZR", "gc_r_click"),
             ]
 
             if not hasattr(self, 'active_custom_keys'):
@@ -1656,10 +1852,10 @@ class Controller:
                 if vc is not None:
                     current_time = time.perf_counter()
                     last_rumble_time = getattr(self, 'last_rumble_time', 0)
-                    
+
                     if current_time - last_rumble_time >= 0.007:
                         self.last_rumble_time = current_time
-                        
+
                         if getattr(vc, 'rumble_force_clear', False):
                             self.rumble_stopped = False
                             self._zero_count = 0
@@ -1682,29 +1878,46 @@ class Controller:
                                     finally:
                                         self._rumble_task_running = False
 
+                                def dispatch_rumble_task(coro):
+                                    loop = getattr(vc, 'loop', None)
+                                    if loop and not loop.is_closed():
+                                        asyncio.run_coroutine_threadsafe(coro, loop)
+                                    else:
+                                        try:
+                                            asyncio.get_running_loop().create_task(coro)
+                                        except RuntimeError:
+                                            pass
+
                                 if is_zero:
                                     if not getattr(self, 'rumble_stopped', False):
                                         self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                        asyncio.get_running_loop().create_task(safe_send_single(v1, v2, v3))
+                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
                                         if self._zero_count >= 3:
                                             self.rumble_stopped = True
                                 else:
                                     self.rumble_stopped = False
                                     self._zero_count = 0
-                                    asyncio.get_running_loop().create_task(safe_send_single(v1, v2, v3))
+                                    # Pace continuous rumble to the BLE connection interval
+                                    # (~7.5ms) for the ESP32-S3 bridge. The 3 frames per
+                                    # command already cover the interval; dispatching every
+                                    # input report (faster, and doubled in merge mode) floods
+                                    # the firmware's per-interval BLE write and causes the
+                                    # stuttering. WinRT is paced by Windows' BLE stack instead.
+                                    if self._bridge_rumble_due():
+                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
                         else:
                             v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
                             v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
-                            
+
                             if self.is_pro_controller():
                                 is_zero = is_zero_l and is_zero_r
                             elif self.is_joycon_left():
                                 is_zero = is_zero_l
                             else:
                                 is_zero = is_zero_r
-                            
+
                             if not getattr(self, '_rumble_task_running', False):
-                                
+
                                 async def safe_send(v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r):
                                     self._rumble_task_running = True
                                     try:
@@ -1717,22 +1930,40 @@ class Controller:
                                     finally:
                                         self._rumble_task_running = False
 
+                                def dispatch_rumble_task(coro):
+                                    loop = getattr(vc, 'loop', None)
+                                    if loop and not loop.is_closed():
+                                        asyncio.run_coroutine_threadsafe(coro, loop)
+                                    else:
+                                        try:
+                                            asyncio.get_running_loop().create_task(coro)
+                                        except RuntimeError:
+                                            pass
+
                                 if is_zero:
                                     if not getattr(self, 'rumble_stopped', False):
                                         self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                        asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
+                                        dispatch_rumble_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
                                         if self._zero_count >= 3:
                                             self.rumble_stopped = True
                                 else:
                                     self.rumble_stopped = False
                                     self._zero_count = 0
-                                    asyncio.get_running_loop().create_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
+                                    # Pace continuous rumble to ~7.5ms for the bridge (see above).
+                                    if self._bridge_rumble_due():
+                                        dispatch_rumble_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
             
             except Exception as e:
                 logger.debug(f"Sync rumble failed: {e}")
 
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
+
+        # Arm the connection settle gate (see input_report_callback): suppress input
+        # until the first neutral frame or this deadline, so connect-moment garbage /
+        # a held wake-button can't fire mapped actions.
+        self._input_settled = False
+        self._input_settle_deadline = time.time() + 1.0
 
         if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             try:
