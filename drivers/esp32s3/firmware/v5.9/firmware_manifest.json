@@ -1,0 +1,57 @@
+{
+    "packageVersion": "1.0.0",
+    "firmwareVersion": "1.0.0",
+    "target": "esp32s3",
+    "flashMode": "dio",
+    "flashFreq": "80m",
+    "flashSize": "16MB",
+    "defaultProfile": "tinyusb_direct",
+    "profiles": [
+        {
+            "id": "basic_ble_transport_0_10_5",
+            "label": "Basic BLE raw transport bridge",
+            "app": "esp32s3_switch2_bridge.bin",
+            "assets": [
+                {
+                    "offset": "0x0",
+                    "path": "pro2_bridge_v5_5/bootloader/bootloader.bin",
+                    "sha256": "578baa713024da5a9c8fd15398c6a96dc2d8edfbb2899aab6460d3a14a1dab5a"
+                },
+                {
+                    "offset": "0x8000",
+                    "path": "pro2_bridge_v5_5/partition_table/partition-table.bin",
+                    "sha256": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
+                },
+                {
+                    "offset": "0x10000",
+                    "path": "pro2_bridge_v5_5/esp32s3_switch2_bridge.bin",
+                    "sha256": "1fed5faa4f489be4b788c4338e8430c5ecc92781e2e827679bfe0726d06db5e0"
+                }
+            ]
+        },
+        {
+            "id": "tinyusb_direct",
+            "label": "ESP32-S3 USB Direct CDC Bridge",
+            "version": "0.11.0",
+            "app": "esp32s3_usb_bridge.bin",
+            "assets": [
+                {
+                    "offset": "0x0",
+                    "path": "v1.0_usb_direct/bootloader.bin",
+                    "sha256": "16e0aeb1c5ef6f472a14e403f6678e2416f2c219583c3814f2022013d9d9101a"
+                },
+                {
+                    "offset": "0x8000",
+                    "path": "v1.0_usb_direct/partition-table.bin",
+                    "sha256": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
+                },
+                {
+                    "offset": "0x10000",
+                    "path": "v1.0_usb_direct/esp32s3_usb_bridge.bin",
+                    "sha256": "389bfb3452a2cc108aa976252b375d973c589acc43edbf792bd6ad2ba30dfd90"
+                }
+            ]
+        }
+    ],
+    "notes": "ESP32-S3 USB Direct CDC firmware bundle. The default profile is the TinyUSB direct serial bridge."
+}
