@@ -6,6 +6,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 
 * **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
 * **Low Latency Bluetooth Mode:** The application now forces Windows Bluetooth LE into `ThroughputOptimized` mode upon connection. This drastically drops the connection interval, massively reducing native Bluetooth input delay across the board.
+* **ESP32-S3 N16R8 Low-Latency Connection:** Added native support for the ESP32-S3 N16R8 development board as a low-latency BLE bridge, which enables 144Hz polling rate. The application provides firmware installation, controller pairing via the SYNC button, and seamless reconnection for controllers previously bonded to the bridge.
 * **Flexible Multi-Driver & Emulation Backend (WinUHid, ViGEmBus & USBIP):** Upgraded the emulation backend to support a flexible multi-driver architecture. Users can now seamlessly toggle between the built-in [WinUHid](https://github.com/lurebat/WinUHid) driver, the industry-standard [ViGEmBus](https://github.com/nefarius/ViGEmBus) virtual gamepad emulator, and a [USBIP](https://github.com/vadimgrn/usbip-win2)-based emulation mode which enables emulating a physical USB-connected Switch 2 Pro Controller.
   * *A special thank you to [LeonChrome](https://github.com/LeonChrome) for [proactively reaching out](https://www.reddit.com/r/NintendoSwitch2/comments/1t4yx0x/comment/ons2veu/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button) and sharing their open-source project [y700-switch2-pro-bridge](https://github.com/LeonChrome/y700-switch2-pro-bridge), which served as a crucial reference for successfully building this Switch 2 emulation mode.*
 * **Dynamic Emu Mode Toggle:** You can now instantly switch between Xbox 360, Xbox One, PS4 (DualShock 4), PS5 (DualSense), Switch 2 Pro Controller, and Switch 1 Joy-Con/Pro Controller emulation modes directly from the settings panel. This allows you to choose the best protocol for your specific game or platform without restarting the app.
@@ -42,7 +43,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **DJG Activation Types:** Trigger behavior options to support different input styles.
   * **Toggle:** Switch the DJG state once per button press.
   * **Hold:** Switch the DJG state when the button is pressed, and revert to the original state when the button is released.
-* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, dual Joy-con gyro trigger, print screen, change profile, system manager, standard buttons, or record custom input.
+* **Custom Extra Button Remapping:** Fully remap extra buttons like `GL`, `GR`, `SL_L`, `SL_R`, `SR_L`, `SR_R`, `NSO GCN L/R Analog Trigger Click`, `Home`, `Capture`, and `Chat` to function as gyro trigger, DualShock/DualSense trackpad click, calibration trigger, dual Joy-con gyro trigger, print screen, change profile, system manager, standard buttons, or record custom input.
 * **Advanced Custom Input Remapping:** Introduced a powerful new "Custom" mapping feature. Users can now record and assign any complex combination of keyboard keys, mouse clicks, or controller buttons to a single input. This flexible system supports both "Tap" (fires the recorded sequence momentarily) and "Hold" (sustains the sequence for as long as the button is pressed) modes.
   * Click the dropdown menu and select the "Custom" option.
   * Press and hold your desired combination of keyboard keys, mouse clicks, and/or controller buttons simultaneously.
@@ -51,6 +52,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
   * Click the **X** button to remove custom input and fall back to the default.
 * **Categorized Button Mapping Profiles:** Segregated custom button mapping and rumble configurations into three independent target categories: **Xbox**, **PS4**, **PS5**, and **Switch 2**. Remap profiles are now saved and loaded automatically based on the active emulation mode.
 * **Custom Mapping Profile System:** Implemented a profile management system. Users can create, rename, delete, and switch between multiple configurations. Each profile persistently stores button mappings, emulation mode, and driver settings.
+* **Assign Profile To Application:** Added profile auto-switching based on active foreground application. Bind one or more executable files (.exe) to a profile; when any of those applications become the focused window, the profile automatically activates.
 * **Joy-con Mouse Toggle:** A new dedicated switch in the GUI to enable or disable the Joy-con mouse mode. This prevents accidental cursor movement during gameplay.
 * **Dynamic Split & Merge System:** The new **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Added V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
@@ -76,6 +78,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Controller UI Navigation:** Implemented UI navigation using the left joystick or D-pad. The currently selected UI element is indicated by a white outline. The outline automatically hides upon detecting mouse clicks anywhere within the application or pressing B button on the controller.
   * **UI Component Interaction:** Added controller support for interacting with UI elements. Pressing the 'A' button clicks buttons or opens dropdown menus, while the 'B' button closes open dropdown menus without applying changes.
   * **Slider and Time Input Adjustment:** Enabled adjustment of sliders and auto-disconnect time input fields using the right joystick. Alternatively, holding the 'A' button while using the left joystick modifies the values without triggering spatial navigation.
+* **Window Position Persistence:** The application now saves and restores the window's position on the screen.
 * **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
 
 ## System Requirements
@@ -83,6 +86,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Operating System:** Windows 10 (22H2 or above) or Windows 11.
     * *Note:* **Windows 11 is highly recommended** for the best experience. It supports a maximum Bluetooth LE polling rate of **70Hz**, while Windows 10 is limited to **20Hz** due to the lack of OS driver support for the BLE protocol.
 * **Bluetooth Hardware:** Bluetooth 5.0 or above is required for stable connectivity and low-latency performance.
+* **Optional ESP32-S3 N16R8 Development Board:** This app natively supports the ESP32-S3 N16R8 development board as a low-latency BLE bridge, which enables 144Hz polling rate. The application provides firmware installation, controller pairing via the SYNC button, and seamless reconnection for controllers previously bonded to the bridge.
 * **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for virtual gamepad emulation (supporting Xbox, PS4, and PS5/DualSense emulation).
     * *Auto-Installation:* The app will automatically detect if the driver is missing on first launch and guide you through a one-click installation (requires administrator privileges).
 
@@ -117,6 +121,25 @@ To achieve drift-free 9-axis tracking, follow these steps to calibrate the magne
 2.  **Figure-8 Motion:** Hold the controller and move it continuously in a **"figure-8"** pattern in the air. Ensure you rotate the controller across all three axes to capture the full magnetic field range.
 3.  **Reference Video:** If you are unsure of the motion, click the [**'figure 8'** link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) in the UI to watch a short demonstration video.
 4.  **Save & Finish:** After performing the motion for about 5-10 seconds, click the **[Stop Mag Calib]** button to save the calibration data. The software will now use the new magnetic bias for stabilized orientation.
+
+## ESP32-S3 N16R8
+
+<img width="447" height="235" alt="ESP32-S3 N16R8 Guide" src="https://github.com/user-attachments/assets/6bb295fb-bc2c-4cb4-b859-ead65429ee64" />
+
+* **ESP32-S3 N16R8 Firmware Installation Guide:**
+
+1.  Hold the boot button on the ESP32-S3 N16R8 board.
+2.  Plug in the ESP32-S3 N16R8 board's OTG  port via USB-C to the PC while holding the boot button.
+3.  In the app, click the **[ESP32-S3 N16R8 Driver]** button.
+4.  Click click **[Install]" and wait until finish installing.
+5.  Unplug and plug the ESP32-S3 N16R8 board.
+6.  Reconnect any previously paired controllers by pressing SYNC.
+
+* **ESP32-S3 N16R8 Buying Guide:**
+1.  Search for development boards strictly labeled as **ESP32-S3 N16R8**. This ensures the board contains 16MB Flash and 8MB PSRAM, which is necessary for handling complex tasks and controller connections. Avoid any boards labeled as "N8R2", "N8R8", or standard "ESP32".
+2.  Select the **ESP32-S3-WROOM-1** version if you want a built-in PCB antenna. This is the recommended, plug-and-play choice for standard plastic enclosures. Only choose the ESP32-S3-WROOM-1U version if you are using a metal case or require an external antenna to extend the Bluetooth/Wi-Fi range.
+3.  Verify that the board features an **OTG USB port** (often a dual USB-C design). The OTG port is strictly required for data transfer and firmware installation.
+
 
 ##
 **This project is developed based on and has been extensively modified from [Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers). I would like to thank the original author for her foundational work.**
