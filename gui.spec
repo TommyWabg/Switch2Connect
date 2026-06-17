@@ -1,9 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('resources', 'resources'), ('config.yaml', 'resources')]
+datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/esp32s3', 'drivers/esp32s3')]
 binaries = []
-hiddenimports = []
+hiddenimports = [
+    'usbip_server',
+    'usbip_dualsense_server',
+    'dualsense_descriptors',
+    'dualsense_structs',
+    'dualsense_haptic',
+    'esp32s3_bridge',
+    'win32com',
+    'win32com.client',
+]
 tmp_ret = collect_all('vgamepad')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('imufusion')
