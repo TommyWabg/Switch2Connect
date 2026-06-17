@@ -1,0 +1,27 @@
+CONFIG_FREERTOS_HZ=1000
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+CONFIG_TINYUSB=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_MAX_BONDS=8
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=8
+CONFIG_BT_NIMBLE_MAX_CCCDS=24
+# Enlarge NimBLE's shared mbuf pool and concurrent-GATT-proc count. The default
+# MSYS_1 pool (12 blocks) and 4 GATT procs are shared across ALL connections' input
+# notifications and output (rumble) writes; in merge mode (2-3 controllers at 7.5ms)
+# the pool runs dry and rumble writes get BLE_HS_ENOMEM, causing periodic gaps. More
+# blocks give the concurrent input+rumble traffic headroom.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=48
+CONFIG_BT_NIMBLE_GATT_MAX_PROCS=8
+# This is a BLE-only bridge — it never initializes WiFi. Leaving WiFi enabled keeps
+# the WiFi/BT software-coexistence arbiter active, which reserves radio time slots and
+# limits how tightly the BLE controller can pack multiple connections (a cause of the
+# multi-controller latency floor). Disabling WiFi cascades ESP_COEX_SW_COEXIST_ENABLE
+# off, giving the BLE controller full, unarbitrated use of the radio.
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
