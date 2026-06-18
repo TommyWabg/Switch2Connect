@@ -331,9 +331,11 @@ class USBIPDualSenseServer(USBIPServer):
                 elif desc_idx == 2:
                     return DUALSENSE_STRING_PRODUCT[:length]
                 elif desc_idx == 3:
-                    # SAxense-style: unique per-session serial busts Windows HID cache.
-                    # If serial is same as previous, Windows reuses cached (potentially wrong) descriptor.
-                    serial_str = _SESSION_SERIAL
+                    # Unique serial per controller instance (mirrors Switch2: f"SWITCH2EMU_{bus_id}").
+                    # Windows uses VID+PID+Serial to identify devices; a shared serial prevents
+                    # a second DualSense from being enumerated alongside the first.
+                    # bus_id is unique per USBIPAllocator slot, so each player gets a distinct device.
+                    serial_str = f"DS5E_{self.bus_id}"
                     encoded = serial_str.encode("utf-16le")
                     return (bytes([len(encoded) + 2, 3]) + encoded)[:length]
                 elif desc_idx == 4:
@@ -401,8 +403,10 @@ class USBIPDualSenseServer(USBIPServer):
                     fw[40:49] = b'12:00:00\0'
                     # fw_type at 49
                     fw[49] = 0x00
-                    # fw_version at 50-53
-                    struct.pack_into("<I", fw, 50, 0x01000000)
+                    # fw_version at 50-53: embed devnum in low byte so each instance
+                    # reports a distinct version; prevents Steam/WGI from treating
+                    # two virtual DualSense devices as the same physical controller.
+                    struct.pack_into("<I", fw, 50, 0x01000000 | (self.devnum & 0xFF))
                     # hw_version at 54-57
                     struct.pack_into("<I", fw, 54, 0x01000000)
                     return bytes(fw)[:length]

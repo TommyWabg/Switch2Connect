@@ -559,11 +559,30 @@ class VirtualController:
                         try:
                             detach_usbip_device(server_port)
                             time.sleep(0.2)
-                            subprocess.Popen(
-                                [usbip_exe, "-t", str(server_port), "attach", "-r", self.host_ip, "-b", self.bus_id],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            _sw2_attach_cmd = [usbip_exe, "-t", str(server_port), "attach", "-r", self.host_ip, "-b", self.bus_id]
+                            logger.info(f"Switch2 USBIP attach cmd: {' '.join(_sw2_attach_cmd)}")
+                            _sw2_proc = subprocess.Popen(
+                                _sw2_attach_cmd,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
                             )
+                            def _log_sw2_attach(proc, player_num, host, port, bus):
+                                try:
+                                    out, err = proc.communicate(timeout=10)
+                                    rc = proc.returncode
+                                    if out: logger.info(f"Player {player_num} SW2 attach stdout: {out.decode(errors='replace').strip()}")
+                                    if err: logger.warning(f"Player {player_num} SW2 attach stderr: {err.decode(errors='replace').strip()}")
+                                    if rc != 0:
+                                        logger.error(f"Player {player_num} SW2 attach failed (rc={rc}) on {host}:{port} bus={bus}")
+                                    else:
+                                        logger.info(f"Player {player_num} SW2 attach OK on {host}:{port} bus={bus}")
+                                except Exception as ex:
+                                    logger.warning(f"Player {player_num} SW2 attach log error: {ex}")
+                            threading.Thread(
+                                target=_log_sw2_attach,
+                                args=(_sw2_proc, self.player_number, self.host_ip, server_port, self.bus_id),
+                                daemon=True
+                            ).start()
                             logger.info(f"Attached virtual Switch2 Controller for Player {self.player_number} via USBIP on {self.host_ip}:{server_port} bus={self.bus_id}")
                         except Exception as e:
                             logger.error(f"Failed to attach USBIP device: {e}")
@@ -667,33 +686,84 @@ class VirtualController:
                 import subprocess
                 import time
                 from usbip_dualsense_server import USBIPDualSenseServer
-                
-                mac_address = self.controllers[0].device.address if self.controllers else None
-                host_ip, bus_id, port = USBIPAllocator.allocate()
-                self.server_port = port
-                self.bus_id = bus_id
-                self.host_ip = host_ip
-                try:
-                    detach_usbip_device(port)
-                except Exception:
-                    pass
-                
-                self.usbip_server = USBIPDualSenseServer(
-                    host=host_ip, port=port,
-                    on_rumble_callback=lambda d, p=port: self._dualsense_rumble_callback(d, side="Pro"),
-                    bus_id=bus_id, mac_address=mac_address,
-                    on_audio_data_callback=self._usbip_audio_callback
-                )
-                self.usbip_server.start()
-                threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
-                
+
                 usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-                if os.path.exists(usbip_exe):
-                    time.sleep(0.2)
-                    subprocess.Popen([usbip_exe, "-t", str(port), "attach", "-r", host_ip, "-b", bus_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
-                    logger.info(f"Attached virtual DualSense for Player {self.player_number} via USBIP on {host_ip}:{port}")
+                mac_address = self.controllers[0].device.address if self.controllers else None
+
+                # Mirror Switch2 pattern: use the MAC_TO_USBIP-cached allocation from __init__
+                # (server_port was already detached at the top of _setup_vg_controller).
+                # On conflict, re-allocate a fresh triple exactly like Switch2 does.
+                started = False
+                for attempt in range(2):
+                    try:
+                        host_ip = self.host_ip
+                        bus_id = self.bus_id
+                        port = self.server_port  # already detached above on attempt 0
+
+                        if attempt > 0:
+                            host_ip, bus_id, port = USBIPAllocator.allocate()
+                            self.host_ip = host_ip
+                            self.bus_id = bus_id
+                            self.server_port = port
+                            logger.warning(f"PS5 USBIP port conflict for Player {self.player_number}; retrying on {host_ip}:{port} bus={bus_id}")
+                            detach_usbip_device(port)
+                            time.sleep(0.1)
+
+                        self.usbip_server = USBIPDualSenseServer(
+                            host=host_ip, port=port,
+                            on_rumble_callback=lambda d, p=port: self._dualsense_rumble_callback(d, side="Pro"),
+                            bus_id=bus_id, mac_address=mac_address,
+                            on_audio_data_callback=self._usbip_audio_callback
+                        )
+                        self.usbip_server.start()
+                        started = True
+                        break
+                    except Exception as e:
+                        logger.error(f"Failed to start PS5 USBIP Server (attempt {attempt + 1}): {e}")
+                        if self.usbip_server is not None:
+                            try:
+                                self.usbip_server.stop()
+                            except Exception:
+                                pass
+                            self.usbip_server = None
+
+                if started:
+                    threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
+                    if os.path.exists(usbip_exe):
+                        try:
+                            detach_usbip_device(self.server_port)
+                            time.sleep(0.2)
+                            _attach_cmd = [usbip_exe, "-t", str(self.server_port), "attach", "-r", self.host_ip, "-b", self.bus_id]
+                            logger.info(f"PS5 USBIP attach cmd: {' '.join(_attach_cmd)}")
+                            _attach_proc = subprocess.Popen(
+                                _attach_cmd,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                            )
+                            def _log_attach_output(proc, player_num, host, port, bus):
+                                try:
+                                    out, err = proc.communicate(timeout=10)
+                                    rc = proc.returncode
+                                    if out: logger.info(f"Player {player_num} usbip attach stdout: {out.decode(errors='replace').strip()}")
+                                    if err: logger.warning(f"Player {player_num} usbip attach stderr: {err.decode(errors='replace').strip()}")
+                                    if rc != 0:
+                                        logger.error(f"Player {player_num} usbip attach failed (rc={rc}) on {host}:{port} bus={bus}")
+                                    else:
+                                        logger.info(f"Player {player_num} usbip attach OK on {host}:{port} bus={bus}")
+                                except Exception as ex:
+                                    logger.warning(f"Player {player_num} usbip attach log error: {ex}")
+                            threading.Thread(
+                                target=_log_attach_output,
+                                args=(_attach_proc, self.player_number, self.host_ip, self.server_port, self.bus_id),
+                                daemon=True
+                            ).start()
+                            logger.info(f"Attached virtual DualSense for Player {self.player_number} via USBIP on {self.host_ip}:{self.server_port} bus={self.bus_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to attach PS5 USBIP device: {e}")
+                    else:
+                        logger.error(f"usbip.exe not found at {usbip_exe}!")
                 else:
-                    logger.error(f"usbip.exe not found at {usbip_exe}!")
+                    logger.error(f"PS5 USBIP Server for Player {self.player_number} could not be started after retries.")
 
                 class MockDualSenseGamepad:
                     def __init__(self, vc):

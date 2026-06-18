@@ -1682,6 +1682,25 @@ class Controller:
                 if raw_up_pressed:    inputData.buttons |= 0x02
                 if raw_left_pressed:  inputData.buttons |= 0x01
 
+            # NSO GameCube Controller Switch Layout override:
+            # GCN physical buttons map differently to Switch Pro buttons.
+            # raw_right=GCN A, raw_left=GCN B, raw_down=GCN X, raw_up=GCN Y
+            # Desired Switch Layout: GCN A→Pro B, GCN B→Pro Y, GCN X→Pro A, GCN Y→Pro X
+            if (should_swap and
+                    getattr(self, 'controller_info', None) and
+                    getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID):
+                # Clear the bits set by the generic Switch layout above
+                inputData.buttons &= ~0x0F
+                # Re-apply with GCN-specific mapping:
+                # GCN X (raw_down) → Pro A (0x08)
+                if raw_down_pressed:  inputData.buttons |= 0x08
+                # GCN A (raw_right) → Pro B (0x04)
+                if raw_right_pressed: inputData.buttons |= 0x04
+                # GCN Y (raw_up) → Pro X (0x02)
+                if raw_up_pressed:    inputData.buttons |= 0x02
+                # GCN B (raw_left) → Pro Y (0x01)
+                if raw_left_pressed:  inputData.buttons |= 0x01
+
             if trigger_screenshot and not getattr(self, 'prev_screenshot', False):
                 win32api.keybd_event(0x5B, 0, 0, 0)
                 win32api.keybd_event(0x2C, 0, 0, 0)
