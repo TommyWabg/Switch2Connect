@@ -10,6 +10,7 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
@@ -31,7 +32,7 @@ void ble_store_config_init(void);
 
 static const char *TAG = "ESP32S3_CDC";
 
-#define APP_FIRMWARE_VERSION "0.11.0"
+#define APP_FIRMWARE_VERSION "0.11.1"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD "cdc_bridge_1"
 #define NINTENDO_REPORT_SIZE 64
@@ -41,7 +42,7 @@ static const char *TAG = "ESP32S3_CDC";
 #define CDC_PACKET_MAX (2 + 1 + 1 + NINTENDO_REPORT_SIZE)
 #define BLE_MAX_SERVICES 32
 #define BLE_MAX_REPORT_CHARS 96
-#define BLE_REPORT_QUEUE_DEPTH 100
+#define Q_CTRL_DEPTH    32   // P0: BLE ACK/command responses (never starved)
 #define MAX_BLE_CHANNELS 8
 
 #define SWITCH2_NOTIFY_FD2_UUID "ab7de9be-89fe-49ad-828f-118f09df7fd2"
@@ -100,7 +101,14 @@ typedef struct {
     size_t init_index;
 } controller_channel_t;
 
-QueueHandle_t ble_report_queue;
+static QueueHandle_t q_ctrl;    // P0: BLE ACK/command responses
+static SemaphoreHandle_t s_stream_wake; // wakes cdc_stream_task
+
+// Per-channel latest input shadow buffer (P2: always keeps newest, old dropped)
+static controller_report_t s_latest_input[MAX_BLE_CHANNELS];
+static bool s_latest_input_dirty[MAX_BLE_CHANNELS];
+static portMUX_TYPE s_input_shadow_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_ctrl_drop_count; // q_ctrl overflow counter
 
 // Per-channel rumble write diagnostics (ok vs dropped). Reported once a second so we
 // can see whether merge-mode rumble alternation is caused by the firmware DROPPING
@@ -174,11 +182,9 @@ static void safe_cdc_write(const uint8_t *data, uint32_t len)
 
 static void wake_cdc_stream_task(void)
 {
-    if (ble_report_queue == NULL) {
-        return;
+    if (s_stream_wake != NULL) {
+        xSemaphoreGive(s_stream_wake);
     }
-    controller_report_t wake = {0};
-    (void)xQueueSend(ble_report_queue, &wake, 0);
 }
 
 static void uuid_to_lower_string(const ble_uuid_t *uuid, char *out, size_t out_len)
@@ -546,25 +552,24 @@ static void handle_disc_command(char *command)
 static void cdc_stream_task(void *arg)
 {
     (void)arg;
-    controller_report_t report;
     int64_t last_rumble_report_us = 0;
 
     while (1) {
-        // Once a second, dump the per-channel rumble write ok/fail counts so we can see
-        // whether merge-mode alternation is dropped writes (fail>0 on a channel) or a
-        // link-level delivery issue (both channels all-ok yet motors still alternate).
+        // Once a second, dump per-channel rumble and drop diagnostics.
         int64_t now_us = esp_timer_get_time();
         if (now_us - last_rumble_report_us >= 1000000) {
             last_rumble_report_us = now_us;
-            if (s_rumble_tx_ok[0] || s_rumble_tx_ok[1] || s_rumble_tx_fail[0] || s_rumble_tx_fail[1]) {
-                char rdbg[240];
+            if (s_rumble_tx_ok[0] || s_rumble_tx_ok[1] || s_rumble_tx_fail[0] || s_rumble_tx_fail[1] || s_ctrl_drop_count) {
+                char rdbg[256];
                 int rl = snprintf(rdbg, sizeof(rdbg),
-                    "{\"cmd\":\"debug\",\"msg\":\"rumble ch0=%u/%u/%u ch1=%u/%u/%u (ok/fail/active) in ch0=%u ch1=%u (/s)\"}\n",
+                    "{\"cmd\":\"debug\",\"msg\":\"rumble ch0=%u/%u/%u ch1=%u/%u/%u (ok/fail/active) in ch0=%u ch1=%u (/s) ctrl_drop=%u\"}\n",
                     (unsigned)s_rumble_tx_ok[0], (unsigned)s_rumble_tx_fail[0], (unsigned)s_rumble_active[0],
                     (unsigned)s_rumble_tx_ok[1], (unsigned)s_rumble_tx_fail[1], (unsigned)s_rumble_active[1],
-                    (unsigned)s_input_fwd[0], (unsigned)s_input_fwd[1]);
+                    (unsigned)s_input_fwd[0], (unsigned)s_input_fwd[1],
+                    (unsigned)s_ctrl_drop_count);
                 if (rl > 0) safe_cdc_write((const uint8_t *)rdbg, rl);
             }
+            s_ctrl_drop_count = 0;
             for (int i = 0; i < MAX_BLE_CHANNELS; i++) {
                 s_rumble_tx_ok[i] = 0;
                 s_rumble_tx_fail[i] = 0;
@@ -575,36 +580,50 @@ static void cdc_stream_task(void *arg)
 
         if (request_status) {
             send_status_response();
-            if (request_status) {
-                vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        // P0: drain q_ctrl (ACK/command — prioritised, re-loop after each item)
+        controller_report_t report;
+        if (xQueueReceive(q_ctrl, &report, 0) == pdTRUE) {
+            uint8_t payload_len = report.length > NINTENDO_REPORT_SIZE ? NINTENDO_REPORT_SIZE : report.length;
+            uint8_t frame_len = payload_len + 1;
+            // High bit (0x80) flags command/ack so the host routes it away from the input parser.
+            uint8_t chan_byte = (uint8_t)(report.channel + 1) | 0x80;
+            uint8_t header[4] = {0xaa, 0x55, frame_len, chan_byte};
+            safe_cdc_write(header, sizeof(header));
+            safe_cdc_write(report.payload, payload_len);
+            continue;
+        }
+
+        // P2: send latest shadow input for each channel (drops superseded frames)
+        bool sent_any = false;
+        for (int i = 0; i < MAX_BLE_CHANNELS; i++) {
+            controller_report_t shadow;
+            bool dirty = false;
+            portENTER_CRITICAL(&s_input_shadow_mux);
+            if (s_latest_input_dirty[i]) {
+                shadow = s_latest_input[i];
+                s_latest_input_dirty[i] = false;
+                dirty = true;
             }
-            continue;
-        }
-
-        if (xQueueReceive(ble_report_queue, &report, pdMS_TO_TICKS(5)) != pdTRUE) {
-            continue;
-        }
-
-        if (request_status) {
-            send_status_response();
-            if (request_status) {
-                vTaskDelay(pdMS_TO_TICKS(1));
+            portEXIT_CRITICAL(&s_input_shadow_mux);
+            if (!dirty) {
+                continue;
             }
-            continue;
+            uint8_t payload_len = shadow.length > NINTENDO_REPORT_SIZE ? NINTENDO_REPORT_SIZE : shadow.length;
+            uint8_t frame_len = payload_len + 1;
+            uint8_t chan_byte = (uint8_t)(shadow.channel + 1);  // no 0x80: input report
+            uint8_t header[4] = {0xaa, 0x55, frame_len, chan_byte};
+            safe_cdc_write(header, sizeof(header));
+            safe_cdc_write(shadow.payload, payload_len);
+            sent_any = true;
         }
 
-        if (report.length == 0) {
-            continue;
+        if (!sent_any) {
+            // Nothing to send — sleep until BLE notify or status request wakes us
+            xSemaphoreTake(s_stream_wake, pdMS_TO_TICKS(5));
         }
-
-        uint8_t payload_len = report.length > NINTENDO_REPORT_SIZE ? NINTENDO_REPORT_SIZE : report.length;
-        uint8_t frame_len = payload_len + 1;
-        // High bit (0x80) of the channel byte flags a command/ack response so the
-        // host routes it away from the input parser.
-        uint8_t chan_byte = (uint8_t)(report.channel + 1) | (report.is_command ? 0x80 : 0x00);
-        uint8_t header[4] = {0xaa, 0x55, frame_len, chan_byte};
-        safe_cdc_write(header, sizeof(header));
-        safe_cdc_write(report.payload, payload_len);
     }
 }
 
@@ -1110,7 +1129,7 @@ static void start_gatt_discovery(uint16_t conn_handle)
 
 static void handle_notify_rx(const struct ble_gap_event *event)
 {
-    if (event->notify_rx.om == NULL || ble_report_queue == NULL) {
+    if (event->notify_rx.om == NULL || q_ctrl == NULL) {
         return;
     }
 
@@ -1155,12 +1174,23 @@ static void handle_notify_rx(const struct ble_gap_event *event)
     // notifications otherwise get misparsed as random buttons/sticks on connect.
     report.is_command = chr->input_target ? 0 : 1;
 
-    if (report.is_command == 0 && report.channel < MAX_BLE_CHANNELS) {
-        s_input_fwd[report.channel]++;  // count input reports forwarded per channel
-    }
-
-    if (xQueueSend(ble_report_queue, &report, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "BLE report queue full; dropping len=%u", (unsigned)copy_len);
+    if (report.is_command) {
+        // P0: ACK/command response — never starve, but never block BLE host task
+        if (xQueueSend(q_ctrl, &report, 0) != pdTRUE) {
+            s_ctrl_drop_count++;  // q_ctrl full = CDC disconnected; dropping here is correct
+        } else {
+            xSemaphoreGive(s_stream_wake);
+        }
+    } else {
+        // P2: input report — always keep latest, discard stale
+        if (report.channel < MAX_BLE_CHANNELS) {
+            s_input_fwd[report.channel]++;
+        }
+        portENTER_CRITICAL(&s_input_shadow_mux);
+        s_latest_input[ch_index] = report;
+        s_latest_input_dirty[ch_index] = true;
+        portEXIT_CRITICAL(&s_input_shadow_mux);
+        xSemaphoreGive(s_stream_wake);
     }
 }
 
@@ -1543,8 +1573,10 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting ESP32-S3 USB CDC BLE Bridge");
 
-    ble_report_queue = xQueueCreate(BLE_REPORT_QUEUE_DEPTH, sizeof(controller_report_t));
-    ESP_ERROR_CHECK(ble_report_queue == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    q_ctrl = xQueueCreate(Q_CTRL_DEPTH, sizeof(controller_report_t));
+    ESP_ERROR_CHECK(q_ctrl == NULL ? ESP_ERR_NO_MEM : ESP_OK);
+    s_stream_wake = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(s_stream_wake == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     tinyusb_config_t tusb_cfg = {
         .device_descriptor = NULL,
