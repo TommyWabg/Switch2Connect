@@ -32,13 +32,13 @@
         {
             "id": "tinyusb_direct",
             "label": "ESP32-S3 USB Direct CDC Bridge",
-            "version": "0.11.0",
+            "version": "0.11.1",
             "app": "esp32s3_usb_bridge.bin",
             "assets": [
                 {
                     "offset": "0x0",
                     "path": "v1.0_usb_direct/bootloader.bin",
-                    "sha256": "16e0aeb1c5ef6f472a14e403f6678e2416f2c219583c3814f2022013d9d9101a"
+                    "sha256": "d64093537e0479dac3e535dd02cfc61ed2e6faf4f6660ca537ee9d9fcdd81662"
                 },
                 {
                     "offset": "0x8000",
@@ -48,7 +48,7 @@
                 {
                     "offset": "0x10000",
                     "path": "v1.0_usb_direct/esp32s3_usb_bridge.bin",
-                    "sha256": "389bfb3452a2cc108aa976252b375d973c589acc43edbf792bd6ad2ba30dfd90"
+                    "sha256": "470a7da4f32944928d723f0fd468cf9571f4b96d1fa9969a7ec28e6dcd57a8a2"
                 }
             ]
         }
