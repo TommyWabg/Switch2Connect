@@ -131,7 +131,7 @@ To achieve drift-free 9-axis tracking, follow these steps to calibrate the magne
 1.  Hold the boot button on the ESP32-S3 N16R8 board.
 2.  Plug in the ESP32-S3 N16R8 board's OTG  port via USB-C to the PC while holding the boot button.
 3.  In the app, click the **[ESP32-S3 N16R8 Driver]** button.
-4.  Click click **[Install]" and wait until finish installing.
+4.  Click click **[Install]** and wait until finish installing.
 5.  Unplug and plug the ESP32-S3 N16R8 board.
 6.  Reconnect any previously paired controllers by pressing SYNC.
 
