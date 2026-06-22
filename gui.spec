@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/esp32s3', 'drivers/esp32s3')]
+datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/esp32s3', 'drivers/esp32s3'), ('drivers/tools', 'drivers/tools')]
 binaries = []
 hiddenimports = [
     'usbip_server',

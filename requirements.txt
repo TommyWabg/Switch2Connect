@@ -13,8 +13,12 @@ winrt-Windows.Foundation.Collections==3.2.1
 winrt-Windows.Storage.Streams==3.2.1
 imufusion==1.2.11
 numpy==1.26.4
+pystray==0.19.5
+Pillow==12.1.1
+pyinstaller==6.20.0
 
 # External C/C++ Driver & Sub-library Repositories (For reference / self-compilation)
 # WinUHid Driver: https://github.com/lurebat/WinUHid
 # Fusion IMU Library: https://github.com/xioTechnologies/Fusion
 # USBIP Driver (usbip-win2): https://github.com/czgdp1807/usbip-win2
+# SoundVolumeCommandLine (svcl): https://www.nirsoft.net/utils/sound_volume_view.html
