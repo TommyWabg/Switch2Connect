@@ -31,27 +31,28 @@
         },
         {
             "id": "tinyusb_direct",
-            "label": "ESP32-S3 USB Direct CDC Bridge",
-            "version": "0.11.1",
-            "app": "esp32s3_usb_bridge.bin",
+            "label": "ESP32-S3 Bluedroid Bridge (production)",
+            "version": "0.11.2",
+            "app": "esp32s3_bluedroid_bridge.bin",
             "assets": [
                 {
                     "offset": "0x0",
-                    "path": "v1.0_usb_direct/bootloader.bin",
-                    "sha256": "d64093537e0479dac3e535dd02cfc61ed2e6faf4f6660ca537ee9d9fcdd81662"
+                    "path": "v1.0_bluedroid/bootloader.bin",
+                    "sha256": "c17c764236947df9580cea5b277c4088e3de6a8a6eed7f2dea472c29d4a66889"
                 },
                 {
                     "offset": "0x8000",
-                    "path": "v1.0_usb_direct/partition-table.bin",
+                    "path": "v1.0_bluedroid/partition-table.bin",
                     "sha256": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
                 },
                 {
                     "offset": "0x10000",
-                    "path": "v1.0_usb_direct/esp32s3_usb_bridge.bin",
-                    "sha256": "470a7da4f32944928d723f0fd468cf9571f4b96d1fa9969a7ec28e6dcd57a8a2"
+                    "path": "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
+                    "sha256": "0ac5240d127a4ca5b11e3aa12be983e56d9cd1d5ec983ed2f0bfa29afa0ab197"
                 }
             ]
         }
     ],
-    "notes": "ESP32-S3 USB Direct CDC firmware bundle. The default profile is the TinyUSB direct serial bridge."
+    "notes": "tinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake.\n4. Auto-disable for DualSense virtual audio endpoint via USBIP. Handled completely in the background via svcl.exe / SoundVolumeView.exe to release the endpoint from Windows audio mixing, allowing proper PS5 haptic passthrough."
 }
+
