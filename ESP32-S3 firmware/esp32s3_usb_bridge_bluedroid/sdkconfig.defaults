@@ -1,0 +1,54 @@
+CONFIG_FREERTOS_HZ=1000
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+
+# USB-CDC bridge transport (same as the NimBLE build)
+CONFIG_TINYUSB=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# --- BLE host: BLUEDROID (not NimBLE) ---
+# This is the whole point of this variant: Bluedroid uses a multi-task host
+# (BTU lower / BTC upper) instead of NimBLE's single host task + single ble_hs_lock,
+# so input-notification RX and rumble-write TX can progress more concurrently. The
+# protocol on the wire is IDENTICAL to the NimBLE build (see switch2-ble-protocol).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=n
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_GATTC_ENABLE=y
+CONFIG_BT_GATTS_ENABLE=n
+CONFIG_BT_CLASSIC_ENABLED=n
+CONFIG_BT_BLE_SMP_ENABLE=y
+# Switch 2 controllers use LEGACY (BLE 4.2) advertising, so enable the 4.2 feature
+# set (legacy esp_ble_gap_set_scan_params / start_scanning APIs).  The S3 controller
+# defaults to 5.0/extended-only, which leaves those legacy GAP symbols unlinked.
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+# v0.12.16 EXPERIMENT REVERTED: enabling BLE 5.0 did NOT make enh_open accept
+# max_ce_len=0x0003 — even the 1st connection got CONN_CANCEL (reason 0x100) before
+# OPEN_EVT.  So ce_len cannot be set on this chip regardless of 4.2/5.0.  Back to 4.2-only.
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+
+# Allow multiple simultaneous BLE connections (4 Joy-Con pairs = up to 8 half-controllers
+# or 4 Pro Controllers; MAX_ACT gives the BLE controller scheduling headroom).
+CONFIG_BT_CTRL_BLE_MAX_ACT=9
+CONFIG_BT_ACL_CONNECTIONS=9
+CONFIG_BT_GATTC_CONNECT_RETRY_COUNT=3
+
+# Each BLE connection registers up to 2 GATT notifications (input characteristic
+# + ACK characteristic).  4 controllers × 2 = 8 minimum; set to 16 for headroom.
+# The IDF default of 5 causes the 3rd controller's 2nd notification registration
+# to fail silently or assert — which is one of the crash contributors.
+CONFIG_BT_GATTC_NOTIF_REG_MAX=16
+
+# WiFi / coexistence notes (mirrors NimBLE sdkconfig.defaults exactly):
+#   CONFIG_ESP_WIFI_ENABLED cannot be turned off on the ESP32-S3 in IDF 5.5.4 —
+#   it is a promptless Kconfig symbol forced to `y` by `default y if SOC_WIFI_SUPPORTED`.
+#   The WiFi library stays linked but no esp_wifi_* call is ever made; only the
+#   software coexistence arbiter below has a runtime effect on radio scheduling.
+# Give the BLE controller full, unarbitrated radio (no WiFi coexistence arbiter).
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+CONFIG_BT_CTRL_CE_LENGTH_TYPE_SD=y
