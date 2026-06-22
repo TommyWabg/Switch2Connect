@@ -26,7 +26,9 @@ import threading
 import ctypes
 import logging
 import gc
-from controller import Controller, ControllerInputData, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
+from controller import (Controller, ControllerInputData, VibrationData,
+                        NSO_GAMECUBE_CONTROLLER_PID,
+                        _gcn_update_pwm_state, normalize_motor_value)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
 from utils import USBIPAllocator
@@ -729,6 +731,16 @@ class VirtualController:
 
                 if started:
                     threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
+                    # Disable the virtual DualSense audio playback endpoint in Windows so
+                    # the game can drive the ISO-OUT haptic stream directly (an ENABLED
+                    # endpoint is claimed/mixed by the Windows audio engine and starves
+                    # the haptic channels).  Runs in the background with retries because
+                    # the endpoint appears a moment after USBIP attach.
+                    try:
+                        from dualsense_audio_endpoint import disable_dualsense_audio_endpoint_async
+                        disable_dualsense_audio_endpoint_async()
+                    except Exception:
+                        logger.debug("DualSense audio-endpoint auto-disable hook failed", exc_info=True)
                     if os.path.exists(usbip_exe):
                         try:
                             detach_usbip_device(self.server_port)
@@ -894,7 +906,25 @@ class VirtualController:
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
         import math
         import discoverer
-        
+
+        # --- NSO GCN Xbox-mode PWM path ---
+        # When an NSO GCN controller is connected and we're in Xbox emulation mode,
+        # bypass the Switch HD Rumble lf/hf accumulation entirely and route the
+        # XInput motor values directly to the per-tick sigma-delta PWM state machine.
+        sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
+        is_xbox_mode = sim_mode in ("Xbox One", "Xbox360")
+        if is_xbox_mode and getattr(CONFIG, "gcn_rumble_pwm_enabled", True):
+            for c in self.controllers:
+                pid = getattr(getattr(c, 'controller_info', None), 'product_id', 0)
+                if pid == NSO_GAMECUBE_CONTROLLER_PID:
+                    _gcn_update_pwm_state(c, large_motor, small_motor)
+                    logger.debug(
+                        "GCN PWM: XInput large_motor=%d small_motor=%d routed to PWM state machine",
+                        large_motor, small_motor
+                    )
+                    return  # Do NOT fall through to HD Rumble buffer
+
+        # --- Standard Switch HD Rumble path (Joy-Con / Pro Controller / DualSense) ---
         lf_val = int(800 * large_motor / 256)
         hf_val = int(800 * small_motor / 256)
 
@@ -1501,6 +1531,58 @@ class VirtualController:
         
         hold_mode = getattr(self, 'hold_mode', 'Vertical')
 
+        # Joy-Con gyro scale for the Default-passthrough Switch1 report.  The report packs
+        # raw int16 gyro that the host reads at the Switch NATIVE scale (~0.061 deg/s per
+        # LSB — proven by the Pro Controller, whose raw gyro passes through unscaled and is
+        # correct).  A Joy-Con 2's raw gyro is at a different sensitivity: CemuHook
+        # Sensitivity=1 converts it with 0.0535 deg/s per LSB (empirically validated).  So
+        # to make the Default report carry the SAME angular velocity as CemuHook Sens=1,
+        # scale the raw gyro by (joycon_dps / native_dps) = 0.0535/0.061 ≈ 0.877.  The old
+        # 0.8719*0.5*0.75 ≈ 0.327 had the right base ratio but an extra 0.375 factor that
+        # made the angular velocity ~0.375x too slow.  Pro/accel are untouched.
+        jc_gyro_scale = 0.0535 / 0.061
+        jc_yaw_mult = 1.1667
+
+        # Rate-limit the Joy-Con gyro to the native Switch IMU rate (~61.5 Hz / 16.25 ms).
+        # The host INTEGRATES the gyro on every report it consumes; we push reports at the
+        # Joy-Con 2 input rate (~134 Hz) and the USBIP layer re-serves held reports on every
+        # poll (≤250 Hz), so the gyro gets integrated far too often → ANGLE overshoot →
+        # drift.  (Accel is a direct reading, NOT integrated, so it's correct at any rate —
+        # which is why only the gyro is wrong.)  Fix the universal/hardware-accurate way:
+        # accumulate the true rotation between 16.25 ms ticks (so none is lost) and emit it as
+        # ONE gyro sample per tick; emit ZERO gyro between ticks.  Combined with the server
+        # only integrating each emitted gyro once (see USBIPJoyConServer.update_state), the
+        # host integrates exactly the native rotation, regardless of its poll rate.
+        # Per-sample VALUE stays jc_gyro_scale (correct angular-velocity feel).
+        # Pro Controller is left on the raw full-rate path (handled in its own branch).
+        if device_type != "Pro":
+            import time as _t
+            _now = _t.perf_counter()
+            if getattr(controller, '_sw1_gyro_accum', None) is None:
+                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
+                controller._sw1_gyro_last_t = _now
+                controller._sw1_gyro_emit_t = _now
+                controller._sw1_gyro_emit = (0.0, 0.0, 0.0)
+            _dt = _now - controller._sw1_gyro_last_t
+            controller._sw1_gyro_last_t = _now
+            _rg = inputData.gyroscope
+            _acc = controller._sw1_gyro_accum
+            for _i in range(3):
+                _acc[_i] += _rg[_i] * _dt          # accumulate raw rotation (raw * seconds)
+            _NATIVE_DT = 0.01625                     # 61.5 Hz
+            _win = _now - controller._sw1_gyro_emit_t
+            if _win >= _NATIVE_DT:
+                # Emit the accumulated rotation as one sample.
+                # CRITICAL: Divide by 0.015 (emulator assumed dt) to preserve 1:1 sensitivity
+                controller._sw1_gyro_emit = tuple(_acc[_i] / 0.015 for _i in range(3))
+                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
+                controller._sw1_gyro_emit_t = _now
+            else:
+                controller._sw1_gyro_emit = (0.0, 0.0, 0.0)
+            gsrc = controller._sw1_gyro_emit
+        else:
+            gsrc = inputData.gyroscope
+
         lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
         gx, gy, gz, ax, ay, az = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
@@ -1509,10 +1591,10 @@ class VirtualController:
             ly = inputData.left_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1] * 0.8719 * 0.5 *0.75,  -inputData.gyroscope[0] * 0.8719 * 0.5 *0.75,  inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
+                gx, gy, gz =  gsrc[1] * jc_gyro_scale,  -gsrc[0] * jc_gyro_scale,  gsrc[2] * jc_gyro_scale * jc_yaw_mult
                 ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz =  inputData.gyroscope[0] * 0.8719 * 0.5 *0.75, inputData.gyroscope[1] * 0.8719 * 0.5 *0.75,  inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
+                gx, gy, gz =  gsrc[0] * jc_gyro_scale, gsrc[1] * jc_gyro_scale,  gsrc[2] * jc_gyro_scale * jc_yaw_mult
                 ax, ay, az =  inputData.accelerometer[0], inputData.accelerometer[1],  inputData.accelerometer[2]
                 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
@@ -1523,10 +1605,10 @@ class VirtualController:
             ry = inputData.right_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  inputData.gyroscope[1] * 0.8719 * 0.5 *0.75, inputData.gyroscope[0] * 0.8719 * 0.5 *0.75, -inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
+                gx, gy, gz =  gsrc[1] * jc_gyro_scale, gsrc[0] * jc_gyro_scale, -gsrc[2] * jc_gyro_scale * jc_yaw_mult
                 ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz = -inputData.gyroscope[0] * 0.8719 * 0.5 *0.75, inputData.gyroscope[1] * 0.8719 * 0.5 *0.75, -inputData.gyroscope[2] * 0.8719 * 0.5 *0.75
+                gx, gy, gz = -gsrc[0] * jc_gyro_scale, gsrc[1] * jc_gyro_scale, -gsrc[2] * jc_gyro_scale * jc_yaw_mult
                 ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
                 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
@@ -1623,11 +1705,11 @@ class VirtualController:
         def clamp_i16(v): return max(-32768, min(32767, int(round(v))))
 
 
-        imu_frame = struct.pack('<6h', 
-            clamp_i16(ax), clamp_i16(ay), clamp_i16(az), 
+        imu_frame = struct.pack('<6h',
+            clamp_i16(ax), clamp_i16(ay), clamp_i16(az),
             clamp_i16(gx), clamp_i16(gy), clamp_i16(gz)
         )
-        
+
         # Switch 1 standard requires 3 IMU frames (each 12 bytes) per packet.
         # We duplicate the latest IMU frame 3 times to ensure smooth integration in the host emulator.
         state[13:25] = imu_frame
@@ -2509,7 +2591,7 @@ class VirtualController:
     def _dualsense_rumble_callback(self, out_data, side="Pro"):
         if len(out_data) < 2:
             return
-            
+
         if out_data[0] == 0x01:
             # Basic Rumble Report (ID=0x01)
             # Format: [0x01, RightMotor, LeftMotor]
@@ -2519,7 +2601,7 @@ class VirtualController:
                 
                 lf_amp = int((left_motor_strong / 255.0) * 1000)
                 hf_amp = int((right_motor_weak / 255.0) * 1000)
-                
+
                 dt = time.perf_counter() - self.cycle_start_time
                 slot_size = RUMBLE_WRITE_INTERVAL / 3.0
                 slot = int(dt / slot_size) if slot_size > 0 else 0
@@ -2553,7 +2635,7 @@ class VirtualController:
                 
                 lf_amp = int(800 * left_intensity / 256)
                 hf_amp = int(800 * right_intensity / 256)
-                
+
                 dt = time.perf_counter() - self.cycle_start_time
                 slot_size = RUMBLE_WRITE_INTERVAL / 3.0
                 slot = int(dt / slot_size) if slot_size > 0 else 0
@@ -2672,7 +2754,7 @@ class VirtualController:
                     if now < getattr(self, 'trigger_l_punch_end', 0):
                         trigger_l_amp = trigger_amp_max
                         trigger_l_freq = 0x0e1
-                
+
                 dt = time.perf_counter() - self.cycle_start_time
                 slot_size = RUMBLE_WRITE_INTERVAL / 3.0
                 slot = int(dt / slot_size) if slot_size > 0 else 0
@@ -3094,10 +3176,26 @@ class VirtualController:
                 v2.lf_freq = XBOX_LF_FREQ; v2.hf_freq = XBOX_HF_FREQ
                 v3.lf_freq = XBOX_LF_FREQ; v3.hf_freq = XBOX_HF_FREQ
 
+            def _copy_vib(vd):
+                return VibrationData(
+                    lf_freq=vd.lf_freq, lf_en_tone=vd.lf_en_tone, lf_amp=vd.lf_amp,
+                    hf_freq=vd.hf_freq, hf_en_tone=vd.hf_en_tone, hf_amp=vd.hf_amp)
             with self.vibration_lock:
                 self.frame_vibrations = [v1, v2, v3]
                 self.latest_vibration = v3
                 self.vibration_dirty = True
+                # Also populate the PER-SIDE buffers that get_current_vibration_frames()
+                # actually consumes for Switch2 (the shared buffer alone is never read
+                # there, which is why Switch2 rumble appeared dead). Use independent
+                # copies so each side's consume (which zeroes its frames) can't clear
+                # the other. Switch 2 sends one rumble for the merged pair, so both
+                # sides get the same waveform.
+                self.frame_vibrations_l = [_copy_vib(v1), _copy_vib(v2), _copy_vib(v3)]
+                self.frame_vibrations_r = [_copy_vib(v1), _copy_vib(v2), _copy_vib(v3)]
+                self.latest_vibration_l = _copy_vib(v3)
+                self.latest_vibration_r = _copy_vib(v3)
+                self.vibration_dirty_l = True
+                self.vibration_dirty_r = True
         else:
             last_active = getattr(self, 'last_rumble_active_time', 0)
             if not last_active or packet_time - last_active > SWITCH_RUMBLE_TIMEOUT:
@@ -3105,6 +3203,12 @@ class VirtualController:
                     self.frame_vibrations = [VibrationData() for _ in range(3)]
                     self.latest_vibration = VibrationData()
                     self.vibration_dirty = True
+                    self.frame_vibrations_l = [VibrationData() for _ in range(3)]
+                    self.frame_vibrations_r = [VibrationData() for _ in range(3)]
+                    self.latest_vibration_l = VibrationData()
+                    self.latest_vibration_r = VibrationData()
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
 
     def update_as_switch2_pro(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         state = bytearray(64)

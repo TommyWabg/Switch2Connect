@@ -1,3 +1,7 @@
+import sys
+import tempfile, os
+with open(os.path.join(tempfile.gettempdir(), "argv_test.log"), "w") as f:
+    f.write(str(sys.argv) + "\n")
 import queue
 import time
 import webbrowser
@@ -25,7 +29,7 @@ import win32gui
 import win32con
 from ctypes import wintypes
 
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.11.2"
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
     _fields_ = [
@@ -2854,7 +2858,12 @@ class ControllerWindow:
             photo = tk.PhotoImage(file=get_resource('images/icon.png'))
             self.root.wm_iconphoto(False, photo)
         except: pass
-        self.root.title(f"Switch2 Controllers v{APP_VERSION}")
+        import sys
+        exe_name = os.path.basename(sys.argv[0])
+        if exe_name.lower().endswith('.exe'):
+            self.root.title(os.path.splitext(exe_name)[0])
+        else:
+            self.root.title(f"Switch2 Controllers v{APP_VERSION}")
         
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1260 * window_resolution_ratio)
@@ -4251,9 +4260,41 @@ bg_color=background_color, widths=[8, 10])
                 
         self.gc_trigger_combo.bind("<<ComboboxSelected>>", on_gc_trigger_combo_selected)
         self.gc_trigger_combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
-        
+
+        # --- NSO GCN Rumble Brake toggle ---
+        tk.Label(
+            row_gc, text="  |  GCN Brake:",
+            bg=background_color, fg=text_color,
+            font=scale_font(("Arial", 11, "bold"))
+        ).pack(side=tk.LEFT, padx=(int(8 * scaling_factor), int(2 * scaling_factor)))
+
+        _gcn_brake_on = getattr(CONFIG, "gcn_rumble_brake_enabled", False)
+        self.gcn_brake_btn = tk.Button(
+            row_gc,
+            text="Brake: On" if _gcn_brake_on else "Brake: Off",
+            font=scale_font(("Arial", 11, "bold")),
+            bg=highlight_color if _gcn_brake_on else button_gray,
+            fg="white",
+            relief=tk.FLAT,
+            bd=0,
+            command=self._on_gcn_brake_toggle
+        )
+        self.gcn_brake_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
         if current_val != "100% at Max":
             self.gc_click_map_frame.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), 0))
+
+    def _on_gcn_brake_toggle(self):
+        """Toggle the experimental GCN rumble brake (0x02 / StopHard) setting."""
+        new_val = not getattr(CONFIG, "gcn_rumble_brake_enabled", False)
+        CONFIG.gcn_rumble_brake_enabled = new_val
+        CONFIG.save_config()
+        if hasattr(self, 'gcn_brake_btn'):
+            self.gcn_brake_btn.config(
+                text="Brake: On" if new_val else "Brake: Off",
+                bg=highlight_color if new_val else button_gray
+            )
+        logger.info("GCN rumble brake %s by user.", "ENABLED" if new_val else "DISABLED")
 
     def on_gc_trigger_calib_clicked(self):
         gc_controller = None
@@ -4493,6 +4534,12 @@ bg_color=background_color, widths=[8, 10])
                 self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
             except ValueError:
                 pass
+        if hasattr(self, 'gcn_brake_btn'):
+            val = getattr(CONFIG, "gcn_rumble_brake_enabled", False)
+            self.gcn_brake_btn.config(
+                text="Brake: On" if val else "Brake: Off",
+                bg=highlight_color if val else button_gray
+            )
         if hasattr(self, 'layout_switch'):
             self.layout_switch.set_value(CONFIG.abxy_mode)
         if hasattr(self, 'rumble_mode_switch'):
@@ -5574,6 +5621,21 @@ bg_color=background_color, widths=[8, 10])
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 
 if __name__ == "__main__":
+    # Scheduled-task entry: when invoked elevated with this flag, just disable the
+    # DualSense audio endpoint and exit (do NOT launch the GUI).  Used so a
+    # non-elevated session can trigger the elevated disable silently via Task
+    # Scheduler instead of a UAC prompt on every controller connect.
+    import sys as _sys
+    if "--disable-dualsense-audio-endpoint" in _sys.argv:
+        try:
+            from dualsense_audio_endpoint import _apply
+            _apply("Disable")
+        except Exception as e:
+            import traceback, os, tempfile
+            with open(os.path.join(tempfile.gettempdir(), "audio_disable_error.log"), "w") as f:
+                f.write(traceback.format_exc())
+        _sys.exit(0)
+
     disable_power_throttling()
     win = ControllerWindow()
     win.init_interface(); win.start()

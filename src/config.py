@@ -231,6 +231,15 @@ class Config:
         self.controller_mode = config.get("controller_mode", "Xbox")
         self.ui_scale = float(config.get("ui_scale", 1.0))
 
+        # NSO GameCube Controller rumble PWM settings
+        self.gcn_rumble_pwm_enabled     = bool(config.get("gcn_rumble_pwm_enabled",   True))
+        self.gcn_rumble_brake_enabled   = bool(config.get("gcn_rumble_brake_enabled", False))
+        self.gcn_rumble_brake_threshold = float(config.get("gcn_rumble_brake_threshold", 0.65))
+        self.gcn_rumble_gamma           = float(config.get("gcn_rumble_gamma",         0.75))
+        self.gcn_rumble_deadzone        = float(config.get("gcn_rumble_deadzone",      0.04))
+        self.gcn_rumble_left_weight     = float(config.get("gcn_rumble_left_weight",   0.85))
+        self.gcn_rumble_right_weight    = float(config.get("gcn_rumble_right_weight",  0.45))
+
         btns = config.get("buttons", {})
         self.dual_joycons_config = ButtonConfig(btns.get("dual_joycons", {}))
         self.single_joycon_l_config = ButtonConfig(btns.get("single_joycon_l", {}))
@@ -594,11 +603,207 @@ class Config:
     def djg_activation(self):
         return self.profiles.get(self.active_profile, {}).get("djg_activation", "Toggle")
 
+        self.window_x = config.get("window_x", None)
+        self.window_y = config.get("window_y", None)
+        self._auto_disconnect_mode = config.get("auto_disconnect_mode", "Absolute" if config.get("auto_disconnect_enabled", False) else "OFF")
+        if self._auto_disconnect_mode not in ["OFF", "Inactive", "Absolute"]:
+            self._auto_disconnect_mode = "Absolute" if config.get("auto_disconnect_enabled", False) else "OFF"
+        self.auto_disconnect_days = int(config.get("auto_disconnect_days", 0))
+        self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
+        self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
+        # abxy_mode, rumble_mode, vibration_strength, vibration_frequency are now properties managed per Emu Mode category
+
+        logger.info(f"Config successfully loaded from {self.config_file_path}")
+
+    @property
+    def button_remaps(self):
+        return self.profiles[self.active_profile]
+
+    def add_profile(self, name):
+        if name and name not in self.profiles:
+            import copy
+            self.profiles[name] = copy.deepcopy(self.profiles[self.active_profile])
+            self.active_profile = name
+            self.save_config()
+            return True
+        return False
+
+    def rename_profile(self, new_name):
+        if new_name and new_name not in self.profiles:
+            self.profiles[new_name] = self.profiles.pop(self.active_profile)
+            self.active_profile = new_name
+            self.save_config()
+            return True
+        return False
+
+    def delete_profile(self):
+        if len(self.profiles) > 1:
+            self.profiles.pop(self.active_profile)
+            self.active_profile = list(self.profiles.keys())[0]
+            self.save_config()
+            return True
+        return False
+
+    def get_default_category_dict(self, cat):
+        # Specific default values matching user's exact current config for each Emu Mode
+        defaults = {
+            "ps4": {
+                "abxy_mode": "Xbox", "c_mapping": "Calibration", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
+                "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
+                "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "ps5_winuhid": {
+                "abxy_mode": "Xbox", "c_mapping": "Default", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
+                "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
+                "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5, "vibration_strength_ps5": 10
+            },
+            "ps5_usbip": {
+                "abxy_mode": "Xbox", "c_mapping": "Default", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "PS_L_Touch", "gr_mapping": "PS_R_Touch",
+                "home_mapping": "Default", "rumble_mode": "PS5", "sll_mapping": "Default",
+                "slr_mapping": "PS_R_Touch", "srl_mapping": "PS_L_Touch", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 10, "vibration_strength_switch": 5, "vibration_strength_xbox": 5, "vibration_strength_ps5": 10
+            },
+            "xbox": {
+                "abxy_mode": "Xbox", "c_mapping": "Calibration", "capt_mapping": "Default",
+                "gc_trigger_mode": "100% at Max", "gl_mapping": "Default", "gr_mapping": "Default",
+                "home_mapping": "Default", "rumble_mode": "Xbox", "sll_mapping": "Default",
+                "slr_mapping": "Default", "srl_mapping": "Default", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength": 10, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "switch1": {
+                "abxy_mode": "Switch", "c_mapping": "Calibration", "capt_mapping": "Default",
+                "gc_trigger_mode": "Hair Trigger", "gl_mapping": "Default", "gr_mapping": "Default",
+                "home_mapping": "Default", "rumble_mode": "Switch", "sll_mapping": "Default",
+                "slr_mapping": "Default", "srl_mapping": "Default", "srr_mapping": "Change Profile",
+                "vibration_frequency": 10, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            },
+            "switch2": {
+                "abxy_mode": "Switch", "c_mapping": "Default", "capt_mapping": "Default",
+                "gc_trigger_mode": "Hair Trigger", "gl_mapping": "Default", "gr_mapping": "Default",
+                "home_mapping": "Default", "rumble_mode": "Switch", "sll_mapping": "Default",
+                "slr_mapping": "GR", "srl_mapping": "GL", "srr_mapping": "Change Profile",
+                "gc_l_click_mapping": "Default", "gc_r_click_mapping": "Default",
+                "vibration_frequency": 10, "vibration_strength": 5, "vibration_strength_switch": 5, "vibration_strength_xbox": 5
+            }
+        }
+        for cat_data in defaults.values():
+            if "gc_l_click_mapping" not in cat_data:
+                cat_data["gc_l_click_mapping"] = "Default"
+            if "gc_r_click_mapping" not in cat_data:
+                cat_data["gc_r_click_mapping"] = "Default"
+        return defaults.get(cat, defaults["xbox"]).copy()
+
+    def get_default_profile_dict(self):
+        categories = ["xbox", "ps4", "ps5_winuhid", "ps5_usbip", "switch1", "switch2"]
+        prof_data = {
+            "driver_type": "WinUHid",
+            "simulation_mode": "PS5",
+            "gyro_passthrough_mode": "Default",
+            "cemuhook_sensitivity": 1,
+            "steam_roll_compensation": False,
+            "djg_enabled": False, 
+            "djg_dominant_side": "Right", 
+            "djg_mode": "Switch Dominant Side",
+            "djg_activation": "Hold",
+            "assigned_apps": []
+        }
+        for cat in categories:
+            prof_data[cat] = self.get_default_category_dict(cat)
+            prof_data[cat]["joycon_hold_mode"] = {}
+        return prof_data
+
+    def reset_profile_to_default(self, name):
+        if name in self.profiles:
+            self.profiles[name] = self.get_default_profile_dict()
+            self.save_config()
+            return True
+        return False
+
+    def reset_category_to_default(self, name, cat):
+        if name in self.profiles and cat in self.profiles[name]:
+            old_hold_mode = self.profiles[name][cat].get("joycon_hold_mode", {})
+            self.profiles[name][cat] = self.get_default_category_dict(cat)
+            self.profiles[name][cat]["joycon_hold_mode"] = old_hold_mode
+            self.save_config()
+            return True
+        return False
+
+    def switch_profile(self, name):
+        if name in self.profiles:
+            self.active_profile = name
+            self.save_config()
+            return True
+        return False
+        
+    @property
+    def gyro_passthrough_mode(self):
+        return self.profiles.get(self.active_profile, {}).get("gyro_passthrough_mode", "Default")
+
+    @gyro_passthrough_mode.setter
+    def gyro_passthrough_mode(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["gyro_passthrough_mode"] = value
+
+    @property
+    def steam_roll_compensation(self):
+        return self.profiles.get(self.active_profile, {}).get("steam_roll_compensation", False)
+
+    @steam_roll_compensation.setter
+    def steam_roll_compensation(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["steam_roll_compensation"] = value
+
+    @property
+    def cemuhook_sensitivity(self):
+        return self.profiles.get(self.active_profile, {}).get("cemuhook_sensitivity", 1)
+
+    @cemuhook_sensitivity.setter
+    def cemuhook_sensitivity(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["cemuhook_sensitivity"] = int(value)
+
+    @property
+    def djg_enabled(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_enabled", False)
+
+    @djg_enabled.setter
+    def djg_enabled(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_enabled"] = value
+
+    @property
+    def djg_dominant_side(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_dominant_side", "Left")
+
+    @djg_dominant_side.setter
+    def djg_dominant_side(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_dominant_side"] = value
+            
+    @property
+    def djg_mode(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_mode", "Single Side Toggle")
+
+    @djg_mode.setter
+    def djg_mode(self, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile]["djg_mode"] = value
+
+    @property
+    def djg_activation(self):
+        return self.profiles.get(self.active_profile, {}).get("djg_activation", "Toggle")
+
     @djg_activation.setter
     def djg_activation(self, value):
         if self.active_profile in self.profiles:
             self.profiles[self.active_profile]["djg_activation"] = value
         
+
     def save_config(self):
         # Snapshot config values in the calling thread
         data = {
@@ -608,6 +813,13 @@ class Config:
             'winuhid_sim_mode': self.winuhid_sim_mode,
             'usbip_sim_mode': self.usbip_sim_mode,
             'vigembus_installed': self.vigembus_installed,
+            'gcn_rumble_pwm_enabled':     self.gcn_rumble_pwm_enabled,
+            'gcn_rumble_brake_enabled':   self.gcn_rumble_brake_enabled,
+            'gcn_rumble_brake_threshold': self.gcn_rumble_brake_threshold,
+            'gcn_rumble_gamma':           self.gcn_rumble_gamma,
+            'gcn_rumble_deadzone':        self.gcn_rumble_deadzone,
+            'gcn_rumble_left_weight':     self.gcn_rumble_left_weight,
+            'gcn_rumble_right_weight':    self.gcn_rumble_right_weight,
             'window_width': self.window_width,
             'window_height': self.window_height,
             'window_x': self.window_x,

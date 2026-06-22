@@ -523,6 +523,23 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                 bridge_connecting_macs.discard(mac)
                                 return
 
+                            if cmd == "disconnected":
+                                # Firmware lost the BLE link for a channel.  Handle immediately
+                                # so the Python host tracks the disconnect in real time instead
+                                # of waiting for 3 consecutive missing-from-status polls.
+                                # This also prevents the "disconnected" JSON from poisoning the
+                                # send_manager_command("status lite") response queue, which
+                                # would return channel_mask=0 and falsely disconnect ALL channels.
+                                channel = int(event.get("channel", -1))
+                                if channel >= 0 and DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
+                                    async def handle_disconnected(ch=channel):
+                                        controller = controllers_by_channel.pop(ch, None)
+                                        missing_counts_by_channel.pop(ch, None)
+                                        if controller is not None:
+                                            await esp32_disconnected_controller(controller)
+                                    asyncio.run_coroutine_threadsafe(handle_disconnected(), DISCOVERER_LOOP)
+                                return
+
                             if cmd == "scan_result":
                                 if not _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE:
                                     return

@@ -275,6 +275,18 @@ class USBIPDualSenseServer(USBIPServer):
                 actual_length = len(out_data)
         elif ep == 1 and direction == 0: # Audio Streaming OUT (Haptic/Speaker)
             if len(out_data) > 0:
+                # Diagnostic: the _iso_out_loop (which logged audio arrival) is disabled
+                # and this inline path was silent, so there was no way to tell whether
+                # Windows is actually streaming haptic audio to ep=1.  Log arrival here,
+                # throttled to 0.5s, distinguishing real audio (non-zero) from silence.
+                non_zero = sum(1 for b in out_data if b != 0)
+                now_time = time.perf_counter()
+                if now_time - getattr(self, 'last_audio_log', 0) > 0.5:
+                    logger.info(
+                        "Audio OUT (ep1 ISO): %d bytes, %d non-zero (audio_active=%s)",
+                        len(out_data), non_zero, getattr(self, 'audio_active', False),
+                    )
+                    self.last_audio_log = now_time
                 if getattr(self, 'on_audio_data_callback', None):
                     self.on_audio_data_callback(out_data)
             actual_length = len(out_data)

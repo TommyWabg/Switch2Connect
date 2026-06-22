@@ -43,7 +43,7 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "0.11.1"
+APP_FIRMWARE_VERSION = "0.11.2"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_1"
 MAX_ESP32S3_CHANNELS = 8
@@ -330,6 +330,69 @@ class ESP32S3SerialClient:
                 logger.debug("Failed to write ESP32-S3 BLE payload: %s", e)
                 return False
 
+    def send_ble_write_pair(self, left_channel: int, right_channel: int, kind: str,
+                            left_data, right_data) -> bool:
+        """Send different rumble payloads to left and right channels in one 'wrpair' command.
+
+        The firmware processes both payloads in a single command-handling cycle,
+        queueing both BLE writes together and preventing the ~30 Hz L/R alternation
+        that occurs when the two writes are sent as separate 'wr' commands.
+        Falls back gracefully: returns False if the write fails so the caller can
+        fall back to individual send_ble_write() calls.
+        """
+        left_hex = bytes(left_data).hex()
+        right_hex = bytes(right_data).hex()
+        cmd = f"wrpair {int(left_channel)} {int(right_channel)} {kind} {left_hex} {right_hex}\n"
+        with self._write_lock:
+            self.open()
+            self._ensure_read_thread()
+            try:
+                self.handle.write(cmd.encode("ascii"))
+                return True
+            except Exception as e:
+                logger.debug("Failed to write ESP32-S3 wrpair payload: %s", e)
+                return False
+
+    def send_rumble_shadow(self, channel: int, data) -> bool:
+        """Push the latest rumble payload for one channel into the firmware shadow.
+
+        Format: 'rs <ch> <hex>'.  The firmware stores this as the channel's latest
+        rumble and a dedicated firmware task re-sends it to BLE at a steady,
+        hardware-timed cadence (stamping a fresh packet-id each write).  The host
+        therefore only sends when the rumble value CHANGES; the firmware owns the
+        sustain, so rumble smoothness no longer depends on host/OS scheduling jitter.
+        Requires firmware with the 'shadow' feature (v0.11.3+).
+        """
+        hexd = bytes(data).hex()
+        cmd = f"rs {int(channel)} {hexd}\n"
+        with self._write_lock:
+            self.open()
+            self._ensure_read_thread()
+            try:
+                self.handle.write(cmd.encode("ascii"))
+                return True
+            except Exception as e:
+                logger.debug("Failed to write ESP32-S3 rs payload: %s", e)
+                return False
+
+    def get_or_create_rumble_dispatcher(self):
+        """Return (creating on first call) the shared rumble dispatcher for this bridge.
+
+        The dispatcher is created lazily and shared between the Left and Right
+        Joy-Con controllers that share this serial client in merged mode.
+        """
+        if not hasattr(self, '_rumble_dispatcher') or self._rumble_dispatcher is None:
+            from esp32_rumble_dispatcher import ESP32BridgeRumbleDispatcher
+            self._rumble_dispatcher = ESP32BridgeRumbleDispatcher(self)
+        return self._rumble_dispatcher
+
+    def stop_rumble_dispatcher(self):
+        """Stop and discard the rumble dispatcher (called on bridge disconnect)."""
+        disp = getattr(self, '_rumble_dispatcher', None)
+        if disp is not None:
+            disp.stop()
+            self._rumble_dispatcher = None
+
     def _queue_text_response(self, data):
         if not data:
             return
@@ -348,7 +411,8 @@ class ESP32S3SerialClient:
             text = text[start:]
         if text:
             if ('"cmd":"scan_result"' in text or '"cmd":"connected"' in text
-                    or '"cmd":"connect_fail"' in text or '"cmd":"connect_busy"' in text):
+                    or '"cmd":"connect_fail"' in text or '"cmd":"connect_busy"' in text
+                    or '"cmd":"disconnected"' in text):
                 if self.event_callback:
                     try:
                         self.event_callback(json.loads(text))

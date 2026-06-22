@@ -729,13 +729,29 @@ class USBIPJoyConServer(USBIPServer):
         super().start()
         
     def update_state(self, state_bytes):
-        """JoyCon override: 不遞增 seq_num（由 EP1 IN 真正送出時遞增）"""
+        """JoyCon override: 不遞增 seq_num（由 EP1 IN 真正送出時遞增）
+
+        Gyro consume-once (Joy-Con L/R only): the host re-serves the held last_state on
+        every IN poll and integrates its gyro each time → angle overshoot.  So put the
+        FULL report (with gyro) in input_queue, which the host drains exactly ONCE, but
+        store a GYRO-ZEROED copy in last_state, so held re-polls integrate zero gyro.
+        Accel and buttons are kept in the held copy (accel is a direct reading; zeroing
+        only the gyro).  Combined with the build-side 66.7 Hz gyro rate-limit, the host
+        integrates exactly the native gyro rate regardless of poll rate.  Pro is unchanged.
+        """
+        full = bytes(state_bytes)
+        held = full
+        if getattr(self, 'device_type', None) in ("L", "R") and len(full) >= 49 and full[0] == 0x30:
+            b = bytearray(full)
+            for _off in (19, 31, 43):   # gyro is bytes 6..11 within each 12-byte IMU frame
+                b[_off:_off + 6] = b'\x00' * 6
+            held = bytes(b)
         with self.lock:
-            self.last_state = bytearray(state_bytes)
+            self.last_state = bytearray(held)
         try:
             if self.input_queue.full():
                 self.input_queue.get_nowait()
-            self.input_queue.put_nowait(bytes(self.last_state))
+            self.input_queue.put_nowait(full)
         except Exception:
             pass
             

@@ -333,8 +333,139 @@ class VibrationData:
         value |= (self.hf_amp & 0x3FF) << 30   
         return value.to_bytes(byteorder='little', length=5)
 
-class Controller:
 
+# ---------------------------------------------------------------------------
+# NSO GameCube Controller — temporal PWM rumble state machine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GCNRumblePWMState:
+    """Per-controller state for the GameCube-style temporal PWM rumble loop."""
+    target_strength: float = 0.0   # normalised 0.0-1.0, set from vibration_callback
+    prev_strength:   float = 0.0   # strength from the previous tick (for brake detection)
+    accumulator:     float = 0.0   # sigma-delta accumulator (per-tick model)
+    last_command:    int   = 0xFF  # sentinel = uninitialised; 0x00/0x01/0x02
+    brake_ticks_remaining: int = 0
+    failed_brake:    bool  = False  # set True if 0x02 write ever fails
+    _brake_ever_sent: bool = False  # for one-time info log
+    transport_name:  str   = ""    # "bridge" or "ble"
+
+
+def normalize_motor_value(value) -> float:
+    """Normalise a raw XInput motor value to [0.0, 1.0].
+
+    Handles three conventions:
+    - Already normalised float in [0.0, 1.0]
+    - ViGEmBus / WinUHid Xbox rumble callback byte range [0, 255]
+    - Defensive: native XInput WORD range [0, 65535]
+    """
+    if value is None:
+        return 0.0
+    value = float(value)
+    if 0.0 <= value <= 1.0:
+        return value
+    if value <= 255.0:
+        return max(0.0, min(value / 255.0, 1.0))
+    # Defensive: native XInput WORD
+    return max(0.0, min(value / 65535.0, 1.0))
+
+
+def _gcn_update_pwm_state(controller, large_motor, small_motor) -> None:
+    """Update the GCN PWM state machine with new XInput motor values.
+
+    Called from VirtualController.vibration_callback() when an NSO GCN
+    controller is connected in Xbox emulation mode.  All CONFIG reads are
+    done here so the hot PWM loop stays lean.
+    """
+    left  = normalize_motor_value(large_motor)
+    right = normalize_motor_value(small_motor)
+
+    left_w  = getattr(CONFIG, "gcn_rumble_left_weight",  0.85)
+    right_w = getattr(CONFIG, "gcn_rumble_right_weight", 0.45)
+    gamma   = getattr(CONFIG, "gcn_rumble_gamma",        0.75)
+    dz      = getattr(CONFIG, "gcn_rumble_deadzone",     0.04)
+
+    strength = max(0.0, min(1.0, left * left_w + right * right_w))
+    if strength > 0.0:
+        strength = strength ** gamma
+    if strength < dz:
+        strength = 0.0
+
+    state = _gcn_get_or_create_state(controller)
+    state.target_strength = strength
+    logger.debug(
+        "GCN PWM: left=%.2f right=%.2f strength=%.3f transport=%s",
+        left, right, strength, state.transport_name
+    )
+
+
+def _gcn_get_or_create_state(controller) -> GCNRumblePWMState:
+    """Return (creating if needed) the per-controller GCN PWM state."""
+    if not hasattr(controller, 'gcn_pwm_state') or controller.gcn_pwm_state is None:
+        state = GCNRumblePWMState()
+        state.transport_name = (
+            "bridge" if getattr(controller, 'is_esp32s3_bridge', False) else "ble"
+        )
+        controller.gcn_pwm_state = state
+    return controller.gcn_pwm_state
+
+
+def _next_gcn_pwm_command(state: GCNRumblePWMState) -> int:
+    """Return the next GCN rumble command byte using a sigma-delta accumulator.
+
+    Per-tick model: every call is one tick, regardless of wall-clock dt.
+    Full strength (>= 0.995) always returns ON; zero returns OFF (or brake).
+    """
+    strength = state.target_strength
+
+    if strength <= 0.0:
+        # Check whether to issue a brake command
+        brake_enabled   = getattr(CONFIG, "gcn_rumble_brake_enabled",   False)
+        brake_threshold = getattr(CONFIG, "gcn_rumble_brake_threshold", 0.65)
+
+        if (
+            state.prev_strength >= brake_threshold
+            and brake_enabled
+            and not state.failed_brake
+            and state.brake_ticks_remaining == 0
+        ):
+            state.brake_ticks_remaining = 1
+
+        state.prev_strength = 0.0
+        state.accumulator   = 0.0
+
+        if state.brake_ticks_remaining > 0:
+            state.brake_ticks_remaining -= 1
+            return 0x02  # experimental brake / StopHard
+        return 0x00
+
+    if strength >= 0.995:
+        state.accumulator   = 0.0
+        state.prev_strength = strength
+        return 0x01
+
+    state.accumulator += strength
+    state.prev_strength = strength
+
+    if state.accumulator >= 1.0:
+        state.accumulator -= 1.0
+        return 0x01
+    return 0x00
+
+
+def _gcn_command_payload(command: int) -> bytearray:
+    """Build the 12-byte GCN rumble command payload.
+
+    Byte index 8 carries the motor value:
+      0x00 = Off,  0x01 = On,  0x02 = Brake (experimental)
+    """
+    motor_byte = command & 0xFF  # 0x00, 0x01, or 0x02
+    return bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04,
+                      0x00, 0x00, motor_byte, 0x00, 0x00, 0x00])
+
+
+
+class Controller:
     def __init__(self, device: BLEDevice):
         self.device: BLEDevice = device
         self.client: BleakClient = None
@@ -1208,11 +1339,11 @@ class Controller:
         
         try:
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
-                # Use the SW2 command channel for GameCube rumble instead of hardcoded 0x0012
-                # Use Software PWM to enable variable strength since it only supports ON/OFF natively
-                self.gc_target_amp = min(1.0, max(v1.lf_amp, v1.hf_amp) / 1023.0)
-                
+                # NSO GCN: rumble is handled by the per-tick PWM state machine
+                # (_gcn_update_pwm_state sets target_strength; _gc_pwm_loop runs the loop).
+                # We must NOT send Switch HD Rumble packets to this controller.
                 if not getattr(self, 'gc_pwm_running', False):
+                    _gcn_get_or_create_state(self)  # ensure state exists
                     self.gc_pwm_running = True
                     asyncio.create_task(self._gc_pwm_loop())
                 return
@@ -1231,7 +1362,64 @@ class Controller:
                     payload = b'\x00' + motor_vibrations_r + motor_vibrations
                 else:
                     payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
-            
+
+                # ESP32 bridge + merged Joy-Con pair rumble routing.
+                # Default "shadow" mode pushes the latest payload to the firmware
+                # rumble shadow; a firmware task re-sends it to BLE at a steady,
+                # hardware-timed cadence (no Windows/asyncio jitter, no per-host
+                # re-send loop).  Other modes are kept for A/B testing:
+                #   "shadow" (default) – firmware-driven sustain (smoothest)
+                #   "pair" / "mirror"  – host-driven wrpair dispatcher
+                #   "single"           – direct per-controller write (original)
+                shared = getattr(self, 'shared_client', None)
+                if (not self.is_pro_controller()
+                        and getattr(self, 'is_esp32s3_bridge', False)
+                        and getattr(self, 'is_merged', False)
+                        and shared is not None):
+
+                    # RUMBLE-SUBMIT diagnostics (per-controller, per-second)
+                    try:
+                        import time as _t
+                        _now_sub = _t.perf_counter()
+                        self._sub_n = getattr(self, '_sub_n', 0) + 1
+                        if _now_sub - getattr(self, '_sub_t0', 0.0) >= 1.0:
+                            from esp32_rumble_dispatcher import is_active_rumble_payload as _iap
+                            _side = 'L' if self.is_joycon_left() else 'R'
+                            logger.info(
+                                "RUMBLE-SUBMIT side=%s total=%d/s len=%d active=%s",
+                                _side, self._sub_n, len(payload),
+                                _iap(payload),
+                            )
+                            self._sub_n = 0
+                            self._sub_t0 = _now_sub
+                    except Exception:
+                        pass
+
+                    try:
+                        _pair_mode = getattr(__import__('config', fromlist=['CONFIG']).CONFIG,
+                                             'esp32_bridge_pair_mode', 'shadow')
+                    except Exception:
+                        _pair_mode = 'shadow'
+
+                    if _pair_mode == 'single':
+                        # Fall through to direct write below for A/B comparison.
+                        pass
+                    elif _pair_mode == 'shadow':
+                        # Firmware-driven sustain: just push the latest payload.
+                        shared.send_rumble_shadow(self.channel, payload)
+                        self.vibration_packet_id += 1
+                        return
+                    else:
+                        dispatcher = shared.get_or_create_rumble_dispatcher()
+                        if not dispatcher._running:
+                            dispatcher.start()
+                        if self.is_joycon_left():
+                            dispatcher.submit_left(self.channel, uuid_to_use, payload)
+                        else:
+                            dispatcher.submit_right(self.channel, uuid_to_use, payload)
+                        self.vibration_packet_id += 1
+                        return
+
             await self.client.write_gatt_char(uuid_to_use, payload, response=False)
         except Exception as e:
             logger.debug(f"Vibration write failed: {e}")
@@ -1239,52 +1427,80 @@ class Controller:
         self.vibration_packet_id += 1
 
     async def _gc_pwm_loop(self):
-        last_is_on = None
+        """Temporal PWM loop for NSO GameCube Controller rumble.
+
+        Uses a per-tick sigma-delta accumulator to convert a continuous
+        [0.0, 1.0] strength into a stream of ON/OFF (and optional brake)
+        GCN commands.  The tick rate is transport-aware:
+          - ESP32-S3 bridge: 120 Hz  (~8.3 ms/tick)
+          - Native BLE:       60 Hz  (~16.7 ms/tick)
+        """
         uuid_to_use = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
+        state = _gcn_get_or_create_state(self)
+
+        is_bridge = getattr(self, 'is_esp32s3_bridge', False)
+        tick_interval = 1.0 / 120.0 if is_bridge else 1.0 / 60.0
+
+        logger.info(
+            "GCN PWM loop started: bridge=%s tick=%.1fms transport=%s",
+            is_bridge, tick_interval * 1000.0, state.transport_name
+        )
+
+        # ON-command refresh interval (prevent BLE stack from silently dropping
+        # sustained-ON writes that look identical to the previous frame)
+        refresh_ticks = 8  # refresh every 8 ticks
+        ticks_since_on = 0
+
         while self.client and self.client.is_connected and getattr(self, 'interp_running', False):
-            amp = getattr(self, 'gc_target_amp', 0.0)
-            if amp <= 0.02:
-                if last_is_on is not False:
-                    last_is_on = False
-                    try:
-                        payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                        await self.client.write_gatt_char(uuid_to_use, payload, response=False)
-                    except: pass
-                await asyncio.sleep(0.05)
-                continue
+            t0 = time.perf_counter()
 
-            if amp >= 0.98:
-                if last_is_on is not True:
-                    last_is_on = True
-                    try:
-                        payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
-                        await self.client.write_gatt_char(uuid_to_use, payload, response=False)
-                    except: pass
-                await asyncio.sleep(0.05)
-                continue
+            command = _next_gcn_pwm_command(state)
 
-            # Software PWM: period = 40ms (25Hz)
-            period = 0.04
-            on_time = period * amp
-            off_time = period - on_time
-            
-            if on_time > 0.005:
+            # Decide whether to actually send a BLE write:
+            #   - Always send when the command changes.
+            #   - Refresh a sustained ON every refresh_ticks to stay alive.
+            #   - Brake is always sent immediately.
+            changed = (command != state.last_command)
+
+            if command == 0x01:
+                ticks_since_on += 1
+                do_send = changed or (ticks_since_on >= refresh_ticks)
+            elif command == 0x02:
+                ticks_since_on = 0
+                do_send = True  # brake always sent
+            else:
+                ticks_since_on = 0
+                do_send = changed
+
+            if do_send:
+                if command == 0x01:
+                    ticks_since_on = 0
+                payload = _gcn_command_payload(command)
                 try:
-                    payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
                     await self.client.write_gatt_char(uuid_to_use, payload, response=False)
-                    last_is_on = True
-                except: pass
-                await asyncio.sleep(on_time)
-                
-            if off_time > 0.005:
-                try:
-                    payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                    await self.client.write_gatt_char(uuid_to_use, payload, response=False)
-                    last_is_on = False
-                except: pass
-                await asyncio.sleep(off_time)
-                
+                    state.last_command = command
+                    if command == 0x02 and not state._brake_ever_sent:
+                        state._brake_ever_sent = True
+                        logger.info(
+                            "GCN rumble: experimental brake command (0x02) sent for the first time."
+                        )
+                except Exception as e:
+                    logger.debug("GCN rumble write failed: %s", e)
+                    if command == 0x02:
+                        # Brake unsupported / failed — disable at runtime
+                        state.failed_brake = True
+                        CONFIG.gcn_rumble_brake_enabled = False
+                        logger.warning(
+                            "GCN brake command 0x02 failed (%s). "
+                            "Brake auto-disabled; falling back to 0x00.", e
+                        )
+
+            elapsed = time.perf_counter() - t0
+            sleep_t = max(0.0, tick_interval - elapsed)
+            await asyncio.sleep(sleep_t)
+
         self.gc_pwm_running = False
+        logger.info("GCN PWM loop exited for %s", self.device.address)
 
     async def set_leds(self, player_number: int, reversed=False):
         if player_number > 8: player_number = 8
@@ -1869,64 +2085,77 @@ class Controller:
             try:
                 vc = getattr(self, 'virtual_controller', None)
                 if vc is not None:
-                    current_time = time.perf_counter()
-                    last_rumble_time = getattr(self, 'last_rumble_time', 0)
+                    # NSO GCN controllers use a dedicated GameCube-style temporal PWM
+                    # rumble loop (_gc_pwm_loop) driven by vibration_callback.
+                    # Dispatching Switch HD Rumble frames here is unnecessary and
+                    # confusing; skip the entire HD Rumble frame path for GCN.
+                    if getattr(getattr(self, 'controller_info', None), 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                        # Ensure the PWM loop is running (lazy-start on first input report)
+                        if not getattr(self, 'gc_pwm_running', False):
+                            _gcn_get_or_create_state(self)
+                            self.gc_pwm_running = True
+                            loop = getattr(vc, 'loop', None)
+                            if loop and not loop.is_closed():
+                                asyncio.run_coroutine_threadsafe(self._gc_pwm_loop(), loop)
+                    else:
+                        current_time = time.perf_counter()
+                        last_rumble_time = getattr(self, 'last_rumble_time', 0)
 
-                    if current_time - last_rumble_time >= 0.007:
-                        self.last_rumble_time = current_time
+                        if current_time - last_rumble_time >= 0.007:
+                            self.last_rumble_time = current_time
 
-                        if getattr(vc, 'rumble_force_clear', False):
-                            self.rumble_stopped = False
-                            self._zero_count = 0
-                            vc.rumble_force_clear = False
+                            if getattr(vc, 'rumble_force_clear', False):
+                                self.rumble_stopped = False
+                                self._zero_count = 0
+                                vc.rumble_force_clear = False
 
-                        use_dualsense_stereo = (
-                            getattr(vc, 'mode', None) == "PS5" and
-                            getattr(vc, 'driver_type', None) == "USBIP"
-                        )
+                            use_dualsense_stereo = (
+                                getattr(vc, 'mode', None) == "PS5" and
+                                getattr(vc, 'driver_type', None) == "USBIP"
+                            )
 
-                        if not use_dualsense_stereo:
-                            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
+                            if not use_dualsense_stereo:
+                                v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
 
-                            if not getattr(self, '_rumble_task_running', False):
+                                if not getattr(self, '_rumble_task_running', False):
 
-                                async def safe_send_single(v1_c, v2_c, v3_c):
-                                    self._rumble_task_running = True
-                                    try:
-                                        await self.set_vibration(v1_c, v2_c, v3_c)
-                                    finally:
-                                        self._rumble_task_running = False
-
-                                def dispatch_rumble_task(coro):
-                                    loop = getattr(vc, 'loop', None)
-                                    if loop and not loop.is_closed():
-                                        asyncio.run_coroutine_threadsafe(coro, loop)
-                                    else:
+                                    async def safe_send_single(v1_c, v2_c, v3_c):
+                                        self._rumble_task_running = True
                                         try:
-                                            asyncio.get_running_loop().create_task(coro)
-                                        except RuntimeError:
-                                            pass
+                                            await self.set_vibration(v1_c, v2_c, v3_c)
+                                        finally:
+                                            self._rumble_task_running = False
 
-                                if is_zero:
-                                    if not getattr(self, 'rumble_stopped', False):
-                                        self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
-                                        if self._zero_count >= 3:
-                                            self.rumble_stopped = True
-                                else:
-                                    self.rumble_stopped = False
-                                    self._zero_count = 0
-                                    # Pace continuous rumble to the BLE connection interval
-                                    # (~7.5ms) for the ESP32-S3 bridge. The 3 frames per
-                                    # command already cover the interval; dispatching every
-                                    # input report (faster, and doubled in merge mode) floods
-                                    # the firmware's per-interval BLE write and causes the
-                                    # stuttering. WinRT is paced by Windows' BLE stack instead.
-                                    if self._bridge_rumble_due():
-                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
-                        else:
-                            v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
-                            v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
+                                    def dispatch_rumble_task(coro):
+                                        loop = getattr(vc, 'loop', None)
+                                        if loop and not loop.is_closed():
+                                            asyncio.run_coroutine_threadsafe(coro, loop)
+                                        else:
+                                            try:
+                                                asyncio.get_running_loop().create_task(coro)
+                                            except RuntimeError:
+                                                pass
+
+                                    if is_zero:
+                                        if not getattr(self, 'rumble_stopped', False):
+                                            self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                            dispatch_rumble_task(safe_send_single(v1, v2, v3))
+                                            if self._zero_count >= 3:
+                                                self.rumble_stopped = True
+                                    else:
+                                        self.rumble_stopped = False
+                                        self._zero_count = 0
+                                        # Pace continuous rumble to the BLE connection interval
+                                        # (~7.5ms) for the ESP32-S3 bridge. The 3 frames per
+                                        # command already cover the interval; dispatching every
+                                        # input report (faster, and doubled in merge mode) floods
+                                        # the firmware's per-interval BLE write and causes the
+                                        # stuttering. WinRT is paced by Windows' BLE stack instead.
+                                        if self._bridge_rumble_due():
+                                            dispatch_rumble_task(safe_send_single(v1, v2, v3))
+                            else:
+                                v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
+                                v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
 
                             if self.is_pro_controller():
                                 is_zero = is_zero_l and is_zero_r
