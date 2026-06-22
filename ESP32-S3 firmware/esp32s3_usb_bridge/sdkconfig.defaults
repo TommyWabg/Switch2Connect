@@ -16,12 +16,17 @@ CONFIG_BT_NIMBLE_MAX_CCCDS=24
 # blocks give the concurrent input+rumble traffic headroom.
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=48
 CONFIG_BT_NIMBLE_GATT_MAX_PROCS=8
-# This is a BLE-only bridge — it never initializes WiFi. Leaving WiFi enabled keeps
-# the WiFi/BT software-coexistence arbiter active, which reserves radio time slots and
-# limits how tightly the BLE controller can pack multiple connections (a cause of the
-# multi-controller latency floor). Disabling WiFi cascades ESP_COEX_SW_COEXIST_ENABLE
-# off, giving the BLE controller full, unarbitrated use of the radio.
-CONFIG_ESP_WIFI_ENABLED=n
+# This is a BLE-only bridge — it never initializes WiFi (no esp_wifi_* calls). The
+# lever that actually matters for the multi-controller latency floor is the WiFi/BT
+# software-coexistence arbiter: while active it reserves radio time slots and limits
+# how tightly the BLE controller can pack multiple connections. Turning it off below
+# gives the BLE controller full, unarbitrated use of the radio.
+#
+# NOTE: ESP_WIFI_ENABLED itself CANNOT be turned off on the ESP32-S3 in IDF v5.5.4 —
+# it is a promptless Kconfig symbol forced to `y` by `default y if SOC_WIFI_SUPPORTED`
+# (esp_wifi/Kconfig), so any `CONFIG_ESP_WIFI_ENABLED=n` here is silently ignored. The
+# WiFi library stays linked but never runs; only the coexistence arbiter below has a
+# runtime effect, and it is the one we need off.
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"

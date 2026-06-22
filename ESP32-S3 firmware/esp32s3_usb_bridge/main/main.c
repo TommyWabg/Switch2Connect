@@ -32,7 +32,7 @@ void ble_store_config_init(void);
 
 static const char *TAG = "ESP32S3_CDC";
 
-#define APP_FIRMWARE_VERSION "0.11.1"
+#define APP_FIRMWARE_VERSION "0.11.17"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD "cdc_bridge_1"
 #define NINTENDO_REPORT_SIZE 64
@@ -120,10 +120,84 @@ static volatile uint32_t s_rumble_tx_fail[MAX_BLE_CHANNELS];
 // (real vs zero) rumble; if both channels are mostly active yet motors alternate,
 // the issue is the BLE link/controller, not the data.
 static volatile uint32_t s_rumble_active[MAX_BLE_CHANNELS];
+// wrpair commands successfully parsed per second (two BLE writes each).
+static volatile uint32_t s_wrpair_cmd;
+// 'rs' (rumble-shadow set) commands received per second.
+static volatile uint32_t s_rumble_shadow_set;
+// Gap-fill HOLD writes emitted per second (steady continuation between host packets).
+static volatile uint32_t s_rumble_hold;
 // Per-channel INPUT reports forwarded to the host per second. Compares against the app's
 // INPUT-RATE log: if firmware fwd is ~60 but the app sees ~30, the shared serial read
 // thread is the bottleneck; if firmware fwd is already ~30, the radio/firmware is.
 static volatile uint32_t s_input_fwd[MAX_BLE_CHANNELS];
+
+// --- Rumble relay ---------------------------------------------------------
+// Each Switch 2 Joy-Con rumble packet carries THREE 5-byte frames that are three
+// CONSECUTIVE time-samples of the waveform (the host builds them from a 144 Hz
+// envelope, so one packet's 3 frames span ~20 ms of playback).  The Joy-Con plays
+// frame1->2->3 in order; a NEW packet restarts that playback at frame 1.
+//
+// Therefore we must relay each "rs <ch> <hex>" packet to BLE EXACTLY ONCE and let
+// all three frames play out — that naturally fills the inter-packet interval.
+// (The previous design re-sent the latest packet on a timer; every re-send
+// restarted playback at frame 1, so only ~7 ms of frame 1 ever played: that
+// caused the equal-interval gaps, the left/right complementary alternation —
+// ~7 ms playback is shorter than the 7.5 ms radio slot offset between the two
+// connections — and stretched transient effects like the Ping double-tap into a
+// continuous buzz.  Relaying once removes all of that.)
+//
+// BLE writes are driven by the dedicated rumble_driver_task; the 'rs' parser only
+// stores the payload as pending.
+typedef struct {
+    uint8_t  payload[NINTENDO_REPORT_SIZE];
+    uint16_t len;
+    bool     pending;       // a freshly-received host packet awaits its next write
+    bool     holding;       // rumble is ongoing; keep feeding between host packets
+    uint8_t  tx_id;         // rolling 4-bit packet-id (byte[1] = 0x50 | tx_id)
+    int64_t  last_packet_us;// time of the last real host packet (relay)
+    int64_t  last_write_us; // time of the last BLE write (for rate limiting)
+    int64_t  suppress_until_us; // ignore rumble until this time (post-connect grace)
+} rumble_shadow_t;
+static rumble_shadow_t s_rumble_shadow[MAX_BLE_CHANNELS];
+static portMUX_TYPE s_rumble_shadow_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// After a channel becomes ready, ignore rumble for this long.  Kills any
+// connect-time buzz (a controller/host pulse at connect) — the user isn't
+// mid-action right at connect, so dropping it is invisible.
+#define RUMBLE_CONNECT_GRACE_US 500000
+
+// Minimum spacing between rumble writes on a channel (per-channel rate limit).
+// A controller-paced burst (queuing several copies to the BLE TX so the LL drains
+// them at the connection interval) was tried but overran the BLE stack and crashed
+// the device, so we send exactly ONE write per drive call and cap the rate here.
+#define RUMBLE_MIN_GAP_US 12000
+
+// Steady output pacing.  The host only streams ~34 packets/s/channel (~29 ms
+// apart) but each packet's 3 frames play ~20 ms, so relaying once leaves a ~9 ms
+// gap (and the two channels' anti-phase gaps looked complementary).  A single
+// high-res esp_timer is the SOLE driver of BLE writes at a fixed cadence (no
+// coalescing with 'rs' posts): every tick each channel sends the freshly-arrived
+// packet if there is one (faithful 3-frame envelope), otherwise a steady HOLD =
+// the latest frame replicated across all 3 slots (a continuation of the current
+// level, NEVER a stop, safe to repeat).  Sending every ~13 ms (< the ~20 ms
+// playback) tiles the gap so rumble is continuous on both channels at once.
+#define RUMBLE_TICK_US      13000  // sole output cadence (~77/s/channel)
+#define RUMBLE_HOLD_IDLE_US 60000  // stop feeding this long after the last packet
+
+// True if a Joy-Con rumble payload commands motor activity (non-zero amplitude).
+// Layout: byte0=0x00, byte1=0x50|id, then 3x 5-byte frames at offsets 2/7/12 with
+// lf_amp at bits 10-19 and hf_amp at bits 30-39.  Short/unknown => treat as active.
+static bool rumble_payload_active(const uint8_t *data, size_t len)
+{
+    if (data == NULL) return false;
+    if (len < 17) return len > 0;
+    for (int fo = 2; fo + 5 <= (int)len && fo <= 12; fo += 5) {
+        uint64_t v = 0;
+        for (int b = 0; b < 5; b++) v |= ((uint64_t)data[fo + b]) << (8 * b);
+        if (((v >> 10) & 0x3FF) || ((v >> 30) & 0x3FF)) return true;
+    }
+    return false;
+}
 
 static char rx_buf[256];
 static int rx_len = 0;
@@ -303,6 +377,11 @@ static void release_channel(controller_channel_t *ctx)
     channels[idx].conn_handle = BLE_HS_CONN_HANDLE_NONE;
     channels[idx].desc_discovery_index = -1;
     channels[idx].subscribe_index = -1;
+    // Drop any stale rumble shadow so a controller that later reuses this slot
+    // does not inherit the previous one's active rumble.
+    portENTER_CRITICAL(&s_rumble_shadow_mux);
+    memset(&s_rumble_shadow[idx], 0, sizeof(s_rumble_shadow[idx]));
+    portEXIT_CRITICAL(&s_rumble_shadow_mux);
     refresh_active_ble_channels();
 }
 
@@ -391,10 +470,10 @@ static void send_status_response(void)
                  own_addr[2], own_addr[1], own_addr[0]);
     }
 
-    char response[200];
+    char response[256];
     int len = snprintf(response,
                        sizeof(response),
-                       "{\"cmd\":\"status\",\"version\":\"%s\",\"profile\":\"%s\",\"build\":\"%s\",\"ble_channels\":%u,\"mac\":\"%s\"}\n",
+                       "{\"cmd\":\"status\",\"version\":\"%s\",\"profile\":\"%s\",\"build\":\"%s\",\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1}}\n",
                        APP_FIRMWARE_VERSION,
                        EXPECTED_FIRMWARE_PROFILE,
                        EXPECTED_FIRMWARE_BUILD,
@@ -474,6 +553,237 @@ static void handle_write_command(char *command)
                      channel, kind_text[0], (unsigned)len, (int)err);
         }
     }
+}
+
+// handle_wrpair_command — write different rumble payloads to left and right
+// Joy-Con BLE channels in one command cycle.
+//
+// Format: "wrpair <ch_l> <ch_r> <kind> <hex_payload_l> <hex_payload_r>"
+// Example: "wrpair 0 1 r 005011... 005011..."
+//
+// Purpose: the Python host sends this instead of two separate "wr" commands so
+// that both BLE writes are queued in the same firmware scheduling cycle.  This
+// avoids the ~30 Hz L/R alternation that occurs when the host dispatches two
+// independent writes: the BLE radio round-robins the two connections and tends
+// to serve only one per connection event when writes arrive separately.
+// Each side keeps its own payload (left ≠ right) so games that produce
+// different L/R rumble intensities are handled correctly.
+static void handle_wrpair_command(char *command)
+{
+    char *save = NULL;
+    char *tok = strtok_r(command, " ", &save);
+    if (tok == NULL || strcmp(tok, "wrpair") != 0) return;
+
+    char *ch_l_text  = strtok_r(NULL, " ", &save);
+    char *ch_r_text  = strtok_r(NULL, " ", &save);
+    char *kind_text  = strtok_r(NULL, " ", &save);
+    char *hex_l_text = strtok_r(NULL, " ", &save);
+    char *hex_r_text = strtok_r(NULL, " ", &save);
+
+    if (!ch_l_text || !ch_r_text || !kind_text || !hex_l_text || !hex_r_text) {
+        ESP_LOGW(TAG, "Invalid wrpair command (missing fields)");
+        return;
+    }
+
+    int ch_l = atoi(ch_l_text);
+    int ch_r = atoi(ch_r_text);
+    if (ch_l < 0 || ch_l >= MAX_BLE_CHANNELS || ch_r < 0 || ch_r >= MAX_BLE_CHANNELS) {
+        ESP_LOGW(TAG, "wrpair invalid channels l=%d r=%d", ch_l, ch_r);
+        return;
+    }
+
+    uint8_t payload_l[96], payload_r[96];
+    size_t len_l = parse_hex_bytes(hex_l_text, payload_l, sizeof(payload_l));
+    size_t len_r = parse_hex_bytes(hex_r_text, payload_r, sizeof(payload_r));
+    if (len_l == 0 || len_r == 0) {
+        ESP_LOGW(TAG, "wrpair empty payload l=%u r=%u", (unsigned)len_l, (unsigned)len_r);
+        return;
+    }
+
+    // Determine active (non-zero amplitude) flag for each side independently.
+    // Joy-Con vibration: lf_amp at bits 10-19, hf_amp at bits 30-39 of each
+    // 5-byte frame at offsets 2/7/12 within the payload.
+    bool active_l = (len_l < 17);
+    for (int fo = 2; !active_l && fo + 5 <= (int)len_l && fo <= 12; fo += 5) {
+        uint64_t v = 0;
+        for (int b = 0; b < 5; b++) v |= ((uint64_t)payload_l[fo + b]) << (8 * b);
+        if (((v >> 10) & 0x3FF) || ((v >> 30) & 0x3FF)) active_l = true;
+    }
+    bool active_r = (len_r < 17);
+    for (int fo = 2; !active_r && fo + 5 <= (int)len_r && fo <= 12; fo += 5) {
+        uint64_t v = 0;
+        for (int b = 0; b < 5; b++) v |= ((uint64_t)payload_r[fo + b]) << (8 * b);
+        if (((v >> 10) & 0x3FF) || ((v >> 30) & 0x3FF)) active_r = true;
+    }
+
+    // Write to both channels sequentially in the same command cycle.
+    // If one write fails, the other is still attempted (independent results).
+    esp_err_t err_l = write_ble_payload(&channels[ch_l], kind_text[0], payload_l, (uint16_t)len_l);
+    esp_err_t err_r = write_ble_payload(&channels[ch_r], kind_text[0], payload_r, (uint16_t)len_r);
+
+    if (kind_text[0] == 'r') {
+        if (err_l == ESP_OK) s_rumble_tx_ok[ch_l]++;   else s_rumble_tx_fail[ch_l]++;
+        if (err_r == ESP_OK) s_rumble_tx_ok[ch_r]++;   else s_rumble_tx_fail[ch_r]++;
+        if (active_l) s_rumble_active[ch_l]++;
+        if (active_r) s_rumble_active[ch_r]++;
+        s_wrpair_cmd++;
+    }
+
+    ESP_LOGD(TAG, "RUMBLE_PAIR chL=%d okL=%d activeL=%d chR=%d okR=%d activeR=%d",
+             ch_l, err_l == ESP_OK, active_l, ch_r, err_r == ESP_OK, active_r);
+
+    if (err_l != ESP_OK)
+        ESP_LOGD(TAG, "wrpair BLE write failed chL=%d err=%d", ch_l, (int)err_l);
+    if (err_r != ESP_OK)
+        ESP_LOGD(TAG, "wrpair BLE write failed chR=%d err=%d", ch_r, (int)err_r);
+}
+
+// handle_rumble_shadow_command — accept ONE rumble packet for one channel.
+// Format: "rs <ch> <hex_payload>".  Stores the payload as pending; rumble_driver_task
+// sends it on its next tick.  The handler does not write BLE itself.
+static void handle_rumble_shadow_command(char *command)
+{
+    char *save = NULL;
+    char *tok = strtok_r(command, " ", &save);
+    if (tok == NULL || strcmp(tok, "rs") != 0) return;
+
+    char *ch_text  = strtok_r(NULL, " ", &save);
+    char *hex_text = strtok_r(NULL, " ", &save);
+    if (!ch_text || !hex_text) {
+        ESP_LOGW(TAG, "Invalid rs command (missing fields)");
+        return;
+    }
+    int ch = atoi(ch_text);
+    if (ch < 0 || ch >= MAX_BLE_CHANNELS) {
+        ESP_LOGW(TAG, "rs invalid channel %d", ch);
+        return;
+    }
+    uint8_t payload[NINTENDO_REPORT_SIZE];
+    size_t len = parse_hex_bytes(hex_text, payload, sizeof(payload));
+    if (len < 2) {
+        ESP_LOGW(TAG, "rs short payload ch=%d", ch);
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_rumble_shadow_mux);
+    if (now_us < s_rumble_shadow[ch].suppress_until_us) {
+        // Connect grace window: drop rumble so a connect-time pulse can't buzz.
+        portEXIT_CRITICAL(&s_rumble_shadow_mux);
+        s_rumble_shadow_set++;
+        return;
+    }
+    memcpy(s_rumble_shadow[ch].payload, payload, len);
+    s_rumble_shadow[ch].len = (uint16_t)len;
+    s_rumble_shadow[ch].pending = true;
+    portEXIT_CRITICAL(&s_rumble_shadow_mux);
+    s_rumble_shadow_set++;
+}
+
+// rumble_relay_ev — runs in the NIMBLE HOST-TASK context once per timer tick.
+// For each ongoing channel it emits exactly ONE write this tick: the freshly
+// arrived host packet if there is one (faithful 3-frame envelope), otherwise a
+// steady HOLD (latest frame x3 = continuation of the current level, never a stop).
+// Emit ONE write for this channel this tick (relay a fresh host packet, or a
+// steady HOLD), advancing the rolling packet-id.  Called from rumble_driver_task.
+static void rumble_drive_channel(int ch, int64_t now_us)
+{
+    if (!channels[ch].used ||
+        channels[ch].conn_handle == BLE_HS_CONN_HANDLE_NONE ||
+        !channels[ch].ready ||
+        channels[ch].rumble_value_handle == 0) {
+        return;
+    }
+
+    uint8_t buf[NINTENDO_REPORT_SIZE];
+    uint16_t len = 0;
+    uint8_t id = 0;
+    bool send = false;
+    bool is_hold = false;
+
+    portENTER_CRITICAL(&s_rumble_shadow_mux);
+    rumble_shadow_t *sh = &s_rumble_shadow[ch];
+
+    // Rate limit: this is driven by the esp_timer event and by input notifications
+    // re-queuing the event, so cap the per-channel write spacing.
+    if (now_us - sh->last_write_us < RUMBLE_MIN_GAP_US) {
+        portEXIT_CRITICAL(&s_rumble_shadow_mux);
+        return;
+    }
+
+    if (sh->pending && sh->len >= 2) {
+        // Relay the real host packet (full, faithful 3-frame envelope).
+        len = sh->len;
+        memcpy(buf, sh->payload, len);
+        sh->pending = false;
+        sh->holding = true;
+        sh->last_packet_us = now_us;
+        sh->tx_id = (sh->tx_id + 1) & 0x0F;
+        id = sh->tx_id;
+        send = true;
+    } else if (sh->holding) {
+        if (now_us - sh->last_packet_us >= RUMBLE_HOLD_IDLE_US) {
+            // Host stopped streaming without further packets — stop feeding.
+            // (A real stop arrives as a zero packet, which is relayed above.)
+            sh->holding = false;
+        } else if (sh->len >= 17) {
+            // Fill with a steady HOLD = latest frame (bytes [12..17)) replicated
+            // across all three slots: continuation of the current level, never a stop.
+            buf[0] = 0x00;
+            memcpy(&buf[2],  &sh->payload[12], 5);
+            memcpy(&buf[7],  &sh->payload[12], 5);
+            memcpy(&buf[12], &sh->payload[12], 5);
+            len = 17;
+            sh->tx_id = (sh->tx_id + 1) & 0x0F;
+            id = sh->tx_id;
+            send = true;
+            is_hold = true;
+        }
+    }
+    if (send) {
+        sh->last_write_us = now_us;
+    }
+    portEXIT_CRITICAL(&s_rumble_shadow_mux);
+
+    if (send) {
+        buf[1] = 0x50 | (id & 0x0F);  // stamp rolling packet-id
+        esp_err_t err = write_ble_payload(&channels[ch], 'r', buf, len);
+        if (err == ESP_OK) s_rumble_tx_ok[ch]++; else s_rumble_tx_fail[ch]++;
+        if (rumble_payload_active(buf, len)) s_rumble_active[ch]++;
+        if (is_hold) s_rumble_hold++;
+    }
+}
+
+// rumble_driver_task — the SOLE driver of rumble output, on its OWN task.
+// The host-task-based event approach was capped at ~33 writes/s/channel because
+// the busy NimBLE host task serviced the event only ~33/s (not enough to tile the
+// ~20 ms 3-frame playback, so a ~10 ms gap remained every cycle).  write_ble_payload
+// is already driven from a non-host task elsewhere (tinyusb_cdc_rx_callback handles
+// wr/wrpair), so writing from this dedicated task is safe; an 8 KB stack avoids the
+// overflow that crashed the first attempt.  vTaskDelayUntil gives a jitter-free
+// cadence both channels share, keeping a merged L/R pair in phase.
+// Driven by esp_timer in the NimBLE HOST-TASK context (via the event below).
+// Writing rumble from the host task (rather than a separate task) avoids
+// ble_hs_lock contention with the host's own input-notification processing, which
+// is what let a dedicated task either starve input (same core) or get starved by
+// the host (other core).  This caps rumble at the host's spare service rate
+// (~33/s/ch) but keeps input at full rate — the best stable balance on this HW.
+static struct ble_npl_event s_rumble_ev;
+
+static void rumble_relay_ev(struct ble_npl_event *ev)
+{
+    (void)ev;
+    int64_t now_us = esp_timer_get_time();
+    for (int ch = 0; ch < MAX_BLE_CHANNELS; ch++) {
+        rumble_drive_channel(ch, now_us);
+    }
+}
+
+static esp_timer_handle_t s_rumble_timer;
+static void rumble_tick_cb(void *arg)
+{
+    (void)arg;
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_rumble_ev);
 }
 
 static void handle_conn_command(char *command)
@@ -559,10 +869,12 @@ static void cdc_stream_task(void *arg)
         int64_t now_us = esp_timer_get_time();
         if (now_us - last_rumble_report_us >= 1000000) {
             last_rumble_report_us = now_us;
-            if (s_rumble_tx_ok[0] || s_rumble_tx_ok[1] || s_rumble_tx_fail[0] || s_rumble_tx_fail[1] || s_ctrl_drop_count) {
-                char rdbg[256];
+            if (s_rumble_tx_ok[0] || s_rumble_tx_ok[1] || s_rumble_tx_fail[0] || s_rumble_tx_fail[1] || s_wrpair_cmd || s_rumble_shadow_set || s_ctrl_drop_count) {
+                char rdbg[360];
                 int rl = snprintf(rdbg, sizeof(rdbg),
-                    "{\"cmd\":\"debug\",\"msg\":\"rumble ch0=%u/%u/%u ch1=%u/%u/%u (ok/fail/active) in ch0=%u ch1=%u (/s) ctrl_drop=%u\"}\n",
+                    "{\"cmd\":\"debug\",\"msg\":\"RUMBLE-FW rs=%u hold=%u ch0=%u/%u/%u ch1=%u/%u/%u (ok/fail/active) in ch0=%u ch1=%u (/s) ctrl_drop=%u\"}\n",
+                    (unsigned)s_rumble_shadow_set,
+                    (unsigned)s_rumble_hold,
                     (unsigned)s_rumble_tx_ok[0], (unsigned)s_rumble_tx_fail[0], (unsigned)s_rumble_active[0],
                     (unsigned)s_rumble_tx_ok[1], (unsigned)s_rumble_tx_fail[1], (unsigned)s_rumble_active[1],
                     (unsigned)s_input_fwd[0], (unsigned)s_input_fwd[1],
@@ -570,6 +882,9 @@ static void cdc_stream_task(void *arg)
                 if (rl > 0) safe_cdc_write((const uint8_t *)rdbg, rl);
             }
             s_ctrl_drop_count = 0;
+            s_wrpair_cmd = 0;
+            s_rumble_shadow_set = 0;
+            s_rumble_hold = 0;
             for (int i = 0; i < MAX_BLE_CHANNELS; i++) {
                 s_rumble_tx_ok[i] = 0;
                 s_rumble_tx_fail[i] = 0;
@@ -805,6 +1120,19 @@ static void subscribe_next_report(controller_channel_t *ctx)
 
     ctx->ready = true;
     refresh_active_ble_channels();
+
+    // Start this channel's rumble shadow clean and silent, and apply a connect
+    // grace window so any connect-time rumble pulse cannot buzz the motor.
+    {
+        int rdy_idx = channel_index(ctx);
+        if (rdy_idx >= 0) {
+            portENTER_CRITICAL(&s_rumble_shadow_mux);
+            memset(&s_rumble_shadow[rdy_idx], 0, sizeof(s_rumble_shadow[rdy_idx]));
+            s_rumble_shadow[rdy_idx].suppress_until_us =
+                esp_timer_get_time() + RUMBLE_CONNECT_GRACE_US;
+            portEXIT_CRITICAL(&s_rumble_shadow_mux);
+        }
+    }
 
     // Re-assert 7.5ms on this connection in case the controller negotiated something
     // slower during setup. NOTE: this pins the per-connection INTERVAL to 7.5ms, but the
@@ -1191,6 +1519,15 @@ static void handle_notify_rx(const struct ble_gap_event *event)
         s_latest_input_dirty[ch_index] = true;
         portEXIT_CRITICAL(&s_input_shadow_mux);
         xSemaphoreGive(s_stream_wake);
+
+        // Nudge the rumble relay event on every input notification.  We MUST NOT call
+        // ble_gattc here: this GAP callback runs with ble_hs_lock held, so a direct
+        // write deadlocks the host task (hangs everything).  ble_npl_eventq_put is
+        // lock-free and safe; because input arrives ~130/s/ch it re-queues the event
+        // far more often than the 13 ms esp_timer, so the host services it (and thus
+        // writes rumble) much more frequently — lifting the rate past the ~33/s the
+        // timer alone managed.  RUMBLE_MIN_GAP_US still caps the per-channel rate.
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_rumble_ev);
     }
 }
 
@@ -1498,7 +1835,11 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event)
             rx_buf[rx_len] = '\0';
             ESP_LOGI(TAG, "Received command: %s", rx_buf);
 
-            if (strncmp(rx_buf, "wr ", 3) == 0) {
+            if (strncmp(rx_buf, "rs ", 3) == 0) {
+                handle_rumble_shadow_command(rx_buf);
+            } else if (strncmp(rx_buf, "wrpair ", 7) == 0) {
+                handle_wrpair_command(rx_buf);
+            } else if (strncmp(rx_buf, "wr ", 3) == 0) {
                 handle_write_command(rx_buf);
             } else if (strncmp(rx_buf, "conn ", 5) == 0) {
                 handle_conn_command(rx_buf);
@@ -1600,6 +1941,16 @@ void app_main(void)
 
     init_ble();
     xTaskCreatePinnedToCore(cdc_stream_task, "cdc_stream_task", 4096, NULL, 10, NULL, 1);
+    // Rumble: a steady esp_timer posts an event that runs the BLE writes in the
+    // NimBLE host-task context (see rumble_relay_ev / rumble_tick_cb).  This keeps
+    // input at full rate (a dedicated task contended and starved one or the other).
+    ble_npl_event_init(&s_rumble_ev, rumble_relay_ev, NULL);
+    const esp_timer_create_args_t rumble_timer_args = {
+        .callback = &rumble_tick_cb,
+        .name = "rumble_tick",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&rumble_timer_args, &s_rumble_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_rumble_timer, RUMBLE_TICK_US));
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
