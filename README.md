@@ -133,7 +133,7 @@ To achieve drift-free 9-axis tracking, follow these steps to calibrate the magne
 3.  In the app, click the **[ESP32-S3 N16R8 Driver]** button.
 4.  Click click **[Install]** and wait until finish installing.
 5.  Unplug and plug the ESP32-S3 N16R8 board.
-6.  Reconnect any previously paired controllers by pressing SYNC.
+6.  Reconnect any controllers previously paired via the system BLE by pressing SYNC.
 
 * **ESP32-S3 N16R8 Buying Guide:**
 1.  Search for development boards strictly labeled as **ESP32-S3 N16R8**. This ensures the board contains 16MB Flash and 8MB PSRAM, which is necessary for handling complex tasks and controller connections. Avoid any boards labeled as "N8R2", "N8R8", or standard "ESP32".
