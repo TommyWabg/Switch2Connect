@@ -19,6 +19,7 @@ from controller import (
     NINTENDO_VENDOR_ID,
     COMMAND_WRITE_UUID,
     COMMAND_RESPONSE_UUID,
+    INPUT_REPORT_UUID,
     VIBRATION_WRITE_PRO_CONTROLLER_UUID,
     VIBRATION_WRITE_JOYCON_L_UUID,
     VIBRATION_WRITE_JOYCON_R_UUID,
@@ -458,6 +459,8 @@ class ESP32S3SerialClient:
                 # callback (the SW2 input stream lives on the ab7de9be… UUID).
                 if is_command and str(uuid).lower().startswith(INPUT_UUID_PREFIX):
                     continue
+                if not is_command and not str(uuid).lower().startswith(INPUT_UUID_PREFIX):
+                    continue
                 try:
                     cb(None, bytearray(report_payload))
                 except Exception:
@@ -566,6 +569,7 @@ class MockService:
         self.uuid = uuid
         self.characteristics = [
             MockCharacteristic(COMMAND_WRITE_UUID, ["write-without-response"]),
+            MockCharacteristic(INPUT_REPORT_UUID, ["notify"]),
             MockCharacteristic(COMMAND_RESPONSE_UUID, ["notify"]),
         ]
 
@@ -945,9 +949,6 @@ class ESP32S3Controller(Controller):
                 await self.client.disconnect()
             self.client = None
 
-    async def set_leds(self, player_number: int, reversed=False):
-        del player_number, reversed
-        return
 
     async def set_vibration(self, vibration: VibrationData, *args, **kwargs):
         return await Controller.set_vibration(self, vibration, *args, **kwargs)

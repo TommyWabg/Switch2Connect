@@ -491,7 +491,7 @@ class ToggleSwitch(tk.Frame):
         except ValueError:
             pass
 
-    def update_options(self, labels, values, current_value):
+    def update_options(self, labels, values, current_value, widths=None):
         # Destroy all old buttons and frames
         for btn, frame in self.buttons:
             try:
@@ -512,7 +512,8 @@ class ToggleSwitch(tk.Frame):
             frame = tk.Frame(self, bg=self.bg_color)
             frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
             
-            btn = tk.Button(frame, text=label, width=8, font=scale_font(("Arial", 11, "bold")),
+            w = widths[i] if widths else 8
+            btn = tk.Button(frame, text=label, width=w, font=scale_font(("Arial", 11, "bold")),
                             bd=0, relief=tk.FLAT, highlightthickness=0,
                             command=lambda idx=i: self._on_click(idx))
             btn.pack(padx=0, pady=0) # Base state: no padding
@@ -3765,6 +3766,18 @@ bg_color=background_color, widths=[8, 10])
         except Exception as e:
             logger.error(f"Failed to save auto disconnect settings: {e}")
 
+    def on_rumble_delay_changed(self, event=None):
+        val_str = getattr(self, "rumble_delay_entry", tk.Entry(self.root)).get().strip()
+        if not val_str:
+            val = 0
+        else:
+            try:
+                val = int(val_str)
+            except ValueError:
+                val = 0
+        CONFIG.rumble_delay_ms = val
+        CONFIG.save_config()
+
     def update_mode_setting(self, val):
         CONFIG.gyro_mode = val
         self.on_gyro_setting_changed()
@@ -4167,6 +4180,21 @@ bg_color=background_color, widths=[8, 10])
         self.vibration_frequency_label = tk.Label(row_vibration, text="Frequency:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
         self.vibration_frequency_scale = tk.Scale(row_vibration, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_vibration_frequency)
         self.vibration_frequency_scale.set(getattr(CONFIG, "vibration_frequency", 10))
+
+        self.delay_label = tk.Label(row_vibration, text="Delay:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.delay_label.pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        
+        def validate_numeric(char):
+            return char.isdigit() or char == ""
+        vcmd = (self.root.register(validate_numeric), '%S')
+        
+        self.rumble_delay_entry = tk.Entry(row_vibration, width=4, bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")), justify=tk.CENTER, validate="key", validatecommand=vcmd)
+        self.rumble_delay_entry.insert(0, str(getattr(CONFIG, "rumble_delay_ms", 0)))
+        self.rumble_delay_entry.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        self.delay_ms_label = tk.Label(row_vibration, text="ms", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.delay_ms_label.pack(side=tk.LEFT, padx=(0, int(10 * scaling_factor)))
+        
+        self.rumble_delay_entry.bind("<KeyRelease>", self.on_rumble_delay_changed)
         self.update_rumble_mode_ui(getattr(CONFIG, "rumble_mode", "Xbox"))
 
         row_mouse = tk.Frame(self.settings_frame, bg=background_color); row_mouse.pack(side=tk.TOP, fill=tk.X, pady=int(5 * scaling_factor))
@@ -4200,8 +4228,6 @@ bg_color=background_color, widths=[8, 10])
 
         self.del_profile_btn = tk.Button(row_profile, text="Delete", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_delete_profile)
         self.del_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
-
-        tk.Label(row_profile, text="Assign Current Profile To:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(5 * scaling_factor)))
         self.assigned_apps_frame = tk.Frame(row_profile, bg=background_color)
         self.assigned_apps_frame.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
         self.refresh_assigned_apps_ui()
@@ -4261,40 +4287,8 @@ bg_color=background_color, widths=[8, 10])
         self.gc_trigger_combo.bind("<<ComboboxSelected>>", on_gc_trigger_combo_selected)
         self.gc_trigger_combo.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
-        # --- NSO GCN Rumble Brake toggle ---
-        tk.Label(
-            row_gc, text="  |  GCN Brake:",
-            bg=background_color, fg=text_color,
-            font=scale_font(("Arial", 11, "bold"))
-        ).pack(side=tk.LEFT, padx=(int(8 * scaling_factor), int(2 * scaling_factor)))
-
-        _gcn_brake_on = getattr(CONFIG, "gcn_rumble_brake_enabled", False)
-        self.gcn_brake_btn = tk.Button(
-            row_gc,
-            text="Brake: On" if _gcn_brake_on else "Brake: Off",
-            font=scale_font(("Arial", 11, "bold")),
-            bg=highlight_color if _gcn_brake_on else button_gray,
-            fg="white",
-            relief=tk.FLAT,
-            bd=0,
-            command=self._on_gcn_brake_toggle
-        )
-        self.gcn_brake_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
-
         if current_val != "100% at Max":
             self.gc_click_map_frame.pack(side=tk.LEFT, padx=(int(5 * scaling_factor), 0))
-
-    def _on_gcn_brake_toggle(self):
-        """Toggle the experimental GCN rumble brake (0x02 / StopHard) setting."""
-        new_val = not getattr(CONFIG, "gcn_rumble_brake_enabled", False)
-        CONFIG.gcn_rumble_brake_enabled = new_val
-        CONFIG.save_config()
-        if hasattr(self, 'gcn_brake_btn'):
-            self.gcn_brake_btn.config(
-                text="Brake: On" if new_val else "Brake: Off",
-                bg=highlight_color if new_val else button_gray
-            )
-        logger.info("GCN rumble brake %s by user.", "ENABLED" if new_val else "DISABLED")
 
     def on_gc_trigger_calib_clicked(self):
         gc_controller = None
@@ -4534,12 +4528,11 @@ bg_color=background_color, widths=[8, 10])
                 self.gc_trigger_combo.set(self.gc_trigger_labels[idx])
             except ValueError:
                 pass
-        if hasattr(self, 'gcn_brake_btn'):
-            val = getattr(CONFIG, "gcn_rumble_brake_enabled", False)
-            self.gcn_brake_btn.config(
-                text="Brake: On" if val else "Brake: Off",
-                bg=highlight_color if val else button_gray
-            )
+            if hasattr(self, 'gc_click_map_frame'):
+                if CONFIG.gc_trigger_mode == "100% at Max":
+                    self.gc_click_map_frame.pack_forget()
+                else:
+                    self.gc_click_map_frame.pack(side=tk.LEFT, padx=(int(scaling_factor * 5), 0))
         if hasattr(self, 'layout_switch'):
             self.layout_switch.set_value(CONFIG.abxy_mode)
         if hasattr(self, 'rumble_mode_switch'):
@@ -4659,7 +4652,7 @@ bg_color=background_color, widths=[8, 10])
             CONFIG.save_config()
             
         if driver_type == "USBIP" and sim_mode == "PS5":
-            self.rumble_mode_switch.update_options(["Xbox", "PS5"], ["Xbox", "PS5"], current_rumble)
+            self.rumble_mode_switch.update_options(["Xbox", "PS5 / HD Rumble"], ["Xbox", "PS5"], current_rumble, widths=[8, 16])
         else:
             if current_rumble == "PS5":
                 current_rumble = "Switch"
@@ -4672,8 +4665,8 @@ bg_color=background_color, widths=[8, 10])
             self.vibration_frequency_label.pack_forget()
             self.vibration_frequency_scale.pack_forget()
         else:
-            self.vibration_frequency_label.pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
-            self.vibration_frequency_scale.pack(side=tk.LEFT)
+            self.vibration_frequency_label.pack(side=tk.LEFT, before=self.delay_label, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+            self.vibration_frequency_scale.pack(side=tk.LEFT, before=self.delay_label)
 
     def update_startup_setting(self, val):
         CONFIG.open_when_startup = val
@@ -4835,71 +4828,127 @@ bg_color=background_color, widths=[8, 10])
         for child in self.assigned_apps_frame.winfo_children():
             child.destroy()
 
-        current_profile = getattr(CONFIG, "active_profile", "")
-        apps = self.get_profile_assigned_apps(current_profile)
-        if not apps:
-            choose_btn = tk.Button(
-                self.assigned_apps_frame,
-                text="Choose App",
-                font=scale_font(("Arial", 11, "bold")),
-                bg=button_gray,
-                fg="white",
-                relief=tk.FLAT,
-                bd=0,
-                padx=0,
-                pady=0,
-                highlightthickness=0,
-                command=lambda: self.on_choose_assigned_app(0),
-            )
-            choose_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0))
-            return
-
-        for index, app in enumerate(apps):
-            self.create_assigned_app_controls(index, app)
-
-        add_btn = tk.Button(
+        btn = tk.Button(
             self.assigned_apps_frame,
-            text="Add",
+            text="Assign Current Profile To Apps",
             font=scale_font(("Arial", 11, "bold")),
             bg=button_gray,
             fg="white",
             relief=tk.FLAT,
             bd=0,
-            padx=0,
-            pady=0,
-            highlightthickness=0,
-            command=self.on_add_assigned_app,
+            command=self.open_assigned_apps_popup
         )
-        add_btn.pack(side=tk.LEFT, padx=(int(4 * scaling_factor), 0))
+        btn.pack(side=tk.LEFT, padx=(int(20 * scaling_factor), 0))
 
-    def create_assigned_app_controls(self, index, app):
-        app_name = app.get("name") if app else "Choose App"
-        choose_btn = tk.Button(
-            self.assigned_apps_frame,
-            text=app_name,
-            font=scale_font(("Arial", 11, "bold")),
-            bg=button_gray,
-            fg="white",
-            relief=tk.FLAT,
-            bd=0,
-            padx=0,
-            pady=0,
-            highlightthickness=0,
-            command=lambda idx=index: self.on_choose_assigned_app(idx),
-        )
-        choose_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0))
+    def open_assigned_apps_popup(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Assigned Apps")
+        popup.configure(bg=background_color)
+        
+        w, h = int(400 * scaling_factor), int(300 * scaling_factor)
+        root_x, root_y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        root_w, root_h = self.root.winfo_width(), self.root.winfo_height()
+        pos_x = root_x + (root_w - w) // 2
+        pos_y = root_y + (root_h - h) // 2
+        popup.geometry(f"{w}x{h}+{pos_x}+{pos_y}")
+        popup.transient(self.root)
+        popup.grab_set()
 
-        remove_btn = tk.Button(
-            self.assigned_apps_frame,
-            text="X",
-            bg="#ff4444",
-            fg="white",
-            font=scale_font(("Arial", 10, "bold")),
-            bd=0,
-            relief=tk.FLAT,
-            command=lambda idx=index: self.on_remove_assigned_app(idx),
-        )
-        remove_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+        btn_frame = tk.Frame(popup, bg=background_color)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(10 * scaling_factor))
+
+        container = tk.Frame(popup, bg=background_color)
+        container.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=int(10 * scaling_factor), pady=(int(10 * scaling_factor), 0))
+
+        canvas = tk.Canvas(container, bg=background_color, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg=background_color)
+
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        def update_scroll_and_center(event=None):
+            bbox = canvas.bbox("all")
+            if not bbox: return
+            canvas.configure(scrollregion=bbox)
+            
+            content_height = scrollable_frame.winfo_reqheight()
+            canvas_height = canvas.winfo_height()
+            canvas_width = canvas.winfo_width()
+            
+            if canvas_height <= 1:
+                return
+
+            if content_height > canvas_height:
+                if not scrollbar.winfo_ismapped():
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                canvas.coords(canvas_window, 0, 0)
+            else:
+                if scrollbar.winfo_ismapped():
+                    scrollbar.pack_forget()
+                y_offset = (canvas_height - content_height) // 2
+                canvas.coords(canvas_window, 0, y_offset)
+
+            canvas.itemconfig(canvas_window, width=canvas_width)
+
+        scrollable_frame.bind("<Configure>", update_scroll_and_center)
+        canvas.bind("<Configure>", update_scroll_and_center)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _on_mousewheel(event):
+            if scrollbar.winfo_ismapped():
+                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        def bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        def populate_list():
+            for child in scrollable_frame.winfo_children():
+                child.destroy()
+            apps = self.get_profile_assigned_apps(getattr(CONFIG, "active_profile", ""))
+            for index, app in enumerate(apps):
+                app_path = app.get("path", "")
+                app_name = os.path.basename(app_path)
+                try:
+                    import win32api
+                    lang, codepage = win32api.GetFileVersionInfo(app_path, '\\VarFileInfo\\Translation')[0]
+                    str_info = u'\\StringFileInfo\\%04X%04X\\FileDescription' % (lang, codepage)
+                    desc = win32api.GetFileVersionInfo(app_path, str_info)
+                    if desc and len(desc) < len(app_name):
+                        app_name = desc
+                except Exception:
+                    pass
+
+                if app_name.lower().endswith(".exe"):
+                    app_name = app_name[:-4]
+
+                row = tk.Frame(scrollable_frame, bg=background_color)
+                row.pack(fill=tk.X, pady=int(2 * scaling_factor))
+                
+                del_btn = tk.Button(row, text="X", bg="#cc0000", fg="white", font=scale_font(("Arial", 9, "bold")), relief=tk.FLAT, bd=0, command=lambda i=index: [self.on_remove_assigned_app(i), populate_list()])
+                del_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=0)
+                
+                lbl = tk.Label(row, text=app_name, bg=button_gray, fg="white", font=scale_font(("Arial", 11, "bold")), justify="center", anchor="center", padx=int(5*scaling_factor), pady=int(4*scaling_factor))
+                lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, int(2*scaling_factor)))
+
+            bind_mousewheel(popup)
+
+        populate_list()
+
+        def add_and_refresh():
+            popup.grab_release()
+            self.on_add_assigned_app()
+            populate_list()
+            popup.grab_set()
+
+        add_btn = tk.Button(btn_frame, text="Add", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=add_and_refresh)
+        add_btn.pack(side=tk.LEFT, padx=int(10 * scaling_factor), expand=True, fill=tk.X)
+
+        close_btn = tk.Button(btn_frame, text="Close", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=popup.destroy)
+        close_btn.pack(side=tk.RIGHT, padx=int(10 * scaling_factor), expand=True, fill=tk.X)
 
     def choose_app_path(self):
         initial_dir = os.environ.get("ProgramFiles") or os.path.expanduser("~")
@@ -5208,6 +5257,9 @@ bg_color=background_color, widths=[8, 10])
         self.update_rumble_mode_ui(getattr(CONFIG, "rumble_mode", "Xbox"))
         self.vibration_strength_scale.set(CONFIG.vibration_strength)
         self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
+        if hasattr(self, "rumble_delay_entry"):
+            self.rumble_delay_entry.delete(0, tk.END)
+            self.rumble_delay_entry.insert(0, str(getattr(CONFIG, "rumble_delay_ms", 0)))
         self._refresh_mapping_comboboxes()
         if hasattr(self, 'gc_trigger_combo'):
             current_val = getattr(CONFIG, "gc_trigger_mode", "100% at Bump")

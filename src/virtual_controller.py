@@ -30,7 +30,7 @@ from controller import (Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         _gcn_update_pwm_state, normalize_motor_value)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
-from usbip_server import USBIPServer
+from usbip_server import USBIPServer, SWITCH1_GYRO_TIMER_EXPERIMENT
 from utils import USBIPAllocator
 from dualsense_structs import DualSenseInputReport01
 from dualsense_haptic import DualSenseHapticProcessor
@@ -310,7 +310,7 @@ class VirtualController:
                 sub_on = getattr(sub_c, 'gyro_active', True) if sub_c else False
                 
                 # Check skip gyro mouse flag
-                if dom_on and sub_on:
+                if dom_on and sub_on and getattr(CONFIG, "gyro_activation_mode", "Toggle") == "Always On":
                     if (controller.is_joycon_left() and djg_sub_side == "Left") or (controller.is_joycon_right() and djg_sub_side == "Right"):
                         controller._skip_gyro_mouse = True
                     else:
@@ -904,6 +904,14 @@ class VirtualController:
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            import threading
+            threading.Timer(delay / 1000.0, self._vibration_callback_internal, args=(client, target, large_motor, small_motor, led_number, user_data)).start()
+        else:
+            self._vibration_callback_internal(client, target, large_motor, small_motor, led_number, user_data)
+
+    def _vibration_callback_internal(self, client, target, large_motor, small_motor, led_number, user_data):
         import math
         import discoverer
 
@@ -1323,7 +1331,16 @@ class VirtualController:
                 
             current_buttons = inputData.buttons 
             
+            # Disable right joystick signal to the game when Gyro Mouse is active (used exclusively for Stick Assist)
+            any_mouse_active = any(getattr(c, 'gyro_mouse_enabled', False) or getattr(c, 'jc_mouse_active', False) for c in self.controllers)
+            if any_mouse_active:
+                inputData.right_stick = (0.0, 0.0)
+            
             if len(self.controllers) == 1 and self.mode != "Switch1":
+                custom_btns = getattr(inputData, 'custom_buttons_mask', 0)
+                custom_btns &= current_buttons
+                current_buttons &= ~custom_btns
+
                 if controller.is_joycon_left():
                     if self.hold_mode == "Vertical":
                         inputData.right_stick = inputData.left_stick
@@ -1396,6 +1413,8 @@ class VirtualController:
                         if current_buttons & SWITCH_BUTTONS["PLUS"]: new_btns |= SWITCH_BUTTONS["PLUS"]
                         if current_buttons & SWITCH_BUTTONS["R_STK"]: new_btns |= SWITCH_BUTTONS["L_STK"]
                         current_buttons = new_btns
+                
+                current_buttons |= custom_btns
                     
             if len(self.controllers) == 2:
                 buttonsConfig = CONFIG.dual_joycons_config
@@ -1530,58 +1549,66 @@ class VirtualController:
             state[2] = 0x8E
         
         hold_mode = getattr(self, 'hold_mode', 'Vertical')
-
-        # Joy-Con gyro scale for the Default-passthrough Switch1 report.  The report packs
-        # raw int16 gyro that the host reads at the Switch NATIVE scale (~0.061 deg/s per
-        # LSB — proven by the Pro Controller, whose raw gyro passes through unscaled and is
-        # correct).  A Joy-Con 2's raw gyro is at a different sensitivity: CemuHook
-        # Sensitivity=1 converts it with 0.0535 deg/s per LSB (empirically validated).  So
-        # to make the Default report carry the SAME angular velocity as CemuHook Sens=1,
-        # scale the raw gyro by (joycon_dps / native_dps) = 0.0535/0.061 ≈ 0.877.  The old
-        # 0.8719*0.5*0.75 ≈ 0.327 had the right base ratio but an extra 0.375 factor that
-        # made the angular velocity ~0.375x too slow.  Pro/accel are untouched.
         jc_gyro_scale = 0.0535 / 0.061
-        jc_yaw_mult = 1.1667
+        jc_yaw_mult = 1.0
 
-        # Rate-limit the Joy-Con gyro to the native Switch IMU rate (~61.5 Hz / 16.25 ms).
-        # The host INTEGRATES the gyro on every report it consumes; we push reports at the
-        # Joy-Con 2 input rate (~134 Hz) and the USBIP layer re-serves held reports on every
-        # poll (≤250 Hz), so the gyro gets integrated far too often → ANGLE overshoot →
-        # drift.  (Accel is a direct reading, NOT integrated, so it's correct at any rate —
-        # which is why only the gyro is wrong.)  Fix the universal/hardware-accurate way:
-        # accumulate the true rotation between 16.25 ms ticks (so none is lost) and emit it as
-        # ONE gyro sample per tick; emit ZERO gyro between ticks.  Combined with the server
-        # only integrating each emitted gyro once (see USBIPJoyConServer.update_state), the
-        # host integrates exactly the native rotation, regardless of its poll rate.
-        # Per-sample VALUE stays jc_gyro_scale (correct angular-velocity feel).
-        # Pro Controller is left on the raw full-rate path (handled in its own branch).
-        if device_type != "Pro":
+        if device_type != "Pro" and not SWITCH1_GYRO_TIMER_EXPERIMENT:
             import time as _t
-            _now = _t.perf_counter()
             if getattr(controller, '_sw1_gyro_accum', None) is None:
                 controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
-                controller._sw1_gyro_last_t = _now
-                controller._sw1_gyro_emit_t = _now
-                controller._sw1_gyro_emit = (0.0, 0.0, 0.0)
-            _dt = _now - controller._sw1_gyro_last_t
-            controller._sw1_gyro_last_t = _now
-            _rg = inputData.gyroscope
-            _acc = controller._sw1_gyro_accum
-            for _i in range(3):
-                _acc[_i] += _rg[_i] * _dt          # accumulate raw rotation (raw * seconds)
-            _NATIVE_DT = 0.01625                     # 61.5 Hz
-            _win = _now - controller._sw1_gyro_emit_t
-            if _win >= _NATIVE_DT:
-                # Emit the accumulated rotation as one sample.
-                # CRITICAL: Divide by 0.015 (emulator assumed dt) to preserve 1:1 sensitivity
-                controller._sw1_gyro_emit = tuple(_acc[_i] / 0.015 for _i in range(3))
-                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
-                controller._sw1_gyro_emit_t = _now
+                controller._sw1_gyro_accum_time = 0.0
+                controller._sw1_gyro_emit_frames = [(0.0, 0.0, 0.0)] * 3
+                controller._sw1_gyro_last_t = _t.perf_counter()
+                controller._sw1_gyro_last_timer = inputData.raw_data[1] if (len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30) else None
+
+            # Calculate _dt using hardware timer if available to completely bypass Windows System BLE jitter.
+            # Standard Switch reports (0x30) have a hardware timer at raw_data[1] where 1 tick = 5ms.
+            if len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30:
+                current_timer = inputData.raw_data[1]
+                if controller._sw1_gyro_last_timer is not None:
+                    timer_diff = (current_timer - controller._sw1_gyro_last_timer) & 0xFF
+                    _dt = timer_diff * 0.005
+                else:
+                    _dt = 0.0075 # fallback
+                controller._sw1_gyro_last_timer = current_timer
             else:
-                controller._sw1_gyro_emit = (0.0, 0.0, 0.0)
-            gsrc = controller._sw1_gyro_emit
+                _now = _t.perf_counter()
+                _dt = _now - controller._sw1_gyro_last_t
+                controller._sw1_gyro_last_t = _now
+
+            # Prevent absurd _dt on lag spikes
+            if _dt > 0.1: _dt = 0.015
+            if _dt < 0.0: _dt = 0.001
+
+            # Accumulate true physical rotation exactly based on real hardware time
+            controller._sw1_gyro_accum_time += _dt
+            _acc = controller._sw1_gyro_accum
+            _rg = inputData.gyroscope
+            for _i in range(3):
+                _acc[_i] += _rg[_i] * _dt
+
+            _NATIVE_DT = 0.015
+            should_emit = False
+            
+            # Strictly push only when 15ms has elapsed physically
+            if controller._sw1_gyro_accum_time >= _NATIVE_DT:
+                _avg = tuple(_acc[_i] / 0.015 for _i in range(3))
+                controller._sw1_gyro_emit_frames = [_avg, _avg, _avg]
+                
+                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
+                controller._sw1_gyro_accum_time -= 0.015
+                if controller._sw1_gyro_accum_time > 0.015:
+                    controller._sw1_gyro_accum_time = 0.0 # Safety cap
+                should_emit = True
+                
+            gsrc3 = controller._sw1_gyro_emit_frames
         else:
-            gsrc = inputData.gyroscope
+            if getattr(controller, '_sw1_gyro_history', None) is None:
+                controller._sw1_gyro_history = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+            controller._sw1_gyro_history.pop(0)
+            controller._sw1_gyro_history.append(inputData.gyroscope)
+            gsrc3 = list(controller._sw1_gyro_history)
+            should_emit = True
 
         lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
         gx, gy, gz, ax, ay, az = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -1591,26 +1618,26 @@ class VirtualController:
             ly = inputData.left_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  gsrc[1] * jc_gyro_scale,  -gsrc[0] * jc_gyro_scale,  gsrc[2] * jc_gyro_scale * jc_yaw_mult
+                _gmap = lambda g: (g[1] * jc_gyro_scale, -g[0] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
                 ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz =  gsrc[0] * jc_gyro_scale, gsrc[1] * jc_gyro_scale,  gsrc[2] * jc_gyro_scale * jc_yaw_mult
+                _gmap = lambda g: (g[0] * jc_gyro_scale, g[1] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
                 ax, ay, az =  inputData.accelerometer[0], inputData.accelerometer[1],  inputData.accelerometer[2]
-                
+
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
-                
+
         elif device_type == "R": # device_type == "R"
             rx = inputData.right_stick[0]
             ry = inputData.right_stick[1]
             
             if hold_mode == "Vertical":
-                gx, gy, gz =  gsrc[1] * jc_gyro_scale, gsrc[0] * jc_gyro_scale, -gsrc[2] * jc_gyro_scale * jc_yaw_mult
+                _gmap = lambda g: (g[1] * jc_gyro_scale, g[0] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
                 ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
             else: # Horizontal
-                gx, gy, gz = -gsrc[0] * jc_gyro_scale, gsrc[1] * jc_gyro_scale, -gsrc[2] * jc_gyro_scale * jc_yaw_mult
+                _gmap = lambda g: (-g[0] * jc_gyro_scale, g[1] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
                 ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
-                
+
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 rx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
         else: # Pro
@@ -1618,13 +1645,12 @@ class VirtualController:
             ly = inputData.left_stick[1]
             rx = inputData.right_stick[0]
             ry = inputData.right_stick[1]
-            
-            gx, gy, gz = inputData.gyroscope[1], -inputData.gyroscope[0], inputData.gyroscope[2]
+
+            _gmap = lambda g: (g[1], -g[0], g[2])
             ax, ay, az = inputData.accelerometer[1], -inputData.accelerometer[0], inputData.accelerometer[2]
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
-
 
         def float_to_12bit(val):
             return int(max(0, min(4095, round((val + 1.0) * 2047.5))))
@@ -1633,6 +1659,8 @@ class VirtualController:
         ly_12 = float_to_12bit(ly)
         rx_12 = float_to_12bit(rx)
         ry_12 = float_to_12bit(ry)
+        
+        controller._sw1_should_emit = should_emit
 
         # Left stick packed (bytes 6-8)
         state[6] = lx_12 & 0xff
@@ -1704,17 +1732,16 @@ class VirtualController:
 
         def clamp_i16(v): return max(-32768, min(32767, int(round(v))))
 
-
-        imu_frame = struct.pack('<6h',
-            clamp_i16(ax), clamp_i16(ay), clamp_i16(az),
-            clamp_i16(gx), clamp_i16(gy), clamp_i16(gz)
-        )
-
-        # Switch 1 standard requires 3 IMU frames (each 12 bytes) per packet.
-        # We duplicate the latest IMU frame 3 times to ensure smooth integration in the host emulator.
-        state[13:25] = imu_frame
-        state[25:37] = imu_frame
-        state[37:49] = imu_frame
+        # The 3 IMU frames carry 3 sub-samples 5 ms apart (oldest=frame 0 .. newest=frame 2),
+        # per imu_sensor_notes.md, so the host gets 5 ms-precision motion instead of one 15 ms
+        # burst.  Same accel in all three (accel is a direct reading, not integrated); gyro is
+        # the per-third sub-sample mapped through _gmap.  (For Pro / experiment, gsrc3 holds 3
+        # identical samples → 3 identical frames, i.e. the original behaviour.)
+        for _fi, _off in enumerate((13, 25, 37)):
+            _g = _gmap(gsrc3[_fi])
+            state[_off:_off + 12] = struct.pack('<6h',
+                clamp_i16(ax), clamp_i16(ay), clamp_i16(az),
+                clamp_i16(_g[0]), clamp_i16(_g[1]), clamp_i16(_g[2]))
 
         return state
 
@@ -1722,13 +1749,15 @@ class VirtualController:
         if self.driver_type == "USBIP":
             if hasattr(self, 'usbip_server_l') and self.usbip_server_l:
                 state = self._build_switch1_report(inputData, buttons, controller, device_type="L")
-                self.usbip_server_l.update_state(state)
+                if getattr(controller, '_sw1_should_emit', True):
+                    self.usbip_server_l.update_state(state)
 
     def update_as_switch1_joycon_r(self, inputData: ControllerInputData, buttons: int, controller):
         if self.driver_type == "USBIP":
             if hasattr(self, 'usbip_server_r') and self.usbip_server_r:
                 state = self._build_switch1_report(inputData, buttons, controller, device_type="R")
-                self.usbip_server_r.update_state(state)
+                if getattr(controller, '_sw1_should_emit', True):
+                    self.usbip_server_r.update_state(state)
 
     def update_as_switch1_pro(self, inputData: ControllerInputData, buttons: int, controller):
         if self.driver_type == "USBIP":
@@ -1742,6 +1771,8 @@ class VirtualController:
             if self.vg_controller is None:
                 return
             self._update_as_ps4_locked(inputData, buttons, controller)
+            if getattr(self, 'driver_type', '') != "ViGEmBus":
+                self.vg_controller.update()
 
     def _update_as_ps4_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         driver_type = self.driver_type
@@ -1908,6 +1939,7 @@ class VirtualController:
             if self.vg_controller is None:
                 return
             self._update_as_ps5_locked(inputData, buttons, controller)
+            self.vg_controller.update()
 
     def _update_as_ps5_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS5")
@@ -2250,12 +2282,14 @@ class VirtualController:
                 self.vg_controller.right_trigger(rt)
                 self.vg_controller.left_joystick_float(self.last_xb_lx, -self.last_xb_ly)
                 self.vg_controller.right_joystick_float(self.last_xb_rx, -self.last_xb_ry)
+                self.vg_controller.update()
             else:
                 self.vg_controller.set_buttons(xb_btns)
                 self.vg_controller.left_trigger(lt)
                 self.vg_controller.right_trigger(rt)
                 self.vg_controller.left_joystick_float(self.last_xb_lx, self.last_xb_ly)
                 self.vg_controller.right_joystick_float(self.last_xb_rx, self.last_xb_ry)
+                self.vg_controller.update()
 
     def is_single(self): 
         return len(self.controllers) == 1
@@ -2291,6 +2325,14 @@ class VirtualController:
         import time
         last_time = time.perf_counter()
         while self.running:
+            driver_type = getattr(self, 'driver_type', None)
+            mode = getattr(self, 'mode', None)
+            
+            if driver_type != "ViGEmBus" or mode != "PS4":
+                time.sleep(0.015)
+                last_time = time.perf_counter()
+                continue
+
             now = time.perf_counter()
             dt = now - last_time
             if dt < 0.001:
@@ -2322,11 +2364,6 @@ class VirtualController:
                         vcli.vigem_target_ds4_update_ex_ptr(busp, devicep, ctypes.byref(self.report_ex))
                     except Exception as e:
                         logger.error(f"Failed to update DS4 ex via ViGEmBus: {e}")
-                        self.vg_controller.update()
-                else:
-                    if self.mode == "Switch1":
-                        pass
-                    else:
                         self.vg_controller.update()
         
         logger.info(f"Player {self.player_number}: Update loop thread finished.")
@@ -2589,6 +2626,14 @@ class VirtualController:
             return False
 
     def _dualsense_rumble_callback(self, out_data, side="Pro"):
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            import threading
+            threading.Timer(delay / 1000.0, self._dualsense_rumble_callback_internal, args=(out_data, side)).start()
+        else:
+            self._dualsense_rumble_callback_internal(out_data, side)
+
+    def _dualsense_rumble_callback_internal(self, out_data, side="Pro"):
         if len(out_data) < 2:
             return
 
@@ -3000,6 +3045,14 @@ class VirtualController:
             self.last_rumble_received_time = now
 
     def _usbip_rumble_callback(self, out_data, side="Left"):
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            import threading
+            threading.Timer(delay / 1000.0, self._usbip_rumble_callback_internal, args=(out_data, side)).start()
+        else:
+            self._usbip_rumble_callback_internal(out_data, side)
+
+    def _usbip_rumble_callback_internal(self, out_data, side="Left"):
         # Disconnect active-push: bytearray(64) from usbip_server means connection dropped
         # In this case out_data[0] == 0x00, so we handle it separately to clear rumble state.
         if len(out_data) < 1:

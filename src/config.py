@@ -835,6 +835,7 @@ class Config:
             'vibration_strength_switch': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_switch", 5),
             'vibration_strength_ps5': self.button_remaps.get(self.get_current_category(), {}).get("vibration_strength_ps5", 10),
             'vibration_frequency': self.vibration_frequency,
+            'rumble_delay_ms': getattr(self, "rumble_delay_ms", 0),
             'rumble_mode': self.rumble_mode,
             'simulation_mode': self.simulation_mode,
             'open_when_startup': self.open_when_startup,
@@ -944,6 +945,17 @@ class Config:
         cat = self.get_current_category()
         if cat not in self.button_remaps: self.button_remaps[cat] = {}
         self.button_remaps[cat]["vibration_frequency"] = int(val)
+
+    @property
+    def rumble_delay_ms(self):
+        cat = self.get_current_category()
+        return int(self.button_remaps.get(cat, {}).get("rumble_delay_ms", 0))
+
+    @rumble_delay_ms.setter
+    def rumble_delay_ms(self, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps: self.button_remaps[cat] = {}
+        self.button_remaps[cat]["rumble_delay_ms"] = int(val)
 
     def get_current_category(self):
         mode = getattr(self, "simulation_mode", "PS5")

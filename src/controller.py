@@ -166,6 +166,7 @@ class ControllerInputData:
     right_trigger: int = 0
     left_trigger_raw: int = 0
     right_trigger_raw: int = 0
+    custom_buttons_mask: int = 0
 
     def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData, right_stick_calibration: StickCalibrationData, product_id: int = 0, gc_trigger_calib: list = None):
         self.raw_data = data
@@ -1782,6 +1783,7 @@ class Controller:
                         inputData.buttons |= original_bit
                     elif resolved in SWITCH_BUTTONS:
                         inputData.buttons |= SWITCH_BUTTONS[resolved]
+                        inputData.custom_buttons_mask |= SWITCH_BUTTONS[resolved]
 
             # Apply active controller buttons and continuous mouse wheel
             now = time.perf_counter()
@@ -1817,6 +1819,7 @@ class Controller:
                         btn_name = k[4:]
                         if btn_name in SWITCH_BUTTONS:
                             inputData.buttons |= SWITCH_BUTTONS[btn_name]
+                            inputData.custom_buttons_mask |= SWITCH_BUTTONS[btn_name]
                     elif k.startswith("MW_"):
                         # Mouse wheel only works in Hold mode due to its continuous nature, but we allow it here if they put it in Tap mode
                         # However, for Tap mode, it will keep scrolling while held, which is acceptable behavior.

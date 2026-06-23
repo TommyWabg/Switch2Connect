@@ -7,6 +7,27 @@ import queue
 
 logger = logging.getLogger(__name__)
 
+# EXPERIMENT toggle: when True, the Switch1 Joy-Con (L/R) report timer byte state[1] is set
+# from REAL elapsed time (+1 per 5 ms, like real hardware) instead of a per-send counter,
+# and the gyro is sent CONTINUOUS at full rate (no 66.7 Hz rate-limit, no consume-once
+# gyro-zeroing).  IF the host (Yuzu) integrates IMU using the timer delta as dt, this gives
+# correct angle AND full-rate smoothness (like the DualSense timestamp path), and held
+# re-polls within the same 5 ms tick carry the same timer → dt=0 → no over-integration.
+# Result: Yuzu integrates Switch1 IMU with a FIXED dt (~16-20ms) per non-duplicate report
+# and DE-DUPLICATES by this timer byte — at factor 0.005 the angle was 4x over (timer faster
+# than reports → every report integrated), at 0.020 the gyro FROZE (timer slower than reports
+# → most reports deduped/skipped).  So the timer can't beat the rate-limit: correct+smooth
+# integration is capped at Yuzu's fixed-dt rate (~61.5 Hz), NOT the 134 Hz of the DualSense
+# (timestamped) path.  Experiment OFF → use the PART 1-3 rate-limit (the 61.5 Hz best case).
+SWITCH1_GYRO_TIMER_EXPERIMENT = False
+
+# Seconds of REAL time per +1 increment of the timer byte.  This is the host's (Yuzu's)
+# timer→dt unit: if it's wrong the angle is off by a CONSTANT factor (host uses the timer
+# but scales it differently).  Measured: at 0.005 the virtual rotated 4x the physical
+# (90°→360°), so the timer was advancing 4x too fast → use 0.020 (= 0.005 * 4).  Tune this
+# if the angle is still off by a constant factor: bigger value = less rotation.
+SWITCH1_TIMER_BYTE_SEC = 0.020
+
 # Switch 2 Pro Controller - HID Report Descriptor (31 Bytes)
 SWITCH_PRO_REPORT_DESCRIPTOR = bytes([
     0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00,
@@ -62,7 +83,7 @@ class USBIPServer:
         self.client_thread = None
         
         # State queue for inputs and bulk responses
-        self.input_queue = queue.Queue(maxsize=1)
+        self.input_queue = queue.Queue(maxsize=16)
         self.subcmd_reply_queue = queue.Queue(maxsize=4)
         self.bulk_response_queue = queue.Queue()
         self.pending_in_urbs = queue.Queue()
@@ -741,7 +762,12 @@ class USBIPJoyConServer(USBIPServer):
         """
         full = bytes(state_bytes)
         held = full
-        if getattr(self, 'device_type', None) in ("L", "R") and len(full) >= 49 and full[0] == 0x30:
+        # Consume-once (zero the held gyro) is the FIXED-dt fallback.  When the timer
+        # experiment is active the real-time timer byte handles de-dup instead, so keep
+        # the gyro continuous in held reports for full-rate smoothness.
+        if (not SWITCH1_GYRO_TIMER_EXPERIMENT
+                and getattr(self, 'device_type', None) in ("L", "R")
+                and len(full) >= 49 and full[0] == 0x30):
             b = bytearray(full)
             for _off in (19, 31, 43):   # gyro is bytes 6..11 within each 12-byte IMU frame
                 b[_off:_off + 6] = b'\x00' * 6
@@ -754,7 +780,21 @@ class USBIPJoyConServer(USBIPServer):
             self.input_queue.put_nowait(full)
         except Exception:
             pass
-            
+
+    def _stamp_timer_byte(self, report):
+        """Set the 0x30 report timer byte (report[1]).
+
+        Joy-Con (L/R) under the timer experiment: stamp REAL elapsed time (+1 per 5 ms),
+        so held re-polls within a 5 ms tick carry the same value (host dt=0 → no
+        re-integration) and fresh reports advance by real time (host dt = real elapsed).
+        Otherwise: the original per-send incrementing counter.
+        """
+        if SWITCH1_GYRO_TIMER_EXPERIMENT and getattr(self, 'device_type', None) in ("L", "R"):
+            report[1] = int(time.perf_counter() / SWITCH1_TIMER_BYTE_SEC) & 0xff
+        else:
+            report[1] = self.seq_num & 0xff
+            self.seq_num += 1
+
     def _get_device_desc(self):
         path = f"/sys/devices/virtual/usbip/{self.bus_id}".encode('ascii')
         busid_bytes = self.bus_id.encode('ascii')
@@ -870,14 +910,12 @@ class USBIPJoyConServer(USBIPServer):
                     reply_data_bytes = self.input_queue.get_nowait()
                     reply_data = bytearray(reply_data_bytes)
                     if len(reply_data) > 0 and reply_data[0] == 0x30:
-                        reply_data[1] = self.seq_num & 0xff
-                        self.seq_num += 1
+                        self._stamp_timer_byte(reply_data)
                     reply_data = bytes(reply_data)
                 except queue.Empty:
                     with self.lock:
                         if self.last_state[0] == 0x30:
-                            self.last_state[1] = self.seq_num & 0xff
-                            self.seq_num += 1
+                            self._stamp_timer_byte(self.last_state)
                         reply_data = bytes(self.last_state)
         else:
             status = -1
