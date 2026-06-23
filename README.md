@@ -60,6 +60,7 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Dual-Controller Gyro Selection (L/R Gyro):** When using a pair of Joy-cons as a single virtual controller, you can now manually select which Joy-con (Left or Right) provides the motion data. This allows for greater flexibility, letting you choose your preferred hand for gyro aiming or motion controls.
 * **Customizable Rumble Strength:** Introduced a new Vibration Strength slider in the settings panel (ranging from 0 to 10), allowing users to dynamically scale the intensity of the controller's haptic feedback.
 * **Rumble Frequency Slider:** You can now customize the vibration/rumble frequency directly from the settings panel.
+* **Rumble Delay Configuration:** Implemented a customizable rumble delay setting in milliseconds. This allows users to manually synchronize haptic feedback with audio for games where sound and vibration are misaligned.
 * **Dual Rumble Mode Toggle:** Introduced a toggle switch in the user interface to easily switch between Xbox and Switch rumble modes. 
   * **Xbox Mode:** Tailored for standard PC games to simulate dual-motor rumble by activating dynamic frequency scaling and high-frequency masking to mimic traditional gamepad motors. 
     * **Strength 5 and Frequency 10** emulates the feel of a DualSense Edge controller.
