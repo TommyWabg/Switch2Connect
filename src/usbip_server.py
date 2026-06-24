@@ -485,8 +485,8 @@ class USBIPServer:
                 )
                 # Endpoint Descriptor format: bLength(7) bDescType(5) bEndpointAddress bmAttributes wMaxPacketSize bInterval
                 # Correct struct: <BBBBHB = 1+1+1+1+2+1 = 7 bytes total
-                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 8)  # Interrupt IN
-                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 8)  # Interrupt OUT
+                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 4)  # Interrupt IN (1ms polling)
+                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 4)  # Interrupt OUT
                 
                 # Interface 1: Vendor Specific Bulk (WinUSB)
                 iface1 = struct.pack("<BBBBBBBBB",
@@ -899,23 +899,25 @@ class USBIPJoyConServer(USBIPServer):
             try:
                 reply_data = self.subcmd_reply_queue.get_nowait()
             except queue.Empty:
-                # 節流 input（限速 250Hz）
-                now = time.perf_counter()
-                elapsed = now - getattr(self, 'last_ep1_in_time', 0)
-                if elapsed < 0.004:
-                    time.sleep(0.004 - elapsed)
-                self.last_ep1_in_time = time.perf_counter()
-
                 try:
                     reply_data_bytes = self.input_queue.get_nowait()
                     reply_data = bytearray(reply_data_bytes)
                     if len(reply_data) > 0 and reply_data[0] == 0x30:
-                        self._stamp_timer_byte(reply_data)
+                        pass # Timer is perfectly handled by virtual_controller
                     reply_data = bytes(reply_data)
+                    self.last_ep1_in_time = time.perf_counter()
                 except queue.Empty:
+                    # 節流空閒時的 held state 回報（限速 250Hz），避免無意義的吃滿 CPU
+                    now = time.perf_counter()
+                    elapsed = now - getattr(self, 'last_ep1_in_time', 0)
+                    if elapsed < 0.004:
+                        time.sleep(0.004 - elapsed)
+                    self.last_ep1_in_time = time.perf_counter()
+
                     with self.lock:
-                        if self.last_state[0] == 0x30:
-                            self._stamp_timer_byte(self.last_state)
+                        # last_state holds the FROZEN timer byte. This is MATHEMATICALLY REQUIRED.
+                        # If we advance the timer on an empty poll (which has 0 gyro), Yuzu will consume the time delta.
+                        # When the real packet arrives 1ms later with the same timer tick, Yuzu will see dt=0 and DISCARD the real packet!
                         reply_data = bytes(self.last_state)
         else:
             status = -1
@@ -982,8 +984,8 @@ class USBIPJoyConServer(USBIPServer):
                     0x22,   # bDescriptorType = Report
                     len(JOYCON_REPORT_DESC) # wDescriptorLength
                 )
-                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 8)  # Interrupt IN
-                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 8)  # Interrupt OUT
+                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 4)  # Interrupt IN (1ms polling)
+                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 4)  # Interrupt OUT
                 
                 # Interface 1: Vendor Specific (WinUSB Bulk)
                 iface1 = struct.pack("<BBBBBBBBB",

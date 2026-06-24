@@ -196,6 +196,7 @@ class ControllerInputData:
             
             if b3 & 0x01: buttons_val |= 0x00001000 # Home
             if b3 & 0x02: buttons_val |= 0x00002000 # Capture
+            if b3 & 0x04: buttons_val |= 0x00004000 # Chat (C)
             
             self.buttons = buttons_val
             
