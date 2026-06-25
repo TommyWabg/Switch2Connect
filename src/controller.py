@@ -2218,36 +2218,50 @@ class Controller:
         self._input_settle_deadline = time.time() + 1.0
 
         if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
-            try:
-                # To be 100% robust against Windows dynamically mangling UUIDs or shifting Handles,
-                # we find all 'notify' characteristics in the SW2 service and subscribe to them all.
-                # We then filter out the short packets (Format 0 and Command Responses) and only
-                # process the 63-byte Format 3 reports.
-                def gc_input_report_callback(sender: BleakGATTCharacteristic, data: bytearray):
-                    if len(data) < 30:
-                        return
-                    input_report_callback(sender, data)
+            # GCN input callback: filter out short packets (command acks, Format 0) and
+            # only process the 63-byte Format 3 input reports.
+            def gc_input_report_callback(sender: BleakGATTCharacteristic, data: bytearray):
+                if len(data) < 30:
+                    return
+                input_report_callback(sender, data)
 
-                notify_chars = []
-                for service in self.client.services:
-                    if "ab7de9be" in str(service.uuid).lower():
-                        for char in service.characteristics:
-                            if "notify" in char.properties:
-                                notify_chars.append(char)
-                
-                if not notify_chars:
-                    logger.warning("No notify characteristics found for GameCube! Falling back.")
-                    await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
-                else:
-                    for char in notify_chars:
-                        try:
-                            logger.info(f"Subscribing to GameCube notify characteristic: {char.uuid}")
-                            await self.client.start_notify(char.uuid, gc_input_report_callback)
-                        except Exception as e:
-                            logger.warning(f"Failed to subscribe to {char.uuid}: {e}")
-            except Exception as e:
-                logger.warning(f"Error subscribing to GameCube characteristics: {e}")
-                await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+            if getattr(self, 'is_esp32s3_bridge', False):
+                # ESP32 bridge: the _dispatch_binary_packet() router already separates
+                # command/ack frames from input frames by UUID prefix.  The MockService
+                # only exposes INPUT_REPORT_UUID and COMMAND_RESPONSE_UUID as notify chars.
+                # Subscribing gc_input_report_callback to COMMAND_RESPONSE_UUID would
+                # overwrite the command_response_callback registered during initialize(),
+                # causing all write_command() calls (including enableFeatures) to timeout.
+                # Use the standard INPUT_REPORT_UUID subscription — the bridge router
+                # ensures GCN input frames reach this callback correctly.
+                logger.info("GCN via ESP32 bridge: using standard INPUT_REPORT_UUID subscription")
+                await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
+            else:
+                # WinRT BLE: The GCN controller may deliver input on any notify char in the
+                # SW2 service (Windows may re-index handles).  Subscribe to all of them so
+                # input is never missed; the gc_input_report_callback length-filter handles
+                # non-input frames that also arrive on the subscribed characteristics.
+                try:
+                    notify_chars = []
+                    for service in self.client.services:
+                        if "ab7de9be" in str(service.uuid).lower():
+                            for char in service.characteristics:
+                                if "notify" in char.properties:
+                                    notify_chars.append(char)
+                    
+                    if not notify_chars:
+                        logger.warning("No notify characteristics found for GameCube! Falling back.")
+                        await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
+                    else:
+                        for char in notify_chars:
+                            try:
+                                logger.info(f"Subscribing to GameCube notify characteristic: {char.uuid}")
+                                await self.client.start_notify(char.uuid, gc_input_report_callback)
+                            except Exception as e:
+                                logger.warning(f"Failed to subscribe to {char.uuid}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error subscribing to GameCube characteristics: {e}")
+                    await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
         else:
             await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
 
