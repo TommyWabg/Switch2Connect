@@ -1568,8 +1568,6 @@ class VirtualController:
                 controller._sw1_gyro_last_t = _t.perf_counter()
                 controller._sw1_gyro_last_timer = inputData.raw_data[1] if (len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30) else None
 
-            # Calculate _dt using hardware timer if available to completely bypass Windows System BLE jitter.
-            # Standard Switch reports (0x30) have a hardware timer at raw_data[1] where 1 tick = 5ms.
             if len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30:
                 current_timer = inputData.raw_data[1]
                 if controller._sw1_gyro_last_timer is not None:
@@ -1578,21 +1576,39 @@ class VirtualController:
                 else:
                     _dt = 0.0075 # fallback
                 controller._sw1_gyro_last_timer = current_timer
+                _integration_dt = _dt
             else:
                 _now = _t.perf_counter()
-                _dt = _now - controller._sw1_gyro_last_t
+                raw_dt = _now - controller._sw1_gyro_last_t
                 controller._sw1_gyro_last_t = _now
 
-            # Prevent absurd _dt on lag spikes
-            if _dt > 0.1: _dt = 0.015
-            if _dt < 0.0: _dt = 0.001
+                # Prevent absurd _dt on lag spikes
+                if raw_dt > 0.1: raw_dt = 0.015
+                if raw_dt < 0.0: raw_dt = 0.001
+                
+                # Auto-adapt to System BLE polling rate (e.g. 66Hz or 20Hz) while eliminating jitter.
+                # Uses an Exponential Moving Average (EMA) to find the steady "per-tick" cadence.
+                if getattr(controller, '_sw1_gyro_smoothed_dt', None) is None:
+                    controller._sw1_gyro_smoothed_dt = raw_dt
+                else:
+                    controller._sw1_gyro_smoothed_dt = 0.85 * controller._sw1_gyro_smoothed_dt + 0.15 * raw_dt
+                
+                _dt = raw_dt
+                if getattr(controller, 'is_esp32s3_bridge', False):
+                    # ESP32 bridge (USB Serial) has inherently low jitter and handles its own cadence perfectly.
+                    # Bypassing the EMA filter ensures ESP32 maintains its exact original precise behavior.
+                    _integration_dt = raw_dt
+                else:
+                    _integration_dt = controller._sw1_gyro_smoothed_dt
 
-            # Accumulate true physical rotation exactly based on real hardware time
-            controller._sw1_gyro_accum_time += _dt
+            # Accumulate true physical rotation.
+            # _dt controls the 15ms emission pacing, _integration_dt handles smooth magnitude integration.
+            controller._sw1_gyro_accum_time += _integration_dt
             _acc = controller._sw1_gyro_accum
             _rg = inputData.gyroscope
+            
             for _i in range(3):
-                _acc[_i] += _rg[_i] * _dt
+                _acc[_i] += _rg[_i] * _integration_dt
 
             _NATIVE_DT = 0.015
             should_emit = False
