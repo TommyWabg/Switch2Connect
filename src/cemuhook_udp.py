@@ -181,7 +181,7 @@ class CemuHookUDPServer:
                 self.clients[addr] = ClientRequestTimes()
             self.clients[addr].request_pad_info(reg_flags, id_to_reg, mac_to_reg)
 
-    def report_controller_data(self, model: int, mac_address: bytes, battery_level: int, input_data, ds4_accel, ds4_gyro, hw_timestamp_micro: int = None):
+    def report_controller_data(self, model: int, mac_address: bytes, battery_level: int, input_data, ds4_accel, ds4_gyro):
         if not self.running:
             return
             
@@ -245,15 +245,16 @@ class CemuHookUDPServer:
         for addr in clients_to_delete:
             del self.clients[addr]
             
-        if not active_clients:
-            return
-            
         self.active_pads[pad_id] = {
             'model': model,
             'mac': mac_address,
             'battery': battery_level,
             'time': now
         }
+            
+        if not active_clients:
+            return
+
             
         self.packet_counter += 1
         
@@ -342,11 +343,7 @@ class CemuHookUDPServer:
         output.extend(b'\x00' * 12)
         
         # Motion Timestamp (uint64)
-        if hw_timestamp_micro is not None:
-            ts = hw_timestamp_micro
-        else:
-            ts = int(time.time() * 1000000)
-        output.extend(struct.pack('<Q', ts))
+        output.extend(struct.pack('<Q', int(time.time() * 1000000)))
         
         # Accel in Gs. 1G = 4096.0
         acc_x = ds4_accel[0] / 4096.0

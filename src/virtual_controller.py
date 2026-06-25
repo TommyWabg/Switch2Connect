@@ -30,7 +30,7 @@ from controller import (Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         _gcn_update_pwm_state, normalize_motor_value)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
-from usbip_server import USBIPServer, SWITCH1_GYRO_TIMER_EXPERIMENT
+from usbip_server import USBIPServer
 from utils import USBIPAllocator
 from dualsense_structs import DualSenseInputReport01
 from dualsense_haptic import DualSenseHapticProcessor
@@ -1454,26 +1454,6 @@ class VirtualController:
                             send_cemuhook = True
                 
                 if send_cemuhook:
-                        if len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30:
-                            current_timer = inputData.raw_data[1]
-                            if getattr(controller, '_cemuhook_last_timer', None) is not None:
-                                timer_diff = (current_timer - controller._cemuhook_last_timer) & 0xFF
-                                dt_micro = timer_diff * 5000
-                            else:
-                                dt_micro = 5000
-                            controller._cemuhook_last_timer = current_timer
-                            
-                            if getattr(controller, '_cemuhook_timer_micro', None) is None:
-                                import time as _t
-                                controller._cemuhook_timer_micro = int(_t.time() * 1000000)
-                            else:
-                                controller._cemuhook_timer_micro += dt_micro
-                        else:
-                            import time as _t
-                            controller._cemuhook_timer_micro = int(_t.time() * 1000000)
-                            
-                        hw_timestamp_micro = getattr(controller, '_cemuhook_timer_micro', None)
-                        
                         model = 3 if (controller.is_joycon_left() or controller.is_joycon_right()) else 2
                         addr_str = (controller.device.address or "").replace(':', '').replace('-', '').upper()
                         try:
@@ -1524,7 +1504,7 @@ class VirtualController:
                         ds4_accel = (emu_accel[0], emu_accel[2], -emu_accel[1])
 
                         cemuhook_udp.cemuhook_server.report_controller_data(
-                            model, mac_bytes, 4, inputData, ds4_accel, ds4_gyro, hw_timestamp_micro)
+                            model, mac_bytes, 4, inputData, ds4_accel, ds4_gyro)
                 
                 # Zero out gyro/accel so the virtual controller driver gets no gyro
                 inputData.gyroscope = (0.0, 0.0, 0.0)
@@ -1569,14 +1549,17 @@ class VirtualController:
             state[2] = 0x8E
         
         hold_mode = getattr(self, 'hold_mode', 'Vertical')
-        # 依據文獻與硬體規格：
-        # Joy-Con 2 Gyro 靈敏度約為 0.0535 dps/LSB (換算約 0.0009337 rad/s 每 LSB)
-        # Joy-Con 1 Gyro 靈敏度約為 0.061 dps/LSB (換算約 0.0010646 rad/s 每 LSB)
-        # 第一步：套用硬體轉換倍率 (0.0535 / 0.061)
+        # Scale Gyro to match the exact sensitivity expected by emulators for a Switch 1 Joy-Con.
+        # Switch 2 controllers natively output ~16.384 LSB/dps (0.061 dps/LSB).
+        # Switch 1 controllers natively output ~14.37 LSB/dps (0.0695 dps/LSB).
+        # To make a Switch 2 controller perfectly emulate a Switch 1 controller, we must 
+        # multiply its raw output by (14.37 / 16.384) = ~0.877 so that emulators calculate 
+        # the exact physical rotation when they divide by their assumed 14.37 LSB/dps.
+        # (0.0535 / 0.061) is mathematically ~0.87704, which perfectly achieves this.
         jc_gyro_scale = 0.0535 / 0.061
         jc_yaw_mult = 1.0
 
-        if device_type != "Pro" and not SWITCH1_GYRO_TIMER_EXPERIMENT:
+        if device_type != "Pro":
             import time as _t
             if getattr(controller, '_sw1_gyro_accum', None) is None:
                 controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
@@ -1585,97 +1568,48 @@ class VirtualController:
                 controller._sw1_gyro_last_t = _t.perf_counter()
                 controller._sw1_gyro_last_timer = inputData.raw_data[1] if (len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30) else None
 
-            # 計算 _dt (捨棄短期的 perf_counter 浮動，依據連線拓樸強制給定穩定虛擬傳輸率)
-            import discoverer
-            is_esp32 = getattr(controller, 'is_esp32s3_bridge', False)
-            if is_esp32:
-                # 計算目前 ESP32 總共連線了幾隻實體搖桿
-                total_esp32_controllers = sum(
-                    len([c for c in vc.controllers if getattr(c, 'is_esp32s3_bridge', False)])
-                    for vc in discoverer.VIRTUAL_CONTROLLERS if vc is not None
-                )
-                if total_esp32_controllers <= 2:
-                    _dt = 0.0075  # 兩隻以內，插值邏輯強制認定間隔 7.5ms (133.3Hz)
+            # Calculate _dt using hardware timer if available to completely bypass Windows System BLE jitter.
+            # Standard Switch reports (0x30) have a hardware timer at raw_data[1] where 1 tick = 5ms.
+            if len(inputData.raw_data) > 1 and inputData.raw_data[0] == 0x30:
+                current_timer = inputData.raw_data[1]
+                if controller._sw1_gyro_last_timer is not None:
+                    timer_diff = (current_timer - controller._sw1_gyro_last_timer) & 0xFF
+                    _dt = timer_diff * 0.005
                 else:
-                    _dt = 0.015   # 三隻或以上，插值邏輯強制認定間隔 15ms (66.6Hz)
+                    _dt = 0.0075 # fallback
+                controller._sw1_gyro_last_timer = current_timer
             else:
-                _dt = 0.015       # 系統藍牙，插值邏輯強制認定間隔 15ms (66.6Hz)
+                _now = _t.perf_counter()
+                _dt = _now - controller._sw1_gyro_last_t
+                controller._sw1_gyro_last_t = _now
 
-            # 進階靈敏度換算：考慮實際物理時間 (EMA 長期平均) vs 虛擬推算時間 (_dt)
-            # 這能完美抵銷「硬體真實發送頻率 (例如 128Hz)」與「理論頻率 (133.3Hz)」之間的誤差
-            # 從而保證角速度積分 (旋轉總角度) 在真實時間內絕對守恆，且完全不受短期 Jitter 影響
-            _now = _t.perf_counter()
-            if not hasattr(controller, '_sw1_dt_tracker_start'):
-                controller._sw1_dt_tracker_start = _now
-                controller._sw1_dt_tracker_count = 0
-                controller._sw1_real_dt_ema = _dt
-                controller._sw1_real_last_t = _now
-            else:
-                controller._sw1_real_last_t = _now
-                controller._sw1_dt_tracker_count += 1
-                
-                # 每 128 個封包 (約 1 秒) 結算一次平均週期
-                # 這樣能將 Bluetooth Lag Spikes 與 0ms 補償封包 (Catch-up) 完美互相抵銷，達成 100% 的無偏差物理時間追蹤
-                if controller._sw1_dt_tracker_count >= 128:
-                    elapsed = _now - controller._sw1_dt_tracker_start
-                    avg_dt = elapsed / controller._sw1_dt_tracker_count
-                    
-                    # 限制範圍避免待機或極端異常，並透過 EMA 平滑更新
-                    if 0.004 < avg_dt < 0.020:
-                        controller._sw1_real_dt_ema = (controller._sw1_real_dt_ema * 0.8) + (avg_dt * 0.2)
-                    
-                    controller._sw1_dt_tracker_start = _now
-                    controller._sw1_dt_tracker_count = 0
+            # Prevent absurd _dt on lag spikes
+            if _dt > 0.1: _dt = 0.015
+            if _dt < 0.0: _dt = 0.001
 
-            # 依據文獻與硬體規格：
-            # Joy-Con 2 Gyro 靈敏度約為 0.0535 dps/LSB (換算約 0.0009337 rad/s 每 LSB)
-            # Joy-Con 1 Gyro 靈敏度約為 0.061 dps/LSB (換算約 0.0010646 rad/s 每 LSB)
-            # 進階靈敏度換算：考慮實際物理時間 (精準 Block EMA 平均) vs 虛擬推算時間 (_dt)
-            # 這能完美抵銷「硬體真實發送頻率 (例如 128Hz)」與「理論頻率 (133.3Hz)」之間的誤差
-            time_correction_ratio = 1.0
-            jc_gyro_scale = 0.0535 / 0.061
-            jc_yaw_mult = 1.0
+            # Accumulate true physical rotation exactly based on real hardware time
+            controller._sw1_gyro_accum_time += _dt
+            _acc = controller._sw1_gyro_accum
+            _rg = inputData.gyroscope
+            for _i in range(3):
+                _acc[_i] += _rg[_i] * _dt
 
-            # 重新套用無 Aliasing 丟包的智慧插值機制
-            if getattr(controller, '_sw1_packet_queue', None) is None:
-                controller._sw1_packet_queue = []
-                controller._sw1_accum_dt = 0.0
-                
-            controller._sw1_packet_queue.append(inputData.gyroscope)
-            controller._sw1_accum_dt += _dt
+            _NATIVE_DT = 0.015
             should_emit = False
             
-            # 若累積時間達到約 15ms (設定 0.014 吸收浮點數誤差)
-            if controller._sw1_accum_dt >= 0.014:
-                num_packets = len(controller._sw1_packet_queue)
+            # Strictly push only when 15ms has elapsed physically.
+            # A real Joy-Con sends a 0x30 report with 3 IMU frames every 15ms (66.7Hz).
+            if controller._sw1_gyro_accum_time >= _NATIVE_DT:
+                _avg = tuple(_acc[_i] / 0.015 for _i in range(3))
+                controller._sw1_gyro_emit_frames = [_avg, _avg, _avg]
                 
-                if num_packets == 1:
-                    # 1. 每 15ms 收到一次：將 15ms 數據填入三幀
-                    p0 = controller._sw1_packet_queue[0]
-                    controller._sw1_gyro_emit_frames = [p0, p0, p0]
-                elif num_packets == 2:
-                    # 2. 每 7.5ms 收到一次：兩次 7.5ms 分別填入第一與第三幀，第二幀用插值
-                    p0 = controller._sw1_packet_queue[0]
-                    p1 = controller._sw1_packet_queue[1]
-                    p_mid = tuple((p0[i] + p1[i]) / 2.0 for i in range(3))
-                    controller._sw1_gyro_emit_frames = [p0, p_mid, p1]
-                else:
-                    # 3. 防呆：如果網路波動導致 15ms 內塞入 3 筆或以上封包
-                    p0 = controller._sw1_packet_queue[0]
-                    p_last = controller._sw1_packet_queue[-1]
-                    mid_packets = controller._sw1_packet_queue[1:-1]
-                    p_mid = tuple(sum(p[i] for p in mid_packets) / len(mid_packets) for i in range(3))
-                    controller._sw1_gyro_emit_frames = [p0, p_mid, p_last]
-                    
-                # 清空佇列，扣除 15ms 時間
-                controller._sw1_last_num_packets = num_packets
-                controller._sw1_packet_queue = []
-                controller._sw1_accum_dt -= 0.015
-                if controller._sw1_accum_dt > 0.015:
-                    controller._sw1_accum_dt = 0.0
+                controller._sw1_gyro_accum = [0.0, 0.0, 0.0]
+                controller._sw1_gyro_accum_time -= 0.015
+                if controller._sw1_gyro_accum_time > 0.015:
+                    controller._sw1_gyro_accum_time = 0.0 # Safety cap
                 should_emit = True
                 
-            gsrc3 = getattr(controller, '_sw1_gyro_emit_frames', [(0.0, 0.0, 0.0)] * 3)
+            gsrc3 = controller._sw1_gyro_emit_frames
         else:
             if getattr(controller, '_sw1_gyro_history', None) is None:
                 controller._sw1_gyro_history = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
@@ -1683,8 +1617,6 @@ class VirtualController:
             controller._sw1_gyro_history.append(inputData.gyroscope)
             gsrc3 = list(controller._sw1_gyro_history)
             should_emit = True
-
-        controller._sw1_should_emit = should_emit
 
         lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
         gx, gy, gz, ax, ay, az = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -1695,10 +1627,10 @@ class VirtualController:
             
             if hold_mode == "Vertical":
                 _gmap = lambda g: (g[1] * jc_gyro_scale, -g[0] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
-                _amap = lambda a: (a[1], -a[0], a[2])
+                ax, ay, az =  inputData.accelerometer[1],  -inputData.accelerometer[0],  inputData.accelerometer[2]
             else: # Horizontal
                 _gmap = lambda g: (g[0] * jc_gyro_scale, g[1] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
-                _amap = lambda a: (a[0], a[1], a[2])
+                ax, ay, az =  inputData.accelerometer[0], inputData.accelerometer[1],  inputData.accelerometer[2]
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
@@ -1709,10 +1641,10 @@ class VirtualController:
             
             if hold_mode == "Vertical":
                 _gmap = lambda g: (g[1] * jc_gyro_scale, g[0] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
-                _amap = lambda a: (a[1], a[0], -a[2])
+                ax, ay, az =  inputData.accelerometer[1], inputData.accelerometer[0], -inputData.accelerometer[2]
             else: # Horizontal
                 _gmap = lambda g: (-g[0] * jc_gyro_scale, g[1] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
-                _amap = lambda a: (-a[0], a[1], -a[2])
+                ax, ay, az = -inputData.accelerometer[0], inputData.accelerometer[1], -inputData.accelerometer[2]
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 rx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
@@ -1723,7 +1655,7 @@ class VirtualController:
             ry = inputData.right_stick[1]
 
             _gmap = lambda g: (g[1], -g[0], g[2])
-            _amap = lambda a: (a[1], -a[0], a[2])
+            ax, ay, az = inputData.accelerometer[1], -inputData.accelerometer[0], inputData.accelerometer[2]
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
@@ -1813,32 +1745,13 @@ class VirtualController:
         # burst.  Same accel in all three (accel is a direct reading, not integrated); gyro is
         # the per-third sub-sample mapped through _gmap.  (For Pro / experiment, gsrc3 holds 3
         # identical samples → 3 identical frames, i.e. the original behaviour.)
-        _a = _amap(inputData.accelerometer)
         for _fi, _off in enumerate((13, 25, 37)):
             _g = _gmap(gsrc3[_fi])
             state[_off:_off + 12] = struct.pack('<6h',
-                clamp_i16(_a[0]), clamp_i16(_a[1]), clamp_i16(_a[2]),
+                clamp_i16(ax), clamp_i16(ay), clamp_i16(az),
                 clamp_i16(_g[0]), clamp_i16(_g[1]), clamp_i16(_g[2]))
 
-        if getattr(controller, '_sw1_should_emit', True):
-            if not hasattr(controller, '_sw1_timer_float'):
-                controller._sw1_timer_float = 0.0
-            
-            n_pkts = getattr(controller, '_sw1_last_num_packets', 2)
-            ema = getattr(controller, '_sw1_real_dt_ema', 0.0075)
-            
-            # 將封包代表的真實物理時間，轉換為 Yuzu 識別的 5ms Ticks
-            # 這能完美解決 4% 的降速問題，且不用去動角速度的振幅 (避免觸發 Madgwick 修正導致 Overshoot)
-            controller._sw1_timer_float += (n_pkts * ema) / 0.005
-            ticks = int(controller._sw1_timer_float)
-            controller._sw1_timer_float -= ticks
-            
-            if ticks < 1: ticks = 1
-            if ticks > 10: ticks = 10
-            
-            controller._sw1_timer = (getattr(controller, '_sw1_timer', 0) + ticks) & 0xFF
-        state[1] = getattr(controller, '_sw1_timer', 0)
-
+        controller._sw1_should_emit = should_emit
         return state
 
     def update_as_switch1_joycon_l(self, inputData: ControllerInputData, buttons: int, controller):

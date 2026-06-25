@@ -7,26 +7,7 @@ import queue
 
 logger = logging.getLogger(__name__)
 
-# EXPERIMENT toggle: when True, the Switch1 Joy-Con (L/R) report timer byte state[1] is set
-# from REAL elapsed time (+1 per 5 ms, like real hardware) instead of a per-send counter,
-# and the gyro is sent CONTINUOUS at full rate (no 66.7 Hz rate-limit, no consume-once
-# gyro-zeroing).  IF the host (Yuzu) integrates IMU using the timer delta as dt, this gives
-# correct angle AND full-rate smoothness (like the DualSense timestamp path), and held
-# re-polls within the same 5 ms tick carry the same timer → dt=0 → no over-integration.
-# Result: Yuzu integrates Switch1 IMU with a FIXED dt (~16-20ms) per non-duplicate report
-# and DE-DUPLICATES by this timer byte — at factor 0.005 the angle was 4x over (timer faster
-# than reports → every report integrated), at 0.020 the gyro FROZE (timer slower than reports
-# → most reports deduped/skipped).  So the timer can't beat the rate-limit: correct+smooth
-# integration is capped at Yuzu's fixed-dt rate (~61.5 Hz), NOT the 134 Hz of the DualSense
-# (timestamped) path.  Experiment OFF → use the PART 1-3 rate-limit (the 61.5 Hz best case).
-SWITCH1_GYRO_TIMER_EXPERIMENT = False
 
-# Seconds of REAL time per +1 increment of the timer byte.  This is the host's (Yuzu's)
-# timer→dt unit: if it's wrong the angle is off by a CONSTANT factor (host uses the timer
-# but scales it differently).  Measured: at 0.005 the virtual rotated 4x the physical
-# (90°→360°), so the timer was advancing 4x too fast → use 0.020 (= 0.005 * 4).  Tune this
-# if the angle is still off by a constant factor: bigger value = less rotation.
-SWITCH1_TIMER_BYTE_SEC = 0.020
 
 # Switch 2 Pro Controller - HID Report Descriptor (31 Bytes)
 SWITCH_PRO_REPORT_DESCRIPTOR = bytes([
@@ -485,8 +466,8 @@ class USBIPServer:
                 )
                 # Endpoint Descriptor format: bLength(7) bDescType(5) bEndpointAddress bmAttributes wMaxPacketSize bInterval
                 # Correct struct: <BBBBHB = 1+1+1+1+2+1 = 7 bytes total
-                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 4)  # Interrupt IN (1ms polling)
-                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 4)  # Interrupt OUT
+                ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 8)  # Interrupt IN
+                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 8)  # Interrupt OUT
                 
                 # Interface 1: Vendor Specific Bulk (WinUSB)
                 iface1 = struct.pack("<BBBBBBBBB",
@@ -762,16 +743,6 @@ class USBIPJoyConServer(USBIPServer):
         """
         full = bytes(state_bytes)
         held = full
-        # Consume-once (zero the held gyro) is the FIXED-dt fallback.  When the timer
-        # experiment is active the real-time timer byte handles de-dup instead, so keep
-        # the gyro continuous in held reports for full-rate smoothness.
-        if (not SWITCH1_GYRO_TIMER_EXPERIMENT
-                and getattr(self, 'device_type', None) in ("L", "R")
-                and len(full) >= 49 and full[0] == 0x30):
-            b = bytearray(full)
-            for _off in (19, 31, 43):   # gyro is bytes 6..11 within each 12-byte IMU frame
-                b[_off:_off + 6] = b'\x00' * 6
-            held = bytes(b)
         with self.lock:
             self.last_state = bytearray(held)
         try:
@@ -789,11 +760,8 @@ class USBIPJoyConServer(USBIPServer):
         re-integration) and fresh reports advance by real time (host dt = real elapsed).
         Otherwise: the original per-send incrementing counter.
         """
-        if SWITCH1_GYRO_TIMER_EXPERIMENT and getattr(self, 'device_type', None) in ("L", "R"):
-            report[1] = int(time.perf_counter() / SWITCH1_TIMER_BYTE_SEC) & 0xff
-        else:
-            report[1] = self.seq_num & 0xff
-            self.seq_num += 1
+        report[1] = self.seq_num & 0xff
+        self.seq_num += 3
 
     def _get_device_desc(self):
         path = f"/sys/devices/virtual/usbip/{self.bus_id}".encode('ascii')
@@ -900,24 +868,17 @@ class USBIPJoyConServer(USBIPServer):
                 reply_data = self.subcmd_reply_queue.get_nowait()
             except queue.Empty:
                 try:
-                    reply_data_bytes = self.input_queue.get_nowait()
+                    # Wait for actual new input. USBIP handles pending IN URBs naturally.
+                    # This enforces the exact 15ms emission rate from virtual_controller.
+                    reply_data_bytes = self.input_queue.get(timeout=0.1)
                     reply_data = bytearray(reply_data_bytes)
                     if len(reply_data) > 0 and reply_data[0] == 0x30:
-                        pass # Timer is perfectly handled by virtual_controller
+                        self._stamp_timer_byte(reply_data)
                     reply_data = bytes(reply_data)
-                    self.last_ep1_in_time = time.perf_counter()
                 except queue.Empty:
-                    # 節流空閒時的 held state 回報（限速 250Hz），避免無意義的吃滿 CPU
-                    now = time.perf_counter()
-                    elapsed = now - getattr(self, 'last_ep1_in_time', 0)
-                    if elapsed < 0.004:
-                        time.sleep(0.004 - elapsed)
-                    self.last_ep1_in_time = time.perf_counter()
-
                     with self.lock:
-                        # last_state holds the FROZEN timer byte. This is MATHEMATICALLY REQUIRED.
-                        # If we advance the timer on an empty poll (which has 0 gyro), Yuzu will consume the time delta.
-                        # When the real packet arrives 1ms later with the same timer tick, Yuzu will see dt=0 and DISCARD the real packet!
+                        if self.last_state[0] == 0x30:
+                            self._stamp_timer_byte(self.last_state)
                         reply_data = bytes(self.last_state)
         else:
             status = -1
@@ -985,7 +946,7 @@ class USBIPJoyConServer(USBIPServer):
                     len(JOYCON_REPORT_DESC) # wDescriptorLength
                 )
                 ep1_in  = struct.pack("<BBBBHB", 7, 5, 0x81, 0x03, 64, 4)  # Interrupt IN (1ms polling)
-                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 4)  # Interrupt OUT
+                ep1_out = struct.pack("<BBBBHB", 7, 5, 0x01, 0x03, 64, 4)  # Interrupt OUT (1ms polling)
                 
                 # Interface 1: Vendor Specific (WinUSB Bulk)
                 iface1 = struct.pack("<BBBBBBBBB",
