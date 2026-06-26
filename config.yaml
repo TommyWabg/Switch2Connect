@@ -126,7 +126,7 @@ cemuhook_mac_to_pad:
   E0EFBFF00E17: 0
 cemuhook_pad_overwrite_idx: 0
 driver_installed: false
-driver_type: USBIP
+driver_type: WinUHid
 gc_l_click_mapping: Default
 gc_r_click_mapping: Default
 gc_trigger_calibration_data: {}
@@ -174,39 +174,18 @@ mouse:
   ir_activate_threshold: 1
   sensitivity: 4.0
 open_when_startup: false
-profile_defaults:
-  cemuhook_sensitivity: 1
-  djg_activation: Hold
-  djg_dominant_side: Right
-  djg_enabled: false
-  djg_mode: Switch Dominant Side
-  gyro_activation_mode: Hold
-  gyro_mode: World
-  gyro_passthrough_mode: Default
-  gyro_sensitivity: 4.0
-  stabilized_gyro: true
-  steam_roll_compensation: false
-  stick_mouse_sensitivity: 5.0
-  virtual_gyro_soft_deadzone: 0.0
 profiles:
   DJG Demo:
-    cemuhook_sensitivity: 1
     djg_activation: Hold
     djg_dominant_side: Right
     djg_enabled: true
     djg_mode: Switch Dominant Side
     driver_type: WinUHid
-    gyro_activation_mode: Hold
-    gyro_mode: World
     gyro_passthrough_mode: Default
-    gyro_sensitivity: 4.0
     ps4:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -214,47 +193,19 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_usbip:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -262,101 +213,43 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: PS_L_Touch
       slr_mapping: DJG
       srl_mapping: DJG
       srr_mapping: PS_R_Touch
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_winuhid:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
-      gc_trigger_mode: Hair Trigger
+      gc_trigger_mode: 100% at Max
       gl_mapping: PS_L_Touch
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: PS_L_Touch
       slr_mapping: DJG
       srl_mapping: DJG
       srr_mapping: PS_R_Touch
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     simulation_mode: PS5
-    stabilized_gyro: true
     steam_roll_compensation: false
-    stick_mouse_sensitivity: 5.0
     switch1:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -364,46 +257,18 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     switch2:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -411,48 +276,19 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: GR
       srl_mapping: GL
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
-    virtual_gyro_soft_deadzone: 0.0
     xbox:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -460,40 +296,15 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
   Default:
     assigned_apps: []
     cemuhook_sensitivity: 1
@@ -501,18 +312,12 @@ profiles:
     djg_dominant_side: Right
     djg_enabled: false
     djg_mode: Switch Dominant Side
-    driver_type: USBIP
-    gyro_activation_mode: Hold
-    gyro_mode: World
+    driver_type: WinUHid
     gyro_passthrough_mode: Default
-    gyro_sensitivity: 4.0
     ps4:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -520,47 +325,40 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_usbip:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
+      gc_l_click_mapping: Default
+      gc_r_click_mapping: Default
+      gc_trigger_mode: 100% at Max
+      gl_mapping: PS_L_Touch
+      gr_mapping: PS_R_Touch
+      home_mapping: Default
+      joycon_hold_mode: {}
+      rumble_mode: PS5
+      sll_mapping: Default
+      slr_mapping: PS_R_Touch
+      srl_mapping: PS_L_Touch
+      srr_mapping: Change Profile
+      vibration_frequency: 10
+      vibration_strength: 10
+      vibration_strength_ps5: 10
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
+    ps5_winuhid:
+      abxy_mode: Xbox
+      c_mapping: Default
+      capt_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -568,101 +366,22 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: *id001
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
-      rumble_mode: PS5
-      sll_mapping: Default
-      slr_mapping: PS_R_Touch
-      srl_mapping: PS_L_Touch
-      srr_mapping: Change Profile
-      up_mapping: Default
-      vibration_frequency: 10
-      vibration_strength: 10
-      vibration_strength_ps5: 10
-      vibration_strength_switch: 5
-      vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
-    ps5_winuhid:
-      a_mapping: Default
-      abxy_mode: Xbox
-      b_mapping: Default
-      c_mapping: Default
-      capt_mapping: Default
-      down_mapping: Default
-      gc_l_click_mapping: Default
-      gc_r_click_mapping: Default
-      gc_trigger_mode: 100% at Max
-      gl_mapping: PS_L_Touch
-      gr_mapping: PS_R_Touch
-      home_mapping: Default
-      joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     simulation_mode: PS5
-    stabilized_gyro: true
     steam_roll_compensation: false
-    stick_mouse_sensitivity: 5.0
     switch1:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -670,46 +389,18 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     switch2:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -717,48 +408,19 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: GR
       srl_mapping: GL
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
-    virtual_gyro_soft_deadzone: 0.0
     xbox:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -766,59 +428,27 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
   PS5 Audio Haptics:
-    assigned_apps: []
     cemuhook_sensitivity: 1
     djg_activation: Hold
     djg_dominant_side: Right
     djg_enabled: false
     djg_mode: Switch Dominant Side
-    driver_type: WinUHid
-    gyro_activation_mode: Hold
-    gyro_mode: World
+    driver_type: USBIP
     gyro_passthrough_mode: Default
-    gyro_sensitivity: 4.0
     ps4:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -826,47 +456,19 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_usbip:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -874,48 +476,20 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: PS5
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 10
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_winuhid:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -923,52 +497,22 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     simulation_mode: PS5
-    stabilized_gyro: true
     steam_roll_compensation: false
-    stick_mouse_sensitivity: 5.0
     switch1:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -976,46 +520,18 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     switch2:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -1023,48 +539,19 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: GR
       srl_mapping: GL
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
-    virtual_gyro_soft_deadzone: 0.0
     xbox:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -1072,40 +559,15 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
   Switch 1 Emulator:
     assigned_apps: []
     cemuhook_sensitivity: 1
@@ -1114,17 +576,11 @@ profiles:
     djg_enabled: false
     djg_mode: Switch Dominant Side
     driver_type: USBIP
-    gyro_activation_mode: Hold
-    gyro_mode: World
     gyro_passthrough_mode: Cemuhook
-    gyro_sensitivity: 4.0
     ps4:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -1132,47 +588,19 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_usbip:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -1180,48 +608,20 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: PS5
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 10
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     ps5_winuhid:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -1229,52 +629,22 @@ profiles:
       gr_mapping: PS_R_Touch
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: PS_R_Touch
       srl_mapping: PS_L_Touch
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_ps5: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     simulation_mode: Switch1
-    stabilized_gyro: true
     steam_roll_compensation: false
-    stick_mouse_sensitivity: 5.0
     switch1:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -1282,46 +652,18 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
     switch2:
-      a_mapping: Default
       abxy_mode: Switch
-      b_mapping: Default
       c_mapping: Default
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
@@ -1329,48 +671,19 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
       slr_mapping: GR
       srl_mapping: GL
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
-    virtual_gyro_soft_deadzone: 0.0
     xbox:
-      a_mapping: Default
       abxy_mode: Xbox
-      b_mapping: Default
       c_mapping: Calibration
       capt_mapping: Default
-      down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
       gc_trigger_mode: 100% at Max
@@ -1378,42 +691,17 @@ profiles:
       gr_mapping: Default
       home_mapping: Default
       joycon_hold_mode: {}
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
       rumble_mode: Xbox
       sll_mapping: Default
       slr_mapping: Default
       srl_mapping: Default
       srr_mapping: Change Profile
-      up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 10
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
 rumble_delay_ms: 0
-rumble_mode: PS5
+rumble_mode: Xbox
 simulation_mode: PS5
 sll_mapping: Default
 slr_mapping: PS_R_Touch
@@ -1427,17 +715,17 @@ stick_r_bias:
 - 0.0
 - 0.0
 ui_scale: 1.0
-usbip_sim_mode: PS5
+usbip_sim_mode: Switch1
 vibration_frequency: 10
-vibration_strength: 10
+vibration_strength: 5
 vibration_strength_ps5: 10
 vibration_strength_switch: 5
 vibration_strength_xbox: 5
 vigembus_installed: true
 vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
-window_height: 1160
-window_width: 1270
-window_x: 1174
-window_y: 137
+window_height: 1290
+window_width: 1260
+window_x: 1264
+window_y: 45
 winuhid_sim_mode: PS5
