@@ -1,6 +1,6 @@
 {
     "packageVersion": "1.0.0",
-    "firmwareVersion": "1.0.0",
+    "firmwareVersion": "0.12.0",
     "target": "esp32s3",
     "flashMode": "dio",
     "flashFreq": "80m",
@@ -32,13 +32,13 @@
         {
             "id": "tinyusb_direct",
             "label": "ESP32-S3 Bluedroid Bridge (production)",
-            "version": "0.11.2",
+            "version": "0.12.0",
             "app": "esp32s3_bluedroid_bridge.bin",
             "assets": [
                 {
                     "offset": "0x0",
                     "path": "v1.0_bluedroid/bootloader.bin",
-                    "sha256": "c17c764236947df9580cea5b277c4088e3de6a8a6eed7f2dea472c29d4a66889"
+                    "sha256": "3c04248f94b141cf5df40a353a18fbd57a7032f6ffe93c52824d91b4debc2e40"
                 },
                 {
                     "offset": "0x8000",
@@ -48,11 +48,11 @@
                 {
                     "offset": "0x10000",
                     "path": "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
-                    "sha256": "0ac5240d127a4ca5b11e3aa12be983e56d9cd1d5ec983ed2f0bfa29afa0ab197"
+                    "sha256": "49c46e06425b7dce45dc5872c8bb14c9cc2a8eb1524ce89c4a3403159242fbc6"
                 }
             ]
         }
     ],
-    "notes": "tinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake.\n4. Auto-disable for DualSense virtual audio endpoint via USBIP. Handled completely in the background via svcl.exe / SoundVolumeView.exe to release the endpoint from Windows audio mixing, allowing proper PS5 haptic passthrough."
+    "notes": "tinyusb_direct v0.12.0 (2026-06-29): \n0. NSO GameCube controller fix: the bridge now subscribes to the LEGACY input notify characteristic (not FD2) for the GCN, matching the controller's compact native report layout. Previously the GCN streamed via the dev board but all mappings were wrong, sticks were pegged and buttons stuck, because FD2 carries a different byte layout the host GCN parser cannot read. The product_id is read from the advertisement at scan time to identify the GCN; all other controllers (Pro 2 / Joy-Con) still use FD2.\n\ntinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake.\n4. Auto-disable for DualSense virtual audio endpoint via USBIP. Handled completely in the background via svcl.exe / SoundVolumeView.exe to release the endpoint from Windows audio mixing, allowing proper PS5 haptic passthrough."
 }
 
