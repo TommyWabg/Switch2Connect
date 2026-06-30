@@ -33,13 +33,20 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "0.11.2"
+#define APP_FIRMWARE_VERSION      "0.12.0"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_1"
 #define CDC_LINE_STATE_DTR        0x01
 #define NINTENDO_COMPANY_ID       0x0553
 #define MAX_CH                    8     // one GATTC app per channel
 #define REPORT_SIZE               64
+// NSO GameCube controller streams its compact native input report on the LEGACY
+// notify characteristic, NOT on FD2 (FD2 carries a different layout the GCN host
+// parser does not understand).  So for this product_id the bridge must prefer the
+// LEGACY characteristic as the input stream — the opposite of every other SW2
+// controller (Pro 2 / Joy-Con), which must use FD2.  See match_and_store_char +
+// the input-source decision in SEARCH_CMPL_EVT.
+#define NSO_GAMECUBE_PID          0x2073
 
 // --- Switch 2 GATT UUIDs (128-bit; little-endian in esp_bt_uuid_t = string reversed) ---
 #define UUID128(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15) \
@@ -72,13 +79,42 @@ typedef struct {
     esp_bd_addr_t bda;
     uint8_t  addr_type;
     uint16_t input_handle;
+    uint16_t fd2_handle;     // canonical SW2 input notify (ab7de9be…), if present
+    uint16_t legacy_handle;  // legacy input notify (74928 66c…), if present
     uint16_t ack_handle;
     uint16_t cmd_handle;
     uint16_t rumble_handle;
     uint16_t itvl;           // connection interval in 1.25 ms units (6=7.5ms, 12=15ms)
     uint8_t  input_src;      // which UUID set input_handle: 1=FD2, 2=legacy (diagnostic)
+    bool     prefer_legacy;  // NSO GameCube: input is on the LEGACY char, not FD2
 } channel_t;
 static channel_t s_ch[MAX_CH];
+
+// --- product_id cache (MAC -> PID) ------------------------------------------
+// The firmware does not read controller memory, but the advertisement already
+// carries the Nintendo product_id (manufacturer data).  We cache it per MAC at
+// scan time so that, when the host asks us to connect that MAC, we know whether
+// it is an NSO GameCube controller (and therefore must subscribe to the LEGACY
+// input characteristic instead of FD2).  Small round-robin table is plenty —
+// only MACs we are about to connect matter.
+#define PID_CACHE_N 16
+static struct { esp_bd_addr_t bda; uint16_t pid; bool valid; } s_pid_cache[PID_CACHE_N];
+static void pid_cache_put(const esp_bd_addr_t bda, uint16_t pid) {
+    for (int i = 0; i < PID_CACHE_N; i++)
+        if (s_pid_cache[i].valid && memcmp(s_pid_cache[i].bda, bda, sizeof(esp_bd_addr_t)) == 0) {
+            s_pid_cache[i].pid = pid; return;
+        }
+    static int rr = 0;
+    memcpy(s_pid_cache[rr].bda, bda, sizeof(esp_bd_addr_t));
+    s_pid_cache[rr].pid = pid; s_pid_cache[rr].valid = true;
+    rr = (rr + 1) % PID_CACHE_N;
+}
+static uint16_t pid_cache_get(const esp_bd_addr_t bda) {
+    for (int i = 0; i < PID_CACHE_N; i++)
+        if (s_pid_cache[i].valid && memcmp(s_pid_cache[i].bda, bda, sizeof(esp_bd_addr_t)) == 0)
+            return s_pid_cache[i].pid;
+    return 0;
+}
 
 static volatile bool s_scan_mode = false;
 static int s_pending_conn = -1;   // channel waiting to open once the scan has stopped
@@ -269,6 +305,9 @@ static void do_conn(char *args) {
     s_ch[ch].connecting = true;
     s_ch[ch].addr_type = (uint8_t)atoi(type_s);
     for (int i = 0; i < 6; i++) s_ch[ch].bda[i] = (uint8_t)m[i];
+    // NSO GameCube controller: its compact input report is on the LEGACY notify
+    // characteristic, so flag this channel to subscribe to legacy instead of FD2.
+    s_ch[ch].prefer_legacy = (pid_cache_get(s_ch[ch].bda) == NSO_GAMECUBE_PID);
     {   // Diagnostic: which channel + how many links already live when this starts.
         char dbg[110];
         snprintf(dbg, sizeof(dbg),
@@ -541,13 +580,16 @@ static void cdc_task(void *arg) {
 
 // --- GATT discovery helpers ---
 static void match_and_store_char(int ch, const esp_bt_uuid_t *uuid, uint16_t val_handle) {
-    // FD2 (ab7de9be…) is the canonical Switch 2 input stream the host parser expects.
-    // Some controllers (e.g. the Pro Controller 2) ALSO expose the legacy notify
-    // characteristic with a DIFFERENT byte layout — subscribing to that instead makes
-    // the host parse it as an FD2 report => random buttons/sticks.  So FD2 always wins;
-    // LEGACY is only a fallback when FD2 is absent.
-    if (memcmp(uuid, &UUID_NOTIFY_FD2, sizeof(*uuid)) == 0)         { s_ch[ch].input_handle = val_handle; s_ch[ch].input_src = 1; }
-    else if (memcmp(uuid, &UUID_NOTIFY_LEGACY, sizeof(*uuid)) == 0) { if (s_ch[ch].input_handle == 0) { s_ch[ch].input_handle = val_handle; s_ch[ch].input_src = 2; } }
+    // Record both input notify characteristics; the actual input_handle is chosen in
+    // SEARCH_CMPL_EVT once discovery is complete (order-independent).
+    // FD2 (ab7de9be…) is the canonical Switch 2 input stream for the Pro 2 / Joy-Cons.
+    // The Pro 2 ALSO exposes the legacy notify characteristic with a DIFFERENT byte
+    // layout — parsing that as an FD2 report gives random buttons/sticks — so for
+    // those controllers FD2 wins.  The NSO GameCube controller is the exception: its
+    // compact native report is on the LEGACY characteristic, so prefer_legacy flips
+    // the choice for it.
+    if (memcmp(uuid, &UUID_NOTIFY_FD2, sizeof(*uuid)) == 0)         s_ch[ch].fd2_handle = val_handle;
+    else if (memcmp(uuid, &UUID_NOTIFY_LEGACY, sizeof(*uuid)) == 0) s_ch[ch].legacy_handle = val_handle;
     else if (memcmp(uuid, &UUID_ACK, sizeof(*uuid)) == 0)      s_ch[ch].ack_handle = val_handle;
     else if (memcmp(uuid, &UUID_CMD, sizeof(*uuid)) == 0)      s_ch[ch].cmd_handle = val_handle;
     else if (memcmp(uuid, &UUID_RUMBLE_PRO, sizeof(*uuid)) == 0 ||
@@ -697,9 +739,20 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         break;
 
     case ESP_GATTC_SEARCH_CMPL_EVT: {
-        char b[140];
-        snprintf(b, sizeof(b), "discovered ch=%d input=0x%04x(src=%u) ack=0x%04x cmd=0x%04x rumble=0x%04x",
-                 ch, s_ch[ch].input_handle, s_ch[ch].input_src,
+        // Choose the input stream now that all characteristics are known.  The NSO
+        // GameCube controller (prefer_legacy) uses the LEGACY characteristic; every
+        // other SW2 controller uses FD2.  Fall back to whichever is present.
+        if (s_ch[ch].prefer_legacy && s_ch[ch].legacy_handle) {
+            s_ch[ch].input_handle = s_ch[ch].legacy_handle; s_ch[ch].input_src = 2;
+        } else if (s_ch[ch].fd2_handle) {
+            s_ch[ch].input_handle = s_ch[ch].fd2_handle;    s_ch[ch].input_src = 1;
+        } else if (s_ch[ch].legacy_handle) {
+            s_ch[ch].input_handle = s_ch[ch].legacy_handle; s_ch[ch].input_src = 2;
+        }
+        char b[160];
+        snprintf(b, sizeof(b), "discovered ch=%d input=0x%04x(src=%u prefer_legacy=%d fd2=0x%04x legacy=0x%04x) ack=0x%04x cmd=0x%04x rumble=0x%04x",
+                 ch, s_ch[ch].input_handle, s_ch[ch].input_src, s_ch[ch].prefer_legacy,
+                 s_ch[ch].fd2_handle, s_ch[ch].legacy_handle,
                  s_ch[ch].ack_handle, s_ch[ch].cmd_handle, s_ch[ch].rumble_handle);
         out_debug(b);
         enable_notifications(ch);
@@ -822,6 +875,19 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
         if (r->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) break;
         if (!s_scan_mode || !adv_is_nintendo(r->scan_rst.ble_adv)) break;
         const uint8_t *a = r->scan_rst.bda;
+        // Cache the advertised Nintendo product_id so do_conn knows whether this MAC is
+        // an NSO GameCube controller (LEGACY input) before GATT discovery runs.
+        // Manufacturer value layout: [company_id_lo, company_id_hi, payload...]; the
+        // host reads product_id from payload[5:7] => mfg[7]|(mfg[8]<<8) (little-endian).
+        {
+            uint8_t mlen = 0;
+            uint8_t *mfg = esp_ble_resolve_adv_data(r->scan_rst.ble_adv,
+                                ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mlen);
+            if (mfg && mlen >= 9) {
+                uint16_t pid = (uint16_t)mfg[7] | ((uint16_t)mfg[8] << 8);
+                pid_cache_put(a, pid);
+            }
+        }
         char data_hex[63]; int dl = r->scan_rst.adv_data_len; if (dl > 31) dl = 31;
         for (int i = 0; i < dl; i++) sprintf(&data_hex[i*2], "%02X", r->scan_rst.ble_adv[i]);
         data_hex[dl*2] = '\0';
