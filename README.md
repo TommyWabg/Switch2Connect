@@ -1,6 +1,8 @@
 # switch2-controllers (Windows 10 & Pro Features Fork)
 
-This fork is heavily optimized for Windows 10/11 users, featuring a fully interactive GUI, advanced Gyro mouse aiming, and on-the-fly layout switching. 
+This project, forked from [Nadeflore](https://github.com/Nadeflore)’s amazing [switch2-controllers](https://github.com/Nadeflore/switch2-controllers), is the ultimate, feature-rich utility designed to seamlessly integrate your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller into the Windows gaming ecosystem via standard Bluetooth or ESP32-S3 N16R8.
+
+Built with a user-experience-first mindset and powered by a highly flexible multi-driver backend, this standalone application transforms your Nintendo hardware into a PC gaming powerhouse. It delivers low latency inputs, unmatched in-app gyro IMU precision, and comprehensive emulation for all major controller protocols without requiring complex installations.
 
 ## Show Your Support
 
