@@ -2,6 +2,20 @@
 
 This fork is heavily optimized for Windows 10/11 users, featuring a fully interactive GUI, advanced Gyro mouse aiming, and on-the-fly layout switching. 
 
+## Show Your Support
+
+Built with a user-experience-first mindset, this project has reached a mature and comprehensive state. It will remain completely free to use forever.
+
+If you are highly satisfied when gaming with this app, please consider leaving a tip. Any financial "thank you" is incredibly appreciated!
+
+<div align="left">
+  <a href="https://ko-fi.com/tagayama">
+    <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi">
+  </a>
+</div>
+
+Happy gaming, and thank you for your generous support!
+
 ## Key Features
 
 * **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
