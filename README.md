@@ -1,4 +1,4 @@
-# switch2-controllers (Windows 10 & Pro Features Fork)
+# Switch 2 Connect
 
 This project, forked from [Nadeflore](https://github.com/Nadeflore)’s amazing [switch2-controllers](https://github.com/Nadeflore/switch2-controllers), is the ultimate, feature-rich utility designed to seamlessly integrate your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller into the Windows gaming ecosystem via standard Bluetooth or ESP32-S3 N16R8.
 
