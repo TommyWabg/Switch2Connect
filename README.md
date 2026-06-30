@@ -4,7 +4,7 @@ This project, forked from [Nadeflore](https://github.com/Nadeflore)’s amazing 
 
 Built with a user-experience-first mindset and powered by a highly flexible multi-driver backend, this standalone application transforms your Nintendo hardware into a PC gaming powerhouse. It delivers low latency inputs, unmatched in-app gyro IMU precision, and comprehensive emulation for all major controller protocols without requiring complex installations.
 
-## Show Your Support
+## Support This Project
 
 Built with a user-experience-first mindset, this project has reached a mature and comprehensive state. It will remain completely free to use forever.
 
