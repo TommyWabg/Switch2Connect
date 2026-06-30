@@ -20,7 +20,7 @@ Happy gaming, and thank you for your generous support!
 
 ## Key Features
 
-* **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
+* **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommended for a 70Hz max Bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for the BLE protocol.
 * **Low Latency Bluetooth Mode:** The application now forces Windows Bluetooth LE into `ThroughputOptimized` mode upon connection. This drastically drops the connection interval, massively reducing native Bluetooth input delay across the board.
 * **ESP32-S3 N16R8 Low-Latency Connection:** Added native support for the ESP32-S3 N16R8 development board as a low-latency BLE bridge, which enables 133Hz polling rate. The application provides firmware installation, controller pairing via the SYNC button, and seamless reconnection for controllers previously bonded to the bridge.
 * **Flexible Multi-Driver & Emulation Backend (WinUHid, ViGEmBus & USBIP):** Upgraded the emulation backend to support a flexible multi-driver architecture. Users can now seamlessly toggle between the built-in [WinUHid](https://github.com/lurebat/WinUHid) driver, the industry-standard [ViGEmBus](https://github.com/nefarius/ViGEmBus) virtual gamepad emulator, and a [USBIP](https://github.com/vadimgrn/usbip-win2)-based emulation mode which enables emulating a physical USB-connected Switch 2 Pro Controller.
@@ -35,10 +35,10 @@ Happy gaming, and thank you for your generous support!
     * **levels 1:** Virtual Switch 1 Joy-cons turn 360 degrees when the physical Switch 2 Joy-cons turn 360 degrees.
     * **levels 5:** Matches real Switch 1 Joycon sensitivity.
 * **On-the-Fly Layout Switching:** No more multiple executables! Instantly toggle between **Nintendo Layout** (matching physical labels) and **Xbox Layout** (standard PC positioning) directly from the UI.
-* **1000Hz Interpolation:** 1000Hz interpolation loop for ultra-smooth, jitter-free gyro motion rendering with both Switch 2 Right Joy-con and Pro Controller. **Gyro Mouse** and **Joy-con Mouse**now output smoother and lag-free movement at 1000Hz. Gyro data handed off to other external applications (such as third-party emulators) is transmitted at a consistent, high-frequency 1000Hz rate. This transmission is purely non-interpolated; rather than generating synthetic intermediate frames which could introduce latency, the app simply increases the packet delivery rate of real-time physical updates to ensure maximum accuracy and zero artificial delay.
+* **1000Hz Interpolation:** 1000Hz interpolation loop for ultra-smooth, jitter-free gyro motion rendering with both Switch 2 Right Joy-con and Pro Controller. **Gyro Mouse** and **Joy-con Mouse**now output smoother and lag-free movement at 1000Hz. Gyro data handed off to other external applications (such as third-party emulators) is transmitted at a consistent, high-frequency 1000Hz rate. This transmission is purely non-interpolated; rather than generating synthetic intermediate frames, which could introduce latency, the app simply increases the packet delivery rate of real-time physical updates to ensure maximum accuracy and zero artificial delay.
 * **In-app Gyro Control (Mouse, R Joystick & Steering):** Utilize in-app gyro control for mouse aiming, or select R Joystick and Steering options. The Steering mode reads the controller's absolute tilt (accelerometer) and maps it directly to the Left Analog Stick's X-axis. Unlike the Mouse control mode, the R Joystick and Steering modes utilize a separate In-app Gyro mapping scope where all buttons default to their standard controller inputs to prevent unexpected mouse clicks during controller emulation.
 * **9-Axis Mouse Mode (Magnetometer Support):** 9-axis motion controled mouse by leveraging the controllers' magnetometer. This provides absolute orientation tracking and eliminates long-term yaw drift. 
-* **6-Axis Mouse Mode:** Play shooters or navigate through UI with high-polling rate gyro mouse control. RT and LT act as left and right mouse click when gyro mouse is activated. This mode self-levels horizontal and vertical input regardless of controller tilt.
+* **6-Axis Mouse Mode:** Play shooters or navigate through UI with high-polling rate gyro mouse control. RT and LT act as left and right mouse clicks when gyro mouse is activated. This mode self-levels horizontal and vertical input regardless of controller tilt.
 * **Stick Assist:** Allowing the right thumbstick to work alongside gyro aiming.
 * **In-app Gyro Lock:** A dedicated mapping option to pause gyro control while remaining in In-app Gyro mode, supporting both Hold and Tap activation logic.
 * **Gyro Data Passthrough:**
@@ -56,7 +56,7 @@ Happy gaming, and thank you for your generous support!
   * Pressing this mapped button during gameplay will execute the action defined by the current DJG Control Mode and DJG Activation settings.
 * **DJG Control Modes:** Three modes to dictate how the mapped DJG trigger button behaves during gameplay.
   * **Single Side Toggle:** Toggle the gyro tracking of a single Joy-con on or off independently.
-  * **Switch Dominant Side:** Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced active upon switching.
+  * **Switch Dominant Side:** Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced to be active upon switching.
   * **Switch Gyro Side:** Turn off the current gyro and activate the opposite Joy-con's gyro exclusively. The Dominant Side setting syncs automatically.
 * **DJG Activation Types:** Trigger behavior options to support different input styles.
   * **Toggle:** Switch the DJG state once per button press.
@@ -155,7 +155,7 @@ To achieve drift-free 9-axis tracking, follow these steps to calibrate the magne
 1.  Hold the boot button on the ESP32-S3 N16R8 board.
 2.  Plug in the ESP32-S3 N16R8 board's OTG  port via USB-C to the PC while holding the boot button.
 3.  In the app, click the **[ESP32-S3 N16R8 Driver]** button.
-4.  Click click **[Install]** and wait until finish installing.
+4.  Click **[Install]** and wait until finish installing.
 5.  Unplug and plug the ESP32-S3 N16R8 board.
 6.  Reconnect any controllers previously paired via the system BLE by pressing SYNC.
 
