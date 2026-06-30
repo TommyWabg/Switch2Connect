@@ -27,8 +27,7 @@ import ctypes
 import logging
 import gc
 from controller import (Controller, ControllerInputData, VibrationData,
-                        NSO_GAMECUBE_CONTROLLER_PID,
-                        _gcn_update_pwm_state, normalize_motor_value)
+                        NSO_GAMECUBE_CONTROLLER_PID)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
 from utils import USBIPAllocator
@@ -260,6 +259,71 @@ class VirtualController:
         self.running = True
         self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
         self.update_thread.start()
+
+    def _controller_mix_key(self, controller):
+        try:
+            return controller.device.address
+        except Exception:
+            return str(id(controller))
+
+    def _clamp_stick_pair(self, stick):
+        return (
+            max(-1.0, min(1.0, stick[0])),
+            max(-1.0, min(1.0, stick[1])),
+        )
+
+    def _controller_mapping_scope(self, controller):
+        active = (
+            getattr(controller, "gyro_mouse_enabled", False) or
+            getattr(controller, "_in_app_gyro_mapping_active_this_frame", False)
+        )
+        return "in_app_gyro_mode_mappings" if active else None
+
+    def _joystick_mapping_mode(self, key, controller):
+        return CONFIG.get_mapping_setting_scoped(key, "Default", self._controller_mapping_scope(controller))
+
+    def _update_merged_stick_mix(self, inputData, controller):
+        if not hasattr(self, "_merged_stick_contribs"):
+            self._merged_stick_contribs = {}
+        route = getattr(inputData, "custom_joystick_mapping", None)
+        left = (0.0, 0.0)
+        right = (0.0, 0.0)
+        if route:
+            if route.get("target") == "left":
+                left = inputData.left_stick
+            elif route.get("target") == "right":
+                right = inputData.right_stick
+        elif controller.is_joycon_left():
+            left = inputData.left_stick
+        elif controller.is_joycon_right():
+            right = inputData.right_stick
+        else:
+            left_mode = self._joystick_mapping_mode("l_joystick", controller)
+            right_mode = self._joystick_mapping_mode("r_joystick", controller)
+            if left_mode == "R Joystick":
+                right = (right[0] + inputData.left_stick[0], right[1] + inputData.left_stick[1])
+            elif left_mode == "L Joystick" or left_mode == "Default":
+                left = (left[0] + inputData.left_stick[0], left[1] + inputData.left_stick[1])
+
+            if right_mode == "L Joystick":
+                left = (left[0] + inputData.right_stick[0], left[1] + inputData.right_stick[1])
+            elif right_mode == "R Joystick" or right_mode == "Default":
+                right = (right[0] + inputData.right_stick[0], right[1] + inputData.right_stick[1])
+
+        self._merged_stick_contribs[self._controller_mix_key(controller)] = {"left": left, "right": right}
+        active_keys = {self._controller_mix_key(c) for c in self.controllers}
+        for key in list(self._merged_stick_contribs.keys()):
+            if key not in active_keys:
+                self._merged_stick_contribs.pop(key, None)
+
+        sum_left = (0.0, 0.0)
+        sum_right = (0.0, 0.0)
+        for contrib in self._merged_stick_contribs.values():
+            l = contrib.get("left", (0.0, 0.0))
+            r = contrib.get("right", (0.0, 0.0))
+            sum_left = (sum_left[0] + l[0], sum_left[1] + l[1])
+            sum_right = (sum_right[0] + r[0], sum_right[1] + r[1])
+        return self._clamp_stick_pair(sum_left), self._clamp_stick_pair(sum_right)
 
     def handle_djg_trigger(self, controller, pressed=True):
         activation = getattr(CONFIG, "djg_activation", "Toggle")
@@ -915,24 +979,6 @@ class VirtualController:
         import math
         import discoverer
 
-        # --- NSO GCN Xbox-mode PWM path ---
-        # When an NSO GCN controller is connected and we're in Xbox emulation mode,
-        # bypass the Switch HD Rumble lf/hf accumulation entirely and route the
-        # XInput motor values directly to the per-tick sigma-delta PWM state machine.
-        sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
-        is_xbox_mode = sim_mode in ("Xbox One", "Xbox360")
-        if is_xbox_mode and getattr(CONFIG, "gcn_rumble_pwm_enabled", True):
-            for c in self.controllers:
-                pid = getattr(getattr(c, 'controller_info', None), 'product_id', 0)
-                if pid == NSO_GAMECUBE_CONTROLLER_PID:
-                    _gcn_update_pwm_state(c, large_motor, small_motor)
-                    logger.debug(
-                        "GCN PWM: XInput large_motor=%d small_motor=%d routed to PWM state machine",
-                        large_motor, small_motor
-                    )
-                    return  # Do NOT fall through to HD Rumble buffer
-
-        # --- Standard Switch HD Rumble path (Joy-Con / Pro Controller / DualSense) ---
         lf_val = int(800 * large_motor / 256)
         hf_val = int(800 * small_motor / 256)
 
@@ -1242,6 +1288,13 @@ class VirtualController:
         controller._own_zl_pressed = False
         controller._shared_zl_pressed = False
         controller._last_raw_buttons = 0
+        controller._own_mode_shift_toggle = False
+        controller._own_mode_shift_tap_edge = False
+        controller._own_mode_shift_hold_pressed = False
+        controller._own_mode_shift_active = False
+        controller._shared_mode_shift_toggle = False
+        controller._shared_mode_shift_hold_pressed = False
+        controller._shared_mode_shift_active = False
         controller.gyro_target_vx = 0.0
         controller.gyro_target_vy = 0.0
         controller.current_vx = 0.0
@@ -1291,13 +1344,38 @@ class VirtualController:
                 # Sync ZR/ZL for Gyro Mouse clicks
                 shared_zr = any(getattr(c, '_own_zr_pressed', False) for c in self.controllers)
                 shared_zl = any(getattr(c, '_own_zl_pressed', False) for c in self.controllers)
+
+                # Mode Shift back button: triggering it on either Joy-Con applies the Mode
+                # Shift mapping layer to both sides. Merged Joy-Cons use one shared Tap
+                # toggle; per-side toggles cannot be ORed because a right-side Tap must be
+                # able to close a left-side Tap-entered Mode Shift.
+                if not hasattr(self, '_mode_shift_shared_toggle'):
+                    self._mode_shift_shared_toggle = False
+                if getattr(controller, '_own_mode_shift_tap_edge', False):
+                    self._mode_shift_shared_toggle = not self._mode_shift_shared_toggle
+                    controller._own_mode_shift_tap_edge = False
+                shared_mode_shift_toggle = bool(self._mode_shift_shared_toggle)
+                shared_mode_shift_hold_pressed = any(getattr(c, '_own_mode_shift_hold_pressed', False) for c in self.controllers)
+                shared_mode_shift = shared_mode_shift_toggle != shared_mode_shift_hold_pressed
+
+                # Sync activation state before sharing gyro-derived outputs. In Hold mode,
+                # the per-side gyro_mouse_enabled flag is driven by the shared trigger.
+                if getattr(CONFIG, 'gyro_activation_mode', 'Hold') == 'Hold':
+                    for c in self.controllers:
+                        if getattr(CONFIG, "djg_enabled", False):
+                            c.gyro_mouse_enabled = getattr(c, '_own_gyro_trigger', False)
+                        else:
+                            c.gyro_mouse_enabled = shared_gyro
                 
                 # Sync Steer Value (From the gyro-active controller)
                 shared_steer = 0.0
                 shared_rs = (0.0, 0.0)
+                shared_gyro_rs = (0.0, 0.0)
                 for c in self.controllers:
                     if getattr(c, 'gyro_active', False):
                         shared_steer = getattr(c, '_own_steer_value', 0.0)
+                        if getattr(c, 'gyro_mouse_enabled', False) or shared_gyro:
+                            shared_gyro_rs = getattr(c, '_gyro_rstick_out', (0.0, 0.0))
                     if c.is_joycon_right():
                         shared_rs = inputData.right_stick if c == controller else getattr(c, '_last_rs', (0.0, 0.0))
 
@@ -1308,43 +1386,88 @@ class VirtualController:
                         c._shared_gyro_trigger = shared_gyro
                     c._shared_zr_pressed = shared_zr
                     c._shared_zl_pressed = shared_zl
+                    c._shared_mode_shift_toggle = shared_mode_shift_toggle
+                    c._shared_mode_shift_hold_pressed = shared_mode_shift_hold_pressed
+                    c._shared_mode_shift_active = shared_mode_shift
                     c._shared_steer_value = shared_steer
+                    c._shared_gyro_rstick_out = shared_gyro_rs
                     c._shared_right_stick = shared_rs
                 
                 if controller.is_joycon_right():
                     controller._last_rs = inputData.right_stick
                 
-                # Sync activation state across controllers for consistent steering/mouse behavior
-                # Only for Hold mode; Toggle mode naturally syncs via shared trigger
-                if getattr(CONFIG, 'gyro_activation_mode', 'Hold') == 'Hold':
-                    for c in self.controllers:
-                        if getattr(CONFIG, "djg_enabled", False):
-                            c.gyro_mouse_enabled = getattr(c, '_own_gyro_trigger', False)
-                        else:
-                            c.gyro_mouse_enabled = shared_gyro
             else:
                 # If not merged, ensure we don't use a stale shared steer value
                 controller._shared_steer_value = getattr(controller, '_own_steer_value', 0.0)
+                controller._shared_gyro_rstick_out = getattr(controller, '_gyro_rstick_out', (0.0, 0.0))
                 controller._shared_gyro_trigger = getattr(controller, '_own_gyro_trigger', False)
                 controller._shared_zr_pressed = getattr(controller, '_own_zr_pressed', False)
                 controller._shared_zl_pressed = getattr(controller, '_own_zl_pressed', False)
+                controller._shared_mode_shift_toggle = getattr(controller, '_own_mode_shift_toggle', False)
+                controller._shared_mode_shift_hold_pressed = getattr(controller, '_own_mode_shift_hold_pressed', False)
+                controller._shared_mode_shift_active = getattr(controller, '_own_mode_shift_active', False)
                 
             current_buttons = inputData.buttons 
             
-            # Disable right joystick signal to the game when Gyro Mouse is active (used exclusively for Stick Assist)
-            any_mouse_active = any(getattr(c, 'gyro_mouse_enabled', False) or getattr(c, 'jc_mouse_active', False) for c in self.controllers)
+            # Mouse mappings consume stick input in controller.py. Gyro mouse alone should not
+            # force-disable the virtual right stick.
+            any_mouse_active = any(getattr(c, 'jc_mouse_active', False) or getattr(c, 'joystick_mouse_active', False) for c in self.controllers)
             if any_mouse_active:
                 inputData.right_stick = (0.0, 0.0)
-            
+
+            # In-app Gyro "R Joystick" control mode: gyro motion drives the virtual right
+            # stick. Add the gyro-derived deflection from the gyro-active controller and
+            # clamp to the stick's maximum (unit magnitude).
+            gyro_rstick_overlay = (0.0, 0.0)
+            if getattr(CONFIG, "gyro_control_mode", "Mouse") == "R Joystick":
+                gyro_rs = (0.0, 0.0)
+                if is_merged:
+                    gyro_rs = getattr(controller, '_shared_gyro_rstick_out', (0.0, 0.0))
+                elif getattr(controller, 'gyro_mouse_enabled', False):
+                    gyro_rs = getattr(controller, '_gyro_rstick_out', (0.0, 0.0))
+                if gyro_rs[0] != 0.0 or gyro_rs[1] != 0.0:
+                    if controller.is_joycon():
+                        gyro_rstick_overlay = gyro_rs
+                    else:
+                        rx = inputData.right_stick[0] + gyro_rs[0]
+                        ry = inputData.right_stick[1] + gyro_rs[1]
+                        inputData.right_stick = (rx, ry)
+
             if len(self.controllers) == 1 and self.mode != "Switch1":
                 custom_btns = getattr(inputData, 'custom_buttons_mask', 0)
                 custom_btns &= current_buttons
                 current_buttons &= ~custom_btns
+                custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
+
+                def apply_custom_stick_route():
+                    if not custom_stick_route:
+                        return
+                    sx, sy = custom_stick_route.get("stick", (0, 0))
+                    if custom_stick_route.get("source") == "gyro":
+                        if self.hold_mode == "Horizontal":
+                            if controller.is_joycon_left():
+                                sx, sy = -sy, sx
+                            elif controller.is_joycon_right():
+                                sx, sy = sy, -sx
+                    elif self.hold_mode == "Horizontal":
+                        if custom_stick_route.get("source") == "left":
+                            sx, sy = -sy, sx
+                        elif custom_stick_route.get("source") == "right":
+                            sx, sy = sy, -sx
+                    if custom_stick_route.get("target") == "left":
+                        inputData.left_stick = (sx, sy)
+                        inputData.right_stick = (0, 0)
+                    elif custom_stick_route.get("target") == "right":
+                        inputData.left_stick = (0, 0)
+                        inputData.right_stick = (sx, sy)
 
                 if controller.is_joycon_left():
                     if self.hold_mode == "Vertical":
-                        inputData.right_stick = inputData.left_stick
-                        inputData.left_stick = (0, 0)
+                        if not custom_stick_route:
+                            inputData.right_stick = inputData.left_stick
+                            inputData.left_stick = (0, 0)
+                        else:
+                            apply_custom_stick_route()
                         
                         new_btns = current_buttons & ~(SWITCH_BUTTONS["UP"] | SWITCH_BUTTONS["DOWN"] | SWITCH_BUTTONS["LEFT"] | SWITCH_BUTTONS["RIGHT"] | SWITCH_BUTTONS["L"] | SWITCH_BUTTONS["ZL"] | SWITCH_BUTTONS["L_STK"] | SWITCH_BUTTONS["MINUS"])
                         
@@ -1368,9 +1491,12 @@ class VirtualController:
                         current_buttons = new_btns
                         
                     elif self.hold_mode == "Horizontal":
-                        lx, ly = inputData.left_stick
-                        inputData.left_stick = (-ly, lx)
-                        inputData.right_stick = (0, 0)
+                        if not custom_stick_route:
+                            lx, ly = inputData.left_stick
+                            inputData.left_stick = (-ly, lx)
+                            inputData.right_stick = (0, 0)
+                        else:
+                            apply_custom_stick_route()
                         
                         new_btns = current_buttons & ~(SWITCH_BUTTONS["UP"] | SWITCH_BUTTONS["DOWN"] | SWITCH_BUTTONS["LEFT"] | SWITCH_BUTTONS["RIGHT"] | SWITCH_BUTTONS["SL_L"] | SWITCH_BUTTONS["SR_L"] | SWITCH_BUTTONS["L"] | SWITCH_BUTTONS["ZL"] | SWITCH_BUTTONS["MINUS"])
                         
@@ -1391,10 +1517,14 @@ class VirtualController:
                         current_buttons = new_btns
                 elif controller.is_joycon_right():
                     if self.hold_mode == "Vertical":
-                        pass 
+                        if custom_stick_route:
+                            apply_custom_stick_route()
                     elif self.hold_mode == "Horizontal":
-                        rx, ry = inputData.right_stick
-                        inputData.right_stick = (ry, -rx)
+                        if not custom_stick_route:
+                            rx, ry = inputData.right_stick
+                            inputData.right_stick = (ry, -rx)
+                        else:
+                            apply_custom_stick_route()
                         new_btns = current_buttons & ~(SWITCH_BUTTONS["X"] | SWITCH_BUTTONS["Y"] | SWITCH_BUTTONS["A"] | SWITCH_BUTTONS["B"] | SWITCH_BUTTONS["SL_R"] | SWITCH_BUTTONS["SR_R"] | SWITCH_BUTTONS["R"] | SWITCH_BUTTONS["ZR"] | SWITCH_BUTTONS["PLUS"] | SWITCH_BUTTONS["R_STK"])
                         
                         if is_switch_layout:
@@ -1415,6 +1545,8 @@ class VirtualController:
                         current_buttons = new_btns
                 
                 current_buttons |= custom_btns
+
+            inputData.gyro_rstick_overlay = gyro_rstick_overlay
                     
             if len(self.controllers) == 2:
                 buttonsConfig = CONFIG.dual_joycons_config
@@ -1636,10 +1768,17 @@ class VirtualController:
 
         lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
         gx, gy, gz, ax, ay, az = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
 
         if device_type == "L":
-            lx = inputData.left_stick[0]
-            ly = inputData.left_stick[1]
+            if custom_stick_route:
+                lx = inputData.left_stick[0]
+                ly = inputData.left_stick[1]
+                rx = inputData.right_stick[0]
+                ry = inputData.right_stick[1]
+            else:
+                lx = inputData.left_stick[0]
+                ly = inputData.left_stick[1]
             
             if hold_mode == "Vertical":
                 _gmap = lambda g: (g[1] * jc_gyro_scale, -g[0] * jc_gyro_scale, g[2] * jc_gyro_scale * jc_yaw_mult)
@@ -1652,8 +1791,14 @@ class VirtualController:
                 lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
 
         elif device_type == "R": # device_type == "R"
-            rx = inputData.right_stick[0]
-            ry = inputData.right_stick[1]
+            if custom_stick_route:
+                lx = inputData.left_stick[0]
+                ly = inputData.left_stick[1]
+                rx = inputData.right_stick[0]
+                ry = inputData.right_stick[1]
+            else:
+                rx = inputData.right_stick[0]
+                ry = inputData.right_stick[1]
             
             if hold_mode == "Vertical":
                 _gmap = lambda g: (g[1] * jc_gyro_scale, g[0] * jc_gyro_scale, -g[2] * jc_gyro_scale * jc_yaw_mult)
@@ -1675,6 +1820,8 @@ class VirtualController:
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 lx = getattr(controller, '_shared_steer_value', getattr(controller, '_own_steer_value', 0.0))
+
+        rx, ry = self._add_gyro_rstick_overlay(rx, ry, inputData)
 
         def float_to_12bit(val):
             return int(max(0, min(4095, round((val + 1.0) * 2047.5))))
@@ -1790,6 +1937,18 @@ class VirtualController:
                 state = self._build_switch1_report(inputData, buttons, controller, device_type="Pro")
                 self.usbip_server_pro.update_state(state)
 
+    def _add_gyro_rstick_overlay(self, rx, ry, inputData):
+        gx, gy = getattr(inputData, "gyro_rstick_overlay", (0.0, 0.0))
+        if gx == 0.0 and gy == 0.0:
+            return rx, ry
+        rx += gx
+        ry += gy
+        mag = (rx * rx + ry * ry) ** 0.5
+        if mag > 1.0:
+            rx /= mag
+            ry /= mag
+        return rx, ry
+
     def update_as_ps4(self, inputData: ControllerInputData, buttons: int, controller: Controller):
 
         with self.state_lock:
@@ -1873,8 +2032,23 @@ class VirtualController:
                 self.last_gx = 0; self.last_gy = 0; self.last_gz = 0
                 self.last_ax = 0; self.last_ay = 0; self.last_az = 0
 
+            custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
             if len(self.controllers) == 1:
-                if controller.is_joycon_right():
+                if not controller.is_joycon() and (
+                    self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                    self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+                ):
+                    mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                    self.last_lx = float_to_byte(mixed_left[0])
+                    self.last_ly = float_to_byte(-mixed_left[1])
+                    self.last_rx = float_to_byte(mixed_right[0])
+                    self.last_ry = float_to_byte(-mixed_right[1])
+                elif custom_stick_route:
+                    self.last_lx = float_to_byte(inputData.left_stick[0])
+                    self.last_ly = float_to_byte(-inputData.left_stick[1])
+                    self.last_rx = float_to_byte(inputData.right_stick[0])
+                    self.last_ry = float_to_byte(-inputData.right_stick[1])
+                elif controller.is_joycon_right():
                     if self.hold_mode == "Vertical":
                         self.last_rx = int(max(0, min(255, round(inputData.right_stick[0] * 127.5 + 128))))
                         self.last_ry = int(max(0, min(255, round(-inputData.right_stick[1] * 127.5 + 128))))
@@ -1883,11 +2057,19 @@ class VirtualController:
                     else:
                         self.last_lx = float_to_byte(inputData.right_stick[0])
                         self.last_ly = float_to_byte(-inputData.right_stick[1])
+                        self.last_rx = 128
+                        self.last_ry = 128
                 else:
                     self.last_lx = float_to_byte(inputData.left_stick[0])
                     self.last_ly = float_to_byte(-inputData.left_stick[1])
                     self.last_rx = float_to_byte(inputData.right_stick[0])
                     self.last_ry = float_to_byte(-inputData.right_stick[1])
+
+                rx_float = (self.last_rx - 128) / 127.5
+                ry_float = -((self.last_ry - 128) / 127.5)
+                rx_float, ry_float = self._add_gyro_rstick_overlay(rx_float, ry_float, inputData)
+                self.last_rx = float_to_byte(rx_float)
+                self.last_ry = float_to_byte(-ry_float)
                 
                 if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
                     if controller.is_joycon_right():
@@ -1912,13 +2094,13 @@ class VirtualController:
                     self.last_ay = inputData.accelerometer[2]
                     self.last_az = -inputData.accelerometer[1]
             else:
-                if controller.is_joycon_left():
-                    self.last_lx = float_to_byte(inputData.left_stick[0])
-                    self.last_ly = float_to_byte(-inputData.left_stick[1])
-                elif controller.is_joycon_right():
-                    self.last_rx = float_to_byte(inputData.right_stick[0])
-                    self.last_ry = float_to_byte(-inputData.right_stick[1])
-                    
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
+                self.last_lx = float_to_byte(mixed_left[0])
+                self.last_ly = float_to_byte(-mixed_left[1])
+                self.last_rx = float_to_byte(mixed_right[0])
+                self.last_ry = float_to_byte(-mixed_right[1])
+
                 is_passthrough_source = False
                 if getattr(CONFIG, "djg_enabled", False):
                     dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
@@ -1931,7 +2113,7 @@ class VirtualController:
                         is_passthrough_source = True
                     elif controller.is_joycon_right() and self.active_gyro_side == "Right":
                         is_passthrough_source = True
-                        
+
                 if is_passthrough_source:
                     self.last_gx = inputData.gyroscope[0]
                     self.last_gy = inputData.gyroscope[2]
@@ -2076,8 +2258,23 @@ class VirtualController:
             self.last_gx = 0; self.last_gy = 0; self.last_gz = 0
             self.last_ax = 0; self.last_ay = 0; self.last_az = 0
 
+        custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
         if len(self.controllers) == 1:
-            if controller.is_joycon_right():
+            if not controller.is_joycon() and (
+                self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+            ):
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                self.last_lx = float_to_byte(mixed_left[0])
+                self.last_ly = float_to_byte(-mixed_left[1])
+                self.last_rx = float_to_byte(mixed_right[0])
+                self.last_ry = float_to_byte(-mixed_right[1])
+            elif custom_stick_route:
+                self.last_lx = float_to_byte(inputData.left_stick[0])
+                self.last_ly = float_to_byte(-inputData.left_stick[1])
+                self.last_rx = float_to_byte(inputData.right_stick[0])
+                self.last_ry = float_to_byte(-inputData.right_stick[1])
+            elif controller.is_joycon_right():
                 if self.hold_mode == "Vertical":
                     self.last_rx = int(max(0, min(255, round(inputData.right_stick[0] * 127.5 + 128))))
                     self.last_ry = int(max(0, min(255, round(-inputData.right_stick[1] * 127.5 + 128))))
@@ -2086,11 +2283,19 @@ class VirtualController:
                 else:
                     self.last_lx = float_to_byte(inputData.right_stick[0])
                     self.last_ly = float_to_byte(-inputData.right_stick[1])
+                    self.last_rx = 128
+                    self.last_ry = 128
             else:
                 self.last_lx = float_to_byte(inputData.left_stick[0])
                 self.last_ly = float_to_byte(-inputData.left_stick[1])
                 self.last_rx = float_to_byte(inputData.right_stick[0])
                 self.last_ry = float_to_byte(-inputData.right_stick[1])
+
+            rx_float = (self.last_rx - 128) / 127.5
+            ry_float = -((self.last_ry - 128) / 127.5)
+            rx_float, ry_float = self._add_gyro_rstick_overlay(rx_float, ry_float, inputData)
+            self.last_rx = float_to_byte(rx_float)
+            self.last_ry = float_to_byte(-ry_float)
             
             if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
                 if controller.is_joycon_right():
@@ -2115,13 +2320,13 @@ class VirtualController:
                 self.last_ay = inputData.accelerometer[2]
                 self.last_az = -inputData.accelerometer[1]
         else:
-            if controller.is_joycon_left():
-                self.last_lx = float_to_byte(inputData.left_stick[0])
-                self.last_ly = float_to_byte(-inputData.left_stick[1])
-            elif controller.is_joycon_right():
-                self.last_rx = float_to_byte(inputData.right_stick[0])
-                self.last_ry = float_to_byte(-inputData.right_stick[1])
-                
+            mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+            mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
+            self.last_lx = float_to_byte(mixed_left[0])
+            self.last_ly = float_to_byte(-mixed_left[1])
+            self.last_rx = float_to_byte(mixed_right[0])
+            self.last_ry = float_to_byte(-mixed_right[1])
+
             is_passthrough_source = False
             if getattr(CONFIG, "djg_enabled", False):
                 dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
@@ -2224,28 +2429,18 @@ class VirtualController:
             # Phase 1: Button Mapping (Respects GUI layout setting)
             xb_btns = 0
             
-            if self.mode == "Xbox360":
-                if CONFIG.abxy_mode == "Switch":
-                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["Y"]
-                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["X"]
-                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["B"]
-                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["A"]
-                else:
-                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["Y"]
-                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["X"]
-                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["B"]
-                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["A"]
-            else:
-                if CONFIG.abxy_mode == "Switch":
-                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
-                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
-                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
-                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
-                else:
-                    if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
-                    if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
-                    if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
-                    if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
+            if CONFIG.abxy_mode == "Xbox":
+                # When UI says "Xbox", we want "Switch layout" (positional match)
+                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
+                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
+                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
+                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
+            else: # Switch layout in UI
+                # When UI says "Switch", we want "Xbox layout" (name match)
+                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
+                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
+                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["A"]
+                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["B"]
                     
             if buttons & SWITCH_BUTTONS["L"]: xb_btns |= XB_BUTTONS["LB"]
             if buttons & SWITCH_BUTTONS["R"]: xb_btns |= XB_BUTTONS["RB"]
@@ -2275,8 +2470,23 @@ class VirtualController:
                 self.last_xb_lx = 0.0; self.last_xb_ly = 0.0
                 self.last_xb_rx = 0.0; self.last_xb_ry = 0.0
  
+            custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
             if len(self.controllers) == 1:
-                if controller.is_joycon_right():
+                if not controller.is_joycon() and (
+                    self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                    self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+                ):
+                    mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                    self.last_xb_lx = mixed_left[0]
+                    self.last_xb_ly = -mixed_left[1]
+                    self.last_xb_rx = mixed_right[0]
+                    self.last_xb_ry = -mixed_right[1]
+                elif custom_stick_route:
+                    self.last_xb_lx = inputData.left_stick[0]
+                    self.last_xb_ly = -inputData.left_stick[1]
+                    self.last_xb_rx = inputData.right_stick[0]
+                    self.last_xb_ry = -inputData.right_stick[1]
+                elif controller.is_joycon_right():
                     if self.hold_mode == "Vertical":
                         self.last_xb_rx = inputData.right_stick[0]
                         self.last_xb_ry = -inputData.right_stick[1]
@@ -2284,18 +2494,23 @@ class VirtualController:
                     else:
                         self.last_xb_lx = inputData.right_stick[0]
                         self.last_xb_ly = -inputData.right_stick[1]
+                        self.last_xb_rx = 0.0
+                        self.last_xb_ry = 0.0
                 else:
                     self.last_xb_lx = inputData.left_stick[0]
                     self.last_xb_ly = -inputData.left_stick[1]
                     self.last_xb_rx = inputData.right_stick[0]
                     self.last_xb_ry = -inputData.right_stick[1]
             else:
-                if controller.is_joycon_left():
-                    self.last_xb_lx = inputData.left_stick[0]
-                    self.last_xb_ly = -inputData.left_stick[1]
-                elif controller.is_joycon_right():
-                    self.last_xb_rx = inputData.right_stick[0]
-                    self.last_xb_ry = -inputData.right_stick[1]
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                self.last_xb_lx = mixed_left[0]
+                self.last_xb_ly = -mixed_left[1]
+                self.last_xb_rx = mixed_right[0]
+                self.last_xb_ry = -mixed_right[1]
+
+            rx_float, ry_float = self._add_gyro_rstick_overlay(self.last_xb_rx, -self.last_xb_ry, inputData)
+            self.last_xb_rx = rx_float
+            self.last_xb_ry = -ry_float
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 self.last_xb_lx = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
@@ -3323,14 +3538,15 @@ class VirtualController:
         
         # Safeguard GL/GR for Joycons: only allow if mapped
         if controller.is_joycon():
+            mapping_scope = self._controller_mapping_scope(controller)
             joycon_mappings = [
-                getattr(CONFIG, "home_mapping", "Default"),
-                getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc"),
-                getattr(CONFIG, "c_mapping", "Default"),
-                getattr(CONFIG, "sll_mapping", "Default"),
-                getattr(CONFIG, "srl_mapping", "Default"),
-                getattr(CONFIG, "slr_mapping", "Default"),
-                getattr(CONFIG, "srr_mapping", "Default"),
+                CONFIG.get_mapping_setting_scoped("home", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("capt", "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("c", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("sll", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("srl", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("slr", "Default", mapping_scope),
+                CONFIG.get_mapping_setting_scoped("srr", "Default", mapping_scope),
             ]
             if "GL" not in joycon_mappings:
                 buttons &= ~SWITCH_BUTTONS.get("GL", 0x02000000)
@@ -3343,8 +3559,23 @@ class VirtualController:
         state[8] = b8
 
         # Joystick and IMU routing
+        custom_stick_route = getattr(inputData, 'custom_joystick_mapping', None)
         if len(self.controllers) == 1:
-            if controller.is_joycon_right():
+            if not controller.is_joycon() and (
+                self._joystick_mapping_mode("l_joystick", controller) in ("L Joystick", "R Joystick") or
+                self._joystick_mapping_mode("r_joystick", controller) in ("L Joystick", "R Joystick")
+            ):
+                mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+                self.last_s2_lx = mixed_left[0]
+                self.last_s2_ly = mixed_left[1]
+                self.last_s2_rx = mixed_right[0]
+                self.last_s2_ry = mixed_right[1]
+            elif custom_stick_route:
+                self.last_s2_lx = inputData.left_stick[0]
+                self.last_s2_ly = inputData.left_stick[1]
+                self.last_s2_rx = inputData.right_stick[0]
+                self.last_s2_ry = inputData.right_stick[1]
+            elif controller.is_joycon_right():
                 if self.hold_mode == "Vertical":
                     self.last_s2_rx = inputData.right_stick[0]
                     self.last_s2_ry = inputData.right_stick[1]
@@ -3353,11 +3584,19 @@ class VirtualController:
                 else: # Horizontal
                     self.last_s2_lx = inputData.right_stick[0]
                     self.last_s2_ly = inputData.right_stick[1]
+                    self.last_s2_rx = 0.0
+                    self.last_s2_ry = 0.0
             else: # Joycon Left or Pro Controller
                 self.last_s2_lx = inputData.left_stick[0]
                 self.last_s2_ly = inputData.left_stick[1]
                 self.last_s2_rx = inputData.right_stick[0]
                 self.last_s2_ry = inputData.right_stick[1]
+
+            self.last_s2_rx, self.last_s2_ry = self._add_gyro_rstick_overlay(
+                self.last_s2_rx,
+                self.last_s2_ry,
+                inputData,
+            )
             
             if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
                 if controller.is_joycon_right():
@@ -3382,12 +3621,12 @@ class VirtualController:
                 self.last_s2_ay = inputData.accelerometer[2]
                 self.last_s2_az = -inputData.accelerometer[1]
         else: # Dual Joycons (len == 2)
-            if controller.is_joycon_left():
-                self.last_s2_lx = inputData.left_stick[0]
-                self.last_s2_ly = inputData.left_stick[1]
-            elif controller.is_joycon_right():
-                self.last_s2_rx = inputData.right_stick[0]
-                self.last_s2_ry = inputData.right_stick[1]
+            mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
+            mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
+            self.last_s2_lx = mixed_left[0]
+            self.last_s2_ly = mixed_left[1]
+            self.last_s2_rx = mixed_right[0]
+            self.last_s2_ry = mixed_right[1]
                 
             if getattr(controller, 'gyro_active', False):
                 self.last_s2_gx = inputData.gyroscope[0]

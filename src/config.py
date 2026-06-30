@@ -7,6 +7,19 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+# Use the libyaml C loader/dumper when available. It is ~6x faster than the pure
+# Python implementation and releases the GIL during (de)serialization, which keeps
+# the Tkinter main thread responsive while the config is saved on a background
+# thread (otherwise large configs cause a UI freeze, e.g. when switching profiles).
+try:
+    _YamlLoader = yaml.CSafeLoader
+except AttributeError:
+    _YamlLoader = yaml.SafeLoader
+try:
+    _YamlDumper = yaml.CDumper
+except AttributeError:
+    _YamlDumper = yaml.Dumper
+
 # (Standalone save_config removed as requested)
 
 SWITCH_BUTTONS = {
@@ -44,10 +57,171 @@ SWITCH_BUTTONS = {
 }
 
 BACK_BUTTON_OPTIONS = [
-    "Default", "Custom", "Gyro", "DJG", "Calibration", "Sys Manager", "Change Profile", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click", 
-    "A", "B", "X", "Y", "L", "R", "ZL", "ZR", 
+    "Default", "Custom", "In-app Gyro", "Gyro Lock", "DJG", "Mode Shift", "Calibration", "Sys Manager", "Change Profile", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click",
+    "A", "B", "X", "Y", "L", "R", "ZL", "ZR",
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR"
 ]
+
+# Back Button Option floating selector layout. Each entry is (category title, rows),
+# where a row is a list of stored tokens (the value get()/set() round-trips through
+# config). The tokens are shown to the user via BACK_BUTTON_LABELS. The wide Switch
+# Input block intentionally spans three rows under a single header.
+BACK_BUTTON_CATEGORIES = [
+    ("General", [
+        ["Default", "Custom", "Mode Shift", "Change Profile"],
+    ]),
+    ("In-app Gyro", [
+        ["In-app Gyro", "Gyro Lock", "DJG", "Calibration"],
+    ]),
+    ("Switch Input", [
+        ["ZL", "L", "MINUS", "Capture", "L_STK", "A", "X"],
+        ["ZR", "R", "PLUS", "Home", "R_STK", "B", "Y"],
+        ["UP", "DOWN", "LEFT", "RIGHT", "Chat", "GL", "GR"],
+    ]),
+    ("PS Input", [
+        ["PS_L_Touch", "PS_R_Touch", "PS_C_Click", "Mute"],
+    ]),
+    ("Windows", [
+        ["Game Bar", "PrtSc", "Sys Manager", "HDR Toggle"],
+    ]),
+]
+
+# Display labels for tokens whose stored name differs from what the user should see.
+# Tokens not listed here are shown verbatim (e.g. "Default", "A", "Home", "Gyro Lock").
+BACK_BUTTON_LABELS = {
+    "MINUS": "Minus",
+    "PLUS": "Plus",
+    "L_STK": "L Joystick Click",
+    "R_STK": "R Joystick Click",
+    "UP": "Dpad Up",
+    "DOWN": "Dpad Down",
+    "LEFT": "Dpad Left",
+    "RIGHT": "Dpad Right",
+    "PS_L_Touch": "Trackpad L Touch",
+    "PS_R_Touch": "Trackpad R Touch",
+    "PS_C_Click": "Trackpad Center Click",
+    "PrtSc": "Print Screen",
+}
+
+
+def back_button_label(token):
+    """Friendly display label for a Back Button Option token (falls back to the token)."""
+    return BACK_BUTTON_LABELS.get(token, token)
+
+JOYSTICK_OPTIONS = ["Default", "R Joystick", "L Joystick", "WASD", "Mouse", "Scroll Wheel", "Custom"]
+
+# In-app Gyro Lock: a Back Button Option that pauses gyro control while staying in
+# In-app Gyro mode. Stored in the Custom recorder form as "Custom[Hold|Tap]:GYRO_LOCK".
+GYRO_LOCK_TOKEN = "GYRO_LOCK"
+GYRO_LOCK_LABEL = "Gyro Lock"
+
+# Mode Shift: a Back Button Option that applies the Mode Shift Mapping layer (the
+# per-Gyro-Control In-app Gyro mapping store) while held (Hold) or toggled (Tap),
+# independently of whether In-app Gyro mode is active. Stored in the Custom recorder
+# form as "Custom[Hold|Tap]:MODE_SHIFT".
+MODE_SHIFT_TOKEN = "MODE_SHIFT"
+MODE_SHIFT_LABEL = "Mode Shift"
+
+# Default Mode Shift auto-apply state per Gyro Control mode. When On, entering In-app
+# Gyro mode automatically applies the Mode Shift Mapping layer; when Off the layer is
+# applied only via the "Mode Shift" back button.
+MODE_SHIFT_ENABLED_DEFAULTS = {"Mouse": True, "R Joystick": False, "Steering": False}
+
+SHARED_BUTTON_MAPPING_DEFAULTS = {
+    "plus_mapping": "Default",
+    "minus_mapping": "Default",
+    "a_mapping": "Default",
+    "b_mapping": "Default",
+    "x_mapping": "Default",
+    "y_mapping": "Default",
+    "up_mapping": "Default",
+    "down_mapping": "Default",
+    "left_mapping": "Default",
+    "right_mapping": "Default",
+    "zl_mapping": "Default",
+    "l_mapping": "Default",
+    "zr_mapping": "Default",
+    "r_mapping": "Default",
+    "l_stk_mapping": "Default",
+    "r_stk_mapping": "Default",
+    "l_joystick_mapping": "Default",
+    "r_joystick_mapping": "Default",
+    "l_joystick_mouse_sensitivity": 5.0,
+    "r_joystick_mouse_sensitivity": 5.0,
+    "l_joystick_scroll_mode": "Up/Down",
+    "r_joystick_scroll_mode": "Up/Down",
+    "l_joystick_scroll_activation": "Hold",
+    "r_joystick_scroll_activation": "Hold",
+}
+
+JOYSTICK_CUSTOM_DEFAULTS = {
+    "l_joystick_custom": {"up": "Default", "down": "Default", "left": "Default", "right": "Default"},
+    "r_joystick_custom": {"up": "Default", "down": "Default", "left": "Default", "right": "Default"},
+}
+
+MAPPING_SCOPE_IN_APP_GYRO = "in_app_gyro_mode_mappings"
+
+def build_in_app_gyro_mapping_defaults(stick_mouse_sensitivity=20.0):
+    defaults = {key: "Default" for key in SHARED_BUTTON_MAPPING_DEFAULTS}
+    for key in (
+        "home_mapping", "capt_mapping", "c_mapping",
+        "gl_mapping", "gr_mapping",
+        "sll_mapping", "srl_mapping", "slr_mapping", "srr_mapping",
+        "gc_l_click_mapping", "gc_r_click_mapping",
+    ):
+        defaults[key] = "Default"
+    defaults.update({
+        "l_joystick_mouse_sensitivity": float(stick_mouse_sensitivity),
+        "r_joystick_mouse_sensitivity": float(stick_mouse_sensitivity),
+        "l_joystick_scroll_mode": "Up/Down",
+        "r_joystick_scroll_mode": "Up/Down",
+        "l_joystick_scroll_activation": "Hold",
+        "r_joystick_scroll_activation": "Hold",
+        "zl_mapping": "Custom[Hold]:MB_3",
+        "zr_mapping": "Custom[Hold]:MB_1",
+        "r_joystick_mapping": "Mouse",
+        "gc_trigger_mode": "Hair Trigger",
+        "gc_l_click_mapping": "Custom[Hold]:MB_3",
+        "gc_r_click_mapping": "Custom[Hold]:MB_1",
+    })
+    for custom_key, custom_defaults in JOYSTICK_CUSTOM_DEFAULTS.items():
+        defaults[custom_key] = custom_defaults.copy()
+    return defaults
+
+# Separate In-app Gyro Mode Mapping store used when Gyro Control == "R Joystick".
+# Unlike the Mouse store, every button defaults to "Default" (no mouse clicks), and
+# the Analog Trigger 100% (gc_trigger_mode) reset default mirrors the emulation mode.
+MAPPING_SCOPE_IN_APP_GYRO_RSTICK = "in_app_gyro_rstick_mode_mappings"
+
+def build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default="Hair Trigger"):
+    defaults = {key: "Default" for key in SHARED_BUTTON_MAPPING_DEFAULTS}
+    for key in (
+        "home_mapping", "capt_mapping", "c_mapping",
+        "gl_mapping", "gr_mapping",
+        "sll_mapping", "srl_mapping", "slr_mapping", "srr_mapping",
+        "gc_l_click_mapping", "gc_r_click_mapping",
+        "zl_mapping", "zr_mapping",
+        "l_joystick_mapping", "r_joystick_mapping",
+    ):
+        defaults[key] = "Default"
+    defaults.update({
+        "l_joystick_scroll_mode": "Up/Down",
+        "r_joystick_scroll_mode": "Up/Down",
+        "l_joystick_scroll_activation": "Hold",
+        "r_joystick_scroll_activation": "Hold",
+        "gc_trigger_mode": gc_trigger_default,
+    })
+    for custom_key, custom_defaults in JOYSTICK_CUSTOM_DEFAULTS.items():
+        defaults[custom_key] = custom_defaults.copy()
+    return defaults
+
+# Separate Mode Shift Mapping store used when Gyro Control == "Steering". Mirrors the
+# R Joystick store (every button defaults to "Default"); kept as its own scope so the
+# Steering Mode Shift layer persists independently of the Mouse/R Joystick stores.
+MAPPING_SCOPE_IN_APP_GYRO_STEERING = "in_app_gyro_steering_mode_mappings"
+
+def build_in_app_gyro_steering_mapping_defaults(gc_trigger_default="Hair Trigger"):
+    return build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default)
 
 XB_BUTTONS = {
     "UP": 0x0001,
@@ -222,7 +396,7 @@ class Config:
         config = {}
         try:
             with open(self.config_file_path, 'r', encoding='utf-8') as cf:
-                config = yaml.safe_load(cf) or {}
+                config = yaml.load(cf, Loader=_YamlLoader) or {}
         except Exception as e:
             logger.error(f"Error loading config file: {e}")
 
@@ -230,15 +404,6 @@ class Config:
         self.deadzone = config.get("deadzone", 50)
         self.controller_mode = config.get("controller_mode", "Xbox")
         self.ui_scale = float(config.get("ui_scale", 1.0))
-
-        # NSO GameCube Controller rumble PWM settings
-        self.gcn_rumble_pwm_enabled     = bool(config.get("gcn_rumble_pwm_enabled",   True))
-        self.gcn_rumble_brake_enabled   = bool(config.get("gcn_rumble_brake_enabled", False))
-        self.gcn_rumble_brake_threshold = float(config.get("gcn_rumble_brake_threshold", 0.65))
-        self.gcn_rumble_gamma           = float(config.get("gcn_rumble_gamma",         0.75))
-        self.gcn_rumble_deadzone        = float(config.get("gcn_rumble_deadzone",      0.04))
-        self.gcn_rumble_left_weight     = float(config.get("gcn_rumble_left_weight",   0.85))
-        self.gcn_rumble_right_weight    = float(config.get("gcn_rumble_right_weight",  0.45))
 
         btns = config.get("buttons", {})
         self.dual_joycons_config = ButtonConfig(btns.get("dual_joycons", {}))
@@ -250,6 +415,11 @@ class Config:
         # Define categories and defaults for button remaps
         self.active_profile = config.get("active_profile", "Default")
         self.profiles = config.get("profiles", {})
+        self.profile_switching_combo_trigger = config.get("profile_switching_combo_trigger", "")
+        # Change Profile behavior: "Auto" cycles + auto-applies after inactivity;
+        # "Manual" opens a selection notification navigated by stick/Dpad + A/B.
+        self.change_profile_mode = config.get("change_profile_mode", "Manual")
+        self.profile_setting_defaults = self._build_profile_setting_defaults(config)
         
         # Migration from old button_remaps
         old_button_remaps = config.get("button_remaps", {})
@@ -269,17 +439,13 @@ class Config:
         categories = ["xbox", "ps4", "ps5_winuhid", "ps5_usbip", "switch1", "switch2"]
         old_hold_mode = config.get("joycon_hold_mode", {}) or {}
         
-        # Migrate old root level gyro_passthrough_mode to active profile
-        old_gyro_passthrough = config.get("gyro_passthrough_mode")
-        if old_gyro_passthrough is not None and self.active_profile in self.profiles:
-            if "gyro_passthrough_mode" not in self.profiles[self.active_profile]:
-                self.profiles[self.active_profile]["gyro_passthrough_mode"] = old_gyro_passthrough
-        
-        # Migrate old root level steam_roll_compensation to active profile
-        old_steam_roll = config.get("steam_roll_compensation")
-        if old_steam_roll is not None and self.active_profile in self.profiles:
-            if "steam_roll_compensation" not in self.profiles[self.active_profile]:
-                self.profiles[self.active_profile]["steam_roll_compensation"] = old_steam_roll
+        profile_setting_defaults = self.get_default_profile_settings()
+        for prof_name, prof_data in self.profiles.items():
+            prof_data.setdefault("change_profile_list", False)
+            prof_data.setdefault("profile_switching_combo", "")
+            for key, def_val in profile_setting_defaults.items():
+                if key not in prof_data:
+                    prof_data[key] = config.get(key, def_val) if prof_name == self.active_profile else def_val
         
         # Populate each category for all profiles
         for prof_name, prof_data in self.profiles.items():
@@ -328,12 +494,9 @@ class Config:
                         if key == "rumble_mode" and val == "PC":
                             val = "Xbox"
                         prof_data[cat][key] = val
+                self.ensure_mapping_scope(cat, MAPPING_SCOPE_IN_APP_GYRO)
         
-        self.gyro_mode = config.get("gyro_mode", "World")
-        self.gyro_sensitivity = float(config.get("gyro_sensitivity", 0.3))
         self.gyro_smoothing = 0.0 
-        self.gyro_activation_mode = config.get("gyro_activation_mode", "Toggle")
-        self.stick_mouse_sensitivity = float(config.get("stick_mouse_sensitivity", 20.0))
         
         self.gyro_bias_l = config.get("gyro_bias_l", [0.0, 0.0, 0.0])
         self.gyro_bias_r = config.get("gyro_bias_r", [0.0, 0.0, 0.0])
@@ -351,12 +514,6 @@ class Config:
         
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
-        self.stabilized_gyro = config.get("stabilized_gyro", False)
-        val = config.get("virtual_gyro_soft_deadzone", 2.0)
-        if isinstance(val, bool):
-            self.virtual_gyro_soft_deadzone = 2.0 if val else 0.0
-        else:
-            self.virtual_gyro_soft_deadzone = float(val)
         self.driver_installed = config.get("driver_installed", False)
         self.driver_type = config.get("driver_type", "WinUHid")
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
@@ -419,6 +576,53 @@ class Config:
         # abxy_mode, rumble_mode, vibration_strength, vibration_frequency are now properties managed per Emu Mode category
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
+
+    def _build_profile_setting_defaults(self, config):
+        saved_defaults = config.get("profile_defaults", {})
+        if isinstance(saved_defaults, dict) and saved_defaults:
+            config = {**config, **saved_defaults}
+        deadzone = config.get("virtual_gyro_soft_deadzone", 2.0)
+        if isinstance(deadzone, bool):
+            deadzone = 2.0 if deadzone else 0.0
+        return {
+            "gyro_mode": config.get("gyro_mode", "World"),
+            "gyro_control_mode": config.get("gyro_control_mode", "Mouse"),
+            "gyro_sensitivity": float(config.get("gyro_sensitivity", 0.3)),
+            "r_joystick_gyro_sensitivity": float(config.get("r_joystick_gyro_sensitivity", 5.0)),
+            "gyro_activation_mode": config.get("gyro_activation_mode", "Toggle"),
+            "stick_mouse_sensitivity": float(config.get("stick_mouse_sensitivity", 20.0)),
+            "stabilized_gyro": bool(config.get("stabilized_gyro", False)),
+            "virtual_gyro_soft_deadzone": float(deadzone),
+            "gyro_passthrough_mode": config.get("gyro_passthrough_mode", "Default"),
+            "cemuhook_sensitivity": int(config.get("cemuhook_sensitivity", 1)),
+            "steam_roll_compensation": bool(config.get("steam_roll_compensation", False)),
+            "djg_enabled": bool(config.get("djg_enabled", False)),
+            "djg_dominant_side": config.get("djg_dominant_side", "Right"),
+            "djg_mode": config.get("djg_mode", "Switch Dominant Side"),
+            "djg_activation": config.get("djg_activation", "Hold"),
+        }
+
+    def get_default_profile_settings(self):
+        defaults = getattr(self, "profile_setting_defaults", None)
+        if defaults:
+            return defaults.copy()
+        return {
+            "gyro_mode": "World",
+            "gyro_control_mode": "Mouse",
+            "gyro_sensitivity": 0.3,
+            "r_joystick_gyro_sensitivity": 5.0,
+            "gyro_activation_mode": "Toggle",
+            "stick_mouse_sensitivity": 20.0,
+            "stabilized_gyro": False,
+            "virtual_gyro_soft_deadzone": 2.0,
+            "gyro_passthrough_mode": "Default",
+            "cemuhook_sensitivity": 1,
+            "steam_roll_compensation": False,
+            "djg_enabled": False,
+            "djg_dominant_side": "Right",
+            "djg_mode": "Switch Dominant Side",
+            "djg_activation": "Hold",
+        }
 
     @property
     def button_remaps(self):
@@ -497,10 +701,20 @@ class Config:
             }
         }
         for cat_data in defaults.values():
+            cat_data.update(SHARED_BUTTON_MAPPING_DEFAULTS)
+            for custom_key, custom_defaults in JOYSTICK_CUSTOM_DEFAULTS.items():
+                cat_data.setdefault(custom_key, custom_defaults.copy())
+            scoped_defaults = build_in_app_gyro_mapping_defaults(self.get_default_profile_settings().get("stick_mouse_sensitivity", 20.0))
+            cat_data.setdefault(MAPPING_SCOPE_IN_APP_GYRO, scoped_defaults)
             if "gc_l_click_mapping" not in cat_data:
                 cat_data["gc_l_click_mapping"] = "Default"
             if "gc_r_click_mapping" not in cat_data:
                 cat_data["gc_r_click_mapping"] = "Default"
+            for key, val in list(cat_data.items()):
+                if key == MAPPING_SCOPE_IN_APP_GYRO:
+                    continue
+                if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS:
+                    cat_data[MAPPING_SCOPE_IN_APP_GYRO].setdefault(key, val.copy() if isinstance(val, dict) else val)
         return defaults.get(cat, defaults["xbox"]).copy()
 
     def get_default_profile_dict(self):
@@ -508,15 +722,11 @@ class Config:
         prof_data = {
             "driver_type": "WinUHid",
             "simulation_mode": "PS5",
-            "gyro_passthrough_mode": "Default",
-            "cemuhook_sensitivity": 1,
-            "steam_roll_compensation": False,
-            "djg_enabled": False, 
-            "djg_dominant_side": "Right", 
-            "djg_mode": "Switch Dominant Side",
-            "djg_activation": "Hold",
-            "assigned_apps": []
+            "assigned_apps": [],
+            "change_profile_list": False,
+            "profile_switching_combo": ""
         }
+        prof_data.update(self.get_default_profile_settings())
         for cat in categories:
             prof_data[cat] = self.get_default_category_dict(cat)
             prof_data[cat]["joycon_hold_mode"] = {}
@@ -692,10 +902,20 @@ class Config:
             }
         }
         for cat_data in defaults.values():
+            cat_data.update(SHARED_BUTTON_MAPPING_DEFAULTS)
+            for custom_key, custom_defaults in JOYSTICK_CUSTOM_DEFAULTS.items():
+                cat_data.setdefault(custom_key, custom_defaults.copy())
+            scoped_defaults = build_in_app_gyro_mapping_defaults(self.get_default_profile_settings().get("stick_mouse_sensitivity", 20.0))
+            cat_data.setdefault(MAPPING_SCOPE_IN_APP_GYRO, scoped_defaults)
             if "gc_l_click_mapping" not in cat_data:
                 cat_data["gc_l_click_mapping"] = "Default"
             if "gc_r_click_mapping" not in cat_data:
                 cat_data["gc_r_click_mapping"] = "Default"
+            for key, val in list(cat_data.items()):
+                if key == MAPPING_SCOPE_IN_APP_GYRO:
+                    continue
+                if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS:
+                    cat_data[MAPPING_SCOPE_IN_APP_GYRO].setdefault(key, val.copy() if isinstance(val, dict) else val)
         return defaults.get(cat, defaults["xbox"]).copy()
 
     def get_default_profile_dict(self):
@@ -703,15 +923,11 @@ class Config:
         prof_data = {
             "driver_type": "WinUHid",
             "simulation_mode": "PS5",
-            "gyro_passthrough_mode": "Default",
-            "cemuhook_sensitivity": 1,
-            "steam_roll_compensation": False,
-            "djg_enabled": False, 
-            "djg_dominant_side": "Right", 
-            "djg_mode": "Switch Dominant Side",
-            "djg_activation": "Hold",
-            "assigned_apps": []
+            "assigned_apps": [],
+            "change_profile_list": False,
+            "profile_switching_combo": ""
         }
+        prof_data.update(self.get_default_profile_settings())
         for cat in categories:
             prof_data[cat] = self.get_default_category_dict(cat)
             prof_data[cat]["joycon_hold_mode"] = {}
@@ -802,6 +1018,179 @@ class Config:
     def djg_activation(self, value):
         if self.active_profile in self.profiles:
             self.profiles[self.active_profile]["djg_activation"] = value
+
+    def _get_profile_setting(self, key):
+        prof = self.profiles.get(self.active_profile, {})
+        if key in prof:
+            return prof[key]
+        # Avoid copying the whole defaults dict (get_default_profile_settings copies);
+        # this is on the hot path via gyro_control_mode scope resolution.
+        defaults = getattr(self, "profile_setting_defaults", None)
+        if not defaults:
+            defaults = self.get_default_profile_settings()
+        return defaults.get(key)
+
+    def _set_profile_setting(self, key, value):
+        if self.active_profile in self.profiles:
+            self.profiles[self.active_profile][key] = value
+
+    @property
+    def gyro_mode(self):
+        return self._get_profile_setting("gyro_mode")
+
+    @gyro_mode.setter
+    def gyro_mode(self, value):
+        self._set_profile_setting("gyro_mode", value)
+
+    @property
+    def gyro_control_mode(self):
+        return self._get_profile_setting("gyro_control_mode")
+
+    @gyro_control_mode.setter
+    def gyro_control_mode(self, value):
+        self._set_profile_setting("gyro_control_mode", value)
+
+    @property
+    def mode_shift_enabled(self):
+        """Whether entering In-app Gyro mode auto-applies the Mode Shift Mapping layer.
+        Stored per (profile, Gyro Control mode); defaults to On for Mouse and Off for
+        R Joystick / Steering."""
+        mode = self.gyro_control_mode
+        stored = self.profiles.get(self.active_profile, {}).get("mode_shift_enabled")
+        if isinstance(stored, dict) and mode in stored:
+            return bool(stored[mode])
+        return MODE_SHIFT_ENABLED_DEFAULTS.get(mode, False)
+
+    @mode_shift_enabled.setter
+    def mode_shift_enabled(self, value):
+        if self.active_profile not in self.profiles:
+            return
+        prof = self.profiles[self.active_profile]
+        stored = prof.get("mode_shift_enabled")
+        stored = dict(stored) if isinstance(stored, dict) else dict(MODE_SHIFT_ENABLED_DEFAULTS)
+        stored[self.gyro_control_mode] = bool(value)
+        prof["mode_shift_enabled"] = stored
+
+    def active_in_app_gyro_scope(self):
+        """Physical In-app Gyro mapping store for the current Gyro Control mode."""
+        if self.gyro_control_mode == "Steering":
+            return MAPPING_SCOPE_IN_APP_GYRO_STEERING
+        if self.gyro_control_mode == "R Joystick":
+            return MAPPING_SCOPE_IN_APP_GYRO_RSTICK
+        return MAPPING_SCOPE_IN_APP_GYRO
+
+    def _resolve_in_app_gyro_scope(self, scope):
+        """Translate the logical In-app Gyro scope used by the UI/runtime into the
+        physical store for the active Gyro Control mode (Mouse / R Joystick / Steering)."""
+        if scope == MAPPING_SCOPE_IN_APP_GYRO and self.gyro_control_mode == "Steering":
+            return MAPPING_SCOPE_IN_APP_GYRO_STEERING
+        if scope == MAPPING_SCOPE_IN_APP_GYRO and self.gyro_control_mode == "R Joystick":
+            return MAPPING_SCOPE_IN_APP_GYRO_RSTICK
+        return scope
+
+    @property
+    def gyro_sensitivity(self):
+        return float(self._get_profile_setting("gyro_sensitivity"))
+
+    @gyro_sensitivity.setter
+    def gyro_sensitivity(self, value):
+        self._set_profile_setting("gyro_sensitivity", float(value))
+
+    @property
+    def r_joystick_gyro_sensitivity(self):
+        return float(self._get_profile_setting("r_joystick_gyro_sensitivity"))
+
+    @r_joystick_gyro_sensitivity.setter
+    def r_joystick_gyro_sensitivity(self, value):
+        self._set_profile_setting("r_joystick_gyro_sensitivity", float(value))
+
+    @property
+    def gyro_activation_mode(self):
+        return self._get_profile_setting("gyro_activation_mode")
+
+    @gyro_activation_mode.setter
+    def gyro_activation_mode(self, value):
+        self._set_profile_setting("gyro_activation_mode", value)
+
+    @property
+    def stick_mouse_sensitivity(self):
+        return float(self._get_profile_setting("stick_mouse_sensitivity"))
+
+    @stick_mouse_sensitivity.setter
+    def stick_mouse_sensitivity(self, value):
+        self._set_profile_setting("stick_mouse_sensitivity", float(value))
+
+    @property
+    def stabilized_gyro(self):
+        return bool(self._get_profile_setting("stabilized_gyro"))
+
+    @stabilized_gyro.setter
+    def stabilized_gyro(self, value):
+        self._set_profile_setting("stabilized_gyro", bool(value))
+
+    @property
+    def virtual_gyro_soft_deadzone(self):
+        return float(self._get_profile_setting("virtual_gyro_soft_deadzone"))
+
+    @virtual_gyro_soft_deadzone.setter
+    def virtual_gyro_soft_deadzone(self, value):
+        self._set_profile_setting("virtual_gyro_soft_deadzone", float(value))
+
+    @property
+    def gyro_passthrough_mode(self):
+        return self._get_profile_setting("gyro_passthrough_mode")
+
+    @gyro_passthrough_mode.setter
+    def gyro_passthrough_mode(self, value):
+        self._set_profile_setting("gyro_passthrough_mode", value)
+
+    @property
+    def steam_roll_compensation(self):
+        return bool(self._get_profile_setting("steam_roll_compensation"))
+
+    @steam_roll_compensation.setter
+    def steam_roll_compensation(self, value):
+        self._set_profile_setting("steam_roll_compensation", bool(value))
+
+    @property
+    def cemuhook_sensitivity(self):
+        return int(self._get_profile_setting("cemuhook_sensitivity"))
+
+    @cemuhook_sensitivity.setter
+    def cemuhook_sensitivity(self, value):
+        self._set_profile_setting("cemuhook_sensitivity", int(value))
+
+    @property
+    def djg_enabled(self):
+        return bool(self._get_profile_setting("djg_enabled"))
+
+    @djg_enabled.setter
+    def djg_enabled(self, value):
+        self._set_profile_setting("djg_enabled", bool(value))
+
+    @property
+    def djg_dominant_side(self):
+        return self._get_profile_setting("djg_dominant_side")
+
+    @djg_dominant_side.setter
+    def djg_dominant_side(self, value):
+        self._set_profile_setting("djg_dominant_side", value)
+
+    @property
+    def djg_mode(self):
+        return self._get_profile_setting("djg_mode")
+
+    @djg_mode.setter
+    def djg_mode(self, value):
+        self._set_profile_setting("djg_mode", value)
+
+    @property
+    def djg_activation(self):
+        return self._get_profile_setting("djg_activation")
+
+    @djg_activation.setter
+    def djg_activation(self, value):
+        self._set_profile_setting("djg_activation", value)
         
 
     def save_config(self):
@@ -813,13 +1202,6 @@ class Config:
             'winuhid_sim_mode': self.winuhid_sim_mode,
             'usbip_sim_mode': self.usbip_sim_mode,
             'vigembus_installed': self.vigembus_installed,
-            'gcn_rumble_pwm_enabled':     self.gcn_rumble_pwm_enabled,
-            'gcn_rumble_brake_enabled':   self.gcn_rumble_brake_enabled,
-            'gcn_rumble_brake_threshold': self.gcn_rumble_brake_threshold,
-            'gcn_rumble_gamma':           self.gcn_rumble_gamma,
-            'gcn_rumble_deadzone':        self.gcn_rumble_deadzone,
-            'gcn_rumble_left_weight':     self.gcn_rumble_left_weight,
-            'gcn_rumble_right_weight':    self.gcn_rumble_right_weight,
             'window_width': self.window_width,
             'window_height': self.window_height,
             'window_x': self.window_x,
@@ -854,6 +1236,7 @@ class Config:
             'capt_mapping': self.capt_mapping,
             'gyro_mode': self.gyro_mode,
             'gyro_sensitivity': self.gyro_sensitivity,
+            'r_joystick_gyro_sensitivity': self.r_joystick_gyro_sensitivity,
             'gyro_activation_mode': self.gyro_activation_mode,
             'stick_mouse_sensitivity': self.stick_mouse_sensitivity,
             'gyro_bias_l': self.gyro_bias_l,
@@ -870,6 +1253,9 @@ class Config:
             'cemuhook_mac_to_pad': self.cemuhook_mac_to_pad,
             'cemuhook_pad_overwrite_idx': self.cemuhook_pad_overwrite_idx,
             'active_profile': self.active_profile,
+            'profile_switching_combo_trigger': getattr(self, "profile_switching_combo_trigger", ""),
+            'change_profile_mode': getattr(self, "change_profile_mode", "Manual"),
+            'profile_defaults': self.get_default_profile_settings(),
             'profiles': self.profiles,
             'mouse': {
                 'enabled': self.mouse_config.enabled,
@@ -885,14 +1271,14 @@ class Config:
                     if os.path.exists(self.config_file_path):
                         try:
                             with open(self.config_file_path, 'r', encoding='utf-8') as f:
-                                existing_data = yaml.safe_load(f) or {}
+                                existing_data = yaml.load(f, Loader=_YamlLoader) or {}
                         except Exception:
                             pass
-                    
+
                     existing_data.update(data)
-                    
+
                     with open(self.config_file_path, 'w', encoding='utf-8') as f:
-                        yaml.dump(existing_data, f, default_flow_style=False)
+                        yaml.dump(existing_data, f, Dumper=_YamlDumper, default_flow_style=False)
                     import time
                     logger.info(f"[{time.strftime('%H:%M:%S')}] Config saved successfully (async) to {self.config_file_path}")
                 except Exception as e:
@@ -987,7 +1373,7 @@ class Config:
     @property
     def gr_mapping(self):
         cat = self.get_current_category()
-        return self.button_remaps.get(cat, {}).get("gr_mapping", "Gyro")
+        return self.button_remaps.get(cat, {}).get("gr_mapping", "In-app Gyro")
     @gr_mapping.setter
     def gr_mapping(self, val):
         cat = self.get_current_category()
@@ -1007,7 +1393,7 @@ class Config:
     @property
     def slr_mapping(self):
         cat = self.get_current_category()
-        return self.button_remaps.get(cat, {}).get("slr_mapping", "Gyro")
+        return self.button_remaps.get(cat, {}).get("slr_mapping", "In-app Gyro")
     @slr_mapping.setter
     def slr_mapping(self, val):
         cat = self.get_current_category()
@@ -1084,6 +1470,341 @@ class Config:
         cat = self.get_current_category()
         if cat not in self.button_remaps: self.button_remaps[cat] = {}
         self.button_remaps[cat]["capt_mapping"] = val
+
+    def get_mapping_setting(self, key, default="Default"):
+        cat = self.get_current_category()
+        return self.button_remaps.get(cat, {}).get(f"{key}_mapping", default)
+
+    def set_mapping_setting(self, key, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        old_val = self.button_remaps[cat].get(f"{key}_mapping", self._get_mapping_reset_default(cat, key, None))
+        self.button_remaps[cat][f"{key}_mapping"] = val
+        self._sync_in_app_gyro_mapping_key(cat, key, old_val, val, None)
+
+    def ensure_mapping_scope(self, cat=None, scope=None):
+        if scope is None:
+            return None
+        if cat is None:
+            cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        scoped = self.button_remaps[cat].get(scope)
+        if isinstance(scoped, dict):
+            # Fast path: the scope is already initialized. Rebuilding the default
+            # dicts and rescanning button_remaps on every call is unnecessary on
+            # reads (set_mapping_setting* keeps the In-app Gyro sync up to date) and,
+            # because this runs ~20+ times per input report, was the cause of the
+            # In-app Gyro input lag/stutter.
+            return scoped
+        scoped = {}
+        self.button_remaps[cat][scope] = scoped
+        if scope in (MAPPING_SCOPE_IN_APP_GYRO, MAPPING_SCOPE_IN_APP_GYRO_RSTICK, MAPPING_SCOPE_IN_APP_GYRO_STEERING):
+            if scope == MAPPING_SCOPE_IN_APP_GYRO_RSTICK:
+                gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+                defaults = build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default)
+            elif scope == MAPPING_SCOPE_IN_APP_GYRO_STEERING:
+                gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+                defaults = build_in_app_gyro_steering_mapping_defaults(gc_trigger_default)
+            else:
+                defaults = build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity)
+            for key, def_val in defaults.items():
+                if key not in scoped:
+                    scoped[key] = def_val.copy() if isinstance(def_val, dict) else def_val
+            # On creation, reconcile the activation buttons with Controller Mapping for
+            # the active scope: Mode Shift always, In-app Gyro only while Mode Shift is On.
+            if scope == self.active_in_app_gyro_scope():
+                mode_shift_on = self.mode_shift_enabled
+                for key, val in list(self.button_remaps[cat].items()):
+                    if not key.endswith("_mapping"):
+                        continue
+                    base_ms = self._is_mode_shift_value(val)
+                    scoped_ms = self._is_mode_shift_value(scoped.get(key))
+                    if base_ms or scoped_ms:
+                        ms_val = val if base_ms else scoped.get(key)
+                        self.button_remaps[cat][key] = ms_val
+                        scoped[key] = ms_val
+                    elif mode_shift_on and (val in ("Gyro", "In-app Gyro") or scoped.get(key) in ("Gyro", "In-app Gyro")):
+                        self.button_remaps[cat][key] = "In-app Gyro"
+                        scoped[key] = "In-app Gyro"
+            return scoped
+        for key, def_val in SHARED_BUTTON_MAPPING_DEFAULTS.items():
+            if key not in scoped:
+                scoped[key] = self.button_remaps[cat].get(key, def_val)
+        for key, def_val in JOYSTICK_CUSTOM_DEFAULTS.items():
+            if key not in scoped:
+                base_val = self.button_remaps[cat].get(key, def_val)
+                scoped[key] = base_val.copy() if isinstance(base_val, dict) else def_val.copy()
+        for key, val in list(self.button_remaps[cat].items()):
+            if key == scope:
+                continue
+            if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS:
+                scoped.setdefault(key, val.copy() if isinstance(val, dict) else val)
+        return scoped
+
+    def get_mapping_scope_dict(self, scope):
+        """Return the raw mapping dict for a scope (resolved for the active Gyro
+        Control mode). Lets per-report hot-path callers resolve once and index the
+        dict directly (dict.get) instead of calling a resolving getter per key.
+        No dict is rebuilt; ensure_mapping_scope fast-paths once initialized."""
+        scope = self._resolve_in_app_gyro_scope(scope)
+        cat = self.get_current_category()
+        if scope:
+            return self.ensure_mapping_scope(cat, scope)
+        return self.button_remaps.get(cat, {})
+
+    def get_mapping_setting_scoped(self, key, default="Default", scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        cat = self.get_current_category()
+        if scope:
+            scoped = self.ensure_mapping_scope(cat, scope)
+            return scoped.get(f"{key}_mapping", default)
+        return self.get_mapping_setting(key, default)
+
+    def set_mapping_setting_scoped(self, key, val, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        if scope:
+            cat = self.get_current_category()
+            scoped = self.ensure_mapping_scope(cat, scope)
+            old_val = scoped.get(f"{key}_mapping", self._get_mapping_reset_default(cat, key, scope))
+            scoped[f"{key}_mapping"] = val
+            self._sync_in_app_gyro_mapping_key(cat, key, old_val, val, scope)
+            return
+        self.set_mapping_setting(key, val)
+
+    def _get_mapping_reset_default(self, cat, key, scope=None):
+        if scope == MAPPING_SCOPE_IN_APP_GYRO:
+            return build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity).get(f"{key}_mapping", "Default")
+        if scope == MAPPING_SCOPE_IN_APP_GYRO_RSTICK:
+            gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+            return build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default).get(f"{key}_mapping", "Default")
+        if scope == MAPPING_SCOPE_IN_APP_GYRO_STEERING:
+            gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+            return build_in_app_gyro_steering_mapping_defaults(gc_trigger_default).get(f"{key}_mapping", "Default")
+        return self.get_default_category_dict(cat).get(f"{key}_mapping", "Default")
+
+    def _is_mode_shift_value(self, val):
+        return isinstance(val, str) and val.startswith("Custom") and val.endswith(":" + MODE_SHIFT_TOKEN)
+
+    def _sync_in_app_gyro_mapping_key(self, cat, key, old_val, new_val, source_scope):
+        if not key or key.endswith("_direction"):
+            return
+        mapping_key = f"{key}_mapping"
+        active_scope = self.active_in_app_gyro_scope()
+        # Resolve the "other" store to mirror into, plus the scope used to look up that
+        # store's reset default when a synced value is cleared.
+        if source_scope in (MAPPING_SCOPE_IN_APP_GYRO, MAPPING_SCOPE_IN_APP_GYRO_RSTICK, MAPPING_SCOPE_IN_APP_GYRO_STEERING):
+            # Edited the active In-app Gyro store -> mirror into Controller Mapping.
+            if source_scope != active_scope:
+                return
+            if cat not in self.button_remaps:
+                self.button_remaps[cat] = {}
+            target = self.button_remaps[cat]
+            reset_scope = None
+        else:
+            # Edited Controller Mapping -> mirror into the active In-app Gyro store.
+            if active_scope is None:
+                return
+            target = self.button_remaps[cat].get(active_scope)
+            if not isinstance(target, dict):
+                target = self.ensure_mapping_scope(cat, active_scope)
+            reset_scope = active_scope
+
+        # Mode Shift back button: ALWAYS cross-synced between the two stores, regardless
+        # of the Mode Shift On/Off toggle. Setting a button to Mode Shift mirrors it (with
+        # its Hold/Tap form); changing away resets the mirrored button to its default.
+        if self._is_mode_shift_value(new_val):
+            target[mapping_key] = new_val
+            return
+        if self._is_mode_shift_value(old_val) and self._is_mode_shift_value(target.get(mapping_key)):
+            target[mapping_key] = self._get_mapping_reset_default(cat, key, reset_scope)
+            return
+
+        # In-app Gyro activation button: cross-synced only while Mode Shift is On (Off
+        # keeps the two stores independent).
+        if not self.mode_shift_enabled:
+            return
+        if new_val in ("Gyro", "In-app Gyro"):
+            target[mapping_key] = "In-app Gyro"
+        elif old_val in ("Gyro", "In-app Gyro") and target.get(mapping_key) in ("Gyro", "In-app Gyro"):
+            target[mapping_key] = self._get_mapping_reset_default(cat, key, reset_scope)
+
+    def sync_active_in_app_gyro_activation(self):
+        """Union-sync the 'In-app Gyro' activation buttons between Controller Mapping
+        and the active In-app Gyro scope (any button that is In-app Gyro in either
+        becomes In-app Gyro in both). Call after a Gyro Control mode switch, since
+        ensure_mapping_scope only performs this once on creation (reads fast-path).
+        The Mode Shift back button always union-syncs; the In-app Gyro activation
+        button only union-syncs while Mode Shift is On."""
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        active_scope = self.active_in_app_gyro_scope()
+        if active_scope is None:
+            return
+        scoped = self.ensure_mapping_scope(cat, active_scope)
+        mode_shift_on = self.mode_shift_enabled
+        for key, val in list(self.button_remaps[cat].items()):
+            if not key.endswith("_mapping"):
+                continue
+            base_ms = self._is_mode_shift_value(val)
+            scoped_ms = self._is_mode_shift_value(scoped.get(key))
+            if base_ms or scoped_ms:
+                ms_val = val if base_ms else scoped.get(key)
+                self.button_remaps[cat][key] = ms_val
+                scoped[key] = ms_val
+            elif mode_shift_on and (val in ("Gyro", "In-app Gyro") or scoped.get(key) in ("Gyro", "In-app Gyro")):
+                self.button_remaps[cat][key] = "In-app Gyro"
+                scoped[key] = "In-app Gyro"
+
+    def reset_in_app_gyro_mode_mapping(self):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        scope = self.active_in_app_gyro_scope()
+        if scope == MAPPING_SCOPE_IN_APP_GYRO_RSTICK:
+            gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+            defaults = build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default)
+        elif scope == MAPPING_SCOPE_IN_APP_GYRO_STEERING:
+            gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+            defaults = build_in_app_gyro_steering_mapping_defaults(gc_trigger_default)
+        else:
+            defaults = build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity)
+        self.button_remaps[cat][scope] = {
+            key: val.copy() if isinstance(val, dict) else val
+            for key, val in defaults.items()
+        }
+
+    def copy_controller_mapping_to_in_app_gyro_mode_mapping(self):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        scope = self.active_in_app_gyro_scope()
+        copied = {}
+        for key, val in self.button_remaps[cat].items():
+            if key in (MAPPING_SCOPE_IN_APP_GYRO, MAPPING_SCOPE_IN_APP_GYRO_RSTICK, MAPPING_SCOPE_IN_APP_GYRO_STEERING, "joycon_hold_mode"):
+                continue
+            if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS or key == "gc_trigger_mode":
+                copied[key] = val.copy() if isinstance(val, dict) else val
+        if scope == MAPPING_SCOPE_IN_APP_GYRO_RSTICK:
+            gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+            defaults = build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default)
+        elif scope == MAPPING_SCOPE_IN_APP_GYRO_STEERING:
+            gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
+            defaults = build_in_app_gyro_steering_mapping_defaults(gc_trigger_default)
+        else:
+            defaults = build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity)
+        for key, val in defaults.items():
+            copied.setdefault(key, val.copy() if isinstance(val, dict) else val)
+        self.button_remaps[cat][scope] = copied
+
+    def get_joystick_custom(self, key):
+        cat = self.get_current_category()
+        custom_key = f"{key}_custom"
+        defaults = JOYSTICK_CUSTOM_DEFAULTS.get(custom_key, {}).copy()
+        stored = self.button_remaps.get(cat, {}).get(custom_key, {})
+        if isinstance(stored, dict):
+            defaults.update(stored)
+        return defaults
+
+    def set_joystick_custom(self, key, val):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        defaults = JOYSTICK_CUSTOM_DEFAULTS.get(f"{key}_custom", {}).copy()
+        if isinstance(val, dict):
+            defaults.update(val)
+        self.button_remaps[cat][f"{key}_custom"] = defaults
+
+    def get_joystick_custom_scoped(self, key, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        if not scope:
+            return self.get_joystick_custom(key)
+        cat = self.get_current_category()
+        scoped = self.ensure_mapping_scope(cat, scope)
+        custom_key = f"{key}_custom"
+        defaults = JOYSTICK_CUSTOM_DEFAULTS.get(custom_key, {}).copy()
+        stored = scoped.get(custom_key, {})
+        if isinstance(stored, dict):
+            defaults.update(stored)
+        return defaults
+
+    def set_joystick_custom_scoped(self, key, val, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        if not scope:
+            self.set_joystick_custom(key, val)
+            return
+        cat = self.get_current_category()
+        scoped = self.ensure_mapping_scope(cat, scope)
+        defaults = JOYSTICK_CUSTOM_DEFAULTS.get(f"{key}_custom", {}).copy()
+        if isinstance(val, dict):
+            defaults.update(val)
+        scoped[f"{key}_custom"] = defaults
+
+    def get_joystick_setting(self, key, setting, default=None):
+        cat = self.get_current_category()
+        defaults = SHARED_BUTTON_MAPPING_DEFAULTS
+        full_key = f"{key}_{setting}"
+        if default is None:
+            default = defaults.get(full_key)
+        return self.button_remaps.get(cat, {}).get(full_key, default)
+
+    def set_joystick_setting(self, key, setting, value):
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        self.button_remaps[cat][f"{key}_{setting}"] = value
+
+    def get_joystick_setting_scoped(self, key, setting, default=None, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        if not scope:
+            return self.get_joystick_setting(key, setting, default)
+        if scope == MAPPING_SCOPE_IN_APP_GYRO and setting == "mouse_sensitivity":
+            return self.stick_mouse_sensitivity
+        cat = self.get_current_category()
+        scoped = self.ensure_mapping_scope(cat, scope)
+        full_key = f"{key}_{setting}"
+        if default is None:
+            default = SHARED_BUTTON_MAPPING_DEFAULTS.get(full_key)
+        return scoped.get(full_key, default)
+
+    def set_joystick_setting_scoped(self, key, setting, value, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        if not scope:
+            self.set_joystick_setting(key, setting, value)
+            return
+        if scope == MAPPING_SCOPE_IN_APP_GYRO and setting == "mouse_sensitivity":
+            self.stick_mouse_sensitivity = float(value)
+        cat = self.get_current_category()
+        scoped = self.ensure_mapping_scope(cat, scope)
+        scoped[f"{key}_{setting}"] = value
+
+    def get_scoped_category_setting(self, key, default=None, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        cat = self.get_current_category()
+        if scope:
+            scoped = self.ensure_mapping_scope(cat, scope)
+            return scoped.get(key, default)
+        return self.button_remaps.get(cat, {}).get(key, default)
+
+    def set_scoped_category_setting(self, key, value, scope=None):
+        scope = self._resolve_in_app_gyro_scope(scope)
+        cat = self.get_current_category()
+        if cat not in self.button_remaps:
+            self.button_remaps[cat] = {}
+        if scope:
+            scoped = self.ensure_mapping_scope(cat, scope)
+            scoped[key] = value
+        else:
+            self.button_remaps[cat][key] = value
+
+    def __getattr__(self, name):
+        if name.endswith("_mapping"):
+            return self.get_mapping_setting(name[:-8], "Default")
+        if name.endswith("_custom"):
+            return self.get_joystick_custom(name[:-7])
+        raise AttributeError(name)
         
     @property
     def joycon_hold_mode(self):
@@ -1132,4 +1853,3 @@ class Config:
         self.button_remaps[cat]["gc_trigger_mode"] = val
     
 CONFIG = Config(get_resource("config.yaml"))
-

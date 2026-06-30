@@ -18,14 +18,16 @@ try:
     ctypes.windll.winmm.timeBeginPeriod(1)
 except Exception:
     pass
-from config import CONFIG, SWITCH_BUTTONS
+from config import CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN
 from utils import (
     apply_calibration_to_axis, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
     convert_mac_string_to_value, vector_normalize, vector_cross, vector_dot,
     quaternion_multiply, quaternion_normalize, quaternion_rotate_vector,
-    quaternion_from_vectors, show_notification, force_ui_update, trigger_change_profile
+    quaternion_from_vectors, show_notification, force_ui_update, trigger_change_profile,
+    trigger_switch_profile
 )
+import utils
 
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
@@ -196,7 +198,7 @@ class ControllerInputData:
             
             if b3 & 0x01: buttons_val |= 0x00001000 # Home
             if b3 & 0x02: buttons_val |= 0x00002000 # Capture
-            if b3 & 0x04: buttons_val |= 0x00004000 # Chat (C)
+            if b3 & 0x10: buttons_val |= 0x00004000 # Chat (C Button)
             
             self.buttons = buttons_val
             
@@ -335,138 +337,6 @@ class VibrationData:
         value |= (self.hf_amp & 0x3FF) << 30   
         return value.to_bytes(byteorder='little', length=5)
 
-
-# ---------------------------------------------------------------------------
-# NSO GameCube Controller — temporal PWM rumble state machine
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GCNRumblePWMState:
-    """Per-controller state for the GameCube-style temporal PWM rumble loop."""
-    target_strength: float = 0.0   # normalised 0.0-1.0, set from vibration_callback
-    prev_strength:   float = 0.0   # strength from the previous tick (for brake detection)
-    accumulator:     float = 0.0   # sigma-delta accumulator (per-tick model)
-    last_command:    int   = 0xFF  # sentinel = uninitialised; 0x00/0x01/0x02
-    brake_ticks_remaining: int = 0
-    failed_brake:    bool  = False  # set True if 0x02 write ever fails
-    _brake_ever_sent: bool = False  # for one-time info log
-    transport_name:  str   = ""    # "bridge" or "ble"
-
-
-def normalize_motor_value(value) -> float:
-    """Normalise a raw XInput motor value to [0.0, 1.0].
-
-    Handles three conventions:
-    - Already normalised float in [0.0, 1.0]
-    - ViGEmBus / WinUHid Xbox rumble callback byte range [0, 255]
-    - Defensive: native XInput WORD range [0, 65535]
-    """
-    if value is None:
-        return 0.0
-    value = float(value)
-    if 0.0 <= value <= 1.0:
-        return value
-    if value <= 255.0:
-        return max(0.0, min(value / 255.0, 1.0))
-    # Defensive: native XInput WORD
-    return max(0.0, min(value / 65535.0, 1.0))
-
-
-def _gcn_update_pwm_state(controller, large_motor, small_motor) -> None:
-    """Update the GCN PWM state machine with new XInput motor values.
-
-    Called from VirtualController.vibration_callback() when an NSO GCN
-    controller is connected in Xbox emulation mode.  All CONFIG reads are
-    done here so the hot PWM loop stays lean.
-    """
-    left  = normalize_motor_value(large_motor)
-    right = normalize_motor_value(small_motor)
-
-    left_w  = getattr(CONFIG, "gcn_rumble_left_weight",  0.85)
-    right_w = getattr(CONFIG, "gcn_rumble_right_weight", 0.45)
-    gamma   = getattr(CONFIG, "gcn_rumble_gamma",        0.75)
-    dz      = getattr(CONFIG, "gcn_rumble_deadzone",     0.04)
-
-    strength = max(0.0, min(1.0, left * left_w + right * right_w))
-    if strength > 0.0:
-        strength = strength ** gamma
-    if strength < dz:
-        strength = 0.0
-
-    state = _gcn_get_or_create_state(controller)
-    state.target_strength = strength
-    logger.debug(
-        "GCN PWM: left=%.2f right=%.2f strength=%.3f transport=%s",
-        left, right, strength, state.transport_name
-    )
-
-
-def _gcn_get_or_create_state(controller) -> GCNRumblePWMState:
-    """Return (creating if needed) the per-controller GCN PWM state."""
-    if not hasattr(controller, 'gcn_pwm_state') or controller.gcn_pwm_state is None:
-        state = GCNRumblePWMState()
-        state.transport_name = (
-            "bridge" if getattr(controller, 'is_esp32s3_bridge', False) else "ble"
-        )
-        controller.gcn_pwm_state = state
-    return controller.gcn_pwm_state
-
-
-def _next_gcn_pwm_command(state: GCNRumblePWMState) -> int:
-    """Return the next GCN rumble command byte using a sigma-delta accumulator.
-
-    Per-tick model: every call is one tick, regardless of wall-clock dt.
-    Full strength (>= 0.995) always returns ON; zero returns OFF (or brake).
-    """
-    strength = state.target_strength
-
-    if strength <= 0.0:
-        # Check whether to issue a brake command
-        brake_enabled   = getattr(CONFIG, "gcn_rumble_brake_enabled",   False)
-        brake_threshold = getattr(CONFIG, "gcn_rumble_brake_threshold", 0.65)
-
-        if (
-            state.prev_strength >= brake_threshold
-            and brake_enabled
-            and not state.failed_brake
-            and state.brake_ticks_remaining == 0
-        ):
-            state.brake_ticks_remaining = 1
-
-        state.prev_strength = 0.0
-        state.accumulator   = 0.0
-
-        if state.brake_ticks_remaining > 0:
-            state.brake_ticks_remaining -= 1
-            return 0x02  # experimental brake / StopHard
-        return 0x00
-
-    if strength >= 0.995:
-        state.accumulator   = 0.0
-        state.prev_strength = strength
-        return 0x01
-
-    state.accumulator += strength
-    state.prev_strength = strength
-
-    if state.accumulator >= 1.0:
-        state.accumulator -= 1.0
-        return 0x01
-    return 0x00
-
-
-def _gcn_command_payload(command: int) -> bytearray:
-    """Build the 12-byte GCN rumble command payload.
-
-    Byte index 8 carries the motor value:
-      0x00 = Off,  0x01 = On,  0x02 = Brake (experimental)
-    """
-    motor_byte = command & 0xFF  # 0x00, 0x01, or 0x02
-    return bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04,
-                      0x00, 0x00, motor_byte, 0x00, 0x00, 0x00])
-
-
-
 class Controller:
     def __init__(self, device: BLEDevice):
         self.device: BLEDevice = device
@@ -501,7 +371,8 @@ class Controller:
         
         self.gyro_target_vx = 0.0
         self.gyro_target_vy = 0.0
-        self.jc_target_vx = 0.0    
+        self._gyro_rstick_out = (0.0, 0.0)
+        self.jc_target_vx = 0.0
         self.jc_target_vy = 0.0    
         self.jc_mouse_active = False
         self.current_vx = 0.0
@@ -1315,14 +1186,8 @@ class Controller:
                 else:
                     hf_mask = 1.0
 
-            gc_lf_scale = 1.0
-            gc_hf_scale = 1.0
-            if getattr(self, 'controller_info', None) and getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
-                gc_lf_scale = 0.5
-                gc_hf_scale = 0.1
-
-            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier * lf_mask * gc_lf_scale)))
-            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier * hf_mask * gc_hf_scale)))
+            scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier * lf_mask)))
+            scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier * hf_mask)))
             
             return VibrationData(
                 lf_freq=scaled_lf_freq,
@@ -1341,14 +1206,10 @@ class Controller:
         
         try:
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
-                # NSO GCN: rumble is handled by the per-tick PWM state machine
-                # (_gcn_update_pwm_state sets target_strength; _gc_pwm_loop runs the loop).
-                # We must NOT send Switch HD Rumble packets to this controller.
-                if not getattr(self, 'gc_pwm_running', False):
-                    _gcn_get_or_create_state(self)  # ensure state exists
-                    self.gc_pwm_running = True
-                    asyncio.create_task(self._gc_pwm_loop())
-                return
+                # Use the SW2 command channel for GameCube rumble instead of hardcoded 0x0012
+                uuid_to_use = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
+                is_on = vibration.lf_amp > 0 or vibration.hf_amp > 0
+                payload = bytearray([0x0A, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01 if is_on else 0x00, 0x00, 0x00, 0x00])
             else:
                 uuid_to_use = VIBRATION_WRITE_PRO_CONTROLLER_UUID if self.is_pro_controller() else (
                     VIBRATION_WRITE_JOYCON_L_UUID if self.is_joycon_left() else VIBRATION_WRITE_JOYCON_R_UUID
@@ -1370,9 +1231,9 @@ class Controller:
                 # rumble shadow; a firmware task re-sends it to BLE at a steady,
                 # hardware-timed cadence (no Windows/asyncio jitter, no per-host
                 # re-send loop).  Other modes are kept for A/B testing:
-                #   "shadow" (default) – firmware-driven sustain (smoothest)
-                #   "pair" / "mirror"  – host-driven wrpair dispatcher
-                #   "single"           – direct per-controller write (original)
+                #   "shadow" (default) ??firmware-driven sustain (smoothest)
+                #   "pair" / "mirror"  ??host-driven wrpair dispatcher
+                #   "single"           ??direct per-controller write (original)
                 shared = getattr(self, 'shared_client', None)
                 if (not self.is_pro_controller()
                         and getattr(self, 'is_esp32s3_bridge', False)
@@ -1428,82 +1289,6 @@ class Controller:
             
         self.vibration_packet_id += 1
 
-    async def _gc_pwm_loop(self):
-        """Temporal PWM loop for NSO GameCube Controller rumble.
-
-        Uses a per-tick sigma-delta accumulator to convert a continuous
-        [0.0, 1.0] strength into a stream of ON/OFF (and optional brake)
-        GCN commands.  The tick rate is transport-aware:
-          - ESP32-S3 bridge: 120 Hz  (~8.3 ms/tick)
-          - Native BLE:       60 Hz  (~16.7 ms/tick)
-        """
-        uuid_to_use = getattr(self, 'command_write_uuid', COMMAND_WRITE_UUID)
-        state = _gcn_get_or_create_state(self)
-
-        is_bridge = getattr(self, 'is_esp32s3_bridge', False)
-        tick_interval = 1.0 / 120.0 if is_bridge else 1.0 / 60.0
-
-        logger.info(
-            "GCN PWM loop started: bridge=%s tick=%.1fms transport=%s",
-            is_bridge, tick_interval * 1000.0, state.transport_name
-        )
-
-        # ON-command refresh interval (prevent BLE stack from silently dropping
-        # sustained-ON writes that look identical to the previous frame)
-        refresh_ticks = 8  # refresh every 8 ticks
-        ticks_since_on = 0
-
-        while self.client and self.client.is_connected and getattr(self, 'interp_running', False):
-            t0 = time.perf_counter()
-
-            command = _next_gcn_pwm_command(state)
-
-            # Decide whether to actually send a BLE write:
-            #   - Always send when the command changes.
-            #   - Refresh a sustained ON every refresh_ticks to stay alive.
-            #   - Brake is always sent immediately.
-            changed = (command != state.last_command)
-
-            if command == 0x01:
-                ticks_since_on += 1
-                do_send = changed or (ticks_since_on >= refresh_ticks)
-            elif command == 0x02:
-                ticks_since_on = 0
-                do_send = True  # brake always sent
-            else:
-                ticks_since_on = 0
-                do_send = changed
-
-            if do_send:
-                if command == 0x01:
-                    ticks_since_on = 0
-                payload = _gcn_command_payload(command)
-                try:
-                    await self.client.write_gatt_char(uuid_to_use, payload, response=False)
-                    state.last_command = command
-                    if command == 0x02 and not state._brake_ever_sent:
-                        state._brake_ever_sent = True
-                        logger.info(
-                            "GCN rumble: experimental brake command (0x02) sent for the first time."
-                        )
-                except Exception as e:
-                    logger.debug("GCN rumble write failed: %s", e)
-                    if command == 0x02:
-                        # Brake unsupported / failed — disable at runtime
-                        state.failed_brake = True
-                        CONFIG.gcn_rumble_brake_enabled = False
-                        logger.warning(
-                            "GCN brake command 0x02 failed (%s). "
-                            "Brake auto-disabled; falling back to 0x00.", e
-                        )
-
-            elapsed = time.perf_counter() - t0
-            sleep_t = max(0.0, tick_interval - elapsed)
-            await asyncio.sleep(sleep_t)
-
-        self.gc_pwm_running = False
-        logger.info("GCN PWM loop exited for %s", self.device.address)
-
     async def set_leds(self, player_number: int, reversed=False):
         if player_number > 8: player_number = 8
         value = LED_PATTERN[player_number]
@@ -1541,7 +1326,7 @@ class Controller:
 
     async def pair(self, host_mac_value=None):
         # host_mac_value lets callers pair the controller to a host other than the
-        # local PC Bluetooth adapter — the ESP32-S3 bridge passes its own BLE MAC so
+        # local PC Bluetooth adapter ??the ESP32-S3 bridge passes its own BLE MAC so
         # the controller bonds to the bridge and reconnects to it on a button press.
         if host_mac_value is None:
             from utils import get_local_mac_value
@@ -1580,14 +1365,14 @@ class Controller:
                 pid = getattr(self.controller_info, 'product_id', 0)
                 log_fn = logger.info if pid in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else logger.debug
                 log_fn(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} pid=0x{pid:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
-                
+
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
 
             # Connection settle gate: right after (re)connection the controller can
             # emit transient/garbage frames (or the wake button is still held), which
             # would otherwise be forwarded as real input the instant we start
-            # listening — firing mapped actions like screenshot or spamming keys
+            # listening ??firing mapped actions like screenshot or spamming keys
             # (IME freeze). Ignore input until the first neutral (no-buttons) frame
             # arrives or a short timeout elapses, establishing a clean baseline.
             if not getattr(self, '_input_settled', True):
@@ -1627,10 +1412,14 @@ class Controller:
             is_left = self.is_joycon_left()
             is_right = self.is_joycon_right()
             is_pro = self.is_pro_controller()
+            raw_left_pressed  = bool(inputData.buttons & 0x01)
+            raw_up_pressed    = bool(inputData.buttons & 0x02)
+            raw_down_pressed  = bool(inputData.buttons & 0x04)
+            raw_right_pressed = bool(inputData.buttons & 0x08)
 
             # Filter out virtual/garbage bits. The top byte of a Joy-Con/Pro report is a
-            # STATUS byte (e.g. 0xE0), so bits 24-31 must be discarded (0x03FFFFFF) — as
-            # in 0.10.1 — or they leak in as phantom GC_L/R_CLICK (0x40000000/0x80000000)
+            # STATUS byte (e.g. 0xE0), so bits 24-31 must be discarded (0x03FFFFFF) ??as
+            # in 0.10.1 ??or they leak in as phantom GC_L/R_CLICK (0x40000000/0x80000000)
             # which the mapping turns into permanent ZL/ZR. Only the NSO GameCube
             # controller legitimately uses bits 30/31 (its digital trigger clicks), so it
             # keeps the wider 0xC3FFFFFF mask.
@@ -1677,10 +1466,55 @@ class Controller:
                 "SL_R": bool(inputData.buttons & 0x00000020) if is_right else False,
                 "SR_R": bool(inputData.buttons & 0x00000010) if is_right else False,
                 "GC_L_CLICK": bool(inputData.buttons & 0x40000000),
-                "GC_R_CLICK": bool(inputData.buttons & 0x80000000)
+                "GC_R_CLICK": bool(inputData.buttons & 0x80000000),
+                "PLUS": bool(inputData.buttons & SWITCH_BUTTONS["PLUS"]),
+                "MINUS": bool(inputData.buttons & SWITCH_BUTTONS["MINUS"]),
+                "A": raw_right_pressed,
+                "B": raw_down_pressed,
+                "X": raw_up_pressed,
+                "Y": raw_left_pressed,
+                "UP": bool(inputData.buttons & SWITCH_BUTTONS["UP"]),
+                "DOWN": bool(inputData.buttons & SWITCH_BUTTONS["DOWN"]),
+                "LEFT": bool(inputData.buttons & SWITCH_BUTTONS["LEFT"]),
+                "RIGHT": bool(inputData.buttons & SWITCH_BUTTONS["RIGHT"]),
+                "ZL": bool(inputData.buttons & SWITCH_BUTTONS["ZL"]),
+                "L": bool(inputData.buttons & SWITCH_BUTTONS["L"]),
+                "ZR": bool(inputData.buttons & SWITCH_BUTTONS["ZR"]),
+                "R": bool(inputData.buttons & SWITCH_BUTTONS["R"]),
+                "L_STK": bool(inputData.buttons & SWITCH_BUTTONS["L_STK"]),
+                "R_STK": bool(inputData.buttons & SWITCH_BUTTONS["R_STK"]),
             }
+            self._profile_combo_btn_states = dict(btn_states)
+            try:
+                utils.record_profile_combo_controller_buttons(btn_states)
+            except Exception:
+                pass
 
-            inputData.buttons &= ~(0x03307030)
+            # Manual Change Profile selection: while active (and while "draining" after
+            # confirm/cancel until A/B is released), read navigation from this controller
+            # and suppress all virtual output (neutral report). Draining prevents the
+            # confirm/cancel A/B press from leaking into the virtual controller.
+            if utils.profile_selection_active or getattr(self, "_ps_drain", False):
+                self._handle_profile_selection_input(inputData, btn_states, utils.profile_selection_active)
+                inputData.buttons = 0
+                inputData.left_stick = (0.0, 0.0)
+                inputData.right_stick = (0.0, 0.0)
+                inputData.gyroscope = (0.0, 0.0, 0.0)
+                inputData.accelerometer = (0.0, 0.0, 0.0)
+                try:
+                    inputData.left_trigger = 0
+                    inputData.right_trigger = 0
+                except Exception:
+                    pass
+                if self.input_report_callback is not None:
+                    self.input_report_callback(inputData, self)
+                return
+            elif getattr(self, "_ps_was_active", False):
+                self._ps_was_active = False
+
+            inputData.buttons &= ~(0x03FFFFFF)
+            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
+                inputData.buttons &= ~(0xC0000000)
 
             trigger_gyro = False
             trigger_djg = False
@@ -1691,33 +1525,217 @@ class Controller:
             trigger_sys_manager = False
             trigger_change_profile_btn = False
 
-            gc_l_click_action = "ZL" if getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max" else getattr(CONFIG, "gc_l_click_mapping", "Default")
-            gc_r_click_action = "ZR" if getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max" else getattr(CONFIG, "gc_r_click_mapping", "Default")
-
             mapping_pairs = [
-                # (is_pressed, action, original_bit, default_action, btn_id)
-                (btn_states["GL"],   getattr(CONFIG, "gl_mapping",   "Default"), 0x02000000, None, "gl"),
-                (btn_states["GR"],   getattr(CONFIG, "gr_mapping",   "Default"), 0x01000000, None, "gr"),
-                (btn_states["HOME"], getattr(CONFIG, "home_mapping", "Default"), 0x00001000, "Home", "home"),
-                (btn_states["CAPT"], getattr(CONFIG, "capt_mapping", "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc"), 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc", "capt"),
-                (btn_states["C"],    getattr(CONFIG, "c_mapping",    "Default"), 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "PS5") == "Switch2" else "Mute", "c"),
-                (btn_states["SL_L"], getattr(CONFIG, "sll_mapping",  "Default"), 0x00200000, None, "sll"),
-                (btn_states["SR_L"], getattr(CONFIG, "srl_mapping",  "Default"), 0x00100000, None, "srl"),
-                (btn_states["SL_R"], getattr(CONFIG, "slr_mapping",  "Default"), 0x00000020, None, "slr"),
-                (btn_states["SR_R"], getattr(CONFIG, "srr_mapping",  "Default"), 0x00000010, None, "srr"),
-                (btn_states["GC_L_CLICK"], gc_l_click_action, 0x40000000, "ZL", "gc_l_click"),
-                (btn_states["GC_R_CLICK"], gc_r_click_action, 0x80000000, "ZR", "gc_r_click"),
+                # (is_pressed, mapping_key, original_bit, default_action, btn_id)
+                (btn_states["GL"], "gl", 0x02000000, None, "gl"),
+                (btn_states["GR"], "gr", 0x01000000, None, "gr"),
+                (btn_states["HOME"], "home", 0x00001000, "Home", "home"),
+                (btn_states["CAPT"], "capt", 0x00002000, "Capture" if getattr(CONFIG, "simulation_mode", "PS5") in ("Switch1", "Switch2") else "PrtSc", "capt"),
+                (btn_states["C"], "c", 0x00004000, "Chat" if getattr(CONFIG, "simulation_mode", "PS5") == "Switch2" else "Mute", "c"),
+                (btn_states["SL_L"], "sll", 0x00200000, None, "sll"),
+                (btn_states["SR_L"], "srl", 0x00100000, None, "srl"),
+                (btn_states["SL_R"], "slr", 0x00000020, None, "slr"),
+                (btn_states["SR_R"], "srr", 0x00000010, None, "srr"),
+                (btn_states["GC_L_CLICK"], "gc_l_click", 0x40000000, "ZL", "gc_l_click"),
+                (btn_states["GC_R_CLICK"], "gc_r_click", 0x80000000, "ZR", "gc_r_click"),
+                (btn_states["PLUS"], "plus", SWITCH_BUTTONS["PLUS"], None, "plus"),
+                (btn_states["MINUS"], "minus", SWITCH_BUTTONS["MINUS"], None, "minus"),
+                (btn_states["A"], "a", SWITCH_BUTTONS["A"], None, "a"),
+                (btn_states["B"], "b", SWITCH_BUTTONS["B"], None, "b"),
+                (btn_states["X"], "x", SWITCH_BUTTONS["X"], None, "x"),
+                (btn_states["Y"], "y", SWITCH_BUTTONS["Y"], None, "y"),
+                (btn_states["UP"], "up", SWITCH_BUTTONS["UP"], None, "up"),
+                (btn_states["DOWN"], "down", SWITCH_BUTTONS["DOWN"], None, "down"),
+                (btn_states["LEFT"], "left", SWITCH_BUTTONS["LEFT"], None, "left"),
+                (btn_states["RIGHT"], "right", SWITCH_BUTTONS["RIGHT"], None, "right"),
+                (btn_states["ZL"], "zl", SWITCH_BUTTONS["ZL"], None, "zl"),
+                (btn_states["L"], "l", SWITCH_BUTTONS["L"], None, "l"),
+                (btn_states["ZR"], "zr", SWITCH_BUTTONS["ZR"], None, "zr"),
+                (btn_states["R"], "r", SWITCH_BUTTONS["R"], None, "r"),
+                (btn_states["L_STK"], "l_stk", SWITCH_BUTTONS["L_STK"], None, "l_stk"),
+                (btn_states["R_STK"], "r_stk", SWITCH_BUTTONS["R_STK"], None, "r_stk"),
             ]
+
+            def _profile_combo_token_pressed(token):
+                if not token:
+                    return False
+                if token.startswith("BTN_"):
+                    name = token[4:]
+                    aliases = {
+                        "Capture": "CAPT",
+                        "PLUS": "PLUS",
+                        "MINUS": "MINUS",
+                    }
+                    name = aliases.get(name, name)
+                    return bool(profile_combo_btn_states.get(name, False))
+                if token.startswith("VK_"):
+                    name = token[3:]
+                    try:
+                        if len(name) == 1:
+                            vk = ord(name)
+                        else:
+                            vk = getattr(win32con, f"VK_{name}", None)
+                        return bool(vk and (win32api.GetAsyncKeyState(vk) & 0x8000))
+                    except Exception:
+                        return False
+                if token.startswith("MB_"):
+                    try:
+                        btn_num = int(token[3:])
+                    except ValueError:
+                        return False
+                    vk_map = {1: win32con.VK_LBUTTON, 2: win32con.VK_RBUTTON, 3: win32con.VK_MBUTTON}
+                    vk = vk_map.get(btn_num)
+                    try:
+                        return bool(vk and (win32api.GetAsyncKeyState(vk) & 0x8000))
+                    except Exception:
+                        return False
+                return False
+
+            def _profile_combo_pressed(value):
+                if not value:
+                    return False
+                if value.startswith("Custom[Tap]:"):
+                    value = value[12:]
+                elif value.startswith("Custom[Hold]:"):
+                    value = value[13:]
+                elif value.startswith("Custom:"):
+                    value = value[7:]
+                tokens = [token for token in value.split("+") if token]
+                return bool(tokens) and all(_profile_combo_token_pressed(token) for token in tokens)
+
+            profile_combo_trigger = getattr(CONFIG, "profile_switching_combo_trigger", "")
+            profile_combo_target = None
+            vc = getattr(self, "virtual_controller", None)
+            profile_combo_btn_states = btn_states
+            profile_combo_signature_owner = self
+            if vc and len(getattr(vc, "controllers", [])) == 2:
+                merged_profile_states = {}
+                for c in getattr(vc, "controllers", []):
+                    states = btn_states if c is self else getattr(c, "_profile_combo_btn_states", {})
+                    for key, pressed in states.items():
+                        merged_profile_states[key] = bool(merged_profile_states.get(key, False) or pressed)
+                profile_combo_btn_states = merged_profile_states
+                profile_combo_signature_owner = vc
+            if _profile_combo_pressed(profile_combo_trigger):
+                for profile_name, profile_data in getattr(CONFIG, "profiles", {}).items():
+                    combo_value = profile_data.get("profile_switching_combo", "")
+                    if profile_name != getattr(CONFIG, "active_profile", "") and _profile_combo_pressed(combo_value):
+                        profile_combo_target = profile_name
+                        break
+            if profile_combo_target:
+                signature = (profile_combo_trigger, profile_combo_target)
+                if getattr(profile_combo_signature_owner, "_prev_profile_combo_signature", None) != signature:
+                    trigger_switch_profile(profile_combo_target)
+                profile_combo_signature_owner._prev_profile_combo_signature = signature
+            else:
+                profile_combo_signature_owner._prev_profile_combo_signature = None
 
             if not hasattr(self, 'active_custom_keys'):
                 self.active_custom_keys = {}
             if not hasattr(self, 'active_custom_mouse_wheel'):
                 self.active_custom_mouse_wheel = {}
 
+            def get_base_mapping_action(mapping_key):
+                if mapping_key == "gc_l_click" and getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max":
+                    return "ZL"
+                if mapping_key == "gc_r_click" and getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max":
+                    return "ZR"
+                return CONFIG.get_mapping_setting(mapping_key, "Default")
+
+            # Single pre-pass over the base (Controller Mapping) actions to resolve both
+            # the In-app Gyro activation trigger and the "Mode Shift" back button state.
+            # The Mode Shift trigger lives in the base layer so it can switch INTO the
+            # shifted layer; it supports Hold (while held) and Tap (toggle).
+            # Tap and Hold share one armed pool so every Mode Shift button can
+            # participate in the same enter/exit state machine.
+            trigger_gyro = False
+            mode_shift_hold_pressed = False
+            if not hasattr(self, "_mode_shift_armed"):
+                self._mode_shift_armed = set(getattr(self, "_mode_shift_tap_held", set()))
+            mode_shift_pressed_ids = set()
+            mode_shift_tap_edge = False
+            for is_pressed, mapping_key, _ms_bit, default_action, btn_id in mapping_pairs:
+                base_action = get_base_mapping_action(mapping_key)
+                base_resolved = default_action if base_action == "Default" else base_action
+                if is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
+                    trigger_gyro = True
+                if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and base_resolved.endswith(":" + MODE_SHIFT_TOKEN):
+                    if is_pressed:
+                        mode_shift_pressed_ids.add(btn_id)
+                    if base_resolved.startswith("Custom[Tap]:"):
+                        if is_pressed and btn_id not in self._mode_shift_armed:
+                            mode_shift_tap_edge = True
+                    else:  # Hold
+                        if is_pressed:
+                            mode_shift_hold_pressed = True
+            is_merged = getattr(self, "is_merged", False)
+            if mode_shift_tap_edge and not is_merged:
+                self._mode_shift_toggle = not getattr(self, "_mode_shift_toggle", False)
+            self._mode_shift_armed = mode_shift_pressed_ids
+            # Compatibility for any older runtime state readers.
+            self._mode_shift_tap_held = self._mode_shift_armed
+            local_mode_shift_toggle = bool(getattr(self, "_mode_shift_toggle", False))
+            # Share the Mode Shift back-button state across a merged Joy-Con pair so pressing
+            # it on EITHER Joy-Con applies the Mode Shift layer to BOTH sides. Publish the
+            # toggle and hold components separately because Hold must temporarily invert a
+            # Tap-entered Mode Shift, not be ORed with it.
+            self._own_mode_shift_toggle = local_mode_shift_toggle
+            self._own_mode_shift_tap_edge = mode_shift_tap_edge
+            self._own_mode_shift_hold_pressed = mode_shift_hold_pressed
+            if is_merged:
+                shared_mode_shift_toggle = bool(getattr(self, "_shared_mode_shift_toggle", False))
+                shared_mode_shift_hold_pressed = bool(getattr(self, "_shared_mode_shift_hold_pressed", False))
+                mode_shift_toggle = (not shared_mode_shift_toggle) if mode_shift_tap_edge else shared_mode_shift_toggle
+            else:
+                shared_mode_shift_hold_pressed = False
+                mode_shift_toggle = local_mode_shift_toggle
+            mode_shift_button_active = mode_shift_toggle != (mode_shift_hold_pressed or shared_mode_shift_hold_pressed)
+            self._own_mode_shift_active = local_mode_shift_toggle != mode_shift_hold_pressed
+            # In-app Gyro auto-applies the Mode Shift layer only when the per-(profile,
+            # Gyro Control) Mode Shift toggle is On; the back button applies it regardless.
+            in_app_gyro_active = getattr(self, "gyro_mouse_enabled", False) or trigger_gyro
+            mapping_scope_active = (in_app_gyro_active and CONFIG.mode_shift_enabled) or mode_shift_button_active
+            self._mode_shift_active = mapping_scope_active
+            # Resolve the active In-app Gyro mapping dict once per report and index it
+            # directly below, instead of calling a resolving getter for every button.
+            mapping_scope_dict = CONFIG.get_mapping_scope_dict("in_app_gyro_mode_mappings") if mapping_scope_active else None
             trigger_calibration = False
-            for is_pressed, action, original_bit, default_action, btn_id in mapping_pairs:
+            gyro_lock_hold_pressed = False
+            if not hasattr(self, "_gyro_lock_tap_held"):
+                self._gyro_lock_tap_held = set()
+            for is_pressed, mapping_key, original_bit, default_action, btn_id in mapping_pairs:
+                base_action = get_base_mapping_action(mapping_key)
+                base_resolved = default_action if base_action == "Default" else base_action
+                if is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
+                    trigger_gyro = True
+                # The Mode Shift trigger is handled in the pre-pass above; skip it here so
+                # it doesn't also emit whatever the shifted layer maps that button to.
+                if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and base_resolved.endswith(":" + MODE_SHIFT_TOKEN):
+                    continue
+                action = mapping_scope_dict.get(f"{mapping_key}_mapping", "Default") if mapping_scope_dict is not None else base_action
                 resolved = default_action if action == "Default" else action
-                
+
+                # In-app Gyro Lock: pause gyro control while staying in In-app Gyro mode.
+                # Stored as a Custom-form pseudo-mapping "Custom[Hold|Tap]:GYRO_LOCK".
+                if isinstance(resolved, str) and resolved.endswith(":" + GYRO_LOCK_TOKEN) and resolved.startswith("Custom"):
+                    if resolved.startswith("Custom[Tap]:"):
+                        was_held = btn_id in self._gyro_lock_tap_held
+                        if is_pressed and not was_held:
+                            self._gyro_lock_toggle = not getattr(self, "_gyro_lock_toggle", False)
+                            self._gyro_lock_tap_held.add(btn_id)
+                        elif not is_pressed and was_held:
+                            self._gyro_lock_tap_held.discard(btn_id)
+                    else:  # Hold
+                        if is_pressed:
+                            gyro_lock_hold_pressed = True
+                    continue
+
+                # A "Mode Shift" mapping that ended up inside the shifted layer is a no-op
+                # here (the trigger is resolved from the base layer in the pre-pass); skip
+                # it so it isn't dispatched as a literal "MODE_SHIFT" key sequence.
+                if isinstance(resolved, str) and resolved.startswith("Custom") and resolved.endswith(":" + MODE_SHIFT_TOKEN):
+                    continue
+
                 if isinstance(resolved, str) and resolved.startswith("Custom"):
                     is_custom = True
                     if resolved.startswith("Custom[Tap]:"):
@@ -1768,7 +1786,7 @@ class Controller:
                         self.physical_tap_held.remove(btn_id)
                 
                 if is_pressed and not (isinstance(resolved, str) and resolved.startswith("Custom")):
-                    if resolved == "Gyro": trigger_gyro = True
+                    if resolved in ("Gyro", "In-app Gyro"): trigger_gyro = True
                     elif resolved == "DJG": trigger_djg = True
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
                     elif resolved == "PrtSc": trigger_screenshot = True
@@ -1785,6 +1803,9 @@ class Controller:
                     elif resolved in SWITCH_BUTTONS:
                         inputData.buttons |= SWITCH_BUTTONS[resolved]
                         inputData.custom_buttons_mask |= SWITCH_BUTTONS[resolved]
+
+            # In-app Gyro Lock state for this report (Hold = while held, Tap = toggled).
+            self.gyro_lock_active = gyro_lock_hold_pressed or getattr(self, "_gyro_lock_toggle", False)
 
             # Apply active controller buttons and continuous mouse wheel
             now = time.perf_counter()
@@ -1878,10 +1899,12 @@ class Controller:
                     self.input_report_callback(inputData, self)
                 return
 
-            raw_left_pressed  = bool(inputData.buttons & 0x01)
-            raw_up_pressed    = bool(inputData.buttons & 0x02)
-            raw_down_pressed  = bool(inputData.buttons & 0x04)
-            raw_right_pressed = bool(inputData.buttons & 0x08)
+            active_mapping_scope = "in_app_gyro_mode_mappings" if mapping_scope_dict is not None else None
+            active_scope_dict = CONFIG.get_mapping_scope_dict(active_mapping_scope)
+            if active_scope_dict.get("y_mapping", "Default") != "Default": raw_left_pressed = False
+            if active_scope_dict.get("x_mapping", "Default") != "Default": raw_up_pressed = False
+            if active_scope_dict.get("b_mapping", "Default") != "Default": raw_down_pressed = False
+            if active_scope_dict.get("a_mapping", "Default") != "Default": raw_right_pressed = False
             inputData.buttons &= ~0x0F
             
             abxy_mode = getattr(CONFIG, "abxy_mode", "Xbox")
@@ -1905,21 +1928,23 @@ class Controller:
             # NSO GameCube Controller Switch Layout override:
             # GCN physical buttons map differently to Switch Pro buttons.
             # raw_right=GCN A, raw_left=GCN B, raw_down=GCN X, raw_up=GCN Y
-            # Desired Switch Layout: GCN A→Pro B, GCN B→Pro Y, GCN X→Pro A, GCN Y→Pro X
+            # Desired Switch Layout: GCN A?ro B, GCN B?ro Y, GCN X?ro A, GCN Y?ro X
             if (should_swap and
                     getattr(self, 'controller_info', None) and
                     getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID):
                 # Clear the bits set by the generic Switch layout above
                 inputData.buttons &= ~0x0F
                 # Re-apply with GCN-specific mapping:
-                # GCN X (raw_down) → Pro A (0x08)
+                # GCN X (raw_down) ??Pro A (0x08)
                 if raw_down_pressed:  inputData.buttons |= 0x08
-                # GCN A (raw_right) → Pro B (0x04)
+                # GCN A (raw_right) ??Pro B (0x04)
                 if raw_right_pressed: inputData.buttons |= 0x04
-                # GCN Y (raw_up) → Pro X (0x02)
+                # GCN Y (raw_up) ??Pro X (0x02)
                 if raw_up_pressed:    inputData.buttons |= 0x02
-                # GCN B (raw_left) → Pro Y (0x01)
+                # GCN B (raw_left) ??Pro Y (0x01)
                 if raw_left_pressed:  inputData.buttons |= 0x01
+
+            inputData.buttons |= getattr(inputData, 'custom_buttons_mask', 0)
 
             if trigger_screenshot and not getattr(self, 'prev_screenshot', False):
                 win32api.keybd_event(0x5B, 0, 0, 0)
@@ -1960,9 +1985,12 @@ class Controller:
                 win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0) # Ctrl up
             self.prev_sys_manager = trigger_sys_manager
 
-            if trigger_change_profile_btn and not getattr(self, 'prev_change_profile_btn', False):
+            if trigger_change_profile_btn and not profile_combo_target and not getattr(self, 'prev_change_profile_btn', False):
                 trigger_change_profile()
             self.prev_change_profile_btn = trigger_change_profile_btn
+
+            self._in_app_gyro_mapping_active_this_frame = mapping_scope_active
+            self._apply_shared_joystick_mapping(inputData)
 
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
@@ -2089,77 +2117,64 @@ class Controller:
             try:
                 vc = getattr(self, 'virtual_controller', None)
                 if vc is not None:
-                    # NSO GCN controllers use a dedicated GameCube-style temporal PWM
-                    # rumble loop (_gc_pwm_loop) driven by vibration_callback.
-                    # Dispatching Switch HD Rumble frames here is unnecessary and
-                    # confusing; skip the entire HD Rumble frame path for GCN.
-                    if getattr(getattr(self, 'controller_info', None), 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
-                        # Ensure the PWM loop is running (lazy-start on first input report)
-                        if not getattr(self, 'gc_pwm_running', False):
-                            _gcn_get_or_create_state(self)
-                            self.gc_pwm_running = True
+                    current_time = time.perf_counter()
+                    last_rumble_time = getattr(self, 'last_rumble_time', 0)
+
+                    if current_time - last_rumble_time >= 0.007:
+                        self.last_rumble_time = current_time
+
+                        if getattr(vc, 'rumble_force_clear', False):
+                            self.rumble_stopped = False
+                            self._zero_count = 0
+                            vc.rumble_force_clear = False
+
+                        use_dualsense_stereo = (
+                            getattr(vc, 'mode', None) == "PS5" and
+                            getattr(vc, 'driver_type', None) == "USBIP"
+                        )
+
+                        def dispatch_rumble_task(coro):
                             loop = getattr(vc, 'loop', None)
                             if loop and not loop.is_closed():
-                                asyncio.run_coroutine_threadsafe(self._gc_pwm_loop(), loop)
-                    else:
-                        current_time = time.perf_counter()
-                        last_rumble_time = getattr(self, 'last_rumble_time', 0)
-
-                        if current_time - last_rumble_time >= 0.007:
-                            self.last_rumble_time = current_time
-
-                            if getattr(vc, 'rumble_force_clear', False):
-                                self.rumble_stopped = False
-                                self._zero_count = 0
-                                vc.rumble_force_clear = False
-
-                            use_dualsense_stereo = (
-                                getattr(vc, 'mode', None) == "PS5" and
-                                getattr(vc, 'driver_type', None) == "USBIP"
-                            )
-
-                            if not use_dualsense_stereo:
-                                v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
-
-                                if not getattr(self, '_rumble_task_running', False):
-
-                                    async def safe_send_single(v1_c, v2_c, v3_c):
-                                        self._rumble_task_running = True
-                                        try:
-                                            await self.set_vibration(v1_c, v2_c, v3_c)
-                                        finally:
-                                            self._rumble_task_running = False
-
-                                    def dispatch_rumble_task(coro):
-                                        loop = getattr(vc, 'loop', None)
-                                        if loop and not loop.is_closed():
-                                            asyncio.run_coroutine_threadsafe(coro, loop)
-                                        else:
-                                            try:
-                                                asyncio.get_running_loop().create_task(coro)
-                                            except RuntimeError:
-                                                pass
-
-                                    if is_zero:
-                                        if not getattr(self, 'rumble_stopped', False):
-                                            self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                            dispatch_rumble_task(safe_send_single(v1, v2, v3))
-                                            if self._zero_count >= 3:
-                                                self.rumble_stopped = True
-                                    else:
-                                        self.rumble_stopped = False
-                                        self._zero_count = 0
-                                        # Pace continuous rumble to the BLE connection interval
-                                        # (~7.5ms) for the ESP32-S3 bridge. The 3 frames per
-                                        # command already cover the interval; dispatching every
-                                        # input report (faster, and doubled in merge mode) floods
-                                        # the firmware's per-interval BLE write and causes the
-                                        # stuttering. WinRT is paced by Windows' BLE stack instead.
-                                        if self._bridge_rumble_due():
-                                            dispatch_rumble_task(safe_send_single(v1, v2, v3))
+                                asyncio.run_coroutine_threadsafe(coro, loop)
                             else:
-                                v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
-                                v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
+                                try:
+                                    asyncio.get_running_loop().create_task(coro)
+                                except RuntimeError:
+                                    pass
+
+                        if not use_dualsense_stereo:
+                            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
+
+                            if not getattr(self, '_rumble_task_running', False):
+
+                                async def safe_send_single(v1_c, v2_c, v3_c):
+                                    self._rumble_task_running = True
+                                    try:
+                                        await self.set_vibration(v1_c, v2_c, v3_c)
+                                    finally:
+                                        self._rumble_task_running = False
+
+                                if is_zero:
+                                    if not getattr(self, 'rumble_stopped', False):
+                                        self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
+                                        if self._zero_count >= 3:
+                                            self.rumble_stopped = True
+                                else:
+                                    self.rumble_stopped = False
+                                    self._zero_count = 0
+                                    # Pace continuous rumble to the BLE connection interval
+                                    # (~7.5ms) for the ESP32-S3 bridge. The 3 frames per
+                                    # command already cover the interval; dispatching every
+                                    # input report (faster, and doubled in merge mode) floods
+                                    # the firmware's per-interval BLE write and causes the
+                                    # stuttering. WinRT is paced by Windows' BLE stack instead.
+                                    if self._bridge_rumble_due():
+                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
+                        else:
+                            v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
+                            v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
 
                             if self.is_pro_controller():
                                 is_zero = is_zero_l and is_zero_r
@@ -2181,16 +2196,6 @@ class Controller:
                                             await self.set_vibration(v1_c_r, v2_c_r, v3_c_r)
                                     finally:
                                         self._rumble_task_running = False
-
-                                def dispatch_rumble_task(coro):
-                                    loop = getattr(vc, 'loop', None)
-                                    if loop and not loop.is_closed():
-                                        asyncio.run_coroutine_threadsafe(coro, loop)
-                                    else:
-                                        try:
-                                            asyncio.get_running_loop().create_task(coro)
-                                        except RuntimeError:
-                                            pass
 
                                 if is_zero:
                                     if not getattr(self, 'rumble_stopped', False):
@@ -2232,7 +2237,7 @@ class Controller:
                 # Subscribing gc_input_report_callback to COMMAND_RESPONSE_UUID would
                 # overwrite the command_response_callback registered during initialize(),
                 # causing all write_command() calls (including enableFeatures) to timeout.
-                # Use the standard INPUT_REPORT_UUID subscription — the bridge router
+                # Use the standard INPUT_REPORT_UUID subscription ??the bridge router
                 # ensures GCN input frames reach this callback correctly.
                 logger.info("GCN via ESP32 bridge: using standard INPUT_REPORT_UUID subscription")
                 await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
@@ -2517,9 +2522,10 @@ class Controller:
         if getattr(self, '_skip_gyro_mouse', False) or not current_gyro_active:
             if hasattr(self, 'gyro_moving_envelope'):
                 self.gyro_moving_envelope *= 0.88
-                
+
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
+            self._gyro_rstick_out = (0.0, 0.0)
             self.current_vx = 0.0
             self.current_vy = 0.0
             self.interp_residual_x = 0.0
@@ -2680,53 +2686,20 @@ class Controller:
             
             now = time.perf_counter()
             current_mode = getattr(CONFIG, "gyro_mode", "World")
-
-            # Hybrid Mouse Button Mapping (Only if NOT in Steering/Roll mode)
-            if current_mode != "Roll":
-                is_merged = getattr(self, "is_merged", False)
-                is_pro = self.is_pro_controller()
-                
-                if is_pro or is_merged:
-                    # Dual / Pro Mode: ZR is Left, ZL is Right
-                    current_l_click = zr_pressed
-                    current_r_click = zl_pressed
-                else:
-                    # Split Mode (Single Joycon behavior)
-                    if self.is_joycon_right():
-                        current_l_click = bool(inputData.buttons & SWITCH_BUTTONS.get("ZR", 0))
-                        current_r_click = bool(inputData.buttons & SWITCH_BUTTONS.get("R", 0))
-                    else:
-                        current_l_click = bool(inputData.buttons & SWITCH_BUTTONS.get("ZL", 0))
-                        current_r_click = bool(inputData.buttons & SWITCH_BUTTONS.get("L", 0))
-
-                # Detect button press and release for clicks
-                prev_l_click = getattr(self, 'prev_l_click', False)
-                prev_r_click = getattr(self, 'prev_r_click', False)
-
-                # Inject mouse clicks immediately
-                if current_l_click and not prev_l_click: win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                elif not current_l_click and prev_l_click: win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                
-                if current_r_click and not prev_r_click: win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-                elif not current_r_click and prev_r_click: win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
-
-                # Track click stabilization window (ONLY on press / down event)
-                if (current_l_click and not prev_l_click) or (current_r_click and not prev_r_click):
-                    self.last_click_event_time = now
-
-                self.prev_l_click = current_l_click
-                self.prev_r_click = current_r_click
+            if getattr(CONFIG, "gyro_control_mode", "Mouse") == "Steering":
+                current_mode = "Roll"
 
             # Suppress movement ONLY during gyro startup (Auto-Leveling period)
             if now - self.gyro_start_time < 0.05:
                 self.gyro_target_vx = 0.0
                 self.gyro_target_vy = 0.0
+                self._gyro_rstick_out = (0.0, 0.0)
                 return
             
             gyro_deadzone = 0.2 
             
             if current_mode in ["World", "Yaw"]:
-                sensitivity = getattr(CONFIG, "gyro_sensitivity", 0.3)
+                sensitivity = getattr(CONFIG, "gyro_sensitivity", 0.3) * 2.0
                 accel_factor = 0.002
                 
                 # Determine vertical sign (invert for Right Joycon in H-mode if needed)
@@ -2767,8 +2740,8 @@ class Controller:
                         orig_tilt = orig_ax
                     tilt_value -= orig_tilt
                 
-                tilt_normalized = tilt_value / 4000.0  
-                sensitivity = getattr(CONFIG, "gyro_sensitivity", 4.0)
+                tilt_normalized = tilt_value / 4000.0
+                sensitivity = getattr(CONFIG, "gyro_sensitivity", 4.0) * 2.0
                 # Sensitivity * 1.0 (Inverted sign based on user feedback)
                 steer_value = max(-1.0, min(1.0, -tilt_normalized * sensitivity))
                 
@@ -2776,20 +2749,37 @@ class Controller:
                 self._own_steer_value = steer_value
 
 
-            # Analog Stick Mouse Movement (Stick Assist) - Only if NOT in Steering mode
-            if current_mode != "Roll":
-                stick_deadzone = 0.05 
-                stick_sens = getattr(CONFIG, "stick_mouse_sensitivity", 20.0) * 0.66
-                
-                stick_magnitude = math.sqrt(sx**2 + sy**2)
-                
-                if stick_magnitude > stick_deadzone:
-                    normalized_mag = (stick_magnitude - stick_deadzone) / (1.0 - stick_deadzone)
-                    normalized_sx = (sx / stick_magnitude) * normalized_mag
-                    normalized_sy = (sy / stick_magnitude) * normalized_mag
-                    
-                    target_vx += normalized_sx * stick_sens
-                    target_vy += normalized_sy * -stick_sens
+            # Gyro Control == "R Joystick": map gyro angular velocity to a right-stick
+            # deflection (push toward motion, recenter when still) instead of mouse motion.
+            # The Sensitivity slider scales the velocity->deflection conversion; the result
+            # is clamped to the right stick's maximum (unit magnitude).
+            if getattr(CONFIG, "gyro_control_mode", "Mouse") == "R Joystick":
+                gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
+                rstick_sens = getattr(CONFIG, "r_joystick_gyro_sensitivity", 5.0) * 8.0
+                RSTICK_CONV = 0.002  # base velocity(dps)->deflection factor
+                if current_mode in ["World", "Yaw"]:
+                    v_sign = -1.0
+                    if self.is_joycon_right() and self.hold_mode == "Horizontal":
+                        v_sign = 1.0
+                    rx = (self.eff_h_final / gyro_scale) * rstick_sens * RSTICK_CONV
+                    ry = -((self.eff_v_final * v_sign) / gyro_scale) * rstick_sens * RSTICK_CONV
+                elif current_mode == "Roll":
+                    rx = getattr(self, "_own_steer_value", 0.0)
+                    ry = 0.0
+                else:
+                    rx = ry = 0.0
+                self._gyro_rstick_out = (rx, ry)
+                # Suppress mouse motion while driving the stick.
+                target_vx = 0.0
+                target_vy = 0.0
+            else:
+                self._gyro_rstick_out = (0.0, 0.0)
+
+            # In-app Gyro Lock: pause gyro motion output but stay in In-app Gyro mode.
+            if getattr(self, "gyro_lock_active", False):
+                target_vx = 0.0
+                target_vy = 0.0
+                self._gyro_rstick_out = (0.0, 0.0)
 
             self.gyro_target_vx = target_vx
             self.gyro_target_vy = target_vy
@@ -2797,7 +2787,9 @@ class Controller:
         else:
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
+            self._gyro_rstick_out = (0.0, 0.0)
             self._own_steer_value = 0.0
+            self._gyro_lock_toggle = False
             self.gyro_steering_origin_accel = None
             if getattr(self, 'prev_l_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             if getattr(self, 'prev_r_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
@@ -2805,6 +2797,511 @@ class Controller:
             self.gyro_residual_x = self.gyro_residual_y = 0.0
             self.current_vx = self.current_vy = 0.0
             self.interp_residual_x = self.interp_residual_y = 0.0
+
+    def _action_to_joystick_tokens(self, action, default_token=None):
+        if action == "Default":
+            return ([default_token] if default_token else []), []
+        if not action:
+            return [], []
+        if isinstance(action, str) and action.startswith("Custom"):
+            if action.startswith("Custom[Tap]:"):
+                seq_str = action[12:]
+                return [], [k for k in seq_str.split("+") if k]
+            elif action.startswith("Custom[Hold]:"):
+                seq_str = action[13:]
+            elif action.startswith("Custom:"):
+                seq_str = action[7:]
+            else:
+                seq_str = ""
+            return [k for k in seq_str.split("+") if k], []
+        if action in SWITCH_BUTTONS:
+            return [f"BTN_{action}"], []
+        named = {
+            "Home": "BTN_HOME",
+            "Capture": "BTN_CAPT",
+            "Chat": "BTN_C",
+            "PrtSc": "VK_SNAPSHOT",
+            "Mute": "VK_VOLUME_MUTE",
+        }
+        token = named.get(action)
+        return ([token] if token else []), []
+
+    def _in_app_gyro_mapping_scope(self):
+        # Follows the resolved Mode Shift state for this report (auto-apply when the
+        # toggle is On during In-app Gyro, or while the Mode Shift back button is held).
+        active = getattr(self, "_mode_shift_active", False) or getattr(self, "_in_app_gyro_mapping_active_this_frame", False)
+        return "in_app_gyro_mode_mappings" if active else None
+
+    def _handle_profile_selection_input(self, inputData, btn_states, selection_active):
+        # Navigation for Manual Change Profile selection. Up = cycle back, Down = cycle
+        # forward; A/B confirm/cancel. Mirrors the per-controller hold-orientation /
+        # layout remapping that the virtual controller applies, so the buttons match
+        # what the user sees. Single Joy-Cons use their directional buttons as ABXY,
+        # so they navigate by stick only; Pro/merged also navigate by the real D-pad.
+        TH = 0.6
+        lx, ly = inputData.left_stick
+        rx, ry = inputData.right_stick
+        hold = getattr(self, "hold_mode", "Vertical")
+        is_left = self.is_joycon_left()
+        is_right = self.is_joycon_right()
+
+        vc = getattr(self, "virtual_controller", None)
+        merged = bool(getattr(self, "is_merged", False) or (vc and len(getattr(vc, "controllers", [])) == 2))
+        pUP, pDOWN = bool(btn_states.get("UP")), bool(btn_states.get("DOWN"))
+        pLEFT, pRIGHT = bool(btn_states.get("LEFT")), bool(btn_states.get("RIGHT"))
+        pA, pB = bool(btn_states.get("A")), bool(btn_states.get("B"))
+        pX, pY = bool(btn_states.get("X")), bool(btn_states.get("Y"))
+
+        # Held-orientation vertical stick value (mirror virtual_controller rotations).
+        # A merged pair is always held vertically: left Joy-Con contributes the left
+        # stick/D-pad, right Joy-Con contributes the right stick.
+        if merged and is_left:
+            up = ly > TH
+            down = ly < -TH
+        elif merged and is_right:
+            up = ry > TH
+            down = ry < -TH
+        elif not (is_left or is_right):
+            up = ly > TH or ry > TH
+            down = ly < -TH or ry < -TH
+        elif is_left:
+            held_v = lx if hold == "Horizontal" else ly
+            up = held_v > TH
+            down = held_v < -TH
+        elif is_right:
+            held_v = -rx if hold == "Horizontal" else ry
+            up = held_v > TH
+            down = held_v < -TH
+
+        # Confirm/Cancel: first apply the V/H-mode mapping to find the physical buttons
+        # at the bottom and right face positions, then apply the Switch/Xbox layout to
+        # decide which is A (confirm) and which is B (cancel).
+        layout = getattr(CONFIG, "abxy_mode", "Xbox")
+        nav_button_now = False
+        if merged and is_left:
+            dpad_up, dpad_down = pUP, pDOWN
+            up = up or dpad_up
+            down = down or dpad_down
+            nav_button_now = dpad_up or dpad_down
+            bottom_pos, right_pos = False, False
+        elif merged or not (is_left or is_right):
+            # Pro / merged right Joy-Con: real D-pad is navigation, ABXY are physical.
+            bottom_pos, right_pos = pB, pA
+            up = up or pUP
+            down = down or pDOWN
+            nav_button_now = pUP or pDOWN
+        elif is_left and hold == "Vertical":
+            bottom_pos, right_pos = pDOWN, pRIGHT
+        elif is_left and hold == "Horizontal":
+            bottom_pos, right_pos = pLEFT, pDOWN
+        elif is_right and hold == "Horizontal":
+            if layout == "Switch":
+                confirm, cancel = pX, pA
+            else:
+                confirm, cancel = pA, pX
+            bottom_pos = right_pos = None
+        else:  # right Joy-Con vertical
+            bottom_pos, right_pos = pB, pA
+
+        if not (is_right and hold == "Horizontal" and not merged):
+            if layout == "Switch":
+                confirm, cancel = right_pos, bottom_pos
+            else:
+                confirm, cancel = bottom_pos, right_pos
+
+        # A Change Profile button press also cycles to the next profile (like Auto).
+        # Buttons mapped to A or B are excluded since they are used for confirm/cancel.
+        cp_now = False
+        cp_map = {
+            "gl": "GL", "gr": "GR", "sll": "SL_L", "srl": "SR_L", "slr": "SL_R", "srr": "SR_R",
+            "gc_l_click": "GC_L_CLICK", "gc_r_click": "GC_R_CLICK",
+            "home": "HOME", "capt": "CAPT", "c": "C", "plus": "PLUS", "minus": "MINUS",
+            "x": "X", "y": "Y", "up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT",
+            "zl": "ZL", "l": "L", "zr": "ZR", "r": "R", "l_stk": "L_STK", "r_stk": "R_STK",
+        }
+        for mkey, bkey in cp_map.items():
+            if btn_states.get(bkey) and CONFIG.get_mapping_setting_scoped(mkey, "Default", None) == "Change Profile":
+                cp_now = True
+                break
+        if nav_button_now:
+            cp_now = False
+
+        if not selection_active:
+            # Draining after confirm/cancel: keep output suppressed until A and B are
+            # released so the press doesn't leak into the virtual controller.
+            if not confirm and not cancel:
+                self._ps_drain = False
+                self._ps_was_active = False
+            self._ps_confirm_prev, self._ps_cancel_prev = confirm, cancel
+            self._ps_cp_prev = cp_now
+            return
+
+        if not getattr(self, "_ps_was_active", False):
+            # Just entered: seed prev states so a held button doesn't fire immediately.
+            self._ps_up_prev, self._ps_down_prev = up, down
+            self._ps_confirm_prev, self._ps_cancel_prev = confirm, cancel
+            self._ps_cp_prev = cp_now
+            self._ps_was_active = True
+            self._ps_drain = False
+            return
+
+        if up and not self._ps_up_prev:
+            utils.profile_nav(-1)
+        if down and not self._ps_down_prev:
+            utils.profile_nav(1)
+        if cp_now and not getattr(self, "_ps_cp_prev", False):
+            utils.profile_nav(1)
+        if confirm and not self._ps_confirm_prev:
+            utils.profile_confirm()
+            self._ps_drain = True
+        if cancel and not self._ps_cancel_prev:
+            utils.profile_cancel()
+            self._ps_drain = True
+
+        self._ps_up_prev, self._ps_down_prev = up, down
+        self._ps_confirm_prev, self._ps_cancel_prev = confirm, cancel
+        self._ps_cp_prev = cp_now
+
+    def _joystick_direction_tokens(self, key, direction_names):
+        defaults = {"up": "VK_W", "down": "VK_S", "left": "VK_A", "right": "VK_D"}
+        scope_dict = CONFIG.get_mapping_scope_dict(self._in_app_gyro_mapping_scope())
+        mode = scope_dict.get(f"{key}_mapping", "Default")
+        custom = scope_dict.get(f"{key}_custom", {}) if mode == "Custom" else {}
+        hold_tokens = []
+        tap_tokens_by_direction = {}
+        for direction in direction_names:
+            action = custom.get(direction, "Default") if mode == "Custom" else "Default"
+            if action == "Custom":
+                action = scope_dict.get(f"{key}_{direction}_mapping", "Default")
+            hold, tap = self._action_to_joystick_tokens(action, defaults.get(direction))
+            hold_tokens.extend(hold)
+            if tap:
+                tap_tokens_by_direction[direction] = tap
+        return hold_tokens, tap_tokens_by_direction
+
+    def _stick_sector_directions(self, stick):
+        directions, _ = self._stick_sector_state(stick)
+        return directions
+
+    def _stick_sector_state(self, stick):
+        x, y = stick
+        magnitude = math.sqrt(x * x + y * y)
+        center_deadzone = 0.40
+        if magnitude < center_deadzone:
+            return [], None
+        sector = int(round((math.atan2(y, x) - math.pi / 2) / (math.pi / 4))) % 8
+        sectors = [
+            (["up"], "up"),
+            (["up", "left"], "up_left"),
+            (["left"], "left"),
+            (["left", "down"], "left_down"),
+            (["down"], "down"),
+            (["down", "right"], "down_right"),
+            (["right"], "right"),
+            (["right", "up"], "right_up"),
+        ]
+        return sectors[sector]
+
+    def _apply_joystick_tokens(self, key, hold_tokens, tap_tokens_by_direction, inputData, active_directions=None, input_state=None, center_reset=False):
+        if not hasattr(self, "active_joystick_tokens"):
+            self.active_joystick_tokens = {}
+        if not hasattr(self, "joystick_tap_armed_inputs"):
+            self.joystick_tap_armed_inputs = {}
+        if not hasattr(self, "joystick_tap_armed_triggered_dirs"):
+            self.joystick_tap_armed_triggered_dirs = {}
+        if not hasattr(self, "joystick_tap_releases"):
+            self.joystick_tap_releases = {}
+        if not hasattr(self, "active_joystick_mouse_wheel"):
+            self.active_joystick_mouse_wheel = {}
+
+        now = time.perf_counter()
+        active_directions = set(active_directions or [])
+        old_tokens = self.active_joystick_tokens.get(key, set())
+        new_tokens = set(hold_tokens)
+        for token in old_tokens - new_tokens:
+            if token.startswith("VK_") or token.startswith("MB_"):
+                self._trigger_custom_os_key(token, False)
+            elif token.startswith("MW_"):
+                self.active_joystick_mouse_wheel.pop((key, token), None)
+        for token in new_tokens - old_tokens:
+            if token.startswith("VK_") or token.startswith("MB_"):
+                self._trigger_custom_os_key(token, True)
+        self.active_joystick_tokens[key] = new_tokens
+        for token in new_tokens:
+            if token.startswith("MW_"):
+                wheel_key = (key, token)
+                last_scroll = self.active_joystick_mouse_wheel.get(wheel_key, 0.0)
+                if now - last_scroll > 0.05:
+                    self._trigger_mouse_wheel_token(token)
+                    self.active_joystick_mouse_wheel[wheel_key] = now
+
+        armed_inputs = self.joystick_tap_armed_inputs.get(key, set())
+        if not isinstance(armed_inputs, set):
+            armed_inputs = {armed_inputs} if armed_inputs else set()
+        previous_armed_inputs = set(armed_inputs)
+        if center_reset:
+            armed_inputs = set()
+            previous_armed_inputs = set()
+            self.joystick_tap_armed_triggered_dirs[key] = set()
+        previous_triggered_dirs = set(self.joystick_tap_armed_triggered_dirs.get(key, set()))
+        should_tap = input_state is not None and input_state not in armed_inputs
+        if should_tap:
+            # Keep only the actual input sector that just triggered; this clears all
+            # other armed sectors without marking diagonal sectors as cardinal arms.
+            trigger_directions = set(active_directions)
+            if input_state and "_" in input_state:
+                for previous_input in previous_armed_inputs:
+                    if previous_input in ("up", "down", "left", "right") and previous_input in trigger_directions:
+                        trigger_directions.discard(previous_input)
+            elif input_state in ("up", "down", "left", "right"):
+                for previous_input in previous_armed_inputs:
+                    if isinstance(previous_input, str) and "_" in previous_input and input_state in previous_triggered_dirs:
+                        trigger_directions.discard(input_state)
+            armed_inputs = {input_state}
+            self.joystick_tap_armed_triggered_dirs[key] = set(trigger_directions)
+            for direction in trigger_directions:
+                for token in tap_tokens_by_direction.get(direction, []):
+                    if token.startswith("VK_") or token.startswith("MB_"):
+                        self._trigger_custom_os_key(token, True)
+                    elif token.startswith("BTN_"):
+                        btn_name = token[4:]
+                        if btn_name in SWITCH_BUTTONS:
+                            inputData.buttons |= SWITCH_BUTTONS[btn_name]
+                            inputData.custom_buttons_mask |= SWITCH_BUTTONS[btn_name]
+                    elif token.startswith("MW_"):
+                        self._trigger_mouse_wheel_token(token)
+                        continue
+                    self.joystick_tap_releases[(key, input_state, direction, token)] = now + 0.08
+        self.joystick_tap_armed_inputs[key] = armed_inputs
+
+        expired_taps = []
+        for tap_key, release_time in list(self.joystick_tap_releases.items()):
+            tap_owner = tap_key[0]
+            token = tap_key[-1]
+            if now >= release_time:
+                if token.startswith("VK_") or token.startswith("MB_"):
+                    still_held = any(token in tokens for tokens in self.active_joystick_tokens.values())
+                    if not still_held:
+                        self._trigger_custom_os_key(token, False)
+                expired_taps.append(tap_key)
+                continue
+            if token.startswith("BTN_"):
+                btn_name = token[4:]
+                if btn_name in SWITCH_BUTTONS:
+                    inputData.buttons |= SWITCH_BUTTONS[btn_name]
+                    inputData.custom_buttons_mask |= SWITCH_BUTTONS[btn_name]
+        for tap_key in expired_taps:
+            self.joystick_tap_releases.pop(tap_key, None)
+
+        for token in new_tokens:
+            if token.startswith("BTN_"):
+                btn_name = token[4:]
+                if btn_name in SWITCH_BUTTONS:
+                    inputData.buttons |= SWITCH_BUTTONS[btn_name]
+                    inputData.custom_buttons_mask |= SWITCH_BUTTONS[btn_name]
+
+    def _clear_joystick_input_state(self, key):
+        if not hasattr(self, "active_joystick_tokens"):
+            self.active_joystick_tokens = {}
+        for token in self.active_joystick_tokens.pop(key, set()):
+            if token.startswith("VK_") or token.startswith("MB_"):
+                self._trigger_custom_os_key(token, False)
+        if hasattr(self, "joystick_tap_armed_inputs"):
+            self.joystick_tap_armed_inputs.pop(key, None)
+        if hasattr(self, "joystick_tap_armed_triggered_dirs"):
+            self.joystick_tap_armed_triggered_dirs.pop(key, None)
+        if hasattr(self, "joystick_tap_releases"):
+            for tap_key in list(self.joystick_tap_releases.keys()):
+                if tap_key[0] == key:
+                    token = tap_key[-1]
+                    if token.startswith("VK_") or token.startswith("MB_"):
+                        self._trigger_custom_os_key(token, False)
+                    self.joystick_tap_releases.pop(tap_key, None)
+        if hasattr(self, "active_joystick_mouse_wheel"):
+            for wheel_key in list(self.active_joystick_mouse_wheel.keys()):
+                if wheel_key[0] == key:
+                    self.active_joystick_mouse_wheel.pop(wheel_key, None)
+        if hasattr(self, "joystick_scroll_tap_armed"):
+            self.joystick_scroll_tap_armed.pop(key, None)
+        if hasattr(self, "joystick_scroll_last_time"):
+            self.joystick_scroll_last_time.pop(key, None)
+        if hasattr(self, "joystick_mouse_vectors"):
+            self.joystick_mouse_vectors.pop(key, None)
+            self._update_joystick_mouse_target()
+
+    def _update_joystick_mouse_target(self):
+        vectors = getattr(self, "joystick_mouse_vectors", {})
+        self.jc_target_vx = sum(v[0] for v in vectors.values())
+        self.jc_target_vy = sum(v[1] for v in vectors.values())
+        self.joystick_mouse_active = any(abs(v[0]) > 0.001 or abs(v[1]) > 0.001 for v in vectors.values())
+
+    def _apply_joystick_mouse(self, key, stick):
+        if not hasattr(self, "joystick_mouse_vectors"):
+            self.joystick_mouse_vectors = {}
+        stick_deadzone = 0.05
+        stick_magnitude = math.sqrt(stick[0] * stick[0] + stick[1] * stick[1])
+        if stick_magnitude <= stick_deadzone:
+            self.joystick_mouse_vectors[key] = (0.0, 0.0)
+        else:
+            scope = self._in_app_gyro_mapping_scope()
+            stick_sens = float(CONFIG.get_joystick_setting_scoped(key, "mouse_sensitivity", 5.0, scope)) * 0.66
+            normalized_mag = (stick_magnitude - stick_deadzone) / (1.0 - stick_deadzone)
+            normalized_sx = (stick[0] / stick_magnitude) * normalized_mag
+            normalized_sy = (stick[1] / stick_magnitude) * normalized_mag
+            self.joystick_mouse_vectors[key] = (normalized_sx * stick_sens, normalized_sy * -stick_sens)
+        self._update_joystick_mouse_target()
+
+    def _apply_joystick_scroll_wheel(self, key, stick):
+        now = time.perf_counter()
+        if not hasattr(self, "joystick_scroll_last_time"):
+            self.joystick_scroll_last_time = {}
+        if not hasattr(self, "joystick_scroll_tap_armed"):
+            self.joystick_scroll_tap_armed = {}
+        if now - self.joystick_scroll_last_time.get(key, 0.0) < 0.03:
+            return
+        magnitude = math.sqrt(stick[0] * stick[0] + stick[1] * stick[1])
+        deadzone = 0.20
+        if magnitude <= deadzone:
+            self.joystick_scroll_tap_armed.pop(key, None)
+            return
+        normalized_mag = (magnitude - deadzone) / (1.0 - deadzone)
+        scope = self._in_app_gyro_mapping_scope()
+        mode = CONFIG.get_joystick_setting_scoped(key, "scroll_mode", "Up/Down", scope)
+        activation = CONFIG.get_joystick_setting_scoped(key, "scroll_activation", "Hold", scope)
+        vertical = 0
+        horizontal = 0
+        step = max(1, int(120 * normalized_mag))
+        directions, _ = self._stick_sector_state(stick)
+        input_state = "_".join(directions) if directions else None
+        if activation == "Tap":
+            if input_state is None or self.joystick_scroll_tap_armed.get(key) == input_state:
+                return
+            self.joystick_scroll_tap_armed[key] = input_state
+        if mode == "Up/Down":
+            if "up" in directions:
+                vertical = step
+            elif "down" in directions:
+                vertical = -step
+        else:
+            if "up" in directions:
+                vertical = step
+            elif "down" in directions:
+                vertical = -step
+            if "right" in directions:
+                horizontal = step
+            elif "left" in directions:
+                horizontal = -step
+        if vertical:
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, vertical, 0)
+        if horizontal:
+            win32api.mouse_event(getattr(win32con, "MOUSEEVENTF_HWHEEL", 0x01000), 0, 0, horizontal, 0)
+        if vertical or horizontal:
+            self.joystick_scroll_last_time[key] = now
+
+    def _trigger_mouse_wheel_token(self, token):
+        if token == "MW_UP":
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 120, 0)
+        elif token == "MW_DOWN":
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
+
+    def _apply_shared_joystick_mapping(self, inputData):
+        scope_dict = CONFIG.get_mapping_scope_dict(self._in_app_gyro_mapping_scope())
+        left_mode = scope_dict.get("l_joystick_mapping", "Default")
+        right_mode = scope_dict.get("r_joystick_mapping", "Default")
+        original_left = inputData.left_stick
+        original_right = inputData.right_stick
+        output_left = original_left
+        output_right = original_right
+        process_left = not self.is_joycon_right()
+        process_right = not self.is_joycon_left()
+        is_dual_stick_controller = not self.is_joycon()
+
+        def rotate_stick_for_mapping(key, stick):
+            if getattr(self, "hold_mode", "Vertical") != "Horizontal":
+                return stick
+            x, y = stick
+            if key == "l_joystick" and self.is_joycon_left():
+                return (-y, x)
+            if key == "r_joystick" and self.is_joycon_right():
+                return (y, -x)
+            return stick
+
+        def consume_stick(key, mode, stick):
+            mapped_stick = rotate_stick_for_mapping(key, stick)
+            if mode != "Mouse" and hasattr(self, "joystick_mouse_vectors"):
+                self.joystick_mouse_vectors.pop(key, None)
+                self._update_joystick_mouse_target()
+            if mode == "Mouse":
+                self._apply_joystick_mouse(key, mapped_stick)
+                self._apply_joystick_tokens(key, [], {}, inputData, center_reset=True)
+                return True
+            if mode == "Scroll Wheel":
+                self._apply_joystick_scroll_wheel(key, mapped_stick)
+                self._apply_joystick_tokens(key, [], {}, inputData, center_reset=True)
+                return True
+            directions, input_state = self._stick_sector_state(mapped_stick)
+            magnitude = math.sqrt(mapped_stick[0] * mapped_stick[0] + mapped_stick[1] * mapped_stick[1])
+            center_deadzone = 0.20
+            hold_tokens, tap_tokens = self._joystick_direction_tokens(key, directions) if mode in ("WASD", "Custom") else ([], {})
+            self._apply_joystick_tokens(
+                key,
+                hold_tokens,
+                tap_tokens,
+                inputData,
+                active_directions=directions,
+                input_state=input_state,
+                center_reset=magnitude < center_deadzone,
+            )
+            return mode in ("WASD", "Custom")
+
+        active_modes = {
+            "l_joystick": left_mode if process_left else None,
+            "r_joystick": right_mode if process_right else None,
+        }
+        if not hasattr(self, "joystick_mapping_active_modes"):
+            self.joystick_mapping_active_modes = {}
+        for key, mode in active_modes.items():
+            if self.joystick_mapping_active_modes.get(key) != mode:
+                self._clear_joystick_input_state(key)
+                self.joystick_mapping_active_modes[key] = mode
+
+        if process_left and left_mode == "R Joystick":
+            if not is_dual_stick_controller:
+                output_left = (0.0, 0.0)
+                output_right = original_left
+                inputData.custom_joystick_mapping = {"source": "left", "target": "right", "stick": original_left}
+            self._apply_joystick_tokens("l_joystick", [], {}, inputData, center_reset=True)
+        elif process_left and left_mode == "L Joystick":
+            if not is_dual_stick_controller:
+                inputData.custom_joystick_mapping = {"source": "left", "target": "left", "stick": original_left}
+            self._apply_joystick_tokens("l_joystick", [], {}, inputData, center_reset=True)
+        elif process_left and consume_stick("l_joystick", left_mode, original_left):
+            output_left = (0.0, 0.0)
+        else:
+            self._apply_joystick_tokens("l_joystick", [], {}, inputData, center_reset=True)
+
+        if process_right and right_mode == "L Joystick":
+            if not is_dual_stick_controller:
+                output_right = (0.0, 0.0)
+                output_left = original_right
+                inputData.custom_joystick_mapping = {"source": "right", "target": "left", "stick": original_right}
+            self._apply_joystick_tokens("r_joystick", [], {}, inputData, center_reset=True)
+        elif process_right and right_mode == "R Joystick":
+            if not is_dual_stick_controller:
+                inputData.custom_joystick_mapping = {"source": "right", "target": "right", "stick": original_right}
+            self._apply_joystick_tokens("r_joystick", [], {}, inputData, center_reset=True)
+        elif process_right and consume_stick("r_joystick", right_mode, original_right):
+            output_right = (0.0, 0.0)
+        else:
+            self._apply_joystick_tokens("r_joystick", [], {}, inputData, center_reset=True)
+
+        if process_left and left_mode == "L Joystick":
+            output_left = original_left
+        if process_right and right_mode == "R Joystick":
+            output_right = original_right
+
+        inputData.left_stick = output_left
+        inputData.right_stick = output_right
 
     def _trigger_custom_os_key(self, k, is_down):
         if k.startswith("VK_"):
@@ -2847,7 +3344,7 @@ class Controller:
     def _interpolation_thread_loop(self):
         last_time = time.perf_counter()
         while self.interp_running:
-            if self.client and self.client.is_connected and (self.gyro_mouse_enabled or getattr(self, 'jc_mouse_active', False)):
+            if self.client and self.client.is_connected and (self.gyro_mouse_enabled or getattr(self, 'jc_mouse_active', False) or getattr(self, 'joystick_mouse_active', False)):
                 if getattr(self, 'is_calibrating', False):
                     self.current_vx = 0.0
                     self.current_vy = 0.0

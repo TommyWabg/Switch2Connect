@@ -222,3 +222,31 @@ def trigger_change_profile():
     if change_profile_callback:
         change_profile_callback()
 
+# Manual Change Profile selection mode. While active, controllers suppress their
+# virtual output and route stick/Dpad/A/B to the navigation callbacks below.
+profile_selection_active = False
+profile_nav_callback = None      # fn(direction): -1 = back, +1 = forward
+profile_confirm_callback = None
+profile_cancel_callback = None
+
+def profile_nav(direction):
+    if profile_nav_callback:
+        profile_nav_callback(direction)
+
+def profile_confirm():
+    if profile_confirm_callback:
+        profile_confirm_callback()
+
+def profile_cancel():
+    if profile_cancel_callback:
+        profile_cancel_callback()
+
+switch_profile_callback = None
+def trigger_switch_profile(profile_name):
+    if switch_profile_callback:
+        switch_profile_callback(profile_name)
+
+profile_combo_record_callback = None
+def record_profile_combo_controller_buttons(btn_states):
+    if profile_combo_record_callback:
+        profile_combo_record_callback(btn_states)
