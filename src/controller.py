@@ -20,7 +20,7 @@ except Exception:
     pass
 from config import CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN
 from utils import (
-    apply_calibration_to_axis, get_stick_xy, press_or_release_mouse_button,
+    apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
     convert_mac_string_to_value, vector_normalize, vector_cross, vector_dot,
     quaternion_multiply, quaternion_normalize, quaternion_rotate_vector,
@@ -133,9 +133,19 @@ class StickCalibrationData:
             # failed bridge read). Fall back to centered defaults so the stick can't
             # get stuck at an extreme, which shows up as continuous joystick input.
             cx, cy = self.center
-            if ((self.center == (0, 0) and self.max == (0, 0))
-                    or (self.center == (4095, 4095) and self.max == (4095, 4095))
-                    or not (1024 <= cx <= 3072) or not (1024 <= cy <= 3072)):
+            mx, my = self.max
+            nx, ny = self.min
+            invalid_center = (
+                (self.center == (0, 0) and self.max == (0, 0))
+                or (self.center == (4095, 4095) and self.max == (4095, 4095))
+                or not (1024 <= cx <= 3072) or not (1024 <= cy <= 3072)
+            )
+            invalid_range = (
+                mx <= 0 or my <= 0 or nx <= 0 or ny <= 0
+                or mx > (4095 - cx) or my > (4095 - cy)
+                or nx > cx or ny > cy
+            )
+            if invalid_center or invalid_range:
                 self.center = (2048, 2048)
                 self.max = (1500, 1500)
                 self.min = (1500, 1500)
@@ -144,9 +154,10 @@ class StickCalibrationData:
             self.max = (1500, 1500)
             self.min = (1500, 1500)
 
-    def apply_calibration(self, raw_values: tuple[int, int]):
-        return (apply_calibration_to_axis(raw_values[0], self.center[0], self.max[0], self.min[0]), 
-                apply_calibration_to_axis(raw_values[1], self.center[1], self.max[1], self.min[1]))
+    def apply_calibration(self, raw_values: tuple[int, int], gain: float = 1.0):
+        x = max(-1.0, min(1.0, apply_calibration_to_axis(raw_values[0], self.center[0], self.max[0], self.min[0]) * gain))
+        y = max(-1.0, min(1.0, apply_calibration_to_axis(raw_values[1], self.center[1], self.max[1], self.min[1]) * gain))
+        return apply_radial_deadzone(x, y, 0.03)
 
 @dataclass
 class ControllerInputData:
@@ -292,10 +303,11 @@ class ControllerInputData:
             self.accelerometer = decodes(data[48:50]), decodes(data[50:52]), decodes(data[52:54])
             self.gyroscope = decodes(data[54:56]), decodes(data[56:58]), decodes(data[58:60])
 
+        stick_gain = 1.05 if product_id in (JOYCON_L_PID, JOYCON_R_PID, JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else 1.0
         if left_stick_calibration:
-            self.left_stick = left_stick_calibration.apply_calibration(self.left_stick)
+            self.left_stick = left_stick_calibration.apply_calibration(self.left_stick, gain=stick_gain)
         if right_stick_calibration:
-            self.right_stick = right_stick_calibration.apply_calibration(self.right_stick)
+            self.right_stick = right_stick_calibration.apply_calibration(self.right_stick, gain=stick_gain)
             
     
 

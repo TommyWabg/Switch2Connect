@@ -20,13 +20,48 @@ We shell out to NirSoft's svcl.exe (console build) or SoundVolumeView.exe (GUI
 build) — either accepts the same /Disable //Enable options.  CRUCIALLY we do NOT
 trust the exit code (these tools often return 0 even when nothing matched).
 Instead we dump the endpoint list (/scomma to a temp CSV), locate the render
-endpoint by name, issue the disable, then re-dump and VERIFY the Device State
-actually became "Disabled".  Enable/disable normally needs no admin (it goes
-through the audio policy service); we retry once elevated only if verification
-fails.
+endpoint by name, issue the disable, then re-dump and VERIFY by polling the real
+Device State.  Note a DISABLED render endpoint vanishes from the enumeration
+entirely, so for Disable "no matched render endpoint still enabled" IS the success
+condition (see Lessons learned below).  Enable/disable normally needs no admin (it
+goes through the audio policy service), so we try a direct call first and only
+fall back to an elevated scheduled task if that verifiably fails.
 
 Place the tool at drivers/tools/svcl.exe (or SoundVolumeView.exe).  If it is
 missing this module logs a warning and becomes a no-op.
+
+Lessons learned (2026-07 — "Audio Device still not disabled" investigation)
+---------------------------------------------------------------------------
+Symptom: "Could not auto-disable ... after 5 attempts", and the playback device
+stayed ENABLED in Sound Settings.  Live diagnostics on the actual virtual
+DualSense ("10- Wireless Controller Audio", render jack named "耳機") exposed
+THREE separate bugs, all now fixed in _apply():
+
+  1. The non-elevated path never even TRIED a direct disable.  On this hardware a
+     plain `SoundVolumeView /Disable <id>` succeeds with NO admin (verified:
+     rc=0, IsUserAnAdmin()=False, device went away).  The old code skipped that
+     and forced everything through the scheduled-task/UAC path, which was the one
+     thing failing.  FIX: attempt a direct (non-elevated) /Disable FIRST; only
+     fall back to the elevated scheduled task if that genuinely doesn't take.
+
+  2. Verification could never report success.  A render endpoint that is
+     successfully DISABLED DISAPPEARS from the /scomma enumeration entirely (only
+     its "...\\Application\\..." sessions linger) — it does NOT remain as a row
+     with Device State "Disabled".  The old _verify_all waited for the endpoint to
+     still be present AND read "disabled", which is impossible, so every attempt
+     was scored as a failure even though the disable had worked.  FIX: for Disable,
+     success == no matched *render* endpoint is still enabled (gone OR "Disabled").
+
+  3. "Already disabled" was misread as "not found -> failure".  When the endpoint
+     is absent (because it is already disabled), _find_all_render returns nothing;
+     the old code logged "endpoint not found" and returned False, burning all 5
+     retries and emitting the warning.  FIX: an absent render endpoint on Disable
+     is the desired end state -> return True immediately (idempotent, silent).
+
+Non-issue ruled out during the hunt: the CJK jack name showing as mojibake
+("耳機" -> "?v?") in piped console output is purely an OUTPUT-encoding artifact.
+The /scomma CSV is valid UTF-8 (BOM + correct bytes) and CreateProcessW passes the
+Unicode selector to SoundVolumeView intact, so matching/selecting was always fine.
 """
 
 import csv
@@ -285,51 +320,84 @@ def _apply(action):
         return False
 
     name = _target_name()
-    want = "disabled" if action == "Disable" else "active"
 
-    # Get current state via /scomma
+    def _verify(timeout=3.0, poll=0.4):
+        """Poll the real device state until `action` is satisfied (or timeout).
+
+        Device State is the single source of truth no matter which process applied
+        the change (direct call, runas, or the elevated scheduled task — the latter
+        boots a fresh interpreter / frozen exe and can take several seconds).
+
+        IMPORTANT: a successfully DISABLED render endpoint normally DISAPPEARS from
+        the endpoint enumeration entirely (or reports state 'Disabled'); it does not
+        linger as an 'Active' row.  So for Disable, success = no matched render
+        endpoint is still enabled.  For Enable, success = the endpoint is present
+        and active.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        first = True
+        while True:
+            time.sleep(0.6 if first else poll)
+            first = False
+            cur = _find_all_render(_dump(svcl), name)
+            if action == "Disable":
+                still_on = [r for r in cur
+                            if "disabled" not in r.get("Device State", "").strip().lower()]
+                if not still_on:
+                    return True
+            else:  # Enable
+                if cur and all("active" in r.get("Device State", "").strip().lower()
+                               for r in cur):
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+
+    # Snapshot current state.
     rows = _dump(svcl)
     targets = _find_all_render(rows, name)
-    
+
+    # An ABSENT physical render endpoint means it is not a usable playback device.
+    # For Disable that is already the desired end state (the endpoint vanishes when
+    # disabled, and only reappears — enabled — on the next USBIP re-attach), so do
+    # NOT treat it as a failure and retry/warn.
     if not targets:
+        if action == "Disable":
+            logger.info("No active %r render endpoint present; already disabled/absent.", name)
+            return True
         logger.warning("Audio endpoint %r (render) not found — is the virtual DualSense "
                        "connected yet?", name)
         return False
 
-    targets_to_change = []
-    for target in targets:
-        state = target.get("Device State", "").strip().lower()
-        if want not in state:
-            targets_to_change.append(target)
-
+    want = "disabled" if action == "Disable" else "active"
+    targets_to_change = [t for t in targets
+                         if want not in t.get("Device State", "").strip().lower()]
     if not targets_to_change:
         logger.info("All matching audio endpoints %r (%d) already %s.", name, len(targets), want)
         return True
 
-    def _verify_all(expected_state):
-        time.sleep(0.8)
-        current_targets = _find_all_render(_dump(svcl), name)
-        for ct in current_targets:
-            if expected_state not in ct.get("Device State", "").strip().lower():
-                return False
-        return True
-
-    # 1) Already elevated (incl. the schtasks-launched copy): run svcl directly, no UAC.
-    if _is_admin():
+    def _direct_apply():
         for t in targets_to_change:
             selector = t.get("Command-Line Friendly ID", "").strip() or name
             _run(svcl, [f"/{action}", selector])
-        
-        if _verify_all(want):
-            logger.info("svcl /%s succeeded (elevated) for all targets.", action)
-            return True
-        logger.warning("svcl /%s did not change all targets.", action)
+
+    # 1) Direct (non-elevated) attempt FIRST.  On many systems enable/disable goes
+    #    through the audio policy service and needs no admin at all, so this is the
+    #    fast path and skips the whole UAC / scheduled-task machinery.  (If we are
+    #    already elevated this is also the right call — svcl just runs directly.)
+    _direct_apply()
+    if _verify():
+        logger.info("svcl /%s succeeded (direct) for all targets.", action)
+        return True
+
+    # Already elevated and the direct call still didn't take: nothing more to try.
+    if _is_admin():
+        logger.warning("svcl /%s did not change all targets (elevated).", action)
         return False
 
-    # 2) Non-elevated DISABLE: drive it through the Scheduled Task so elevation is
-    #    SILENT.  UAC appears only once — when the task is first registered.  We do
-    #    NOT fall back to a per-call runas here (that would re-prompt every connect,
-    #    exactly what the task is meant to avoid).
+    # 2) Non-elevated DISABLE that needs admin on this system: drive it through the
+    #    Scheduled Task so elevation is SILENT.  UAC appears only once — when the
+    #    task is first registered.  We do NOT fall back to a per-call runas here
+    #    (that would re-prompt every connect, exactly what the task avoids).
     if action == "Disable":
         global _task_reg_attempted
         if not _task_exists():
@@ -342,23 +410,24 @@ def _apply(action):
                     "register a Scheduled Task.  Accept the UAC prompt next time, or "
                     "disable the '%s' playback device manually in mmsys.cpl.", name)
                 return False
-        if _run_task():
-            time.sleep(1.5)            # task re-discovers + disables with admin
-            if _verify_all(want):
-                logger.info("svcl /Disable succeeded via scheduled task for all targets.")
-                return True
-        logger.warning("Scheduled-task disable did not change all targets.")
+        # Trigger the elevated task.  schtasks /run returns non-zero if a previous
+        # instance is still running — that is NOT a failure here, the running task
+        # is still doing the work, so we poll the device state either way.  The
+        # elevated process (esp. a frozen exe) can take several seconds to boot, so
+        # give verification a generous window.
+        _run_task()
+        if _verify(timeout=8.0):
+            logger.info("svcl /Disable succeeded via scheduled task for all targets.")
+            return True
+        logger.warning("Scheduled-task disable did not change all targets yet.")
         return False
 
     # 3) ENABLE from a non-elevated session (manual/cleanup, rare): one runas prompt.
-    # Note: runas prompts UAC for each launch. To avoid multiple UACs, we just pass the wildcard or the first one, but wildcard is better if supported.
-    # However, svcl /Enable "Wireless Controller Audio" usually works for all if wildcard is not used?
-    # We will just iterate. If there are multiple, there might be multiple UAC prompts unfortunately.
     for t in targets_to_change:
         selector = t.get("Command-Line Friendly ID", "").strip() or name
         _run(svcl, [f"/{action}", selector], elevated=True)
-        
-    if _verify_all(want):
+
+    if _verify():
         logger.info("svcl /%s succeeded (runas) for all targets.", action)
         return True
     logger.warning("svcl /%s did not change all targets.", action)

@@ -21,8 +21,6 @@ class USBIPAllocator:
                 
             return host, bus_id, port
 
-from config import CONFIG
-
 def to_hex(buffer):
     return " ".join("{:02x}".format(x) for x in buffer)
 
@@ -65,11 +63,15 @@ def signed_looping_difference_16bit(a, b):
 
 def apply_calibration_to_axis(raw_value, center, max_abs, min_abs):
     signed_value = raw_value - center
-    if signed_value > CONFIG.deadzone:
-        return min((signed_value / max_abs) * 1.05, 1.0)
-    if signed_value < -CONFIG.deadzone:
-        return -min((-signed_value / min_abs) * 1.05, 1.0)
-    return 0
+    if signed_value >= 0:
+        return min(signed_value / max(max_abs, 1), 1.0)
+    return -min(-signed_value / max(min_abs, 1), 1.0)
+
+def apply_radial_deadzone(x, y, deadzone):
+    magnitude = math.sqrt(x * x + y * y)
+    if magnitude < deadzone:
+        return 0.0, 0.0
+    return x, y
 
 def press_or_release_mouse_button(state: bool, prev_state: bool, button: int, mouse_x: int, mouse_y):
     if (state and not prev_state):
