@@ -33,7 +33,7 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "0.12.0"
+#define APP_FIRMWARE_VERSION      "0.12.2"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_1"
 #define CDC_LINE_STATE_DTR        0x01
@@ -289,6 +289,41 @@ static size_t parse_hex(const char *s, uint8_t *out, size_t max) {
     return n;
 }
 
+static void write_cccd_value(int ch, uint16_t handle, bool enable) {
+    if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || handle == 0) return;
+    esp_gattc_descr_elem_t descr;
+    uint16_t got = 1;
+    if (esp_ble_gattc_get_descr_by_char_handle(s_ch[ch].gattc_if, s_ch[ch].conn_id,
+                                               handle, UUID_CCCD, &descr, &got) == ESP_OK && got > 0) {
+        uint8_t v[2] = { enable ? 0x01 : 0x00, 0x00 };
+        esp_ble_gattc_write_char_descr(s_ch[ch].gattc_if, s_ch[ch].conn_id,
+                                       descr.handle, sizeof(v), v,
+                                       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+    }
+}
+
+static uint16_t choose_input_handle(int ch, bool prefer_legacy, uint8_t *src) {
+    if (src) *src = 0;
+    if (ch < 0 || ch >= MAX_CH) return 0;
+    if (prefer_legacy && s_ch[ch].legacy_handle) {
+        if (src) *src = 2;
+        return s_ch[ch].legacy_handle;
+    }
+    if (!prefer_legacy && s_ch[ch].fd2_handle) {
+        if (src) *src = 1;
+        return s_ch[ch].fd2_handle;
+    }
+    if (s_ch[ch].fd2_handle) {
+        if (src) *src = 1;
+        return s_ch[ch].fd2_handle;
+    }
+    if (s_ch[ch].legacy_handle) {
+        if (src) *src = 2;
+        return s_ch[ch].legacy_handle;
+    }
+    return 0;
+}
+
 // --- command handlers (cdc_task context) ---
 static void do_conn(char *args) {
     char *save = NULL;
@@ -352,6 +387,52 @@ static void do_conn(char *args) {
     // from cdc_task once s_conn_open_after elapses.
     s_pending_conn = ch;
     esp_ble_gap_stop_scanning();
+}
+
+static void do_inputsrc(char *args) {  // inputsrc <ch> <fd2|legacy>
+    char *save = NULL;
+    char *ch_s = strtok_r(args, " ", &save);
+    char *mode_s = strtok_r(NULL, " ", &save);
+    if (!ch_s || !mode_s) return;
+    int ch = atoi(ch_s);
+    if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used) return;
+
+    bool prefer_legacy;
+    if (strcmp(mode_s, "legacy") == 0) {
+        prefer_legacy = true;
+    } else if (strcmp(mode_s, "fd2") == 0) {
+        prefer_legacy = false;
+    } else {
+        return;
+    }
+
+    s_ch[ch].prefer_legacy = prefer_legacy;
+    uint8_t new_src = 0;
+    uint16_t new_handle = choose_input_handle(ch, prefer_legacy, &new_src);
+    if (!new_handle) {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "inputsrc ch=%d mode=%s pending (fd2=0x%04x legacy=0x%04x)",
+                 ch, mode_s, s_ch[ch].fd2_handle, s_ch[ch].legacy_handle);
+        out_debug(dbg);
+        return;
+    }
+
+    uint16_t old_handle = s_ch[ch].input_handle;
+    if (old_handle && old_handle != new_handle) {
+        write_cccd_value(ch, old_handle, false);
+        esp_ble_gattc_unregister_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, old_handle);
+    }
+
+    s_ch[ch].input_handle = new_handle;
+    s_ch[ch].input_src = new_src;
+    if (!old_handle || old_handle != new_handle) {
+        esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, new_handle);
+    }
+
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "inputsrc ch=%d mode=%s input=0x%04x(src=%u prefer_legacy=%d)",
+             ch, mode_s, s_ch[ch].input_handle, s_ch[ch].input_src, s_ch[ch].prefer_legacy);
+    out_debug(dbg);
 }
 // Steady-state interval policy.  This controller CANNOT sustain two 7.5ms links plus a
 // third, so: 3+ established links all run at 15ms (itvl=12); with <=2 links everyone runs
@@ -518,6 +599,7 @@ static void handle_command(char *cmd) {
     else if (strncmp(cmd, "ble disconnect", 14) == 0) { do_disc_all(); }
     else if (strncmp(cmd, "auto", 4) == 0)      { /* host-driven conn only */ }
     else if (strncmp(cmd, "conn ", 5) == 0)     { do_conn(cmd + 5); }
+    else if (strncmp(cmd, "inputsrc ", 9) == 0) { do_inputsrc(cmd + 9); }
     else if (strncmp(cmd, "disc ", 5) == 0)     { do_disc(cmd + 5); }
     else if (strncmp(cmd, "wrpair ", 7) == 0)   { do_wrpair(cmd + 7); }
     else if (strncmp(cmd, "wr ", 3) == 0)       { do_wr(cmd + 3); }
@@ -742,13 +824,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         // Choose the input stream now that all characteristics are known.  The NSO
         // GameCube controller (prefer_legacy) uses the LEGACY characteristic; every
         // other SW2 controller uses FD2.  Fall back to whichever is present.
-        if (s_ch[ch].prefer_legacy && s_ch[ch].legacy_handle) {
-            s_ch[ch].input_handle = s_ch[ch].legacy_handle; s_ch[ch].input_src = 2;
-        } else if (s_ch[ch].fd2_handle) {
-            s_ch[ch].input_handle = s_ch[ch].fd2_handle;    s_ch[ch].input_src = 1;
-        } else if (s_ch[ch].legacy_handle) {
-            s_ch[ch].input_handle = s_ch[ch].legacy_handle; s_ch[ch].input_src = 2;
-        }
+        s_ch[ch].input_handle = choose_input_handle(ch, s_ch[ch].prefer_legacy, &s_ch[ch].input_src);
         char b[160];
         snprintf(b, sizeof(b), "discovered ch=%d input=0x%04x(src=%u prefer_legacy=%d fd2=0x%04x legacy=0x%04x) ack=0x%04x cmd=0x%04x rumble=0x%04x",
                  ch, s_ch[ch].input_handle, s_ch[ch].input_src, s_ch[ch].prefer_legacy,
@@ -801,7 +877,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
             memcpy(s_in_shadow[ch].data, param->notify.value, len);
             s_in_dirty[ch] = true;
             portEXIT_CRITICAL(&s_in_mux);
-        } else if (s_ack_queue) {
+        } else if (param->notify.handle == s_ch[ch].ack_handle && s_ack_queue) {
             in_report_t a; a.ch = ch; a.len = len; memcpy(a.data, param->notify.value, len);
             xQueueSend(s_ack_queue, &a, 0);
         }
