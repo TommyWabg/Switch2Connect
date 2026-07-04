@@ -177,7 +177,8 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             logger.warning("Discovery already running. Skipping...")
             return
         _CURRENTLY_DISCOVERING = True
-    
+
+    usb_hid_task = None
     try:
         UPDATE_CALLBACK = update_controllers_threadsafe
         DISCOVERER_LOOP = asyncio.get_running_loop()
@@ -205,7 +206,11 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
     
         if UPDATE_CALLBACK:
             UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
-    
+
+        # Wired USB controllers (e.g. Pro Controller 2) run on an independent transport,
+        # so watch for them concurrently with whichever BLE route is chosen below.
+        usb_hid_task = asyncio.create_task(run_usb_hid_discovery(quit_event))
+
         try:
             import usb_serial_bridge as _usb_serial_bridge_mod
             from usb_serial_bridge import (
@@ -848,7 +853,9 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
 
                         if created_virtual_controller:
                             await asyncio.to_thread(virtual_controller.setup_virtual_device)
-                        asyncio.create_task(controller.trigger_connection_haptics())
+                        async def _connection_haptics(c=controller):
+                            await c.trigger_connection_haptics()
+                        asyncio.create_task(_connection_haptics())
                         logger.info("Controller connected via ESP32-S3 N16R8 channel=%d", channel)
                         return controller
 
@@ -1097,6 +1104,12 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
             if tasks:
                 await asyncio.gather(*tasks)
 
+        async def trigger_connection_haptics(controller):
+            if getattr(controller, "_connection_haptics_done", False):
+                return
+            controller._connection_haptics_done = True
+            await controller.trigger_connection_haptics()
+
         async def disconnected_controller(controller: Controller):
             logger.info(f"Controller disconected {controller.client.address}")
         
@@ -1142,9 +1155,6 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     _connecting_macs.discard(device.address)
                     connected_mac_addresses.append(device.address)
             
-                # 2. Trigger haptic feedback asynchronously in the background
-                asyncio.create_task(controller.trigger_connection_haptics())
-
                 # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
                 async with GLOBAL_LOCK:
                     virtual_controller = None
@@ -1176,6 +1186,10 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     logger.info(f"Controller {device.address} connected. Remaining pending connections: {pending_connections_count}")
                     if pending_connections_count == 0:
                         await start_all_pending_virtual_usb()
+                        for vc in VIRTUAL_CONTROLLERS:
+                            if vc is not None:
+                                for c in getattr(vc, "controllers", []):
+                                    asyncio.create_task(trigger_connection_haptics(c))
             except Exception:
                 logger.exception(f"Unable to initialize device {device.address}")
                 if device.address in connected_mac_addresses:
@@ -1242,6 +1256,14 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                 logger.error(f"Bluetooth scanner error: {e}. Retrying in 2 seconds...")
                 await asyncio.sleep(2.0)
     finally:
+        if usb_hid_task is not None:
+            usb_hid_task.cancel()
+            try:
+                await usb_hid_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("USB HID discovery task teardown error", exc_info=True)
         with DISCOVERY_LOCK:
             _CURRENTLY_DISCOVERING = False
         logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery loop exited. Starting session cleanup...")
@@ -1255,6 +1277,154 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
         logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery session cleanup complete.")
         # Allow WinRT background events (like services_changed_handler) to clear out before closing the loop
         await asyncio.sleep(0.5)
+
+async def run_usb_hid_discovery(quit_event):
+    """Concurrent watcher for wired USB Pro Controller 2 devices.
+
+    Polls hidapi for the controller, hides its physical HID via HidHide, drives it
+    through the shared Controller pipeline, and occupies a normal player slot. Always
+    runs in the background alongside whichever BLE route ``run_discovery`` is using.
+    """
+    try:
+        from usb_hid_controller import USBHidController, enumerate_pro_controller2
+        import hidhide
+    except Exception as e:
+        logger.info("Wired USB support unavailable (missing hidapi?): %s", e)
+        return
+    logger.info("Wired USB watcher started (polling for Pro Controller 2, VID 057E/PID 2069).")
+
+    known: dict = {}          # device key -> USBHidController
+    connecting: set = set()
+
+    def _device_key(entry):
+        # The HID path is unique per physical device/port; Nintendo serials are all '00'.
+        path = entry.get("path")
+        if path is not None:
+            return path if isinstance(path, str) else bytes(path)
+        return (entry.get("serial_number") or "").strip().upper()
+
+    async def _remove(controller, key):
+        known.pop(key, None)
+        instance_id = getattr(controller, "_hidhide_instance_id", None)
+        async with GLOBAL_LOCK:
+            for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
+                if vc is not None and controller in getattr(vc, "controllers", []):
+                    try:
+                        became_empty = await vc.remove_controller(controller)
+                    except Exception:
+                        logger.exception("Failed to remove wired USB controller")
+                        became_empty = True
+                    if became_empty:
+                        VIRTUAL_CONTROLLERS[i] = None
+            if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+                reorder_controllers()
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                await update_all_player_leds()
+        try:
+            await controller.disconnect()
+        except Exception:
+            pass
+        if instance_id:
+            try:
+                hidhide.unhide_device(instance_id)
+            except Exception:
+                pass
+
+    async def _add(entry, key):
+        controller = None
+        instance_id = None
+        try:
+            # Hide the physical HID first (whitelists our own process so we keep access).
+            instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
+            if instance_id and hidhide.is_available():
+                hidhide.hide_device(instance_id)
+
+            controller = USBHidController(entry)
+            controller._hidhide_instance_id = instance_id
+
+            async def _on_disc(c, _k=key):
+                await _remove(c, _k)
+            controller.disconnected_callback = _on_disc
+
+            await controller.initialize()
+
+            async with GLOBAL_LOCK:
+                slot_index = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c is None), None)
+                if slot_index is None:
+                    logger.warning("Wired USB pad connected but no free player slot.")
+                    await controller.disconnect()
+                    if instance_id:
+                        hidhide.unhide_device(instance_id)
+                    return
+                vc = VirtualController(slot_index + 1, [controller], _on_disc, setup_usb=False)
+                VIRTUAL_CONTROLLERS[slot_index] = vc
+                await vc.init_added_controller(controller)
+                reorder_controllers()
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                await update_all_player_leds()
+
+            await asyncio.to_thread(vc.setup_virtual_device)
+            async def _connection_haptics(c_ref=controller):
+                await c_ref.trigger_connection_haptics()
+            asyncio.create_task(_connection_haptics())
+            known[key] = controller
+            logger.info("Wired USB Pro Controller 2 added (%s)", controller.device.address)
+        except Exception:
+            logger.exception("Failed to add wired USB controller")
+            if controller is not None:
+                try:
+                    await controller.disconnect()
+                except Exception:
+                    pass
+            if instance_id:
+                try:
+                    hidhide.unhide_device(instance_id)
+                except Exception:
+                    pass
+        finally:
+            connecting.discard(key)
+
+    try:
+        while not quit_event.is_set():
+            try:
+                chosen = {}
+                # hidapi enumeration is a blocking syscall. When no wired pad is
+                # present (the common case for wireless-only users) it always falls
+                # back to enumerating every HID device on the system, which can take
+                # tens of milliseconds. Running it inline on this event loop stalls
+                # the BLE rumble dispatch that shares the loop, producing an even ~1Hz
+                # gap in continuous vibration. Offload it to a thread so the wireless
+                # rumble timing matches 0.12.1 (which had no wired watcher at all).
+                entries = await asyncio.to_thread(enumerate_pro_controller2)
+                for entry in entries:
+                    key = _device_key(entry)
+                    if key and key not in chosen:
+                        chosen[key] = entry
+                for key, entry in chosen.items():
+                    if key in known or key in connecting:
+                        continue
+                    connecting.add(key)
+                    asyncio.create_task(_add(entry, key))
+                for key in list(known):
+                    if key not in chosen:
+                        controller = known.get(key)
+                        if controller is not None:
+                            await _remove(controller, key)
+            except Exception:
+                logger.exception("Wired USB discovery poll error")
+            await asyncio.sleep(1.0)
+    finally:
+        # Unhide anything we hid so devices aren't left invisible after teardown.
+        for controller in list(known.values()):
+            instance_id = getattr(controller, "_hidhide_instance_id", None)
+            if instance_id:
+                try:
+                    hidhide.unhide_device(instance_id)
+                except Exception:
+                    pass
+
 
 def start_discoverer(update_controllers_threadsafe, quit_event):
     asyncio.run(run_discovery(update_controllers_threadsafe, quit_event))

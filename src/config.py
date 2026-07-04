@@ -57,7 +57,7 @@ SWITCH_BUTTONS = {
 }
 
 BACK_BUTTON_OPTIONS = [
-    "Default", "Custom", "In-app Gyro", "Gyro Lock", "DJG", "Mode Shift", "Calibration", "Sys Manager", "Change Profile", "Home", "Capture", "PrtSc", "Chat", "Mute", "Game Bar", "HDR Toggle", "PS_L_Touch", "PS_R_Touch", "PS_C_Click",
+    "Default", "Custom", "In-app Gyro", "Gyro Lock", "DJG", "Mode Shift", "Calibration", "Task Manager", "Change Profile", "None", "Home", "Capture", "PrtSc", "On-Screen Keyboard", "Chat", "Mute", "Game Bar", "HDR Toggle", "Play/Pause", "Stop", "Next Track", "Previous Track", "Volume Up", "Volume Down", "Media Mute", "PS_L_Touch", "PS_R_Touch", "PS_C_Click",
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR",
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR"
 ]
@@ -68,7 +68,7 @@ BACK_BUTTON_OPTIONS = [
 # Input block intentionally spans three rows under a single header.
 BACK_BUTTON_CATEGORIES = [
     ("General", [
-        ["Default", "Custom", "Mode Shift", "Change Profile"],
+        ["Default", "Custom", "Mode Shift", "Change Profile", "None"],
     ]),
     ("In-app Gyro", [
         ["In-app Gyro", "Gyro Lock", "DJG", "Calibration"],
@@ -78,11 +78,14 @@ BACK_BUTTON_CATEGORIES = [
         ["ZR", "R", "PLUS", "Home", "R_STK", "B", "Y"],
         ["UP", "DOWN", "LEFT", "RIGHT", "Chat", "GL", "GR"],
     ]),
+    ("Media Keys", [
+        ["Play/Pause", "Stop", "Next Track", "Previous Track", "Volume Up", "Volume Down", "Media Mute"],
+    ]),
     ("PS Input", [
         ["PS_L_Touch", "PS_R_Touch", "PS_C_Click", "Mute"],
     ]),
     ("Windows", [
-        ["Game Bar", "PrtSc", "Sys Manager", "HDR Toggle"],
+        ["Game Bar", "PrtSc", "On-Screen Keyboard", "Task Manager", "HDR Toggle"],
     ]),
 ]
 
@@ -101,6 +104,9 @@ BACK_BUTTON_LABELS = {
     "PS_R_Touch": "Trackpad R Touch",
     "PS_C_Click": "Trackpad Center Click",
     "PrtSc": "Print Screen",
+    "Sys Manager": "Task Manager",
+    "Media Mute": "Mute",
+    "Mute": "PS Mute",
 }
 
 
@@ -108,7 +114,7 @@ def back_button_label(token):
     """Friendly display label for a Back Button Option token (falls back to the token)."""
     return BACK_BUTTON_LABELS.get(token, token)
 
-JOYSTICK_OPTIONS = ["Default", "R Joystick", "L Joystick", "WASD", "Mouse", "Scroll Wheel", "Custom"]
+JOYSTICK_OPTIONS = ["Default", "R Joystick", "L Joystick", "WASD", "KB Arrow Keys", "Mouse", "Scroll Wheel", "Custom"]
 
 # In-app Gyro Lock: a Back Button Option that pauses gyro control while staying in
 # In-app Gyro mode. Stored in the Custom recorder form as "Custom[Hold|Tap]:GYRO_LOCK".
@@ -330,6 +336,7 @@ def get_resource(resource_path: str):
 
 class Config:
     def __init__(self, config_file_path: str):
+        self.settings_generation = 0
         if hasattr(sys, 'frozen'):
             base_dir = os.path.dirname(sys.executable)
         else:
@@ -391,6 +398,12 @@ class Config:
 
         self._save_lock = threading.Lock()
         self.load_config()
+
+    def _bump_settings_generation(self):
+        try:
+            self.settings_generation = int(getattr(self, "settings_generation", 0)) + 1
+        except Exception:
+            self.settings_generation = 1
 
     def load_config(self):
         config = {}
@@ -504,8 +517,10 @@ class Config:
         
         # MAC address -> Calibration data mapping dictionary
         self.calibration_data = config.get("calibration_data", {}) or {}
+        self.joystick_calibration_data = config.get("joystick_calibration_data", {}) or {}
         self.mag_calibration_data = config.get("mag_calibration_data", {}) or {}
         self.gc_trigger_calibration_data = config.get("gc_trigger_calibration_data", {}) or {}
+        self.controller_calibration_aliases = config.get("controller_calibration_aliases", {}) or {}
         self.merged_gyro_side = config.get("merged_gyro_side", {}) or {}
         
         # Persistent Cemuhook pad_id mapping
@@ -515,6 +530,9 @@ class Config:
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
         self.driver_installed = config.get("driver_installed", False)
+        # Wired USB Pro Controller 2 support + auto-hide of its physical HID via HidHide.
+        self.wired_usb_enabled = config.get("wired_usb_enabled", True)
+        self.hidhide_installed = config.get("hidhide_installed", False)
         self.driver_type = config.get("driver_type", "WinUHid")
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
@@ -581,9 +599,9 @@ class Config:
         saved_defaults = config.get("profile_defaults", {})
         if isinstance(saved_defaults, dict) and saved_defaults:
             config = {**config, **saved_defaults}
-        deadzone = config.get("virtual_gyro_soft_deadzone", 2.0)
+        deadzone = config.get("virtual_gyro_soft_deadzone", 0.0)
         if isinstance(deadzone, bool):
-            deadzone = 2.0 if deadzone else 0.0
+            deadzone = 0.0
         return {
             "gyro_mode": config.get("gyro_mode", "World"),
             "gyro_control_mode": config.get("gyro_control_mode", "Mouse"),
@@ -614,7 +632,7 @@ class Config:
             "gyro_activation_mode": "Toggle",
             "stick_mouse_sensitivity": 20.0,
             "stabilized_gyro": False,
-            "virtual_gyro_soft_deadzone": 2.0,
+            "virtual_gyro_soft_deadzone": 0.0,
             "gyro_passthrough_mode": "Default",
             "cemuhook_sensitivity": 1,
             "steam_roll_compensation": False,
@@ -633,6 +651,7 @@ class Config:
             import copy
             self.profiles[name] = copy.deepcopy(self.profiles[self.active_profile])
             self.active_profile = name
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -641,6 +660,7 @@ class Config:
         if new_name and new_name not in self.profiles:
             self.profiles[new_name] = self.profiles.pop(self.active_profile)
             self.active_profile = new_name
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -649,6 +669,7 @@ class Config:
         if len(self.profiles) > 1:
             self.profiles.pop(self.active_profile)
             self.active_profile = list(self.profiles.keys())[0]
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -735,6 +756,7 @@ class Config:
     def reset_profile_to_default(self, name):
         if name in self.profiles:
             self.profiles[name] = self.get_default_profile_dict()
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -744,6 +766,7 @@ class Config:
             old_hold_mode = self.profiles[name][cat].get("joycon_hold_mode", {})
             self.profiles[name][cat] = self.get_default_category_dict(cat)
             self.profiles[name][cat]["joycon_hold_mode"] = old_hold_mode
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -751,6 +774,7 @@ class Config:
     def switch_profile(self, name):
         if name in self.profiles:
             self.active_profile = name
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -952,6 +976,7 @@ class Config:
     def switch_profile(self, name):
         if name in self.profiles:
             self.active_profile = name
+            self._bump_settings_generation()
             self.save_config()
             return True
         return False
@@ -1033,6 +1058,7 @@ class Config:
     def _set_profile_setting(self, key, value):
         if self.active_profile in self.profiles:
             self.profiles[self.active_profile][key] = value
+            self._bump_settings_generation()
 
     @property
     def gyro_mode(self):
@@ -1070,6 +1096,7 @@ class Config:
         stored = dict(stored) if isinstance(stored, dict) else dict(MODE_SHIFT_ENABLED_DEFAULTS)
         stored[self.gyro_control_mode] = bool(value)
         prof["mode_shift_enabled"] = stored
+        self._bump_settings_generation()
 
     def active_in_app_gyro_scope(self):
         """Physical In-app Gyro mapping store for the current Gyro Control mode."""
@@ -1197,6 +1224,8 @@ class Config:
         # Snapshot config values in the calling thread
         data = {
             'driver_installed': self.driver_installed,
+            'wired_usb_enabled': self.wired_usb_enabled,
+            'hidhide_installed': self.hidhide_installed,
             'driver_type': self.driver_type,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
@@ -1243,8 +1272,10 @@ class Config:
             'gyro_bias_r': self.gyro_bias_r,
             'stick_r_bias': self.stick_r_bias,
             'calibration_data': self.calibration_data,
+            'joystick_calibration_data': self.joystick_calibration_data,
             'mag_calibration_data': self.mag_calibration_data,
             'gc_trigger_calibration_data': self.gc_trigger_calibration_data,
+            'controller_calibration_aliases': self.controller_calibration_aliases,
             'gc_trigger_mode': self.gc_trigger_mode,
             'gc_l_click_mapping': self.gc_l_click_mapping,
             'gc_r_click_mapping': self.gc_r_click_mapping,
@@ -1482,6 +1513,7 @@ class Config:
         old_val = self.button_remaps[cat].get(f"{key}_mapping", self._get_mapping_reset_default(cat, key, None))
         self.button_remaps[cat][f"{key}_mapping"] = val
         self._sync_in_app_gyro_mapping_key(cat, key, old_val, val, None)
+        self._bump_settings_generation()
 
     def ensure_mapping_scope(self, cat=None, scope=None):
         if scope is None:
@@ -1570,6 +1602,7 @@ class Config:
             old_val = scoped.get(f"{key}_mapping", self._get_mapping_reset_default(cat, key, scope))
             scoped[f"{key}_mapping"] = val
             self._sync_in_app_gyro_mapping_key(cat, key, old_val, val, scope)
+            self._bump_settings_generation()
             return
         self.set_mapping_setting(key, val)
 
@@ -1657,6 +1690,7 @@ class Config:
             elif mode_shift_on and (val in ("Gyro", "In-app Gyro") or scoped.get(key) in ("Gyro", "In-app Gyro")):
                 self.button_remaps[cat][key] = "In-app Gyro"
                 scoped[key] = "In-app Gyro"
+        self._bump_settings_generation()
 
     def reset_in_app_gyro_mode_mapping(self):
         cat = self.get_current_category()
@@ -1675,6 +1709,7 @@ class Config:
             key: val.copy() if isinstance(val, dict) else val
             for key, val in defaults.items()
         }
+        self._bump_settings_generation()
 
     def copy_controller_mapping_to_in_app_gyro_mode_mapping(self):
         cat = self.get_current_category()
@@ -1698,6 +1733,7 @@ class Config:
         for key, val in defaults.items():
             copied.setdefault(key, val.copy() if isinstance(val, dict) else val)
         self.button_remaps[cat][scope] = copied
+        self._bump_settings_generation()
 
     def get_joystick_custom(self, key):
         cat = self.get_current_category()
@@ -1716,6 +1752,7 @@ class Config:
         if isinstance(val, dict):
             defaults.update(val)
         self.button_remaps[cat][f"{key}_custom"] = defaults
+        self._bump_settings_generation()
 
     def get_joystick_custom_scoped(self, key, scope=None):
         scope = self._resolve_in_app_gyro_scope(scope)
@@ -1741,6 +1778,7 @@ class Config:
         if isinstance(val, dict):
             defaults.update(val)
         scoped[f"{key}_custom"] = defaults
+        self._bump_settings_generation()
 
     def get_joystick_setting(self, key, setting, default=None):
         cat = self.get_current_category()
@@ -1755,6 +1793,7 @@ class Config:
         if cat not in self.button_remaps:
             self.button_remaps[cat] = {}
         self.button_remaps[cat][f"{key}_{setting}"] = value
+        self._bump_settings_generation()
 
     def get_joystick_setting_scoped(self, key, setting, default=None, scope=None):
         scope = self._resolve_in_app_gyro_scope(scope)
@@ -1779,6 +1818,7 @@ class Config:
         cat = self.get_current_category()
         scoped = self.ensure_mapping_scope(cat, scope)
         scoped[f"{key}_{setting}"] = value
+        self._bump_settings_generation()
 
     def get_scoped_category_setting(self, key, default=None, scope=None):
         scope = self._resolve_in_app_gyro_scope(scope)
@@ -1798,6 +1838,7 @@ class Config:
             scoped[key] = value
         else:
             self.button_remaps[cat][key] = value
+        self._bump_settings_generation()
 
     def __getattr__(self, name):
         if name.endswith("_mapping"):

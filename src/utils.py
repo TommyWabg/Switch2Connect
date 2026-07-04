@@ -183,6 +183,20 @@ def force_ui_update():
     if force_ui_update_callback is not None:
         force_ui_update_callback()
 
+joystick_calibration_callback = None
+
+def trigger_joystick_calibration(virtual_controller):
+    global joystick_calibration_callback
+    if joystick_calibration_callback is not None:
+        joystick_calibration_callback(virtual_controller)
+
+joystick_calibration_cancel_callback = None
+
+def cancel_joystick_calibration(virtual_controller):
+    global joystick_calibration_cancel_callback
+    if joystick_calibration_cancel_callback is not None:
+        joystick_calibration_cancel_callback(virtual_controller)
+
 def disable_power_throttling():
     try:
         import ctypes

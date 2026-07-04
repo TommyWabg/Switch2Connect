@@ -15,13 +15,14 @@ import asyncio
 import os
 import re
 import ctypes
-from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID
+from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
 from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, _YamlLoader, _YamlDumper
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
 from utils import set_startup, disable_power_throttling
+import utils
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageTk
@@ -30,6 +31,14 @@ import win32con
 from ctypes import wintypes
 
 APP_VERSION = "0.11.2"
+
+def _set_current_thread_priority(level):
+    try:
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
+    except Exception:
+        pass
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
     _fields_ = [
@@ -232,6 +241,41 @@ def check_vigembus_pnputil():
 def is_vigembus_installed():
     return check_vigembus_registry() or check_vigembus_pnputil()
 
+def is_pro2_winusb_bound():
+    """True when the Pro Controller 2 vendor interface (MI_01) is bound to WinUSB.
+
+    On Windows 8+ the controller's own MS OS descriptor makes Windows auto-install
+    WinUSB, so this is normally always True and needs no user action. It is used only
+    as an internal safety-net signal (to warn if activation might fail); there is no
+    WinUSB install/uninstall UI. Uses a fast registry read (no PowerShell subprocess).
+    """
+    try:
+        import winreg
+    except Exception:
+        return False
+    base = r"SYSTEM\CurrentControlSet\Enum\USB\VID_057E&PID_2069&MI_01"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as key:
+            index = 0
+            while True:
+                try:
+                    instance = winreg.EnumKey(key, index)
+                    index += 1
+                except OSError:
+                    break
+                if "SWITCH2EMU" in instance.upper():
+                    continue
+                try:
+                    with winreg.OpenKey(key, instance) as inst_key:
+                        service = str(winreg.QueryValueEx(inst_key, "Service")[0]).upper()
+                    if service == "WINUSB":
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return False
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -256,6 +300,8 @@ except Exception:
 resolution_ratio = 1.0
 window_resolution_ratio = 1.0
 scaling_factor = 1.0
+ui_dpi = 120
+ui_dpi_scale = 1.25
 controller_frame_size = 200
 battery_height = 40
 player_row_height = 40
@@ -284,20 +330,53 @@ def _get_effective_client_height(fallback_height):
         pass
     return effective_height
 
+def _get_current_dpi_scale():
+    try:
+        get_dpi = getattr(ctypes.windll.user32, "GetDpiForSystem", None)
+        if get_dpi:
+            dpi = int(get_dpi())
+            if dpi > 0:
+                return dpi, dpi / 96.0
+    except Exception:
+        pass
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        if hdc:
+            try:
+                dpi = int(gdi32.GetDeviceCaps(hdc, 88))  # LOGPIXELSX
+                if dpi > 0:
+                    return dpi, dpi / 96.0
+            finally:
+                user32.ReleaseDC(0, hdc)
+    except Exception:
+        pass
+    return 120, 1.25
+
 def refresh_ui_scaling(current_screen_height=None):
     global screen_height, resolution_ratio, window_resolution_ratio, scaling_factor
+    global ui_dpi, ui_dpi_scale
     global controller_frame_size, battery_height, player_row_height
     global player_led_width, player_led_height
 
     if current_screen_height:
         screen_height = current_screen_height
 
-    window_resolution_ratio = (screen_height / 1440.0) * getattr(CONFIG, 'ui_scale', 1.0)
-
     ui_scale = getattr(CONFIG, 'ui_scale', 1.0)
-    if screen_height >= 1440:
+    ui_dpi, ui_dpi_scale = _get_current_dpi_scale()
+    if screen_height > 1440:
+        resolution_ratio = (ui_dpi_scale / 1.25) * ui_scale
+        window_resolution_ratio = resolution_ratio
+        logger.info(
+            "UI scaling: 4K/high-res DPI mode screen_height=%s dpi=%s dpi_scale=%.3f resolution_ratio=%.3f",
+            screen_height, ui_dpi, ui_dpi_scale, resolution_ratio
+        )
+    elif screen_height == 1440:
         resolution_ratio = (screen_height / 1440.0) * ui_scale
+        window_resolution_ratio = (screen_height / 1440.0) * ui_scale
     else:
+        window_resolution_ratio = (screen_height / 1440.0) * ui_scale
         effective_height = _get_effective_client_height(screen_height)
         try:
             baseline_height = max(1, 1440 - _get_window_non_client_height())
@@ -340,7 +419,7 @@ _INPUT_MODIFIER_TOKENS = {
 
 def format_input_display(text):
     """Human-readable form of a recorded Custom input token string. Mouse buttons are
-    shown as M1/M2/M3 (left/middle/right), keyboard keys as KB<key> (e.g. KB1, KBA),
+    shown as M1/M2/M3 (left/right/middle), keyboard keys as KB<key> (e.g. KB1, KBA),
     keyboard modifiers keep their bare name (CONTROL, SHIFT, ...), and controller buttons
     keep their bare name. The stored config value still uses the raw MB_/VK_/BTN_ tokens;
     this only affects what the recorder entry displays."""
@@ -351,7 +430,7 @@ def format_input_display(text):
         elif token.startswith("VK_"):
             parts.append("KB" + token[3:])
         elif token.startswith("MB_"):
-            parts.append("M" + token[3:])
+            parts.append({"MB_1": "M1", "MB_2": "M3", "MB_3": "M2"}.get(token, "M" + token[3:]))
         elif token.startswith("BTN_"):
             parts.append(token[4:])
         else:
@@ -782,6 +861,8 @@ class PlayerInfoBlock:
         self.mag_frame_l = None
         self.mag_btn_r = None
         self.mag_frame_r = None
+        self.joystick_cal_btn = None
+        self.joystick_cal_frame = None
 
         self.load_pictures()
         self.init_interface()
@@ -816,6 +897,10 @@ class PlayerInfoBlock:
             btn.config(text="Mag Cal", fg="white")
             frame.config(bg=button_gray)
             btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+    def _on_joystick_cal_clicked(self):
+        if self.current_vc is not None and self.current_vc.controllers:
+            self.window.start_joystick_calibration_from_callback(self.current_vc)
 
     def _on_split_clicked(self):
         if self.current_vc is not None:
@@ -1072,7 +1157,7 @@ class PlayerInfoBlock:
         }
 
     def clearControllerInfo(self):
-        for attr in ['controller_label', 'player_led_label', 'close_btn', 'split_btn', 'split_frame', 'merge_btn', 'merge_frame', 'mode_switch', 'gyro_btn_l', 'gyro_btn_r', 'gyro_frame_l', 'gyro_frame_r', 'vibrate_btn', 'vibrate_frame', 'player_row', 'battery_label', 'battery_label2', 'mag_btn_single', 'mag_frame_single', 'mag_btn_l', 'mag_frame_l', 'mag_btn_r', 'mag_frame_r']:
+        for attr in ['controller_label', 'player_led_label', 'close_btn', 'split_btn', 'split_frame', 'merge_btn', 'merge_frame', 'mode_switch', 'gyro_btn_l', 'gyro_btn_r', 'gyro_frame_l', 'gyro_frame_r', 'vibrate_btn', 'vibrate_frame', 'player_row', 'battery_label', 'battery_label2', 'mag_btn_single', 'mag_frame_single', 'mag_btn_l', 'mag_frame_l', 'mag_btn_r', 'mag_frame_r', 'joystick_cal_btn', 'joystick_cal_frame']:
             widget = getattr(self, attr, None)
             if widget is not None:
                 if attr in ['controller_label', 'player_row']: widget.pack_forget()
@@ -1098,6 +1183,17 @@ class PlayerInfoBlock:
                                        command=self._on_close_clicked)
         self.close_btn.place(x=controller_frame_size - int(30 * scaling_factor), y=int(5 * scaling_factor), width=int(25 * scaling_factor), height=int(25 * scaling_factor))
         if self.close_btn.cget("state") == tk.DISABLED: self.close_btn.config(state=tk.NORMAL)
+
+        if not getattr(self, 'joystick_cal_btn', None):
+            self.joystick_cal_frame = tk.Frame(self.controllers_frame, bg=button_gray)
+            self.joystick_cal_btn = tk.Button(
+                self.joystick_cal_frame, text="Joysticks Cal",
+                font=scale_font(("Arial", 8, "bold")), bd=0, relief=tk.FLAT,
+                highlightthickness=0, bg=button_gray, fg="white",
+                command=self._on_joystick_cal_clicked
+            )
+            self.joystick_cal_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+        self.joystick_cal_frame.place(relx=0.5, y=int(125 * scaling_factor), anchor=tk.N)
 
         if virtualController.is_single():
             if not getattr(self, 'battery_label', None): self.battery_label = tk.Label(self.battery_frame, bg=block_color)
@@ -1449,6 +1545,266 @@ class CalibrationOverlay:
             self.profile_window.destroy()
         self.profile_window = None
 
+class JoystickCalibrationWizard:
+    ROTATE_SECONDS = 10.0
+    RELEASE_SECONDS = 3.0
+    STILL_BEFORE_COUNTDOWN = 2.0
+    MOVE_THRESHOLD = 10
+    TOUCH_THRESHOLD = 45
+
+    def __init__(self, root, virtual_controller, on_closed=None):
+        self.root = root
+        self.virtual_controller = virtual_controller
+        self.on_closed = on_closed
+        self.closed = False
+        self.completed = False
+        self.sources = self._build_sources(virtual_controller)
+        if not self.sources:
+            utils.show_notification("Joysticks Calibration", "No joystick found for this player slot.")
+            return
+        if any(getattr(source["controller"], "last_input_data", None) is None for source in self.sources):
+            utils.show_notification("Joysticks Calibration", "Waiting for joystick input data. Please try again in a moment.")
+            return
+
+        self.stage = "rotate"
+        self.last_tick = time.perf_counter()
+        self.auto_close_timer = None
+        self.data = {}
+        for source in self.sources:
+            sample = self._read_raw(source)
+            self.data[source["key"]] = {
+                "source": source,
+                "rotate_elapsed": 0.0,
+                "release_elapsed": 0.0,
+                "observed_min": list(sample),
+                "observed_max": list(sample),
+                "prev": sample,
+                "still_since": None,
+                "anchor": sample,
+                "idle_samples": [],
+                "rotate_done": False,
+                "release_done": False,
+            }
+        self._set_controller_flags(True)
+
+        self.window = tk.Toplevel(root)
+        self.window.title("Joysticks Calibration")
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.window.attributes("-alpha", 0.95)
+        self.window.resizable(False, False)
+        self.window.configure(bg="#1c1c1e")
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.frame = tk.Frame(self.window, bg="#1c1c1e", highlightbackground="#3a3a3c", highlightthickness=2, bd=0)
+        self.frame.pack(fill="both", expand=True)
+        self.title_label = tk.Label(self.frame, text="Joysticks Calibration", fg="#0a84ff", bg="#1c1c1e", font=scale_font(("Segoe UI", 12, "bold")))
+        self.title_label.pack(anchor="w", padx=int(20 * scaling_factor), pady=(int(12 * scaling_factor), int(4 * scaling_factor)))
+        self.message_label = tk.Label(self.frame, text="", fg="white", bg="#1c1c1e", font=scale_font(("Segoe UI", 11)), justify="center")
+        self.message_label.pack(padx=int(20 * scaling_factor), pady=(0, int(10 * scaling_factor)))
+        self.grid_frame = tk.Frame(self.frame, bg="#1c1c1e")
+        self.grid_frame.pack(padx=int(20 * scaling_factor), pady=(0, int(14 * scaling_factor)))
+        self.value_labels = {}
+        self._build_counter_grid()
+        self._place_notification()
+        self._refresh_text()
+        self._tick()
+
+    def _set_controller_flags(self, active):
+        for controller in getattr(self.virtual_controller, "controllers", []) or []:
+            controller.is_joystick_calibrating = active
+            controller.back_button_calibration_active = active
+
+    def _build_sources(self, vc):
+        sources = []
+        for controller in vc.controllers:
+            if controller.is_joycon_left():
+                sources.append({"controller": controller, "side": "left", "label": "L Joystick", "key": f"{controller.device.address}:left"})
+            elif controller.is_joycon_right():
+                sources.append({"controller": controller, "side": "right", "label": "R Joystick", "key": f"{controller.device.address}:right"})
+            else:
+                sources.append({"controller": controller, "side": "right", "label": "R Joystick", "key": f"{controller.device.address}:right"})
+                sources.append({"controller": controller, "side": "left", "label": "L Joystick", "key": f"{controller.device.address}:left"})
+        side_order = {"left": 0, "right": 1}
+        return sorted(sources, key=lambda s: side_order.get(s["side"], 2))
+
+    def _read_raw(self, source):
+        input_data = getattr(source["controller"], "last_input_data", None)
+        if input_data is None:
+            return (2048, 2048)
+        attr = "raw_left_stick" if source["side"] == "left" else "raw_right_stick"
+        return tuple(int(v) for v in getattr(input_data, attr, (2048, 2048)))
+
+    def _build_counter_grid(self):
+        for child in self.grid_frame.winfo_children():
+            child.destroy()
+        self.value_labels.clear()
+        col_count = len(self.sources)
+        for idx, source in enumerate(self.sources):
+            tk.Label(self.grid_frame, text=source["label"], fg="white", bg="#1c1c1e", font=scale_font(("Segoe UI", 11, "bold")), width=14).grid(row=0, column=idx, padx=int(12 * scaling_factor))
+            value = tk.Label(self.grid_frame, text="10", fg="#30d158", bg="#1c1c1e", font=scale_font(("Segoe UI", 18, "bold")), width=8)
+            value.grid(row=1, column=idx, padx=int(12 * scaling_factor), pady=(int(4 * scaling_factor), 0))
+            self.value_labels[source["key"]] = value
+        for idx in range(col_count):
+            self.grid_frame.grid_columnconfigure(idx, weight=1)
+
+    def _place_notification(self):
+        self.window.update_idletasks()
+        w = max(int(430 * scaling_factor), self.window.winfo_reqwidth())
+        h = self.window.winfo_reqheight()
+        sw = self.window.winfo_screenwidth()
+        sh = self.window.winfo_screenheight()
+        x = sw - w - int(30 * scaling_factor)
+        y = sh - h - int(70 * scaling_factor)
+        self.window.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _distance(self, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def _tick(self):
+        if not self.window.winfo_exists():
+            return
+        now = time.perf_counter()
+        dt = min(0.1, max(0.0, now - self.last_tick))
+        self.last_tick = now
+
+        if self.stage == "rotate":
+            self._tick_rotate(dt)
+            if all(item["rotate_done"] for item in self.data.values()):
+                self.stage = "release"
+                for item in self.data.values():
+                    sample = self._read_raw(item["source"])
+                    item["prev"] = sample
+                    item["anchor"] = sample
+                    item["still_since"] = now
+                    item["idle_samples"] = []
+                self._refresh_text()
+        elif self.stage == "release":
+            self._tick_release(dt, now)
+            if all(item["release_done"] for item in self.data.values()):
+                self._finish()
+                return
+
+        self._refresh_text()
+        self.root.after(50, self._tick)
+
+    def _tick_rotate(self, dt):
+        for item in self.data.values():
+            if item["rotate_done"]:
+                continue
+            sample = self._read_raw(item["source"])
+            item["observed_min"][0] = min(item["observed_min"][0], sample[0])
+            item["observed_min"][1] = min(item["observed_min"][1], sample[1])
+            item["observed_max"][0] = max(item["observed_max"][0], sample[0])
+            item["observed_max"][1] = max(item["observed_max"][1], sample[1])
+            if self._distance(sample, item["prev"]) >= self.MOVE_THRESHOLD:
+                item["rotate_elapsed"] += dt
+            item["prev"] = sample
+            if item["rotate_elapsed"] >= self.ROTATE_SECONDS:
+                item["rotate_done"] = True
+
+    def _tick_release(self, dt, now):
+        for item in self.data.values():
+            if item["release_done"]:
+                continue
+            sample = self._read_raw(item["source"])
+            moved = self._distance(sample, item["prev"]) >= self.MOVE_THRESHOLD
+            touched = self._distance(sample, item["anchor"]) >= self.TOUCH_THRESHOLD
+            if moved or touched:
+                item["still_since"] = None
+                item["anchor"] = sample
+            elif item["still_since"] is None:
+                item["still_since"] = now
+                item["anchor"] = sample
+
+            if item["still_since"] is not None and now - item["still_since"] >= self.STILL_BEFORE_COUNTDOWN:
+                item["release_elapsed"] += dt
+                item["idle_samples"].append(sample)
+            item["prev"] = sample
+            if item["release_elapsed"] >= self.RELEASE_SECONDS:
+                item["release_done"] = True
+
+    def _refresh_text(self):
+        if self.stage == "rotate":
+            self.message_label.config(text="Please fully rotate both joysticks for 10 seconds each.")
+            for key, item in self.data.items():
+                text = "Done" if item["rotate_done"] else str(max(0, int(self.ROTATE_SECONDS - item["rotate_elapsed"] + 0.999)))
+                self.value_labels[key].config(text=text)
+        elif self.stage == "release":
+            self.message_label.config(text="Please release and don't touch the joysticks for 3 seconds.")
+            for key, item in self.data.items():
+                text = "Done" if item["release_done"] else str(max(0, int(self.RELEASE_SECONDS - item["release_elapsed"] + 0.999)))
+                self.value_labels[key].config(text=text)
+
+    def _finish(self):
+        self.completed = True
+        updates_by_controller = {}
+        for item in self.data.values():
+            source = item["source"]
+            samples = item["idle_samples"] or [self._read_raw(source)]
+            cx = int(round(sum(s[0] for s in samples) / len(samples)))
+            cy = int(round(sum(s[1] for s in samples) / len(samples)))
+            cal = {
+                "center": [cx, cy],
+                "max": [max(1, item["observed_max"][0] - cx), max(1, item["observed_max"][1] - cy)],
+                "min": [max(1, cx - item["observed_min"][0]), max(1, cy - item["observed_min"][1])],
+            }
+            controller = source["controller"]
+            updates_by_controller.setdefault(controller, {})[source["side"]] = cal
+
+        store = getattr(CONFIG, "joystick_calibration_data", {}) or {}
+        for controller, sides in updates_by_controller.items():
+            existing = {}
+            keys = controller_calibration_keys(controller)
+            normalized_keys = {normalize_calibration_key(key) for key in keys}
+            for key in keys:
+                if isinstance(store.get(key), dict):
+                    existing.update(store[key])
+            for key, value in store.items():
+                if normalize_calibration_key(key) in normalized_keys and isinstance(value, dict):
+                    existing.update(value)
+            existing.update(sides)
+            for key in keys:
+                store[key] = existing
+        CONFIG.joystick_calibration_data = store
+        CONFIG.save_config()
+
+        for controller in self.virtual_controller.controllers:
+            try:
+                controller.apply_in_app_joystick_calibration()
+            except Exception as e:
+                logger.warning(f"Failed to apply joystick calibration for {controller.device.address}: {e}")
+        self._set_controller_flags(False)
+
+        for child in self.grid_frame.winfo_children():
+            child.destroy()
+        self.message_label.config(text="Joysticks calibration done.")
+        self.title_label.config(fg="#30d158")
+        self._place_notification()
+        self.auto_close_timer = self.root.after(3000, self.close)
+
+    def cancel(self):
+        self._set_controller_flags(False)
+        utils.show_notification("Switch 2 Controller", "Calibration cancelled.")
+        self.close()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if not self.completed:
+            self._set_controller_flags(False)
+        if self.auto_close_timer:
+            try:
+                self.root.after_cancel(self.auto_close_timer)
+            except Exception:
+                pass
+            self.auto_close_timer = None
+        if getattr(self, "window", None) and self.window.winfo_exists():
+            self.window.destroy()
+        if self.on_closed is not None:
+            self.on_closed(self)
+
 class GCTriggerCalibrationWizard:
     def __init__(self, root, gc_controller):
         self.root = root
@@ -1563,6 +1919,12 @@ class ControllerWindow:
         self.app_profile_switching = False
         self.esp32s3_bridge_status = None
         self.esp32s3_detected = False
+        # Wired USB Pro Controller 2 detection (drives the HidHide button visibility).
+        self.wired_pro2_detected = False
+        self._hidhide_installed_cached = False
+        self._wired_pro2_refresh_running = False
+        self._wired_pro2_prompt_shown = False
+        self._winusb_warn_shown = False
         self._esp32s3_refresh_running = False
         self._esp32s3_auto_firmware_running = False
         self._esp32s3_auto_firmware_attempted = set()
@@ -1577,6 +1939,7 @@ class ControllerWindow:
         # with esptool during the flash and holds the port open during the replug,
         # forcing the user to restart the app to clear the occupancy.
         self._esp32s3_firmware_busy = False
+        self.active_joystick_calibration_wizards = {}
         
         import utils
         utils.change_profile_callback = self.on_cycle_profile
@@ -1595,6 +1958,75 @@ class ControllerWindow:
         x = rx + (rw - width) // 2
         y = ry + (rh - height) // 2
         window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def start_joystick_calibration_from_callback(self, virtual_controller):
+        if threading.current_thread() != threading.main_thread():
+            self.root.after(0, self.start_joystick_calibration_from_callback, virtual_controller)
+            return
+        if virtual_controller is None or not getattr(virtual_controller, "controllers", None):
+            utils.show_notification("Joysticks Calibration", "No joystick found for this player slot.")
+            return
+        if getattr(self, "calibration_overlay", None):
+            self.calibration_overlay.close()
+        key = id(virtual_controller)
+        existing = self.active_joystick_calibration_wizards.get(key)
+        if existing is not None and not getattr(existing, "closed", False):
+            existing.cancel()
+        wizard = JoystickCalibrationWizard(
+            self.root,
+            virtual_controller,
+            on_closed=lambda w, k=key: self.active_joystick_calibration_wizards.pop(k, None)
+        )
+        if getattr(wizard, "window", None) is not None:
+            self.active_joystick_calibration_wizards[key] = wizard
+
+    def cancel_joystick_calibration_from_callback(self, virtual_controller):
+        if threading.current_thread() != threading.main_thread():
+            self.root.after(0, self.cancel_joystick_calibration_from_callback, virtual_controller)
+            return
+        key = id(virtual_controller) if virtual_controller is not None else None
+        wizard = self.active_joystick_calibration_wizards.get(key)
+        if wizard is not None and not getattr(wizard, "closed", False):
+            wizard.cancel()
+            return
+        if virtual_controller is not None:
+            for controller in getattr(virtual_controller, "controllers", []) or []:
+                controller.is_joystick_calibrating = False
+                controller.back_button_calibration_active = False
+        utils.show_notification("Switch 2 Controller", "Calibration cancelled.")
+
+    def cancel_all_calibration_after_profile_switch(self):
+        if threading.current_thread() != threading.main_thread():
+            self.root.after(0, self.cancel_all_calibration_after_profile_switch)
+            return
+        calibration_active = False
+        for wizard in list(getattr(self, "active_joystick_calibration_wizards", {}).values()):
+            if wizard is not None and not getattr(wizard, "closed", False):
+                calibration_active = True
+                wizard.cancel()
+        getattr(self, "active_joystick_calibration_wizards", {}).clear()
+        for vc in getattr(self, "current_controllers", []) or []:
+            for controller in getattr(vc, "controllers", []) or []:
+                if (getattr(controller, "is_calibration_counting_down", False) or
+                        getattr(controller, "is_calibrating", False) or
+                        getattr(controller, "is_mag_calibration_waiting", False) or
+                        getattr(controller, "is_mag_calibrating", False) or
+                        getattr(controller, "is_joystick_calibrating", False) or
+                        getattr(controller, "back_button_calibration_active", False)):
+                    calibration_active = True
+                cancel = getattr(controller, "cancel_back_button_calibration_state", None)
+                if callable(cancel):
+                    cancel()
+                else:
+                    controller.is_calibration_counting_down = False
+                    controller.is_calibrating = False
+                    controller.is_mag_calibration_waiting = False
+                    controller.is_mag_calibrating = False
+                    controller.is_joystick_calibrating = False
+                    controller.back_button_calibration_active = False
+                    controller.prev_calibration = False
+        if calibration_active and getattr(self, "calibration_overlay", None):
+            self.calibration_overlay.close()
 
     def get_root_hwnd(self):
         try:
@@ -2779,6 +3211,7 @@ class ControllerWindow:
         self.quit_event.clear()
         
         def run():
+            _set_current_thread_priority(1)
             from discoverer import start_discoverer
             start_discoverer(self.discoverer_callback, self.quit_event)
             
@@ -2910,6 +3343,7 @@ class ControllerWindow:
         # First, unpack all frames from top_btn_frame to preserve order
         if hasattr(self, 'driver_frame'): self.driver_frame.pack_forget()
         if hasattr(self, 'esp32s3_frame'): self.esp32s3_frame.pack_forget()
+        if hasattr(self, 'hidhide_frame'): self.hidhide_frame.pack_forget()
         if hasattr(self, 'usbip_frame'): self.usbip_frame.pack_forget()
         if hasattr(self, 'startup_frame'): self.startup_frame.pack_forget()
         if hasattr(self, 'min_frame'): self.min_frame.pack_forget()
@@ -2945,6 +3379,17 @@ class ControllerWindow:
             if hasattr(self, 'esp32s3_btn'):
                 self.esp32s3_btn.config(text=btn_text, bg=btn_color)
             self.esp32s3_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+
+        # Wired Pro Controller 2 button: shown only when a wired pad is present. WinUSB is
+        # auto-installed by the controller's MS OS descriptor, so the only optional driver
+        # here is HidHide. Orange "Install HidHide" when missing, gray "HidHide" once present.
+        if getattr(self, 'wired_pro2_detected', False) and hasattr(self, 'hidhide_frame'):
+            hh_installed = getattr(self, '_hidhide_installed_cached', False)
+            hh_color = button_gray if hh_installed else "#CC5500"
+            hh_text = "HidHide" if hh_installed else "Install HidHide"
+            self.hidhide_frame.config(bg=hh_color)
+            self.hidhide_btn.config(text=hh_text, bg=hh_color)
+            self.hidhide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         # Pack the rest of the buttons
         if hasattr(self, 'startup_frame'): self.startup_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
@@ -3299,6 +3744,8 @@ class ControllerWindow:
         self.calibration_overlay = CalibrationOverlay(self.root)
         import utils
         utils.show_notification_callback = self.calibration_overlay.update
+        utils.joystick_calibration_callback = self.start_joystick_calibration_from_callback
+        utils.joystick_calibration_cancel_callback = self.cancel_joystick_calibration_from_callback
 
         def safe_ui_update():
             if getattr(self, 'discoverer_callback', None):
@@ -3317,7 +3764,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1270 * window_resolution_ratio)
-        default_h = int(1250 * window_resolution_ratio)
+        default_h = int(1238 * window_resolution_ratio)
         x = CONFIG.window_x if CONFIG.window_x is not None else 50
         y = CONFIG.window_y if CONFIG.window_y is not None else 50
         self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
@@ -3506,6 +3953,20 @@ class ControllerWindow:
             command=self.on_esp32s3_btn_clicked
         )
         self.esp32s3_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        # Wired Pro Controller 2 Driver Button (only shown when detected)
+        self.hidhide_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
+        self.hidhide_btn = tk.Button(
+            self.hidhide_frame,
+            text="Wired Pro Controller 2 Driver",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")),
+            command=self.on_wired_usb_driver_button
+        )
+        self.hidhide_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         # Startup Button
         self.startup_frame = tk.Frame(self.top_btn_frame, bg=highlight_color if CONFIG.open_when_startup else button_gray)
@@ -3979,7 +4440,7 @@ class ControllerWindow:
             font=scale_font(("Arial", 11, "bold")),
             command=self.update_virtual_gyro_soft_deadzone_setting
         )
-        self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 2.0))
+        self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
         self.deadzone_scale.grid(row=0, column=7, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
 
         tk.Label(self.comp_frame, text="Mode:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(5 * scaling_factor), 0), sticky="e")
@@ -4164,36 +4625,59 @@ bg_color=panel_bg, widths=[8, 10])
 
         tk.Label(l2, text=" pattern during calibration.", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT)
 
-        # ---- Row 1: Gyro Control + Sensitivity + Calibrate Gyro ----
+        # ---- Row 1: Gyro Control + Mode Shift + Calibrate Gyro ----
         tk.Label(self.gyro_frame, text="Gyro Control:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
         initial_gyro_control = "Steering" if getattr(CONFIG, "gyro_mode", "World") == "Roll" else getattr(CONFIG, "gyro_control_mode", "Mouse")
         self.gyro_control_switch = ToggleSwitch(self.gyro_frame, labels=["Mouse", "R Joystick", "Steering"], values=["Mouse", "R Joystick", "Steering"], initial_value=initial_gyro_control, command=self.update_gyro_control_mode, bg_color=panel_bg)
         self.gyro_control_switch.grid(row=1, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
-        tk.Label(self.gyro_frame, text="Sensitivity:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.sens_scale = tk.Scale(self.gyro_frame, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
-        self.sens_scale.set(self._current_gyro_control_sensitivity())
-        self.sens_scale.grid(row=1, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        tk.Label(self.gyro_frame, text="Mode Shift:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
+        self.mode_shift_switch = ToggleSwitch(self.gyro_frame, labels=["On", "Off"], values=[True, False], initial_value=CONFIG.mode_shift_enabled, command=self.update_mode_shift_setting, bg_color=panel_bg)
+        self.mode_shift_switch.grid(row=1, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
         gyro_calib_row.grid(row=1, column=4, columnspan=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
 
-        # ---- Row 2: Mode + Stick Assist + Mag Cal hint ----
+        # ---- Row 2: Mode + Sensitivity + Mag Cal hint ----
         tk.Label(self.gyro_frame, text="Mode:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=2, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
         self.gyro_mode_switch = ToggleSwitch(self.gyro_frame, labels=["9-Axis", "6-Axis"], values=["World", "Yaw"], initial_value=(CONFIG.gyro_mode if CONFIG.gyro_mode in ("World", "Yaw") else "World"), command=self.update_mode_setting, bg_color=panel_bg)
         self.gyro_mode_switch.grid(row=2, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
-        self.stick_assist_label = tk.Label(self.gyro_frame, text="Stick Assist:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
-        self.stick_assist_label.grid(row=2, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.stick_scale = tk.Scale(self.gyro_frame, from_=0, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
-        self.stick_scale.set(getattr(CONFIG, "stick_mouse_sensitivity", 5.0))
-        self.stick_scale.grid(row=2, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        tk.Label(self.gyro_frame, text="Sensitivity:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=2, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
+        self.sens_scale = tk.Scale(self.gyro_frame, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
+        self.sens_scale.set(self._current_gyro_control_sensitivity())
+        self.sens_scale.grid(row=2, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
         mag_hint_frame.grid(row=2, column=4, columnspan=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
 
-        # ---- Row 3: Activation + Mode Shift ----
+        # ---- Row 3: Activation + Deadzone + Stick Assist ----
         tk.Label(self.gyro_frame, text="Activation:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=3, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
         self.gyro_act_switch = ToggleSwitch(self.gyro_frame, labels=["Toggle", "Hold"], values=["Toggle", "Hold"], initial_value=CONFIG.gyro_activation_mode, command=self.update_act_setting, bg_color=panel_bg)
         self.gyro_act_switch.grid(row=3, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
-        tk.Label(self.gyro_frame, text="Mode Shift:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=3, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.mode_shift_switch = ToggleSwitch(self.gyro_frame, labels=["On", "Off"], values=[True, False], initial_value=CONFIG.mode_shift_enabled, command=self.update_mode_shift_setting, bg_color=panel_bg)
-        self.mode_shift_switch.grid(row=3, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        tk.Label(self.gyro_frame, text="Deadzone:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=3, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
+        self.in_app_deadzone_scale = tk.Scale(
+            self.gyro_frame,
+            from_=0.0,
+            to=5.0,
+            resolution=0.5,
+            orient=tk.HORIZONTAL,
+            length=int(120 * scaling_factor),
+            bg=panel_bg,
+            fg=text_color,
+            troughcolor=button_gray,
+            activebackground=highlight_color,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief=tk.FLAT,
+            sliderlength=int(15 * scaling_factor),
+            width=int(15 * scaling_factor),
+            font=scale_font(("Arial", 11, "bold")),
+            command=self.update_virtual_gyro_soft_deadzone_setting
+        )
+        self.in_app_deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
+        self.in_app_deadzone_scale.grid(row=3, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+
+        self.stick_assist_label = tk.Label(self.gyro_frame, text="Stick Assist:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.stick_assist_label.grid(row=3, column=4, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
+        self.stick_scale = tk.Scale(self.gyro_frame, from_=0, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
+        self.stick_scale.set(getattr(CONFIG, "stick_mouse_sensitivity", 5.0))
+        self.stick_scale.grid(row=3, column=5, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
         self._update_gyro_control_visibility(initial_gyro_control)
 
@@ -4287,10 +4771,20 @@ bg_color=panel_bg, widths=[8, 10])
         logger.info(f"Roll Compensation: {val}")
 
     def update_virtual_gyro_soft_deadzone_setting(self, val):
+        if getattr(self, "_updating_virtual_gyro_soft_deadzone", False):
+            return
         val = float(val)
         CONFIG.virtual_gyro_soft_deadzone = val
+        self._updating_virtual_gyro_soft_deadzone = True
+        try:
+            for attr in ("deadzone_scale", "in_app_deadzone_scale"):
+                scale = getattr(self, attr, None)
+                if scale is not None and abs(float(scale.get()) - val) > 0.001:
+                    scale.set(val)
+        finally:
+            self._updating_virtual_gyro_soft_deadzone = False
         CONFIG.save_config()
-        logger.info(f"Third-Party Gyro Deadzone: {val}")
+        logger.info(f"In-app Gyro Deadzone: {val}")
 
     def update_mouse_setting(self, val):
         CONFIG.mouse_config.enabled = val
@@ -5179,7 +5673,8 @@ bg_color=panel_bg, widths=[8, 10])
 
         bottom_row = tk.Frame(body, bg=background_color)
         bottom_row.pack(side=tk.TOP, anchor=tk.W)
-        render_category(bottom_row, "Switch Input")
+        for title in ("Switch Input", "Media Keys"):
+            render_category(bottom_row, title)
 
         # Pre-realize and paint the popup off-screen so every button is already drawn with
         # its gray background before the popup appears at the anchor. Mapping the buttons
@@ -5848,7 +6343,8 @@ bg_color=panel_bg, widths=[8, 10])
         self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.update_dynamic_rumble_mode_options()
 
-        tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+        self.strength_label = tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.strength_label.pack(side=tk.LEFT, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
         self.vibration_strength_scale = tk.Scale(row_vibration, from_=0, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.update_vibration_strength)
         self.vibration_strength_scale.set(getattr(CONFIG, "vibration_strength", 5))
         self.vibration_strength_scale.pack(side=tk.LEFT)
@@ -5898,7 +6394,7 @@ bg_color=panel_bg, widths=[8, 10])
             btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
             self.settings_tab_buttons[tab_id] = (btn, frame)
 
-        self.tab_content_frame = tk.Frame(self.settings_frame, bg=tab_black, padx=int(8 * scaling_factor), pady=int(8 * scaling_factor))
+        self.tab_content_frame = tk.Frame(self.settings_frame, bg=tab_black, padx=int(8 * scaling_factor), pady=int(3 * scaling_factor))
         self.tab_content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.controller_mapping_frame = tk.Frame(self.tab_content_frame, bg=tab_black)
         self.in_app_gyro_mode_mapping_frame = tk.Frame(self.tab_content_frame, bg=tab_black)
@@ -6624,6 +7120,295 @@ bg_color=panel_bg, widths=[8, 10])
         if hasattr(self, 'min_frame'):
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
+    def on_hidhide_button(self):
+        try:
+            import hidhide
+            installed = hidhide.is_available()
+        except Exception:
+            installed = False
+        if installed:
+            if self.ask_centered_yes_no("Uninstall HidHide", "Uninstall the HidHide driver?\n(Requires administrator privileges.)"):
+                self.run_hidhide_uninstall()
+        else:
+            if self.ask_centered_yes_no(
+                "Install HidHide",
+                "A wired Pro Controller 2 was detected.\n\nHidHide hides the physical "
+                "controller's HID so games only see the virtual controller. Install it "
+                "now?\n(Requires administrator privileges.)",
+            ):
+                self.run_hidhide_install()
+
+    def on_wired_usb_driver_button(self):
+        # WinUSB is auto-installed by the controller's MS OS descriptor, so the only
+        # optional driver here is HidHide. If it's not installed, prompt to install it
+        # directly (a centered notification). If it is installed, open a small options
+        # window to enable/disable filtering or uninstall.
+        try:
+            import hidhide
+            hidhide_installed = hidhide.is_available()
+        except Exception:
+            hidhide_installed = False
+
+        self._hidhide_installed_cached = hidhide_installed
+        CONFIG.hidhide_installed = hidhide_installed
+        CONFIG.save_config()
+        self.update_driver_buttons_visibility()
+
+        if not hidhide_installed:
+            if self.ask_centered_yes_no(
+                "Install HidHide",
+                "A wired Pro Controller 2 was detected.\n\n"
+                "HidHide hides the controller's physical HID so games only see the virtual "
+                "controller (no double input). Install it now?\n"
+                "(Optional. Requires administrator privileges.)",
+            ):
+                self.run_hidhide_install(prompt_restart=True)
+            return
+
+        # HidHide installed → options window (enable/disable filtering, uninstall).
+        try:
+            hidhide_active = hidhide.is_active()
+        except Exception:
+            hidhide_active = False
+
+        dialog_w = int(460 * scaling_factor)
+        dialog_h = int(210 * scaling_factor)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("HidHide")
+        dialog.resizable(False, False)
+        dialog.config(bg="#1E1E1E")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.center_window_on_root(dialog, dialog_w, dialog_h)
+
+        info_label = tk.Label(
+            dialog, text="", fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")), justify=tk.LEFT,
+        )
+        info_label.pack(pady=(int(16 * scaling_factor), int(10 * scaling_factor)), padx=int(16 * scaling_factor), anchor=tk.W)
+
+        sel_frame = tk.Frame(dialog, bg="#1E1E1E")
+        sel_frame.pack(pady=int(8 * scaling_factor))
+        buttons = {}
+
+        def refresh():
+            if not dialog.winfo_exists():
+                return
+            nonlocal hidhide_active
+            info_label.config(
+                text=(
+                    "HidHide (hides the physical controller from games)\n"
+                    f"Status: Installed\n"
+                    f"Filtering: {'Enabled' if hidhide_active else 'Disabled'}"
+                )
+            )
+            buttons["active"].config(text=("Disable HidHide" if hidhide_active else "Enable HidHide"))
+
+        def recheck_and_refresh():
+            nonlocal hidhide_installed, hidhide_active
+            try:
+                import hidhide
+                hidhide_installed = hidhide.is_available()
+                hidhide_active = hidhide.is_active() if hidhide_installed else False
+            except Exception:
+                hidhide_installed = False
+                hidhide_active = False
+            self._hidhide_installed_cached = hidhide_installed
+            CONFIG.hidhide_installed = hidhide_installed
+            CONFIG.save_config()
+            self.update_driver_buttons_visibility()
+            if not hidhide_installed and dialog.winfo_exists():
+                dialog.destroy()
+                return
+            refresh()
+
+        def toggle_hidhide_active():
+            try:
+                import hidhide
+                if not hidhide.is_available():
+                    return
+                if hidhide.is_active():
+                    hidhide.set_active(False)
+                else:
+                    self._hide_detected_pro2_with_hidhide()
+                    hidhide.set_active(True)
+            except Exception as e:
+                self.show_centered_message("Error", f"Failed to change HidHide state: {e}")
+            recheck_and_refresh()
+
+        def uninstall_hidhide():
+            # Close this modal options window first so its grab doesn't keep the app in
+            # the foreground — otherwise the elevated UAC prompt only flashes in the
+            # taskbar. run_hidhide_uninstall refreshes the top-bar button on its own.
+            if dialog.winfo_exists():
+                dialog.grab_release()
+                dialog.destroy()
+            self.run_hidhide_uninstall()
+
+        for key, command in (
+            ("active", toggle_hidhide_active),
+            ("uninstall", uninstall_hidhide),
+        ):
+            frame = tk.Frame(sel_frame, bg=button_gray)
+            frame.pack(side=tk.LEFT, padx=int(4 * scaling_factor))
+            btn = tk.Button(
+                frame, text=("Uninstall HidHide" if key == "uninstall" else ""),
+                bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
+                font=scale_font(("Arial", 10, "bold")), width=15, command=command,
+            )
+            btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+            buttons[key] = btn
+
+        close_btn_frame = tk.Frame(dialog, bg=button_gray)
+        close_btn_frame.pack(pady=int(10 * scaling_factor))
+        tk.Button(
+            close_btn_frame, text="Close", bg=button_gray, fg=text_color,
+            bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), width=8,
+            command=dialog.destroy,
+        ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        refresh()
+
+    def _hide_detected_pro2_with_hidhide(self):
+        try:
+            import hidhide
+            from usb_hid_controller import enumerate_pro_controller2
+            for entry in enumerate_pro_controller2():
+                instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
+                if instance_id:
+                    hidhide.hide_device(instance_id)
+        except Exception as e:
+            logger.debug("Failed to add detected Pro Controller 2 to HidHide: %s", e)
+
+    def _run_hidhide_script(self, script_name, wait_text):
+        """Run a bundled HidHide install/uninstall PowerShell script elevated (runas),
+        blocking until it exits. Returns the process exit code, or None on cancel/error."""
+        ps1 = get_driver_path(os.path.join("hidhide", script_name))
+        if not os.path.exists(ps1):
+            self.show_centered_message("Error", f"Could not find {script_name}. Please verify the application files.")
+            return None
+        exit_code = [None]
+        try:
+            progress_win = tk.Toplevel(self.root)
+            progress_win.title("HidHide")
+            progress_win.resizable(False, False)
+            progress_win.config(bg="#1E1E1E")
+            progress_win.transient(self.root)
+            progress_win.grab_set()
+            self.center_window_on_root(progress_win, int(450 * scaling_factor), int(130 * scaling_factor))
+            tk.Label(progress_win, text=wait_text, fg="white", bg="#1E1E1E",
+                     font=scale_font(("Arial", 11, "bold"))).pack(pady=int(40 * scaling_factor))
+
+            info = SHELLEXECUTEINFOW()
+            info.cbSize = ctypes.sizeof(info)
+            info.fMask = SEE_MASK_NOCLOSEPROCESS
+            info.hwnd = self.get_root_hwnd()
+            info.lpVerb = "runas"
+            info.lpFile = "powershell.exe"
+            info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{ps1}"'
+            info.lpDirectory = None
+            info.nShow = 1
+
+            # Grant foreground rights + release the modal grab so the UAC consent prompt
+            # comes to the front instead of only flashing in the taskbar.
+            try:
+                progress_win.grab_release()
+                self.root.focus_force()
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+            except Exception:
+                pass
+
+            if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+                progress_win.grab_release()
+                progress_win.destroy()
+                self.show_centered_message("Error", "HidHide operation was cancelled (UAC prompt declined).")
+                return None
+
+            hProcess = info.hProcess
+
+            def check_process():
+                if hProcess and ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0) == WAIT_TIMEOUT:
+                    progress_win.after(200, check_process)
+                else:
+                    if hProcess:
+                        code = wintypes.DWORD()
+                        ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(code))
+                        exit_code[0] = code.value
+                        ctypes.windll.kernel32.CloseHandle(hProcess)
+                    progress_win.grab_release()
+                    progress_win.destroy()
+
+            progress_win.after(200, check_process)
+            self.root.wait_window(progress_win)
+        except Exception as e:
+            self.show_centered_message("Error", f"Failed to run HidHide operation: {e}")
+        return exit_code[0]
+
+    def run_hidhide_install(self, prompt_restart=True):
+        code = self._run_hidhide_script("install_hidhide.ps1", "Installing HidHide...\nPlease authorize the UAC prompt if asked.")
+        if code is None:
+            return False  # cancelled / could not start
+        try:
+            import hidhide
+            ok = hidhide.is_available()
+        except Exception:
+            ok = False
+        CONFIG.hidhide_installed = ok
+        CONFIG.save_config()
+        self._hidhide_installed_cached = ok
+        self.update_driver_buttons_visibility()
+
+        if code not in (0, 3010) and not ok:
+            self.show_centered_message("Error", "HidHide installation did not complete.")
+            return False
+
+        # Centered success notification (on the main window).
+        self.show_centered_message("Success", "HidHide installed successfully.")
+
+        # HidHide's filter driver needs a reboot to attach to already-connected
+        # controllers. Ask the user first — never auto-restart.
+        if prompt_restart and self.ask_centered_yes_no(
+            "Restart Required",
+            "A restart is required to finish HidHide setup and hide the physical "
+            "controller.\n\nRestart now?",
+        ):
+            try:
+                import subprocess
+                subprocess.Popen(["shutdown", "/r", "/t", "0"])
+            except Exception as e:
+                self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
+        return bool(ok or code in (0, 3010))
+
+    def run_hidhide_uninstall(self):
+        code = self._run_hidhide_script("uninstall_hidhide.ps1", "Uninstalling HidHide...\nPlease authorize the UAC prompt if asked.")
+        if code is None:
+            return  # cancelled / could not start
+        try:
+            import hidhide
+            still = hidhide.is_available()
+        except Exception:
+            still = False
+        CONFIG.hidhide_installed = still
+        CONFIG.save_config()
+        self._hidhide_installed_cached = still
+        self.update_driver_buttons_visibility()
+
+        # HidHide's kernel driver stays loaded until the next boot, so the removal only
+        # finishes after a restart (is_available() is still True right now). Report this
+        # accurately and offer to restart, mirroring the install flow.
+        self.show_centered_message(
+            "Success",
+            "HidHide removal started. A restart is required to complete the uninstall.",
+        )
+        if self.ask_centered_yes_no(
+            "Restart Required",
+            "A restart is required to finish removing HidHide.\n\nRestart now?",
+        ):
+            try:
+                import subprocess
+                subprocess.Popen(["shutdown", "/r", "/t", "0"])
+            except Exception as e:
+                self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
 
     def custom_askstring(self, title, prompt, initialvalue=""):
         dialog = tk.Toplevel(self.root)
@@ -7195,8 +7980,8 @@ bg_color=panel_bg, widths=[8, 10])
         if profile_name == getattr(CONFIG, "active_profile", ""):
             return
         import utils
-        utils.show_notification("Profile Switched", f"Current Profile: {profile_name}")
-        self.switch_to_profile(profile_name)
+        if self.switch_to_profile(profile_name):
+            self.root.after(0, lambda p=profile_name: utils.show_notification("Profile Switched", f"Current Profile: {p}"))
         
     def apply_pending_profile(self):
         self.profile_apply_timer = None
@@ -7254,6 +8039,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         # 4. ???單?rofile?ustom buttons?隞身摰?
         self.refresh_ui_for_profile()
+        self.cancel_all_calibration_after_profile_switch()
 
     def on_profile_selected(self, event):
         return
@@ -7382,7 +8168,9 @@ bg_color=panel_bg, widths=[8, 10])
             self.steam_roll_comp_switch.set_value(getattr(CONFIG, "steam_roll_compensation", False))
                 
         if hasattr(self, 'deadzone_scale'):
-            self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 2.0))
+            self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
+        if hasattr(self, 'in_app_deadzone_scale'):
+            self.in_app_deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
                 
         # Update Cemuhook Sensitivity
         if hasattr(self, 'cemuhook_sens_scale'):
@@ -7716,7 +8504,69 @@ bg_color=panel_bg, widths=[8, 10])
     def start_esp32s3_refresh_timer(self):
         if not getattr(self, 'is_quitting', False):
             self.refresh_esp32s3_status_async()
+            self.refresh_wired_pro2_status_async()
             self.root.after(5000, self.start_esp32s3_refresh_timer)
+
+    def refresh_wired_pro2_status_async(self):
+        """Poll for a wired Pro Controller 2, then update the HidHide button. WinUSB is
+        auto-installed by the controller (MS OS descriptor), so it isn't managed here —
+        we only keep an internal check as a safety-net warning. When a pad is present and
+        HidHide is absent, prompt to install HidHide once per session."""
+        if getattr(self, '_wired_pro2_refresh_running', False) or getattr(self, 'is_quitting', False):
+            return
+        self._wired_pro2_refresh_running = True
+
+        def worker():
+            detected = False
+            hh_installed = False
+            winusb_bound = True
+            try:
+                from usb_hid_controller import enumerate_pro_controller2
+                detected = len(enumerate_pro_controller2()) > 0
+            except Exception as e:
+                logger.debug("Wired Pro2 detection failed: %s", e)
+            try:
+                import hidhide
+                hh_installed = hidhide.is_available()
+            except Exception:
+                hh_installed = False
+            if detected:
+                # Safety-net only: WinUSB should be auto-bound. If it isn't, activation
+                # (input) will fail, so we warn the user once.
+                winusb_bound = is_pro2_winusb_bound()
+
+            def apply():
+                self._wired_pro2_refresh_running = False
+                self.wired_pro2_detected = detected
+                self._hidhide_installed_cached = hh_installed
+                self.update_driver_buttons_visibility()
+
+                # Safety net: pad present but WinUSB not bound -> input won't work.
+                if detected and not winusb_bound and not getattr(self, '_winusb_warn_shown', False):
+                    self._winusb_warn_shown = True
+                    self.show_centered_message(
+                        "Wired Controller",
+                        "Windows is still setting up the wired Pro Controller 2 driver. "
+                        "If the controller doesn't respond, unplug and reconnect it.",
+                    )
+
+                # Auto-prompt HidHide install on first detection while it's absent.
+                if (detected and not hh_installed
+                        and not getattr(self, '_wired_pro2_prompt_shown', False)):
+                    self._wired_pro2_prompt_shown = True
+                    self.on_wired_usb_driver_button()
+
+                if not detected:
+                    # Allow the prompts again next time a pad is (re)connected.
+                    self._wired_pro2_prompt_shown = False
+                    self._winusb_warn_shown = False
+
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                self._wired_pro2_refresh_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_detection_and_discovery(self):
         if getattr(self, '_startup_detection_done', False) or getattr(self, 'is_quitting', False):
@@ -7808,22 +8658,27 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 
 if __name__ == "__main__":
-    # Scheduled-task entry: when invoked elevated with this flag, just disable the
-    # DualSense audio endpoint and exit (do NOT launch the GUI).  Used so a
-    # non-elevated session can trigger the elevated disable silently via Task
-    # Scheduler instead of a UAC prompt on every controller connect.
-    import sys as _sys
-    if "--disable-dualsense-audio-endpoint" in _sys.argv:
+    if "--dualsense-server" in sys.argv:
+        idx = sys.argv.index("--dualsense-server")
         try:
-            from dualsense_audio_endpoint import _apply
-            _apply("Disable")
-        except Exception as e:
-            import traceback, os, tempfile
-            with open(os.path.join(tempfile.gettempdir(), "audio_disable_error.log"), "w") as f:
-                f.write(traceback.format_exc())
-        _sys.exit(0)
-
+            from dualsense_server_process import main as _dualsense_server_main
+            _dualsense_server_main(sys.argv[idx + 1:])
+        except Exception:
+            try:
+                import traceback
+                _log_dir = os.path.join(
+                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                    "Switch2Controllers",
+                )
+                os.makedirs(_log_dir, exist_ok=True)
+                with open(os.path.join(_log_dir, "dualsense_server.log"), "a", encoding="utf-8") as _f:
+                    _f.write("DualSense server child crashed:\n")
+                    _f.write(traceback.format_exc())
+                    _f.write("\n")
+            except Exception:
+                pass
+            sys.exit(1)
+        sys.exit(0)
     disable_power_throttling()
     win = ControllerWindow()
     win.init_interface(); win.start()
-

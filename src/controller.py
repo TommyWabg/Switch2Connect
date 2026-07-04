@@ -14,8 +14,11 @@ import threading
 import math
 import imufusion
 import numpy as np
+import os
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS','0')=='1'
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
+    ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
 except Exception:
     pass
 from config import CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN
@@ -29,15 +32,44 @@ from utils import (
 )
 import utils
 
-logging.basicConfig(
-    format='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
-    datefmt='%H:%M:%S'
-)
-logging.getLogger().setLevel(logging.INFO)
+# Non-blocking logging: every thread's logger call only enqueues a record (O(1), no
+# I/O), and a dedicated listener thread does the actual console write.  A synchronous
+# StreamHandler holds the handler lock across the console write, so when the Windows
+# console stalls (full-screen game starving redraws, or QuickEdit text-selection
+# freezing all writers), ANY thread's emit blocks — including the single USBIP recv
+# thread, which then stops reading ISO OUT submits and the audio endpoint halt-storms.
+import atexit as _atexit
+import queue as _queue
+from logging.handlers import QueueHandler as _QueueHandler, QueueListener as _QueueListener
+
+_log_queue = _queue.SimpleQueue()          # unbounded; put() never blocks
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(
+    fmt='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
+    datefmt='%H:%M:%S'))
+_root_logger = logging.getLogger()
+for _h in list(_root_logger.handlers):
+    _root_logger.removeHandler(_h)
+_root_logger.addHandler(_QueueHandler(_log_queue))
+_root_logger.setLevel(logging.INFO)
+_log_listener = _QueueListener(_log_queue, _console_handler, respect_handler_level=False)
+_log_listener.start()
+_atexit.register(_log_listener.stop)
 # Bleak's WinRT scanner logs every received advertisement at DEBUG and is extremely
 # noisy; keep it quiet even if the root level is lowered for debugging (matches 0.10.1).
 logging.getLogger("bleak").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+def _set_current_thread_priority(level):
+    try:
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
+    except Exception:
+        pass
+
+USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL = 0.015
+USBIP_PS5_CONCURRENT_RUMBLE_TEST = True
 
 # Controller identification info
 NINTENDO_VENDOR_ID = 0x057e
@@ -60,6 +92,303 @@ CONTROLER_NAMES = {
 }
 
 _gc_debug_counter = 0
+
+
+def _hf_mask_at_strength5(hf_mapped, is_pro):
+    """High-frequency dynamic mask at Strength=5 (PS5 Emu Mode / Xbox Rumble curve).
+
+    hf_mapped is the 1..10 normalized high-frequency position.  Used by both the Xbox
+    rumble path and the Audio-Haptics direct path so the two never diverge.
+    """
+    if is_pro:
+        if hf_mapped <= 5.0:
+            return 0.25 - 0.0375 * (hf_mapped - 1.0)
+        return 0.1 + 0.028 * (hf_mapped - 5.0)
+    if hf_mapped <= 5.0:
+        return 0.19 - 0.02375 * (hf_mapped - 1.0)
+    return 0.095 + 0.00164 * (hf_mapped - 5.0)
+
+
+def _vib_map_y700_to_ble(value: int, direct_gain: float) -> int:
+    """Map a y700 raw02 physical amplitude (0..29000) to a BLE 10-bit amplitude (0..1023).
+
+    Extracted from set_vibration() so it is not redefined on every rumble tick.
+    Mirrors the original map_y700_switch_amp_to_ble() closure exactly.
+    """
+    mapped = float(max(0, int(value))) * 1023.0 * direct_gain / 29000.0
+    return min(1023, max(0, int(round(mapped))))
+
+
+def _vib_convert_y700_frame(v, direct_gain: float):
+    """Convert a y700 raw02 VibrationData frame through the BLE Switch rumble encoding.
+
+    Matches the original convert_y700_audio_haptic_frame() closure exactly.
+    Returns a new VibrationData with BLE-scaled fields.
+    """
+    high_freq = int(v.hf_freq) & 0x03ff
+    low_freq  = int(v.lf_freq) & 0x03ff
+    high_amp  = int(v.hf_amp)  & 0xffc0
+    low_amp   = int(v.lf_amp)  & 0xffc0
+
+    frame = bytearray(5)
+    frame[0] = high_freq & 0xff
+    frame[1] = ((high_freq >> 8) & 0x03) | ((high_amp >> 4) & 0xfc)
+    frame[2] = ((high_amp >> 12) & 0x0f) | ((low_freq & 0x0f) << 4)
+    frame[3] = ((low_freq >> 4) & 0x3f) | (low_amp & 0xc0)
+    frame[4] = (low_amp >> 8) & 0xff
+
+    decoded_high_freq = frame[0] | ((frame[1] & 0x03) << 8)
+    decoded_high_amp  = ((frame[1] & 0xfc) << 4) | ((frame[2] & 0x0f) << 12)
+    decoded_low_freq  = ((frame[2] & 0xf0) >> 4) | ((frame[3] & 0x3f) << 4)
+    decoded_low_amp   = (frame[3] & 0xc0) | (frame[4] << 8)
+
+    return VibrationData(
+        lf_freq=decoded_low_freq  & 0x01ff,
+        lf_amp=_vib_map_y700_to_ble(decoded_low_amp, direct_gain),
+        hf_freq=decoded_high_freq & 0x01ff,
+        hf_amp=_vib_map_y700_to_ble(decoded_high_amp, direct_gain),
+    )
+
+
+def _vib_merge_ble(*sources) -> "VibrationData":
+    """Merge multiple VibrationData sources: summed amplitude, winner frequency.
+
+    Extracted from merge_ble_vibrations() closure. Identical logic.
+    """
+    active_sources = [s for s in sources if s is not None]
+    lf_sources = [s for s in active_sources if int(getattr(s, 'lf_amp', 0)) > 0]
+    hf_sources = [s for s in active_sources if int(getattr(s, 'hf_amp', 0)) > 0]
+    lf_winner  = max(lf_sources, key=lambda s: int(s.lf_amp)) if lf_sources else None
+    hf_winner  = max(hf_sources, key=lambda s: int(s.hf_amp)) if hf_sources else None
+    return VibrationData(
+        lf_freq=lf_winner.lf_freq if lf_winner is not None else 0x0e1,
+        lf_en_tone=lf_winner.lf_en_tone if lf_winner is not None else 0,
+        lf_amp=min(1023, max(0, sum(int(getattr(s, 'lf_amp', 0)) for s in active_sources))),
+        hf_freq=hf_winner.hf_freq if hf_winner is not None else 0x1e1,
+        hf_en_tone=hf_winner.hf_en_tone if hf_winner is not None else 0,
+        hf_amp=min(1023, max(0, sum(int(getattr(s, 'hf_amp', 0)) for s in active_sources))),
+    )
+
+
+def _vib_merge_ble_source_aware(base=None, trigger=None, audio=None) -> "VibrationData":
+    """Merge amplitudes as before, but choose frequency by source priority.
+
+    Priority per band: trigger, traditional/base, audio. This preserves the
+    overlay amplitude behavior while keeping event sources from losing their
+    frequency identity to a stronger audio-haptic frame.
+    """
+    sources = [s for s in (base, trigger, audio) if s is not None]
+
+    def band_winner(attr):
+        for source in (trigger, base, audio):
+            if source is not None and int(getattr(source, attr, 0)) > 0:
+                return source
+        return None
+
+    lf_winner = band_winner('lf_amp')
+    hf_winner = band_winner('hf_amp')
+    return VibrationData(
+        lf_freq=lf_winner.lf_freq if lf_winner is not None else 0x0e1,
+        lf_en_tone=lf_winner.lf_en_tone if lf_winner is not None else 0,
+        lf_amp=min(1023, max(0, sum(int(getattr(s, 'lf_amp', 0)) for s in sources))),
+        hf_freq=hf_winner.hf_freq if hf_winner is not None else 0x1e1,
+        hf_en_tone=hf_winner.hf_en_tone if hf_winner is not None else 0,
+        hf_amp=min(1023, max(0, sum(int(getattr(s, 'hf_amp', 0)) for s in sources))),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Derived vibration-config cache
+# ---------------------------------------------------------------------------
+# Key: (strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+#       ignore_freq_scaling, direct_amplitude)
+# Value: (lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain)
+#
+# The cache is per-Controller-instance to avoid cross-instance aliasing, but
+# the computation is pure (no side effects) so a module-level helper is fine.
+
+def _compute_vibration_config(
+    strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+    ignore_freq_scaling, direct_amplitude
+):
+    """Compute the (lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain)
+    tuple for the given controller/config settings.
+
+    This is the exact same logic that was previously inlined at the top of set_vibration()
+    on every call.  Moving it here lets callers cache the result by a settings tuple.
+    """
+    is_switch1 = simulation_mode == "Switch1"
+
+    if ignore_freq_scaling:
+        lf_multiplier = 1.3
+        hf_multiplier = 1.0 if is_pro else 0.6
+    elif is_switch1:
+        if is_pro:
+            if rumble_mode == "Switch":
+                lf_at_5 = 1.0 * (2.6 / 2.6)
+                hf_at_5 = 1.2 * (4.0 / 4.0)
+                if strength <= 5.0:
+                    lf_multiplier = (strength / 5.0) * lf_at_5
+                    hf_multiplier = (strength / 5.0) * hf_at_5
+                else:
+                    t = (strength - 5.0) / 5.0
+                    lf_multiplier = lf_at_5 + (2.6 - lf_at_5) * t
+                    hf_multiplier = hf_at_5 + (4.0 - hf_at_5) * t
+                lf_multiplier = min(2.6, lf_multiplier)
+                hf_multiplier = min(4.0, hf_multiplier)
+            else:
+                target_lf_mult  = (strength / 5.0) * 2.0
+                target_hf_scale = (strength / 5.0) * 1.0
+                target_lf_mult  *= (2.6 / 2.6)
+                target_hf_scale *= (2.0 / 2.0)
+                lf_multiplier = min(2.6, target_lf_mult)
+                hf_multiplier = min(2.0, target_hf_scale)
+        else:
+            if rumble_mode == "Switch":
+                if strength <= 5.0:
+                    lf_multiplier = (strength / 5.0) * 0.504
+                    hf_multiplier = (strength / 5.0) * 0.336
+                else:
+                    t = (strength - 5.0) / 5.0
+                    lf_multiplier = 0.504 + (0.84 - 0.504) * t
+                    hf_multiplier = 0.336 + (0.56 - 0.336) * t
+                lf_multiplier = min(0.84, lf_multiplier)
+                hf_multiplier = min(0.56, hf_multiplier)
+            else:
+                target_lf_mult  = (strength / 5.0) * 2.0
+                target_hf_scale = (strength / 5.0) * 1.0
+                target_lf_mult  *= 1.0
+                target_hf_scale *= 0.5
+                lf_multiplier = min(0.84, target_lf_mult)
+                hf_multiplier = min(0.56, target_hf_scale)
+    elif rumble_mode in ("Switch", "PS5"):
+        if is_pro:
+            if strength <= 5.0:
+                lf_multiplier = (strength / 5.0)
+                hf_multiplier = (strength / 5.0) * 0.6
+            else:
+                t = (strength - 5.0) / 5.0
+                lf_multiplier = 1.0 + (2.6 - 1.0) * t
+                hf_multiplier = 0.6 + (2.0 - 0.6) * t
+            lf_multiplier = min(2.6, lf_multiplier)
+            hf_multiplier = min(2.0, hf_multiplier)
+        else:
+            if strength <= 5.0:
+                lf_multiplier = (strength / 5.0) * 0.504
+                hf_multiplier = (strength / 5.0) * 0.672
+            else:
+                t = (strength - 5.0) / 5.0
+                lf_multiplier = 0.504 + (0.84 - 0.504) * t
+                hf_multiplier = 0.672 + (1.12 - 0.672) * t
+            lf_multiplier = min(0.84, lf_multiplier)
+            hf_multiplier = min(1.12, hf_multiplier)
+    else:
+        target_lf_mult  = (strength / 5.0) * 2.0
+        target_hf_scale = (strength / 5.0) * 1.0
+        if is_pro:
+            target_lf_mult  *= (2.6 / 2.6)
+            target_hf_scale *= (2.0 / 2.0)
+            lf_multiplier = min(2.6, target_lf_mult)
+            hf_multiplier = min(2.0, target_hf_scale)
+        else:
+            lf_multiplier = min(0.84, target_lf_mult)
+            hf_multiplier = min(1.12, target_hf_scale)
+
+    freq_factor_lf = 1.0
+    freq_factor_hf = (freq_setting - 1) * 4 / 81.0
+    direct_gain = 1.0
+    if direct_amplitude:
+        direct_gain = max(0.0, min(8.0, float(strength) / 5.0 * 4.0))
+
+    return lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain
+
+
+
+def normalize_calibration_key(key):
+    if not key:
+        return ""
+    return "".join(ch for ch in str(key).upper() if ch in "0123456789ABCDEF")
+
+def controller_calibration_keys(controller):
+    keys = []
+    for value in (
+        getattr(getattr(controller, 'device', None), 'address', None),
+        getattr(getattr(controller, 'controller_info', None), 'mac_address', None),
+        getattr(getattr(controller, 'controller_info', None), 'serial_number', None),
+    ):
+        if value and value not in keys:
+            keys.append(value)
+        normalized = normalize_calibration_key(value)
+        if len(normalized) == 12 and normalized not in keys:
+            keys.append(normalized)
+    normalized_keys = {normalize_calibration_key(key) for key in keys}
+    aliases = getattr(CONFIG, "controller_calibration_aliases", {}) or {}
+    if isinstance(aliases, dict):
+        for src, targets in aliases.items():
+            target_list = targets if isinstance(targets, list) else [targets]
+            src_norm = normalize_calibration_key(src)
+            target_norms = {normalize_calibration_key(target) for target in target_list}
+            if src_norm in normalized_keys:
+                for target in target_list:
+                    if target and target not in keys:
+                        keys.append(target)
+                    target_norm = normalize_calibration_key(target)
+                    if len(target_norm) == 12 and target_norm not in keys:
+                        keys.append(target_norm)
+            elif normalized_keys.intersection(target_norms):
+                if src and src not in keys:
+                    keys.append(src)
+                if len(src_norm) == 12 and src_norm not in keys:
+                    keys.append(src_norm)
+    return keys
+
+def get_calibration_entry(store, controller):
+    if not isinstance(store, dict):
+        return None
+    keys = controller_calibration_keys(controller)
+    for key in keys:
+        if key in store:
+            return store[key]
+    normalized_keys = {normalize_calibration_key(key) for key in keys}
+    normalized_keys.discard("")
+    for stored_key, value in store.items():
+        if normalize_calibration_key(stored_key) in normalized_keys:
+            return value
+    return None
+
+def set_calibration_entry(store, controller, value):
+    if not isinstance(store, dict):
+        return
+    for key in controller_calibration_keys(controller):
+        store[key] = value
+
+def ensure_wired_controller_calibration_alias(controller):
+    if not getattr(controller, "is_wired_usb", False):
+        return
+    current_keys = controller_calibration_keys(controller)
+    current_norms = {normalize_calibration_key(key) for key in current_keys}
+    aliases = getattr(CONFIG, "controller_calibration_aliases", {}) or {}
+    if isinstance(aliases, dict):
+        for src, targets in aliases.items():
+            all_keys = [src] + (targets if isinstance(targets, list) else [targets])
+            if current_norms.intersection(normalize_calibration_key(key) for key in all_keys):
+                return
+
+    joystick_store = getattr(CONFIG, "joystick_calibration_data", {}) or {}
+    candidates = {}
+    for key, value in joystick_store.items():
+        if not isinstance(value, dict) or "left" not in value or "right" not in value:
+            continue
+        norm = normalize_calibration_key(key)
+        if len(norm) != 12 or norm in current_norms:
+            continue
+        candidates[norm] = key
+    if len(candidates) == 1:
+        target_key = next(iter(candidates.values()))
+        source_key = current_keys[0] if current_keys else getattr(controller.device, "address", "")
+        CONFIG.controller_calibration_aliases[source_key] = target_key
+        CONFIG.save_config()
+        logger.info("Auto-linked wired controller calibration alias %s -> %s", source_key, target_key)
 
 # BLE GATT Characteristics UUID
 INPUT_REPORT_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd2"
@@ -122,6 +451,10 @@ class StickCalibrationData:
     min: tuple[int, int]
 
     def __init__(self, data: bytes):
+        # True when the raw data decoded to a plausible calibration; False when we
+        # had to fall back to centered defaults. Lets callers (e.g. the GameCube
+        # path) decide to use a different fallback instead.
+        self.valid = False
         if len(data) >= 9:
             self.center = get_stick_xy(data[0:3])
             # Max/min are absolute offsets from center
@@ -149,15 +482,43 @@ class StickCalibrationData:
                 self.center = (2048, 2048)
                 self.max = (1500, 1500)
                 self.min = (1500, 1500)
+            else:
+                self.valid = True
         else:
             self.center = (2048, 2048)
             self.max = (1500, 1500)
             self.min = (1500, 1500)
 
+    @classmethod
+    def from_values(cls, values):
+        cal = cls(b'')
+        cal.center = tuple(int(v) for v in values["center"])
+        cal.max = tuple(max(1, int(v)) for v in values["max"])
+        cal.min = tuple(max(1, int(v)) for v in values["min"])
+        cal.valid = True
+        cal.in_app = True
+        return cal
+
     def apply_calibration(self, raw_values: tuple[int, int], gain: float = 1.0):
         x = max(-1.0, min(1.0, apply_calibration_to_axis(raw_values[0], self.center[0], self.max[0], self.min[0]) * gain))
         y = max(-1.0, min(1.0, apply_calibration_to_axis(raw_values[1], self.center[1], self.max[1], self.min[1]) * gain))
         return apply_radial_deadzone(x, y, 0.03)
+
+def make_fixed_stick_calibration() -> StickCalibrationData:
+    """Build a fixed, centered stick calibration (center 2048, full range).
+
+    The NSO GameCube controller does not expose Joy-Con/Pro-style stick
+    calibration at the SW2 SPI addresses. Reading those addresses back returns
+    unrelated data that, depending on transport, either pins a stick to an
+    extreme (stuck bottom-left) or collapses its range (no response). The
+    reference NSO pairing app sidesteps this entirely by normalizing against a
+    fixed center of 2048 with a full 0-4095 range, so we do the same here.
+    """
+    cal = StickCalibrationData(b'')
+    cal.center = (2048, 2048)
+    cal.max = (2047, 2047)
+    cal.min = (2047, 2047)
+    return cal
 
 @dataclass
 class ControllerInputData:
@@ -186,11 +547,11 @@ class ControllerInputData:
         
         if product_id == NSO_GAMECUBE_CONTROLLER_PID:
             self.time = data[0]
-            
+
             b1 = data[2]
             b2 = data[3]
             b3 = data[4]
-            
+
             buttons_val = 0
             if b1 & 0x01: buttons_val |= 0x00000004 # B
             if b1 & 0x02: buttons_val |= 0x00000008 # A
@@ -303,11 +664,16 @@ class ControllerInputData:
             self.accelerometer = decodes(data[48:50]), decodes(data[50:52]), decodes(data[52:54])
             self.gyroscope = decodes(data[54:56]), decodes(data[56:58]), decodes(data[58:60])
 
-        stick_gain = 1.05 if product_id in (JOYCON_L_PID, JOYCON_R_PID, JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else 1.0
+        self.raw_left_stick = self.left_stick
+        self.raw_right_stick = self.right_stick
+
+        joycon_gain = 1.05 if product_id in (JOYCON_L_PID, JOYCON_R_PID, JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else 1.0
         if left_stick_calibration:
-            self.left_stick = left_stick_calibration.apply_calibration(self.left_stick, gain=stick_gain)
+            left_gain = 1.0 if getattr(left_stick_calibration, "in_app", False) else joycon_gain
+            self.left_stick = left_stick_calibration.apply_calibration(self.left_stick, gain=left_gain)
         if right_stick_calibration:
-            self.right_stick = right_stick_calibration.apply_calibration(self.right_stick, gain=stick_gain)
+            right_gain = 1.0 if getattr(right_stick_calibration, "in_app", False) else joycon_gain
+            self.right_stick = right_stick_calibration.apply_calibration(self.right_stick, gain=right_gain)
             
     
 
@@ -366,6 +732,14 @@ class Controller:
         self.response_future = None
         self.vibration_packet_id = 0
         self.battery_voltage = None
+        self._rumble_scheduler_event = threading.Event()
+        self._rumble_scheduler_running = True
+        self._rumble_scheduler_thread = threading.Thread(
+            target=self._rumble_scheduler_loop,
+            daemon=True,
+            name=f"RumbleScheduler-{getattr(device, 'address', 'unknown')}"
+        )
+        self._rumble_scheduler_thread.start()
         
         self.gyro_mouse_enabled = False
         self.gr_was_pressed = False
@@ -392,6 +766,7 @@ class Controller:
         self.interp_residual_x = 0.0
         self.interp_residual_y = 0.0
         self.interp_task = None
+        self._interp_wake_event = threading.Event()
         self.virtual_controller = None
         
         self.is_calibrating = False
@@ -401,6 +776,7 @@ class Controller:
         self.calibration_countdown_end = 0.0
         self.last_remaining_sec = None
         self.is_mag_calibration_waiting = False
+        self.is_joystick_calibrating = False
         self.back_button_calibration_active = False
         self.prev_calibration = False
         
@@ -439,6 +815,12 @@ class Controller:
         self.gyro_moving_envelope = 0.0
         self._suspended = False
         self.prev_q = None
+        self._gyro_buf = np.empty(3, dtype=np.float64)
+        self._accel_buf = np.empty(3, dtype=np.float64)
+        self._mag_buf = np.empty(3, dtype=np.float64)
+        self._accel_blend_buf = np.empty(3, dtype=np.float64)
+        self._gyro_config_generation = -1
+        self._gyro_config_snapshot = {}
         
     @property
     def suspended(self):
@@ -492,7 +874,7 @@ class Controller:
         logger.info(f"Magnetometer calibration complete for {self.device.address}. Bias: ({bx:.1f}, {by:.1f}, {bz:.1f})")
         
         # Store in config
-        CONFIG.mag_calibration_data[self.device.address] = list(self.mag_bias)
+        set_calibration_entry(CONFIG.mag_calibration_data, self, list(self.mag_bias))
         CONFIG.save_config()
 
         # Reset orientation filter state to prevent continuous sensor fusion skew/direction issues
@@ -514,10 +896,13 @@ class Controller:
             is_active = (getattr(gyro_ctrl, 'is_calibrating', False) or 
                          getattr(gyro_ctrl, 'is_mag_calibrating', False) or 
                          getattr(gyro_ctrl, 'is_calibration_counting_down', False) or
-                         getattr(gyro_ctrl, 'is_mag_calibration_waiting', False))
+                         getattr(gyro_ctrl, 'is_mag_calibration_waiting', False) or
+                         getattr(gyro_ctrl, 'is_joystick_calibrating', False))
                          
             if is_active:
-                if getattr(gyro_ctrl, 'is_mag_calibration_waiting', False):
+                if getattr(gyro_ctrl, 'is_joystick_calibrating', False):
+                    utils.cancel_joystick_calibration(vc)
+                elif getattr(gyro_ctrl, 'is_mag_calibration_waiting', False):
                     # Start Mag Calibration ONLY on the gyro active controller!
                     gyro_ctrl.is_mag_calibration_waiting = False
                     gyro_ctrl.start_mag_calibration()
@@ -525,6 +910,7 @@ class Controller:
                 elif getattr(gyro_ctrl, 'is_mag_calibrating', False):
                     # Stop Mag Calibration ONLY on the gyro active controller!
                     gyro_ctrl.stop_mag_calibration()
+                    should_start_joystick_cal = getattr(gyro_ctrl, 'back_button_calibration_active', False)
                     # Clear states on all controllers in the merged pair
                     for c in vc.controllers:
                         c.back_button_calibration_active = False
@@ -532,7 +918,10 @@ class Controller:
                         c.is_calibrating = False
                         c.is_mag_calibration_waiting = False
                         c.is_mag_calibrating = False
-                    show_notification("Switch 2 Controller", "Magnetometer calibration complete! Calibration data saved successfully.")
+                    if should_start_joystick_cal:
+                        utils.trigger_joystick_calibration(vc)
+                    else:
+                        show_notification("Switch 2 Controller", "Magnetometer calibration complete! Calibration data saved successfully.")
                 else:
                     # Cancel active countdown/gyro calibration on ALL controllers in the merged pair
                     for c in vc.controllers:
@@ -540,6 +929,7 @@ class Controller:
                         c.is_calibrating = False
                         c.is_mag_calibration_waiting = False
                         c.is_mag_calibrating = False
+                        c.is_joystick_calibrating = False
                         c.back_button_calibration_active = False
                     show_notification("Switch 2 Controller", "Calibration cancelled.")
             else:
@@ -557,21 +947,29 @@ class Controller:
         is_active = (getattr(self, 'is_calibrating', False) or 
                      getattr(self, 'is_mag_calibrating', False) or 
                      getattr(self, 'is_calibration_counting_down', False) or
-                     getattr(self, 'is_mag_calibration_waiting', False))
+                     getattr(self, 'is_mag_calibration_waiting', False) or
+                     getattr(self, 'is_joystick_calibrating', False))
         
         if is_active:
-            if getattr(self, 'is_mag_calibration_waiting', False):
+            if getattr(self, 'is_joystick_calibrating', False):
+                utils.cancel_joystick_calibration(getattr(self, 'virtual_controller', None))
+            elif getattr(self, 'is_mag_calibration_waiting', False):
                 self.is_mag_calibration_waiting = False
                 self.start_mag_calibration()
                 show_notification("Switch 2 Controller", "Magnetometer calibration started. Please rotate the controller in all directions (figure-8 pattern), and press the Calibration button again to end.")
             elif getattr(self, 'is_mag_calibrating', False):
                 self.stop_mag_calibration()
+                should_start_joystick_cal = getattr(self, 'back_button_calibration_active', False)
                 self.back_button_calibration_active = False
-                show_notification("Switch 2 Controller", "Magnetometer calibration complete! Calibration data saved successfully.")
+                if should_start_joystick_cal:
+                    utils.trigger_joystick_calibration(getattr(self, 'virtual_controller', None))
+                else:
+                    show_notification("Switch 2 Controller", "Magnetometer calibration complete! Calibration data saved successfully.")
             else:
                 self.is_calibration_counting_down = False
                 self.is_calibrating = False
                 self.is_mag_calibration_waiting = False
+                self.is_joystick_calibrating = False
                 self.back_button_calibration_active = False
                 show_notification("Switch 2 Controller", "Calibration cancelled.")
         else:
@@ -582,6 +980,16 @@ class Controller:
             show_notification("Switch 2 Controller", "Gyro calibration starts in 5 seconds. Please keep the controllers stationary.")
         
         force_ui_update()
+
+    def cancel_back_button_calibration_state(self):
+        self.is_calibration_counting_down = False
+        self.is_calibrating = False
+        self.is_mag_calibration_waiting = False
+        self.is_mag_calibrating = False
+        self.is_joystick_calibrating = False
+        self.back_button_calibration_active = False
+        self.prev_calibration = False
+        self.last_remaining_sec = None
     
     async def connect_ble(self):
         try:
@@ -785,8 +1193,9 @@ class Controller:
             
             # After getting controller info, prioritize loading specific calibration from MAC address
             addr = self.device.address
-            if addr in CONFIG.calibration_data:
-                self.gyro_bias = tuple(CONFIG.calibration_data[addr])
+            gyro_cal_data = get_calibration_entry(getattr(CONFIG, "calibration_data", {}) or {}, self)
+            if gyro_cal_data is not None:
+                self.gyro_bias = tuple(gyro_cal_data)
                 logger.info(f"Loaded per-device calibration for {addr}")
             elif self.is_joycon_left():
                 self.gyro_bias = tuple(getattr(CONFIG, "gyro_bias_l", [0.0, 0.0, 0.0]))
@@ -794,8 +1203,9 @@ class Controller:
                 self.gyro_bias = tuple(getattr(CONFIG, "gyro_bias_r", [0.0, 0.0, 0.0]))
                 
             mag_cal_data = getattr(CONFIG, "mag_calibration_data", {}) or {}
-            if addr in mag_cal_data:
-                self.mag_bias = tuple(mag_cal_data[addr])
+            mag_entry = get_calibration_entry(mag_cal_data, self)
+            if mag_entry is not None:
+                self.mag_bias = tuple(mag_entry)
                 logger.info(f"Loaded per-device mag calibration for {addr}")
                 
             try:
@@ -809,9 +1219,16 @@ class Controller:
                 # defaults keep the stick neutral until a clean reconnect re-reads it.
                 self.stick_calibration = StickCalibrationData(b'')
                 self.second_stick_calibration = StickCalibrationData(b'')
+            self.apply_in_app_joystick_calibration()
 
             await self.enable_input_notify_callback()
             
+            # Arm the connection settle gate (see input_report_callback): suppress input
+            # until the first neutral frame or this deadline, so connect-moment garbage /
+            # a held wake-button can't fire mapped actions.
+            self._input_settled = False
+            self._input_settle_deadline = time.time() + 1.0
+
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
                 await self.enableFeatures(0x27)
             elif not is_sw2_device:
@@ -875,6 +1292,10 @@ class Controller:
             
         logger.info(f"Controller {self.device.address}: Suspending interpolation...")
         self.interp_running = False
+        self._rumble_scheduler_running = False
+        self._poke_rumble_scheduler()
+        if hasattr(self, '_rumble_scheduler_thread') and self._rumble_scheduler_thread.is_alive():
+            self._rumble_scheduler_thread.join(timeout=0.2)
         
         # Join the interpolation thread if it exists and is running
         if hasattr(self, 'interp_thread') and self.interp_thread.is_alive():
@@ -960,129 +1381,361 @@ class Controller:
             return True
         return False
 
-    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None):
-        # --- TEMP rumble-rate diagnostic (transport-agnostic): logs how many rumble
-        # writes/sec each controller actually issues, so WinRT vs ESP32-bridge can be
-        # compared directly (same dispatch code, so this isolates rate vs timing). ---
+    async def _simple_rumble_send_worker(self, v1, v2, v3):
+        """Single-shot rumble send worker (non-audio-haptic path).
+
+        Promoted from the per-tick inline `safe_send_single` closure so that no
+        coroutine *function* object is created on every input report.
+        Semantics are identical: set _rumble_task_running, send, clear flag.
+        """
+        self._rumble_task_running = True
         try:
-            _now_r = time.perf_counter()
-            self._rumble_diag_count = getattr(self, '_rumble_diag_count', 0) + 1
-            if _now_r - getattr(self, '_rumble_diag_t0', 0.0) >= 1.0:
-                _side = 'L' if self.is_joycon_left() else ('R' if self.is_joycon_right() else 'P')
-                logger.info("RUMBLE-RATE side=%s bridge=%s rate=%d/s",
-                            _side, getattr(self, 'is_esp32s3_bridge', False), self._rumble_diag_count)
-                self._rumble_diag_count = 0
-                self._rumble_diag_t0 = _now_r
+            await self.set_vibration(v1, v2, v3)
+        finally:
+            self._rumble_task_running = False
+
+    async def _audio_haptic_send_worker(self, initial_payload, interval=USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL):
+        """Latest-only audio-haptic rumble loop worker.
+
+        Promoted from the per-tick inline `safe_send_latest` closure.
+        Drains _pending_audio_haptic_rumble after each send so the caller only
+        needs to poke _pending_audio_haptic_rumble to coalesce newer payloads.
+        Semantics (coalescing, interval pacing,
+        _audio_haptic_rumble_task_running flag) are identical to the original.
+        """
+        payload_to_send = initial_payload
+        try:
+            while payload_to_send is not None:
+                send_started = time.perf_counter()
+                self._pending_audio_haptic_rumble = None
+                (
+                    v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r,
+                    t1_c_l, t2_c_l, t3_c_l, t1_c_r, t2_c_r, t3_c_r,
+                    a1_c_l, a2_c_l, a3_c_l, a1_c_r, a2_c_r, a3_c_r
+                ) = payload_to_send
+                if self.is_pro_controller():
+                    await self.set_vibration(
+                        v1_c_l, v2_c_l, v3_c_l, False,
+                        v1_c_r, v2_c_r, v3_c_r,
+                        audio_overlay=(a1_c_l, a2_c_l, a3_c_l),
+                        audio_overlay_r=(a1_c_r, a2_c_r, a3_c_r),
+                        trigger_overlay=(t1_c_l, t2_c_l, t3_c_l),
+                        trigger_overlay_r=(t1_c_r, t2_c_r, t3_c_r))
+                elif self.is_joycon_left():
+                    await self.set_vibration(
+                        v1_c_l, v2_c_l, v3_c_l,
+                        audio_overlay=(a1_c_l, a2_c_l, a3_c_l),
+                        trigger_overlay=(t1_c_l, t2_c_l, t3_c_l))
+                else:
+                    await self.set_vibration(
+                        v1_c_r, v2_c_r, v3_c_r,
+                        audio_overlay=(a1_c_r, a2_c_r, a3_c_r),
+                        trigger_overlay=(t1_c_r, t2_c_r, t3_c_r))
+                elapsed = time.perf_counter() - send_started
+                wait_time = interval - elapsed
+                while wait_time > 0:
+                    if getattr(self, '_pending_audio_haptic_rumble_priority', False):
+                        break
+                    await asyncio.sleep(min(wait_time, 0.001))
+                    wait_time = interval - (time.perf_counter() - send_started)
+                payload_to_send = getattr(self, '_pending_audio_haptic_rumble', None)
+                if payload_to_send is not None:
+                    interval = getattr(
+                        self,
+                        '_pending_audio_haptic_rumble_interval',
+                        USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL,
+                    )
+                    self._pending_audio_haptic_rumble_priority = False
+        finally:
+            self._audio_haptic_rumble_task_running = False
+
+    async def _stereo_rumble_send_worker(
+        self, v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
+        t1_l, t2_l, t3_l, t1_r, t2_r, t3_r
+    ):
+        """Stereo (non-audio-haptic) rumble send worker.
+
+        Promoted from the per-tick inline `safe_send` closure.
+        Semantics are identical: set _rumble_task_running, send, clear flag.
+        """
+        self._rumble_task_running = True
+        try:
+            if self.is_pro_controller():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l, False,
+                    v1_r, v2_r, v3_r,
+                    trigger_overlay=(t1_l, t2_l, t3_l),
+                    trigger_overlay_r=(t1_r, t2_r, t3_r))
+            elif self.is_joycon_left():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l,
+                    trigger_overlay=(t1_l, t2_l, t3_l))
+            else:
+                await self.set_vibration(
+                    v1_r, v2_r, v3_r,
+                    trigger_overlay=(t1_r, t2_r, t3_r))
+        finally:
+            self._rumble_task_running = False
+
+    def _poke_rumble_scheduler(self):
+        try:
+            self._rumble_scheduler_event.set()
         except Exception:
             pass
+
+    def _rumble_scheduler_loop(self):
+        while getattr(self, '_rumble_scheduler_running', False):
+            self._rumble_scheduler_event.wait(timeout=0.0015)
+            self._rumble_scheduler_event.clear()
+            try:
+                self._run_rumble_scheduler_once()
+            except Exception as e:
+                logger.debug(f"Async rumble scheduler failed: {e}")
+
+    def _run_rumble_scheduler_once(self):
+        vc = getattr(self, 'virtual_controller', None)
+        if vc is None:
+            return
+        current_time = time.perf_counter()
+        last_rumble_time = getattr(self, 'last_rumble_time', 0)
+        if current_time - last_rumble_time < 0.007:
+            return
+        self.last_rumble_time = current_time
+
+        if getattr(vc, 'rumble_force_clear', False):
+            self.rumble_stopped = False
+            self._zero_count = 0
+            vc.rumble_force_clear = False
+
+        use_dualsense_stereo = (
+            getattr(vc, 'mode', None) == "PS5" and
+            getattr(vc, 'driver_type', None) == "USBIP"
+        )
+
+        def dispatch_rumble_task(coro):
+            loop = getattr(vc, 'loop', None)
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(coro, loop)
+                return True
+            return False
+
+        if not use_dualsense_stereo:
+            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
+
+            if not getattr(self, '_rumble_task_running', False):
+
+                if is_zero:
+                    if not getattr(self, 'rumble_stopped', False):
+                        self._zero_count = getattr(self, '_zero_count', 0) + 1
+                        dispatch_rumble_task(self._simple_rumble_send_worker(v1, v2, v3))
+                        if self._zero_count >= 3:
+                            self.rumble_stopped = True
+                else:
+                    self.rumble_stopped = False
+                    self._zero_count = 0
+                    if self._bridge_rumble_due():
+                        dispatch_rumble_task(self._simple_rumble_send_worker(v1, v2, v3))
+            return
+
+        source_state = vc.get_usbip_ps5_rumble_source_state()
+        if self.is_pro_controller():
+            trigger_active = source_state['trigger_active_l'] or source_state['trigger_active_r']
+            audio_active = source_state['audio_active_l'] or source_state['audio_active_r']
+        elif self.is_joycon_left():
+            trigger_active = source_state['trigger_active_l']
+            audio_active = source_state['audio_active_l']
+        else:
+            trigger_active = source_state['trigger_active_r']
+            audio_active = source_state['audio_active_r']
+
+        traditional_active = source_state['traditional_active']
+        traditional_seq = source_state['traditional_seq']
+        traditional_stop_seq = source_state['traditional_stop_seq']
+        trigger_seq = source_state['trigger_seq']
+        audio_seq = source_state['audio_seq']
+        traditional_changed = traditional_seq != getattr(self, '_last_usbip_traditional_seq_sent', -1)
+        traditional_stop_changed = traditional_stop_seq != getattr(self, '_last_usbip_traditional_stop_seq_sent', -1)
+        trigger_changed = trigger_seq != getattr(self, '_last_usbip_trigger_seq_sent', -1)
+        audio_changed = audio_seq != getattr(self, '_last_usbip_audio_seq_seen', -1)
+        non_audio_due = (
+            traditional_active or trigger_active or
+            traditional_changed or traditional_stop_changed or trigger_changed
+        )
+        is_zero_state = not (traditional_active or trigger_active or audio_active)
+        send_due = False
+        send_interval = USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL
+        send_priority = False
+        send_reason = None
+
+        if is_zero_state:
+            if not getattr(self, 'rumble_stopped', False) or traditional_stop_changed:
+                send_due = True
+                send_interval = 0.0075 if getattr(self, 'is_esp32s3_bridge', False) else 0.0
+                send_priority = True
+                send_reason = 'zero_flush'
+        elif non_audio_due:
+            if self._bridge_rumble_due():
+                send_due = True
+                send_interval = 0.0075 if getattr(self, 'is_esp32s3_bridge', False) else 0.0
+                send_priority = True
+                if trigger_changed or trigger_active:
+                    send_reason = 'trigger_seq'
+                elif traditional_stop_changed:
+                    send_reason = 'traditional_stop'
+                else:
+                    send_reason = 'traditional_seq'
+        elif audio_active and (
+            audio_changed or
+            current_time - getattr(self, '_last_usbip_audio_haptic_rumble_rt', 0.0) >= USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL
+        ):
+            send_due = current_time - getattr(self, '_last_usbip_audio_haptic_rumble_rt', 0.0) >= USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL
+            send_reason = 'audio_interval' if send_due else None
+
+        self._last_usbip_audio_seq_seen = audio_seq
+
+        if not send_due:
+            return
+
+        v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
+        v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
+        t1_l, t2_l, t3_l, trigger_zero_l = vc.get_current_adaptive_trigger_frames(is_left=True)
+        t1_r, t2_r, t3_r, trigger_zero_r = vc.get_current_adaptive_trigger_frames(is_left=False)
+        a1_l, a2_l, a3_l, audio_zero_l = vc.get_current_audio_haptic_frames(is_left=True)
+        a1_r, a2_r, a3_r, audio_zero_r = vc.get_current_audio_haptic_frames(is_left=False)
+
+        if self.is_pro_controller():
+            is_zero = is_zero_l and is_zero_r and trigger_zero_l and trigger_zero_r and audio_zero_l and audio_zero_r
+        elif self.is_joycon_left():
+            is_zero = is_zero_l and trigger_zero_l and audio_zero_l
+        else:
+            is_zero = is_zero_r and trigger_zero_r and audio_zero_r
+
+        pending_payload = (
+            v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
+            t1_l, t2_l, t3_l, t1_r, t2_r, t3_r,
+            a1_l, a2_l, a3_l, a1_r, a2_r, a3_r)
+
+        if _PERF_DIAGNOSTICS:
+            logger.info(
+                "USBIP PS5 rumble scheduler reason=%s base=%d trigger=%d audio=%d interval=%.4f seq=(%d,%d,%d,%d)",
+                send_reason, int(traditional_active), int(trigger_active), int(audio_active),
+                send_interval, traditional_seq, traditional_stop_seq, trigger_seq, audio_seq)
+
+        if is_zero:
+            if not getattr(self, 'rumble_stopped', False):
+                self._zero_count = getattr(self, '_zero_count', 0) + 1
+                if self._zero_count >= 3:
+                    self.rumble_stopped = True
+        else:
+            self.rumble_stopped = False
+            self._zero_count = 0
+
+        self._last_usbip_traditional_seq_sent = traditional_seq
+        self._last_usbip_traditional_stop_seq_sent = traditional_stop_seq
+        self._last_usbip_trigger_seq_sent = trigger_seq
+        self._last_usbip_audio_haptic_rumble_rt = current_time
+
+        if getattr(self, '_audio_haptic_rumble_task_running', False):
+            self._pending_audio_haptic_rumble = pending_payload
+            self._pending_audio_haptic_rumble_interval = send_interval
+            if send_priority:
+                self._pending_audio_haptic_rumble_priority = True
+        else:
+            self._audio_haptic_rumble_task_running = True
+            self._pending_audio_haptic_rumble_interval = send_interval
+            self._pending_audio_haptic_rumble_priority = False
+            send_coro = self._audio_haptic_send_worker(pending_payload, send_interval)
+            if not dispatch_rumble_task(send_coro):
+                send_coro.close()
+                self._audio_haptic_rumble_task_running = False
+
+    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None):
+        if _PERF_DIAGNOSTICS:
+            try:
+                _now_r = time.perf_counter()
+                self._rumble_diag_count = getattr(self, '_rumble_diag_count', 0) + 1
+                if _now_r - getattr(self, '_rumble_diag_t0', 0.0) >= 1.0:
+                    _side = 'L' if self.is_joycon_left() else ('R' if self.is_joycon_right() else 'P')
+                    logger.info("RUMBLE-RATE side=%s bridge=%s rate=%d/s",
+                                _side, getattr(self, 'is_esp32s3_bridge', False), self._rumble_diag_count)
+                    self._rumble_diag_count = 0
+                    self._rumble_diag_t0 = _now_r
+            except Exception:
+                pass
 
         strength = getattr(CONFIG, "vibration_strength", 5)
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
-
         is_switch1 = getattr(CONFIG, "simulation_mode", "PS5") == "Switch1"
-
         rumble_mode = getattr(CONFIG, "rumble_mode", "Xbox")
+        simulation_mode = getattr(CONFIG, "simulation_mode", "PS5")
 
-        if ignore_freq_scaling:
-            lf_multiplier = 1.3
-            hf_multiplier = 1.0 if is_pro else 0.6
-        elif is_switch1:
-            if is_pro:
-                if rumble_mode == "Switch":
-                    # LF: 2.6, HF: 4.0 (Doubled from 2.0)
-                    lf_at_5 = 1.0 * (2.6 / 2.6)
-                    hf_at_5 = 1.2 * (4.0 / 4.0)
-                    
-                    if strength <= 5.0:
-                        lf_multiplier = (strength / 5.0) * lf_at_5
-                        hf_multiplier = (strength / 5.0) * hf_at_5
-                    else:
-                        t = (strength - 5.0) / 5.0
-                        lf_multiplier = lf_at_5 + (2.6 - lf_at_5) * t
-                        hf_multiplier = hf_at_5 + (4.0 - hf_at_5) * t
-                    
-                    lf_multiplier = min(2.6, lf_multiplier)
-                    hf_multiplier = min(4.0, hf_multiplier)
-                else:
-                    # Align Xbox Rumble to other modes' Xbox Rumble
-                    target_lf_mult = (strength / 5.0) * 2.0
-                    target_hf_scale = (strength / 5.0) * 1.0
-                    
-                    target_lf_mult *= (2.6 / 2.6)
-                    target_hf_scale *= (2.0 / 2.0)
-                    
-                    lf_multiplier = min(2.6, target_lf_mult)
-                    hf_multiplier = min(2.0, target_hf_scale)
-            else:
-                if rumble_mode == "Switch":
-                    if strength <= 5.0:
-                        lf_multiplier = (strength / 5.0) * 0.504
-                        hf_multiplier = (strength / 5.0) * 0.336
-                    else:
-                        t = (strength - 5.0) / 5.0
-                        lf_multiplier = 0.504 + (0.84 - 0.504) * t
-                        hf_multiplier = 0.336 + (0.56 - 0.336) * t
-                    lf_multiplier = min(0.84, lf_multiplier)
-                    hf_multiplier = min(0.56, hf_multiplier)
-                else:
-                    # Align Xbox Rumble for Joy-Con using the same ratio (LF: 1.0x, HF: 0.5x) compared to standard modes
-                    target_lf_mult = (strength / 5.0) * 2.0
-                    target_hf_scale = (strength / 5.0) * 1.0
-                    
-                    target_lf_mult *= 1.0
-                    target_hf_scale *= 0.5
-                    
-                    lf_multiplier = min(0.84, target_lf_mult)
-                    hf_multiplier = min(0.56, target_hf_scale)
-        elif rumble_mode in ("Switch", "PS5"):
-            if is_pro:
-                if strength <= 5.0:
-                    lf_multiplier = (strength / 5.0)
-                    hf_multiplier = (strength / 5.0) * 0.6
-                else:
-                    t = (strength - 5.0) / 5.0
-                    lf_multiplier = 1.0 + (2.6 - 1.0) * t
-                    hf_multiplier = 0.6 + (2.0 - 0.6) * t
-                lf_multiplier = min(2.6, lf_multiplier)
-                hf_multiplier = min(2.0, hf_multiplier)
-            else:
-                if strength <= 5.0:
-                    lf_multiplier = (strength / 5.0) * 0.504
-                    hf_multiplier = (strength / 5.0) * 0.672
-                else:
-                    t = (strength - 5.0) / 5.0
-                    lf_multiplier = 0.504 + (0.84 - 0.504) * t
-                    hf_multiplier = 0.672 + (1.12 - 0.672) * t
-                lf_multiplier = min(0.84, lf_multiplier)
-                hf_multiplier = min(1.12, hf_multiplier)
-        else:
-            # Low Frequency mapping based on 0.6.6: default (S=5) behaves like 0.6.6 strength=10 (factor = 2.0)
-            target_lf_mult = (strength / 5.0) * 2.0
+        # Use direct_amplitude from the audio-haptics path to determine whether
+        # the direct_gain needs to be included in the cache key.
+        _use_direct = bool(direct_amplitude or audio_overlay is not None or audio_overlay_r is not None)
 
-            # High Frequency mapping based on 0.6.6: default (S=5) behaves like 0.6.6 strength=5 (factor = 1.0)
-            target_hf_scale = (strength / 5.0) * 1.0
+        # Derived-config cache: keyed on all settings that influence multipliers/factors.
+        # A settings change produces a new key -> automatic cache miss.
+        _cache_key = (strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+                      ignore_freq_scaling, _use_direct)
+        _cfg_cache = getattr(self, '_vibration_config_cache', None)
+        if _cfg_cache is None:
+            self._vibration_config_cache = {}
+            _cfg_cache = self._vibration_config_cache
+        if _cache_key not in _cfg_cache:
+            _cfg_cache[_cache_key] = _compute_vibration_config(
+                strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+                ignore_freq_scaling, _use_direct)
+            # Evict if cache grows too large (settings changed repeatedly).
+            if len(_cfg_cache) > 32:
+                _cfg_cache.clear()
+                _cfg_cache[_cache_key] = _compute_vibration_config(
+                    strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+                    ignore_freq_scaling, _use_direct)
+        lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain = _cfg_cache[_cache_key]
 
-            # Apply limits from 0.7.1 to prevent physical hardware limitations from being exceeded
-            if is_pro:
-                # Synchronize with Switch1 maximums
-                target_lf_mult *= (2.6 / 2.6)
-                target_hf_scale *= (2.0 / 2.0)
-                lf_multiplier = min(2.6, target_lf_mult)
-                hf_multiplier = min(2.0, target_hf_scale)
-            else:
-                lf_multiplier = min(0.84, target_lf_mult) # 0.84 is the Joy-Con LF upper limit (based on S=7)
-                hf_multiplier = min(1.12, target_hf_scale)
+        def map_y700_switch_amp_to_ble(value):
+            # Thin wrapper so existing in-function references continue to work;
+            # actual logic lives in the module-level _vib_map_y700_to_ble().
+            return _vib_map_y700_to_ble(value, direct_gain)
 
-        # LF frequency is constant (freq_factor_lf = 1.0) so frequency slider has no effect
-        freq_factor_lf = 1.0
-        # HF default (F=10) behaves like 0.6.6 frequency=5 (factor = 4/9)
-        freq_factor_hf = (freq_setting - 1) * 4 / 81.0
+        def convert_y700_audio_haptic_frame(v: VibrationData) -> VibrationData:
+            return _vib_convert_y700_frame(v, direct_gain)
 
-        def scale_and_clamp(v: VibrationData) -> VibrationData:
+        def merge_ble_vibrations(*sources: VibrationData) -> VibrationData:
+            return _vib_merge_ble(*sources)
+
+        def scale_and_clamp(v: VibrationData, force_direct_amplitude = None) -> VibrationData:
+            use_direct_amplitude = direct_amplitude if force_direct_amplitude is None else force_direct_amplitude
             is_switch1 = getattr(CONFIG, "simulation_mode", "PS5") == "Switch1"
 
             is_pure_switch_rumble = rumble_mode in ("Switch", "PS5")
+
+            if use_direct_amplitude:
+                lf_f = min(511, max(1, int(v.lf_freq)))
+                hf_f = min(511, max(1, int(v.hf_freq)))
+                # Apply the PS5 Emu Mode / Xbox Rumble Strength=5 high-frequency dynamic
+                # mask so Audio-Haptics HF amplitude tracks frequency like ordinary
+                # rumble.  The mask is fixed at the S=5 curve; overall strength scaling
+                # (S10 = 2x S5, linear) is supplied by direct_gain at encode time, so LF
+                # is untouched here.  Mirrors the Xbox-path hf_mapped computation exactly.
+                if v.hf_freq > 0:
+                    max_hf_freq = min(511, max(1, int(256.0 + 255.0 * (4.0 / 9.0))))
+                    min_hf_freq = lf_f
+                    denom = max(1.0, max_hf_freq - min_hf_freq)
+                    hf_mapped = 1.0 + ((hf_f - min_hf_freq) / denom) * 9.0
+                    hf_mapped = min(10.0, max(1.0, hf_mapped))
+                    hf_mask = _hf_mask_at_strength5(hf_mapped, is_pro)
+                else:
+                    hf_mask = 1.0
+                return VibrationData(
+                    lf_freq=lf_f,
+                    lf_en_tone=v.lf_en_tone,
+                    lf_amp=min(29000, max(0, int(v.lf_amp))),
+                    hf_freq=hf_f,
+                    hf_en_tone=v.hf_en_tone,
+                    hf_amp=min(29000, max(0, int(v.hf_amp * hf_mask)))
+                )
 
             if ignore_freq_scaling or (is_pure_switch_rumble and not is_switch1):
                 scaled_lf_freq = min(511, max(1, int(v.lf_freq)))
@@ -1156,16 +1809,7 @@ class Controller:
                     hf_mapped = min(10.0, max(1.0, hf_mapped))
 
                     # Calculate base mask values at Strength=5 (F=1 -> 0.25, F=5 -> 0.1, F=10 -> 0.24 for Pro; F=1 -> 0.19, F=5 -> 0.095, F=10 -> 0.06 for Joy-Con)
-                    if is_pro:
-                        if hf_mapped <= 5.0:
-                            mask_at_5 = 0.25 - 0.0375 * (hf_mapped - 1.0)
-                        else:
-                            mask_at_5 = 0.1 + 0.028 * (hf_mapped - 5.0)
-                    else:
-                        if hf_mapped <= 5.0:
-                            mask_at_5 = 0.19 - 0.02375 * (hf_mapped - 1.0)
-                        else:
-                            mask_at_5 = 0.095 + 0.00164 * (hf_mapped - 5.0)
+                    mask_at_5 = _hf_mask_at_strength5(hf_mapped, is_pro)
 
                     # Calculate target mask values at Strength=10 (F=1 -> 0.34375, F=5 -> 0.1375, F=10 -> 0.33 for Pro; F=1 -> 0.8, F=5 -> 0.4, F=10 -> 0.4 for Joy-Con)
                     if is_pro:
@@ -1210,11 +1854,32 @@ class Controller:
                 hf_amp=scaled_hf
             )
 
-        v1 = scale_and_clamp(vibration)
-        v2 = scale_and_clamp(vibration2)
-        v3 = scale_and_clamp(vibration3)
+        def scaled_audio_frame(v):
+            return convert_y700_audio_haptic_frame(scale_and_clamp(v, True))
 
-        motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + v1.get_bytes() + v2.get_bytes() + v3.get_bytes()
+        def merge_scaled_frame(base, trigger=None, audio=None):
+            scaled_base = scale_and_clamp(base, force_direct_amplitude=False)
+            scaled_trigger = scale_and_clamp(trigger, force_direct_amplitude=False) if trigger is not None else None
+            scaled_audio = scaled_audio_frame(audio) if audio is not None else None
+            if scaled_trigger is not None or scaled_audio is not None:
+                return _vib_merge_ble_source_aware(scaled_base, scaled_trigger, scaled_audio)
+            return merge_ble_vibrations(scaled_base)
+
+        v1 = merge_scaled_frame(
+            vibration,
+            trigger_overlay[0] if trigger_overlay is not None else None,
+            audio_overlay[0] if audio_overlay is not None else None)
+        v2 = merge_scaled_frame(
+            vibration2,
+            trigger_overlay[1] if trigger_overlay is not None else None,
+            audio_overlay[1] if audio_overlay is not None else None)
+        v3 = merge_scaled_frame(
+            vibration3,
+            trigger_overlay[2] if trigger_overlay is not None else None,
+            audio_overlay[2] if audio_overlay is not None else None)
+
+        encode_frame = lambda v: v.get_bytes()
+        motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + encode_frame(v1) + encode_frame(v2) + encode_frame(v3)
         
         try:
             if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
@@ -1228,13 +1893,23 @@ class Controller:
                 )
                 
                 if self.is_pro_controller() and vibration_r1 is not None:
-                    v1_r = scale_and_clamp(vibration_r1)
-                    v2_r = scale_and_clamp(vibration_r2)
-                    v3_r = scale_and_clamp(vibration_r3)
-                    motor_vibrations_r = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + v1_r.get_bytes() + v2_r.get_bytes() + v3_r.get_bytes()
-                    # The Pro controller expects Right side data first, then Left side data
-                    # (Standard Nintendo Switch protocol expects Right Rumble then Left Rumble)
-                    payload = b'\x00' + motor_vibrations_r + motor_vibrations
+                    v1_r = merge_scaled_frame(
+                        vibration_r1,
+                        trigger_overlay_r[0] if trigger_overlay_r is not None else None,
+                        audio_overlay_r[0] if audio_overlay_r is not None else None)
+                    v2_r = merge_scaled_frame(
+                        vibration_r2,
+                        trigger_overlay_r[1] if trigger_overlay_r is not None else None,
+                        audio_overlay_r[1] if audio_overlay_r is not None else None)
+                    v3_r = merge_scaled_frame(
+                        vibration_r3,
+                        trigger_overlay_r[2] if trigger_overlay_r is not None else None,
+                        audio_overlay_r[2] if audio_overlay_r is not None else None)
+                    motor_vibrations_r = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + encode_frame(v1_r) + encode_frame(v2_r) + encode_frame(v3_r)
+                    # Match y700/Switch2 raw02 layout: left motor block first,
+                    # then right motor block.  Reversing these makes DualSense
+                    # Ch2 drive the right motor and Ch3 drive the left motor.
+                    payload = b'\x00' + motor_vibrations + motor_vibrations_r
                 else:
                     payload = (b'\x00' + motor_vibrations + motor_vibrations) if self.is_pro_controller() else (b'\x00' + motor_vibrations)
 
@@ -1243,9 +1918,9 @@ class Controller:
                 # rumble shadow; a firmware task re-sends it to BLE at a steady,
                 # hardware-timed cadence (no Windows/asyncio jitter, no per-host
                 # re-send loop).  Other modes are kept for A/B testing:
-                #   "shadow" (default) ??firmware-driven sustain (smoothest)
-                #   "pair" / "mirror"  ??host-driven wrpair dispatcher
-                #   "single"           ??direct per-controller write (original)
+                #   "shadow" (default) -- firmware-driven sustain (smoothest)
+                #   "pair" / "mirror"  -- host-driven wrpair dispatcher
+                #   "single"           -- direct per-controller write (original)
                 shared = getattr(self, 'shared_client', None)
                 if (not self.is_pro_controller()
                         and getattr(self, 'is_esp32s3_bridge', False)
@@ -1253,22 +1928,23 @@ class Controller:
                         and shared is not None):
 
                     # RUMBLE-SUBMIT diagnostics (per-controller, per-second)
-                    try:
-                        import time as _t
-                        _now_sub = _t.perf_counter()
-                        self._sub_n = getattr(self, '_sub_n', 0) + 1
-                        if _now_sub - getattr(self, '_sub_t0', 0.0) >= 1.0:
-                            from esp32_rumble_dispatcher import is_active_rumble_payload as _iap
-                            _side = 'L' if self.is_joycon_left() else 'R'
-                            logger.info(
-                                "RUMBLE-SUBMIT side=%s total=%d/s len=%d active=%s",
-                                _side, self._sub_n, len(payload),
-                                _iap(payload),
-                            )
-                            self._sub_n = 0
-                            self._sub_t0 = _now_sub
-                    except Exception:
-                        pass
+                    if _PERF_DIAGNOSTICS:
+                        try:
+                            import time as _t
+                            _now_sub = _t.perf_counter()
+                            self._sub_n = getattr(self, '_sub_n', 0) + 1
+                            if _now_sub - getattr(self, '_sub_t0', 0.0) >= 1.0:
+                                from esp32_rumble_dispatcher import is_active_rumble_payload as _iap
+                                _side = 'L' if self.is_joycon_left() else 'R'
+                                logger.info(
+                                    "RUMBLE-SUBMIT side=%s total=%d/s len=%d active=%s",
+                                    _side, self._sub_n, len(payload),
+                                    _iap(payload),
+                                )
+                                self._sub_n = 0
+                                self._sub_t0 = _now_sub
+                        except Exception:
+                            pass
 
                     try:
                         _pair_mode = getattr(__import__('config', fromlist=['CONFIG']).CONFIG,
@@ -1323,6 +1999,12 @@ class Controller:
         return ControllerInfo(info)
 
     async def read_calibration_data(self):
+        # Stick calibration lives in factory data (primary 0x130A8 / secondary
+        # 0x130E8, 9 bytes each) with an optional user override in the user
+        # calibration region (0x1FC040 / 0x1FC060, prefixed by a 2-byte magic, so
+        # the real data starts +2 at 0x1FC042 / 0x1FC062). Verified against
+        # switch2_controller_research memory_layout.md. Prefer the user override
+        # when present, else fall back to factory.
         calibration_data_1 = await self.read_memory(0x0b, CALIBRATION_USER_JOYSTICK_1)
         if (decodeu(calibration_data_1[:3]) == 0xFFFFFF):
             calibration_data_1 = await self.read_memory(0x0b, CALIBRATION_JOYSTICK_1)
@@ -1334,11 +2016,50 @@ class Controller:
             return StickCalibrationData(calibration_data_1), None
         if self.is_joycon_right():
             return None, StickCalibrationData(calibration_data_1)
-        return StickCalibrationData(calibration_data_1), StickCalibrationData(calibration_data_2)
+
+        cal_1 = StickCalibrationData(calibration_data_1)
+        cal_2 = StickCalibrationData(calibration_data_2)
+
+        # The NSO GameCube controller doesn't always populate usable stick
+        # calibration at these addresses (the research docs note not all factory
+        # fields are initialised per controller type), and a partial read over the
+        # ESP32-S3 bridge can return garbage that pins a stick to an extreme
+        # (stuck bottom-left) or collapses its range (no response). Use the real
+        # calibration when the read is valid; otherwise fall back to the reference
+        # pairing app's fixed centered calibration.
+        if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            if not cal_1.valid:
+                cal_1 = make_fixed_stick_calibration()
+            if not cal_2.valid:
+                cal_2 = make_fixed_stick_calibration()
+        return cal_1, cal_2
+
+    def apply_in_app_joystick_calibration(self):
+        cal_data = get_calibration_entry(getattr(CONFIG, "joystick_calibration_data", {}) or {}, self)
+        if not isinstance(cal_data, dict):
+            return
+        try:
+            if self.is_joycon_left():
+                if "left" in cal_data:
+                    self.stick_calibration = StickCalibrationData.from_values(cal_data["left"])
+                    logger.info(f"Loaded in-app left joystick calibration for {self.device.address}")
+                return
+            if self.is_joycon_right():
+                if "right" in cal_data:
+                    self.second_stick_calibration = StickCalibrationData.from_values(cal_data["right"])
+                    logger.info(f"Loaded in-app right joystick calibration for {self.device.address}")
+                return
+            if "left" in cal_data:
+                self.stick_calibration = StickCalibrationData.from_values(cal_data["left"])
+            if "right" in cal_data:
+                self.second_stick_calibration = StickCalibrationData.from_values(cal_data["right"])
+            logger.info(f"Loaded in-app joystick calibration for {self.device.address}")
+        except Exception as e:
+            logger.warning(f"Invalid in-app joystick calibration for {self.device.address}: {e}")
 
     async def pair(self, host_mac_value=None):
         # host_mac_value lets callers pair the controller to a host other than the
-        # local PC Bluetooth adapter ??the ESP32-S3 bridge passes its own BLE MAC so
+        # local PC Bluetooth adapter -- the ESP32-S3 bridge passes its own BLE MAC so
         # the controller bonds to the bridge and reconnects to it on a button press.
         if host_mac_value is None:
             from utils import get_local_mac_value
@@ -1358,25 +2079,25 @@ class Controller:
 
             # --- TEMP input-rate diagnostic: how many input reports/sec reach this
             # controller's callback (compare WinRT vs bridge; pairs with RUMBLE-RATE). ---
-            try:
-                _now_i = time.perf_counter()
-                self._input_diag_count = getattr(self, '_input_diag_count', 0) + 1
-                if _now_i - getattr(self, '_input_diag_t0', 0.0) >= 1.0:
-                    _side_i = 'L' if self.is_joycon_left() else ('R' if self.is_joycon_right() else 'P')
-                    logger.info("INPUT-RATE side=%s bridge=%s rate=%d/s",
-                                _side_i, getattr(self, 'is_esp32s3_bridge', False), self._input_diag_count)
-                    self._input_diag_count = 0
-                    self._input_diag_t0 = _now_i
-            except Exception:
-                pass
+            if _PERF_DIAGNOSTICS:
+                try:
+                    _now_i = time.perf_counter()
+                    self._input_diag_count = getattr(self, '_input_diag_count', 0) + 1
+                    if _now_i - getattr(self, '_input_diag_t0', 0.0) >= 1.0:
+                        _side_i = 'L' if self.is_joycon_left() else ('R' if self.is_joycon_right() else 'P')
+                        logger.info("INPUT-RATE side=%s bridge=%s rate=%d/s",
+                                    _side_i, getattr(self, 'is_esp32s3_bridge', False), self._input_diag_count)
+                        self._input_diag_count = 0
+                        self._input_diag_t0 = _now_i
+                except Exception:
+                    pass
 
             # Debug log for the first few packets to see what's being sent on wake
             if not hasattr(self, '_packet_count'): self._packet_count = 0
             if self._packet_count < 5:
                 self._packet_count += 1
                 pid = getattr(self.controller_info, 'product_id', 0)
-                log_fn = logger.info if pid in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else logger.debug
-                log_fn(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} pid=0x{pid:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
+                logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} pid=0x{pid:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
 
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
@@ -1441,11 +2162,11 @@ class Controller:
                 inputData.buttons &= 0x03FFFFFF
             self.raw_buttons = inputData.buttons
 
-            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
+            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
                 self.simulate_mouse(inputData)
 
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
-            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False):
+            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False) and not getattr(self, 'is_joystick_calibrating', False):
                 bx, by, bz = self.gyro_bias
                 raw_gx, raw_gy, raw_gz = inputData.gyroscope
                 gyro_x = raw_gx - bx
@@ -1535,6 +2256,8 @@ class Controller:
             trigger_game_bar = False
             trigger_hdr_toggle = False
             trigger_sys_manager = False
+            trigger_on_screen_keyboard = False
+            trigger_media_action = None
             trigger_change_profile_btn = False
 
             mapping_pairs = [
@@ -1595,7 +2318,7 @@ class Controller:
                         btn_num = int(token[3:])
                     except ValueError:
                         return False
-                    vk_map = {1: win32con.VK_LBUTTON, 2: win32con.VK_RBUTTON, 3: win32con.VK_MBUTTON}
+                    vk_map = {1: win32con.VK_LBUTTON, 2: win32con.VK_MBUTTON, 3: win32con.VK_RBUTTON}
                     vk = vk_map.get(btn_num)
                     try:
                         return bool(vk and (win32api.GetAsyncKeyState(vk) & 0x8000))
@@ -1636,11 +2359,37 @@ class Controller:
                         break
             if profile_combo_target:
                 signature = (profile_combo_trigger, profile_combo_target)
+                suppressed_now = {
+                    btn_id for is_pressed, _mapping_key, _original_bit, _default_action, btn_id in mapping_pairs
+                    if is_pressed
+                }
+                existing_suppressed = getattr(profile_combo_signature_owner, "_profile_switch_suppressed_btn_ids", set())
+                profile_combo_signature_owner._profile_switch_suppressed_btn_ids = set(existing_suppressed) | suppressed_now
                 if getattr(profile_combo_signature_owner, "_prev_profile_combo_signature", None) != signature:
                     trigger_switch_profile(profile_combo_target)
                 profile_combo_signature_owner._prev_profile_combo_signature = signature
             else:
                 profile_combo_signature_owner._prev_profile_combo_signature = None
+
+            suppressed_btn_ids = getattr(profile_combo_signature_owner, "_profile_switch_suppressed_btn_ids", set())
+            if suppressed_btn_ids:
+                pressed_by_id = {btn_id: bool(is_pressed) for is_pressed, _mapping_key, _original_bit, _default_action, btn_id in mapping_pairs}
+                if profile_combo_signature_owner is vc:
+                    btn_id_to_state = {
+                        "gl": "GL", "gr": "GR", "home": "HOME", "capt": "CAPT", "c": "C",
+                        "sll": "SL_L", "srl": "SR_L", "slr": "SL_R", "srr": "SR_R",
+                        "gc_l_click": "GC_L_CLICK", "gc_r_click": "GC_R_CLICK",
+                        "plus": "PLUS", "minus": "MINUS", "a": "A", "b": "B", "x": "X", "y": "Y",
+                        "up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT",
+                        "zl": "ZL", "l": "L", "zr": "ZR", "r": "R", "l_stk": "L_STK", "r_stk": "R_STK",
+                    }
+                    pressed_by_id = {
+                        btn_id: bool(profile_combo_btn_states.get(state_name, False))
+                        for btn_id, state_name in btn_id_to_state.items()
+                    }
+                suppressed_btn_ids = {btn_id for btn_id in suppressed_btn_ids if pressed_by_id.get(btn_id, False)}
+                profile_combo_signature_owner._profile_switch_suppressed_btn_ids = suppressed_btn_ids
+            profile_switch_input_suppressed = bool(suppressed_btn_ids)
 
             if not hasattr(self, 'active_custom_keys'):
                 self.active_custom_keys = {}
@@ -1667,6 +2416,8 @@ class Controller:
             mode_shift_pressed_ids = set()
             mode_shift_tap_edge = False
             for is_pressed, mapping_key, _ms_bit, default_action, btn_id in mapping_pairs:
+                if btn_id in suppressed_btn_ids:
+                    is_pressed = False
                 base_action = get_base_mapping_action(mapping_key)
                 base_resolved = default_action if base_action == "Default" else base_action
                 if is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
@@ -1716,6 +2467,8 @@ class Controller:
             if not hasattr(self, "_gyro_lock_tap_held"):
                 self._gyro_lock_tap_held = set()
             for is_pressed, mapping_key, original_bit, default_action, btn_id in mapping_pairs:
+                if btn_id in suppressed_btn_ids:
+                    is_pressed = False
                 base_action = get_base_mapping_action(mapping_key)
                 base_resolved = default_action if base_action == "Default" else base_action
                 if is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
@@ -1808,8 +2561,13 @@ class Controller:
                     elif resolved == "Calibration": trigger_calibration = True
                     elif resolved == "Game Bar": trigger_game_bar = True
                     elif resolved == "HDR Toggle": trigger_hdr_toggle = True
-                    elif resolved == "Sys Manager": trigger_sys_manager = True
+                    elif resolved == "On-Screen Keyboard": trigger_on_screen_keyboard = True
+                    elif resolved in ("Sys Manager", "Task Manager"): trigger_sys_manager = True
+                    elif resolved in ("Play/Pause", "Stop", "Next Track", "Previous Track", "Volume Up", "Volume Down", "Media Mute"):
+                        trigger_media_action = resolved
                     elif resolved == "Change Profile": trigger_change_profile_btn = True
+                    elif resolved == "None":
+                        pass
                     elif resolved is None:
                         inputData.buttons |= original_bit
                     elif resolved in SWITCH_BUTTONS:
@@ -1868,9 +2626,13 @@ class Controller:
                             win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
                             self.active_custom_mouse_wheel[btn_id] = now
 
-            if trigger_calibration and not getattr(self, 'prev_calibration', False):
+            if profile_switch_input_suppressed:
+                self.prev_calibration = False
+            elif not trigger_calibration and getattr(self, 'prev_calibration', False):
                 self._handle_calibration_button_pressed()
-            self.prev_calibration = trigger_calibration
+                self.prev_calibration = False
+            else:
+                self.prev_calibration = trigger_calibration
 
             if getattr(self, 'is_calibration_counting_down', False):
                 inputData.left_stick = (0.0, 0.0)
@@ -1911,6 +2673,16 @@ class Controller:
                     self.input_report_callback(inputData, self)
                 return
 
+            if getattr(self, 'is_joystick_calibrating', False):
+                inputData.buttons = 0
+                inputData.left_stick = (0.0, 0.0)
+                inputData.right_stick = (0.0, 0.0)
+                inputData.gyroscope = (0.0, 0.0, 0.0)
+                inputData.accelerometer = (0.0, 0.0, 0.0)
+                if self.input_report_callback is not None:
+                    self.input_report_callback(inputData, self)
+                return
+
             active_mapping_scope = "in_app_gyro_mode_mappings" if mapping_scope_dict is not None else None
             active_scope_dict = CONFIG.get_mapping_scope_dict(active_mapping_scope)
             if active_scope_dict.get("y_mapping", "Default") != "Default": raw_left_pressed = False
@@ -1937,24 +2709,25 @@ class Controller:
                 if raw_up_pressed:    inputData.buttons |= 0x02
                 if raw_left_pressed:  inputData.buttons |= 0x01
 
-            # NSO GameCube Controller Switch Layout override:
-            # GCN physical buttons map differently to Switch Pro buttons.
-            # raw_right=GCN A, raw_left=GCN B, raw_down=GCN X, raw_up=GCN Y
+            # NSO GameCube Controller: apply the requested GCN layout directly
+            # so Xbox/Switch layout mode is consistent across every emulation mode.
+            # raw_right=GCN A, raw_down=GCN B, raw_up=GCN X, raw_left=GCN Y.
             # Desired Switch Layout: GCN A?ro B, GCN B?ro Y, GCN X?ro A, GCN Y?ro X
-            if (should_swap and
-                    getattr(self, 'controller_info', None) and
+            if (getattr(self, 'controller_info', None) and
                     getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID):
-                # Clear the bits set by the generic Switch layout above
                 inputData.buttons &= ~0x0F
-                # Re-apply with GCN-specific mapping:
-                # GCN X (raw_down) ??Pro A (0x08)
-                if raw_down_pressed:  inputData.buttons |= 0x08
-                # GCN A (raw_right) ??Pro B (0x04)
-                if raw_right_pressed: inputData.buttons |= 0x04
-                # GCN Y (raw_up) ??Pro X (0x02)
-                if raw_up_pressed:    inputData.buttons |= 0x02
-                # GCN B (raw_left) ??Pro Y (0x01)
-                if raw_left_pressed:  inputData.buttons |= 0x01
+                if abxy_mode == "Xbox":
+                    # Letter-matched: GCN A->A, B->X, X->B, Y->Y.
+                    if raw_right_pressed: inputData.buttons |= 0x08
+                    if raw_down_pressed:  inputData.buttons |= 0x02
+                    if raw_up_pressed:    inputData.buttons |= 0x04
+                    if raw_left_pressed:  inputData.buttons |= 0x01
+                else:
+                    # Switch layout: positional match.
+                    if raw_right_pressed: inputData.buttons |= 0x08
+                    if raw_down_pressed:  inputData.buttons |= 0x04
+                    if raw_up_pressed:    inputData.buttons |= 0x02
+                    if raw_left_pressed:  inputData.buttons |= 0x01
 
             inputData.buttons |= getattr(inputData, 'custom_buttons_mask', 0)
 
@@ -1997,6 +2770,14 @@ class Controller:
                 win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0) # Ctrl up
             self.prev_sys_manager = trigger_sys_manager
 
+            if trigger_on_screen_keyboard and not getattr(self, 'prev_on_screen_keyboard', False):
+                self._tap_os_keys(0x5B, win32con.VK_CONTROL, 0x4F)
+            self.prev_on_screen_keyboard = trigger_on_screen_keyboard
+
+            if trigger_media_action and trigger_media_action != getattr(self, 'prev_media_action', None):
+                self._tap_media_action(trigger_media_action)
+            self.prev_media_action = trigger_media_action
+
             if trigger_change_profile_btn and not profile_combo_target and not getattr(self, 'prev_change_profile_btn', False):
                 trigger_change_profile()
             self.prev_change_profile_btn = trigger_change_profile_btn
@@ -2010,7 +2791,7 @@ class Controller:
             if getattr(self, 'gyro_fusion_callback', None):
                 self.gyro_fusion_callback(inputData, self)
 
-            if getattr(self, 'is_calibrating', False) or getattr(self, 'is_mag_calibrating', False):
+            if getattr(self, 'is_calibrating', False) or getattr(self, 'is_mag_calibrating', False) or getattr(self, 'is_joystick_calibrating', False):
                 self.simulate_gyro_mouse(inputData, False, False, False)
             else:
                 # Record own trigger state and use shared trigger (for combined mode cross-controller activation)
@@ -2031,7 +2812,7 @@ class Controller:
             self.prev_djg = trigger_djg
 
             # If Steam roll compensation is enabled, apply built-in anti-roll projection to gyroscope and accelerometer
-            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
+            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
                 if getattr(CONFIG, 'steam_roll_compensation', False):
                     # 1. Extract current gyroscope and accelerometer vectors
                     gx, gy, gz = inputData.gyroscope
@@ -2098,8 +2879,8 @@ class Controller:
                     inputData.accelerometer = (ax_comp, ay_comp, az_comp)
 
             # Apply flat static deadzone (base_dz) to the final virtual controller gyroscope data
-            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False):
-                base_dz = float(getattr(CONFIG, 'virtual_gyro_soft_deadzone', 2.0))
+            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
+                base_dz = float(getattr(CONFIG, 'virtual_gyro_soft_deadzone', 0.0))
                 if base_dz > 0.0:
                     gx_dz, gy_dz, gz_dz = inputData.gyroscope
                     
@@ -2126,113 +2907,10 @@ class Controller:
                     
                     inputData.gyroscope = (gx_dz, gy_dz, gz_dz)
 
-            try:
-                vc = getattr(self, 'virtual_controller', None)
-                if vc is not None:
-                    current_time = time.perf_counter()
-                    last_rumble_time = getattr(self, 'last_rumble_time', 0)
-
-                    if current_time - last_rumble_time >= 0.007:
-                        self.last_rumble_time = current_time
-
-                        if getattr(vc, 'rumble_force_clear', False):
-                            self.rumble_stopped = False
-                            self._zero_count = 0
-                            vc.rumble_force_clear = False
-
-                        use_dualsense_stereo = (
-                            getattr(vc, 'mode', None) == "PS5" and
-                            getattr(vc, 'driver_type', None) == "USBIP"
-                        )
-
-                        def dispatch_rumble_task(coro):
-                            loop = getattr(vc, 'loop', None)
-                            if loop and not loop.is_closed():
-                                asyncio.run_coroutine_threadsafe(coro, loop)
-                            else:
-                                try:
-                                    asyncio.get_running_loop().create_task(coro)
-                                except RuntimeError:
-                                    pass
-
-                        if not use_dualsense_stereo:
-                            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
-
-                            if not getattr(self, '_rumble_task_running', False):
-
-                                async def safe_send_single(v1_c, v2_c, v3_c):
-                                    self._rumble_task_running = True
-                                    try:
-                                        await self.set_vibration(v1_c, v2_c, v3_c)
-                                    finally:
-                                        self._rumble_task_running = False
-
-                                if is_zero:
-                                    if not getattr(self, 'rumble_stopped', False):
-                                        self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
-                                        if self._zero_count >= 3:
-                                            self.rumble_stopped = True
-                                else:
-                                    self.rumble_stopped = False
-                                    self._zero_count = 0
-                                    # Pace continuous rumble to the BLE connection interval
-                                    # (~7.5ms) for the ESP32-S3 bridge. The 3 frames per
-                                    # command already cover the interval; dispatching every
-                                    # input report (faster, and doubled in merge mode) floods
-                                    # the firmware's per-interval BLE write and causes the
-                                    # stuttering. WinRT is paced by Windows' BLE stack instead.
-                                    if self._bridge_rumble_due():
-                                        dispatch_rumble_task(safe_send_single(v1, v2, v3))
-                        else:
-                            v1_l, v2_l, v3_l, is_zero_l = vc.get_current_vibration_frames(is_left=True)
-                            v1_r, v2_r, v3_r, is_zero_r = vc.get_current_vibration_frames(is_left=False)
-
-                            if self.is_pro_controller():
-                                is_zero = is_zero_l and is_zero_r
-                            elif self.is_joycon_left():
-                                is_zero = is_zero_l
-                            else:
-                                is_zero = is_zero_r
-
-                            if not getattr(self, '_rumble_task_running', False):
-
-                                async def safe_send(v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r):
-                                    self._rumble_task_running = True
-                                    try:
-                                        if self.is_pro_controller():
-                                            await self.set_vibration(v1_c_l, v2_c_l, v3_c_l, False, v1_c_r, v2_c_r, v3_c_r)
-                                        elif self.is_joycon_left():
-                                            await self.set_vibration(v1_c_l, v2_c_l, v3_c_l)
-                                        else:
-                                            await self.set_vibration(v1_c_r, v2_c_r, v3_c_r)
-                                    finally:
-                                        self._rumble_task_running = False
-
-                                if is_zero:
-                                    if not getattr(self, 'rumble_stopped', False):
-                                        self._zero_count = getattr(self, '_zero_count', 0) + 1
-                                        dispatch_rumble_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
-                                        if self._zero_count >= 3:
-                                            self.rumble_stopped = True
-                                else:
-                                    self.rumble_stopped = False
-                                    self._zero_count = 0
-                                    # Pace continuous rumble to ~7.5ms for the bridge (see above).
-                                    if self._bridge_rumble_due():
-                                        dispatch_rumble_task(safe_send(v1_l, v2_l, v3_l, v1_r, v2_r, v3_r))
-            
-            except Exception as e:
-                logger.debug(f"Sync rumble failed: {e}")
-
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
 
-        # Arm the connection settle gate (see input_report_callback): suppress input
-        # until the first neutral frame or this deadline, so connect-moment garbage /
-        # a held wake-button can't fire mapped actions.
-        self._input_settled = False
-        self._input_settle_deadline = time.time() + 1.0
+            self._poke_rumble_scheduler()
 
         if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             # GCN input callback: filter out short packets (command acks, Format 0) and
@@ -2249,7 +2927,22 @@ class Controller:
                 # Subscribing gc_input_report_callback to COMMAND_RESPONSE_UUID would
                 # overwrite the command_response_callback registered during initialize(),
                 # causing all write_command() calls (including enableFeatures) to timeout.
-                # Use the standard INPUT_REPORT_UUID subscription ??the bridge router
+                # Directed advertising can hide the controller PID from the ESP32 scan
+                # cache, so force the bridge-side input source to the GCN legacy notify
+                # characteristic before routing its frames to the standard INPUT_REPORT_UUID.
+                try:
+                    channel = int(getattr(self, 'channel', getattr(self.client, 'channel', 0)))
+                    reply = await asyncio.to_thread(
+                        self.client.send_manager_command,
+                        f"inputsrc {channel} legacy",
+                        0.5,
+                    )
+                    logger.info("GCN via ESP32 bridge: forced legacy input source on channel %d (%s)", channel, reply.strip() or "no reply")
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    logger.warning("GCN via ESP32 bridge: failed to force legacy input source: %s", e)
+
+                # Use the standard INPUT_REPORT_UUID subscription; the bridge router
                 # ensures GCN input frames reach this callback correctly.
                 logger.info("GCN via ESP32 bridge: using standard INPUT_REPORT_UUID subscription")
                 await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
@@ -2306,8 +2999,34 @@ class Controller:
         self.last_fusion_time = time.perf_counter()
         self.prev_q = None
 
+    def _get_gyro_config_snapshot(self):
+        generation = int(getattr(CONFIG, "settings_generation", 0))
+        snap = getattr(self, "_gyro_config_snapshot", None)
+        if generation == getattr(self, "_gyro_config_generation", -1) and snap:
+            return snap
+        gyro_control_mode = getattr(CONFIG, "gyro_control_mode", "Mouse")
+        gyro_sensitivity = float(getattr(CONFIG, "gyro_sensitivity", 0.3))
+        rstick_sensitivity = float(getattr(CONFIG, "r_joystick_gyro_sensitivity", 5.0))
+        snap = {
+            "generation": generation,
+            "gyro_mode": getattr(CONFIG, "gyro_mode", "World"),
+            "gyro_control_mode": gyro_control_mode,
+            "gyro_activation_mode": getattr(CONFIG, "gyro_activation_mode", "Toggle"),
+            "gyro_sensitivity": gyro_sensitivity,
+            "gyro_sensitivity_mouse": gyro_sensitivity * 2.0,
+            "gyro_sensitivity_roll": gyro_sensitivity * 2.0,
+            "rstick_sens_scaled": rstick_sensitivity * 8.0,
+            "rstick_conv_scaled": rstick_sensitivity * 8.0 * 0.002,
+            "stabilized_gyro": bool(getattr(CONFIG, "stabilized_gyro", False)),
+            "virtual_gyro_soft_deadzone": float(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0)),
+        }
+        self._gyro_config_snapshot = snap
+        self._gyro_config_generation = generation
+        return snap
+
     def _mahony_update(self, gx, gy, gz, ax, ay, az, mx, my, mz, dt):
-        current_mode = getattr(CONFIG, "gyro_mode", "World")
+        cfg = self._get_gyro_config_snapshot()
+        current_mode = cfg["gyro_mode"]
         
         # 1. Convert raw gyroscope and accelerometer values into standard physical units
         # Deduct static bias and dynamic bias integral (dynamic bias is in rad/s, convert to dps)
@@ -2324,8 +3043,14 @@ class Controller:
         az_g = az / 16384.0
         
         # 2. Perform sensor fusion using C-extension imufusion
-        gyro_arr = np.array([gx_dps, gy_dps, gz_dps], dtype=np.float64)
-        accel_arr = np.array([ax_g, ay_g, az_g], dtype=np.float64)
+        gyro_arr = self._gyro_buf
+        gyro_arr[0] = gx_dps
+        gyro_arr[1] = gy_dps
+        gyro_arr[2] = gz_dps
+        accel_arr = self._accel_buf
+        accel_arr[0] = ax_g
+        accel_arr[1] = ay_g
+        accel_arr[2] = az_g
         
         # Single smooth rational formula to dynamically scale blend_factor based on movement intensity.
         # This addresses centripetal acceleration (proportional to omega^2), which introduces a DC bias during waving.
@@ -2334,13 +3059,20 @@ class Controller:
         # - For high velocities (envelope>=50 dps), blend_factor approaches 0.995+ (completely locking out massive centripetal noise).
         envelope = getattr(self, 'gyro_moving_envelope', 0.0)
         blend_factor = (envelope / 0.26) / (1.0 + (envelope / 0.26))
-        accel_blended = accel_arr * (1.0 - blend_factor) + self.ahrs.gravity * blend_factor
+        accel_blended = self._accel_blend_buf
+        np.multiply(accel_arr, 1.0 - blend_factor, out=accel_blended)
+        gravity_scaled = self._mag_buf
+        np.multiply(self.ahrs.gravity, blend_factor, out=gravity_scaled)
+        np.add(accel_blended, gravity_scaled, out=accel_blended)
         
         if current_mode == "World" and (mx != 0 or my != 0 or mz != 0):
             mx_cal = mx - self.mag_bias[0]
             my_cal = my - self.mag_bias[1]
             mz_cal = mz - self.mag_bias[2]
-            mag_arr = np.array([mx_cal, my_cal, mz_cal], dtype=np.float64)
+            mag_arr = self._mag_buf
+            mag_arr[0] = mx_cal
+            mag_arr[1] = my_cal
+            mag_arr[2] = mz_cal
             self.ahrs.update(gyro_arr, accel_blended, mag_arr, float(dt))
         else:
             self.ahrs.update_no_magnetometer(gyro_arr, accel_blended, float(dt))
@@ -2466,6 +3198,7 @@ class Controller:
             self.previous_mouse_state = None
 
     def simulate_gyro_mouse(self, inputData: ControllerInputData, trigger_pressed: bool = False, zr_pressed: bool = False, zl_pressed: bool = False):
+        cfg = self._get_gyro_config_snapshot()
 
         if getattr(self, 'is_calibrating', False):
             if time.perf_counter() < self.calibration_end_time:
@@ -2488,7 +3221,7 @@ class Controller:
                     logger.info(f"Calibration complete for {self.device.address}. Gyro bias: ({gx:.1f}, {gy:.1f}, {gz:.1f})")
                     
                     # Store device-specific calibration data
-                    CONFIG.calibration_data[self.device.address] = list(self.gyro_bias)
+                    set_calibration_entry(CONFIG.calibration_data, self, list(self.gyro_bias))
                     
                     if self.is_joycon_left():
                         CONFIG.gyro_bias_l = list(self.gyro_bias)
@@ -2522,6 +3255,13 @@ class Controller:
             inputData.accelerometer = (0.0, 0.0, 0.0)
             return
 
+        if getattr(self, 'is_joystick_calibrating', False):
+            inputData.left_stick = (0.0, 0.0)
+            inputData.right_stick = (0.0, 0.0)
+            inputData.gyroscope = (0.0, 0.0, 0.0)
+            inputData.accelerometer = (0.0, 0.0, 0.0)
+            return
+
         current_gyro_active = getattr(self, 'gyro_active', True)
         if current_gyro_active and not getattr(self, 'prev_gyro_active', True):
             if hasattr(self, 'true_accel'):
@@ -2544,7 +3284,21 @@ class Controller:
             self.interp_residual_y = 0.0
             return
 
-        activation_mode = getattr(CONFIG, "gyro_activation_mode", "Toggle")
+        activation_mode = cfg["gyro_activation_mode"]
+        if (
+            not trigger_pressed
+            and not getattr(self, "gyro_mouse_enabled", False)
+            and activation_mode != "Always On"
+        ):
+            self.gr_was_pressed = False
+            self.gyro_target_vx = 0.0
+            self.gyro_target_vy = 0.0
+            self._gyro_rstick_out = (0.0, 0.0)
+            self.current_vx = 0.0
+            self.current_vy = 0.0
+            self.interp_residual_x = 0.0
+            self.interp_residual_y = 0.0
+            return
 
         bx, by, bz = self.gyro_bias
         raw_gx, raw_gy, raw_gz = inputData.gyroscope
@@ -2573,7 +3327,7 @@ class Controller:
         gyro_y = raw_gy - by
         gyro_z = raw_gz - bz
 
-        if getattr(CONFIG, 'stabilized_gyro', False):
+        if cfg["stabilized_gyro"]:
             gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
             gyro_x -= math.degrees(self.gyro_bias_integral[0]) * gyro_scale
             gyro_y -= math.degrees(self.gyro_bias_integral[1]) * gyro_scale
@@ -2583,7 +3337,7 @@ class Controller:
 
         # Always extract decoupled movements and calculate soft deadzones
         # so that they can be applied to both the gyro mouse and virtual controller data.
-        current_mode = getattr(CONFIG, "gyro_mode", "World")
+        current_mode = cfg["gyro_mode"]
         self.soft_dz_h = 0.0
         self.soft_dz_v = 0.0
         self.eff_h_final = 0.0
@@ -2654,6 +3408,7 @@ class Controller:
                     self._reset_orientation_from_accel(ax, ay, az)
                 self.gyro_start_time = time.perf_counter()
                 self.gyro_steering_origin_accel = (ax, ay, az)
+                self._interp_wake_event.set()
             self.gyro_mouse_enabled = trigger_pressed
         else:
             if trigger_pressed and not self.gr_was_pressed:
@@ -2666,6 +3421,7 @@ class Controller:
                         self._reset_orientation_from_accel(ax, ay, az)
                     self.gyro_start_time = time.perf_counter()
                     self.gyro_steering_origin_accel = (ax, ay, az)
+                    self._interp_wake_event.set()
                 
         self.gr_was_pressed = trigger_pressed
 
@@ -2697,8 +3453,9 @@ class Controller:
             target_vy = 0.0
             
             now = time.perf_counter()
-            current_mode = getattr(CONFIG, "gyro_mode", "World")
-            if getattr(CONFIG, "gyro_control_mode", "Mouse") == "Steering":
+            current_mode = cfg["gyro_mode"]
+            gyro_control_mode = cfg["gyro_control_mode"]
+            if gyro_control_mode == "Steering":
                 current_mode = "Roll"
 
             # Suppress movement ONLY during gyro startup (Auto-Leveling period)
@@ -2711,7 +3468,7 @@ class Controller:
             gyro_deadzone = 0.2 
             
             if current_mode in ["World", "Yaw"]:
-                sensitivity = getattr(CONFIG, "gyro_sensitivity", 0.3) * 2.0
+                sensitivity = cfg["gyro_sensitivity_mouse"]
                 accel_factor = 0.002
                 
                 # Determine vertical sign (invert for Right Joycon in H-mode if needed)
@@ -2753,7 +3510,7 @@ class Controller:
                     tilt_value -= orig_tilt
                 
                 tilt_normalized = tilt_value / 4000.0
-                sensitivity = getattr(CONFIG, "gyro_sensitivity", 4.0) * 2.0
+                sensitivity = cfg["gyro_sensitivity_roll"]
                 # Sensitivity * 1.0 (Inverted sign based on user feedback)
                 steer_value = max(-1.0, min(1.0, -tilt_normalized * sensitivity))
                 
@@ -2765,16 +3522,15 @@ class Controller:
             # deflection (push toward motion, recenter when still) instead of mouse motion.
             # The Sensitivity slider scales the velocity->deflection conversion; the result
             # is clamped to the right stick's maximum (unit magnitude).
-            if getattr(CONFIG, "gyro_control_mode", "Mouse") == "R Joystick":
+            if gyro_control_mode == "R Joystick":
                 gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
-                rstick_sens = getattr(CONFIG, "r_joystick_gyro_sensitivity", 5.0) * 8.0
-                RSTICK_CONV = 0.002  # base velocity(dps)->deflection factor
+                rstick_conv = cfg["rstick_conv_scaled"]
                 if current_mode in ["World", "Yaw"]:
                     v_sign = -1.0
                     if self.is_joycon_right() and self.hold_mode == "Horizontal":
                         v_sign = 1.0
-                    rx = (self.eff_h_final / gyro_scale) * rstick_sens * RSTICK_CONV
-                    ry = -((self.eff_v_final * v_sign) / gyro_scale) * rstick_sens * RSTICK_CONV
+                    rx = (self.eff_h_final / gyro_scale) * rstick_conv
+                    ry = -((self.eff_v_final * v_sign) / gyro_scale) * rstick_conv
                 elif current_mode == "Roll":
                     rx = getattr(self, "_own_steer_value", 0.0)
                     ry = 0.0
@@ -2795,6 +3551,8 @@ class Controller:
 
             self.gyro_target_vx = target_vx
             self.gyro_target_vy = target_vy
+            if target_vx != 0.0 or target_vy != 0.0 or self._gyro_rstick_out != (0.0, 0.0):
+                self._interp_wake_event.set()
 
         else:
             self.gyro_target_vx = 0.0
@@ -2833,7 +3591,13 @@ class Controller:
             "Capture": "BTN_CAPT",
             "Chat": "BTN_C",
             "PrtSc": "VK_SNAPSHOT",
-            "Mute": "VK_VOLUME_MUTE",
+            "Media Mute": "VK_VOLUME_MUTE",
+            "Play/Pause": "VK_MEDIA_PLAY_PAUSE",
+            "Stop": "VK_MEDIA_STOP",
+            "Next Track": "VK_MEDIA_NEXT_TRACK",
+            "Previous Track": "VK_MEDIA_PREV_TRACK",
+            "Volume Up": "VK_VOLUME_UP",
+            "Volume Down": "VK_VOLUME_DOWN",
         }
         token = named.get(action)
         return ([token] if token else []), []
@@ -2975,9 +3739,12 @@ class Controller:
         self._ps_cp_prev = cp_now
 
     def _joystick_direction_tokens(self, key, direction_names):
-        defaults = {"up": "VK_W", "down": "VK_S", "left": "VK_A", "right": "VK_D"}
         scope_dict = CONFIG.get_mapping_scope_dict(self._in_app_gyro_mapping_scope())
         mode = scope_dict.get(f"{key}_mapping", "Default")
+        if mode == "KB Arrow Keys":
+            defaults = {"up": "VK_UP", "down": "VK_DOWN", "left": "VK_LEFT", "right": "VK_RIGHT"}
+        else:
+            defaults = {"up": "VK_W", "down": "VK_S", "left": "VK_A", "right": "VK_D"}
         custom = scope_dict.get(f"{key}_custom", {}) if mode == "Custom" else {}
         hold_tokens = []
         tap_tokens_by_direction = {}
@@ -3172,7 +3939,7 @@ class Controller:
         if now - self.joystick_scroll_last_time.get(key, 0.0) < 0.03:
             return
         magnitude = math.sqrt(stick[0] * stick[0] + stick[1] * stick[1])
-        deadzone = 0.20
+        deadzone = 0.05
         if magnitude <= deadzone:
             self.joystick_scroll_tap_armed.pop(key, None)
             return
@@ -3216,6 +3983,26 @@ class Controller:
         elif token == "MW_DOWN":
             win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
 
+    def _tap_os_keys(self, *vk_codes):
+        for vk in vk_codes:
+            win32api.keybd_event(vk, 0, 0, 0)
+        for vk in reversed(vk_codes):
+            win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+    def _tap_media_action(self, action):
+        vk_map = {
+            "Play/Pause": getattr(win32con, "VK_MEDIA_PLAY_PAUSE", 0xB3),
+            "Stop": getattr(win32con, "VK_MEDIA_STOP", 0xB2),
+            "Next Track": getattr(win32con, "VK_MEDIA_NEXT_TRACK", 0xB0),
+            "Previous Track": getattr(win32con, "VK_MEDIA_PREV_TRACK", 0xB1),
+            "Volume Up": win32con.VK_VOLUME_UP,
+            "Volume Down": win32con.VK_VOLUME_DOWN,
+            "Media Mute": win32con.VK_VOLUME_MUTE,
+        }
+        vk = vk_map.get(action)
+        if vk:
+            self._tap_os_keys(vk)
+
     def _apply_shared_joystick_mapping(self, inputData):
         scope_dict = CONFIG.get_mapping_scope_dict(self._in_app_gyro_mapping_scope())
         left_mode = scope_dict.get("l_joystick_mapping", "Default")
@@ -3254,7 +4041,7 @@ class Controller:
             directions, input_state = self._stick_sector_state(mapped_stick)
             magnitude = math.sqrt(mapped_stick[0] * mapped_stick[0] + mapped_stick[1] * mapped_stick[1])
             center_deadzone = 0.20
-            hold_tokens, tap_tokens = self._joystick_direction_tokens(key, directions) if mode in ("WASD", "Custom") else ([], {})
+            hold_tokens, tap_tokens = self._joystick_direction_tokens(key, directions) if mode in ("WASD", "KB Arrow Keys", "Custom") else ([], {})
             self._apply_joystick_tokens(
                 key,
                 hold_tokens,
@@ -3264,7 +4051,7 @@ class Controller:
                 input_state=input_state,
                 center_reset=magnitude < center_deadzone,
             )
-            return mode in ("WASD", "Custom")
+            return mode in ("WASD", "KB Arrow Keys", "Custom")
 
         active_modes = {
             "l_joystick": left_mode if process_left else None,
@@ -3337,6 +4124,13 @@ class Controller:
                 elif vk_name == "DOWN": vk_code = win32con.VK_DOWN
                 elif vk_name == "LEFT": vk_code = win32con.VK_LEFT
                 elif vk_name == "RIGHT": vk_code = win32con.VK_RIGHT
+                elif vk_name == "MEDIA_PLAY_PAUSE": vk_code = 0xB3
+                elif vk_name == "MEDIA_STOP": vk_code = 0xB2
+                elif vk_name == "MEDIA_NEXT_TRACK": vk_code = 0xB0
+                elif vk_name == "MEDIA_PREV_TRACK": vk_code = 0xB1
+                elif vk_name == "VOLUME_UP": vk_code = win32con.VK_VOLUME_UP
+                elif vk_name == "VOLUME_DOWN": vk_code = win32con.VK_VOLUME_DOWN
+                elif vk_name == "VOLUME_MUTE": vk_code = win32con.VK_VOLUME_MUTE
             if vk_code:
                 if is_down:
                     win32api.keybd_event(vk_code, 0, 0, 0)
@@ -3357,7 +4151,8 @@ class Controller:
         last_time = time.perf_counter()
         while self.interp_running:
             if self.client and self.client.is_connected and (self.gyro_mouse_enabled or getattr(self, 'jc_mouse_active', False) or getattr(self, 'joystick_mouse_active', False)):
-                if getattr(self, 'is_calibrating', False):
+                self._interp_wake_event.clear()
+                if getattr(self, 'is_calibrating', False) or getattr(self, 'is_joystick_calibrating', False):
                     self.current_vx = 0.0
                     self.current_vy = 0.0
                 else:
@@ -3387,6 +4182,9 @@ class Controller:
                     win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, move_x, move_y, 0, 0)
             else:
                 last_time = time.perf_counter()
+                self._interp_wake_event.wait(0.02)
+                self._interp_wake_event.clear()
+                continue
 
             time.sleep(0.001)
 

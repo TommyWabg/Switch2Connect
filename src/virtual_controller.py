@@ -2,6 +2,8 @@ import struct
 import winuhid_client as winuhid
 from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_SPECIAL_BUTTONS
 import threading
+import os
+import math
 
 VIRTUAL_DEVICE_CREATION_LOCK = threading.Lock()
 import time
@@ -27,14 +29,42 @@ import ctypes
 import logging
 import gc
 from controller import (Controller, ControllerInputData, VibrationData,
-                        NSO_GAMECUBE_CONTROLLER_PID)
+                        NSO_GAMECUBE_CONTROLLER_PID,
+                        USBIP_PS5_CONCURRENT_RUMBLE_TEST)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
+from audio_endpoint_guard import DualSenseAudioEndpointGuard
 from utils import USBIPAllocator
 from dualsense_structs import DualSenseInputReport01
 from dualsense_haptic import DualSenseHapticProcessor
 
 logger = logging.getLogger(__name__)
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
+
+def _copy_vibration(v) -> VibrationData:
+    return VibrationData(
+        lf_freq=v.lf_freq, lf_amp=v.lf_amp, lf_en_tone=getattr(v, 'lf_en_tone', False),
+        hf_freq=v.hf_freq, hf_amp=v.hf_amp, hf_en_tone=getattr(v, 'hf_en_tone', False)
+    )
+
+def _zero_vibration(lf_freq=0x0e1, hf_freq=0x1e1) -> VibrationData:
+    return VibrationData(lf_freq=lf_freq, hf_freq=hf_freq, lf_amp=0, hf_amp=0)
+
+def _clear_vibration_buffer(frames, lf_freq=0x0e1, hf_freq=0x1e1):
+    for f in frames:
+        f.lf_amp = 0
+        f.hf_amp = 0
+        f.lf_freq = lf_freq
+        f.hf_freq = hf_freq
+
+def _fuse_djg_axis(dom_adj, sub_adj, scale):
+    if (dom_adj > 0 and sub_adj > 0) or (dom_adj < 0 and sub_adj < 0):
+        sub_scaled = sub_adj * scale
+        if abs(sub_scaled) > abs(dom_adj):
+            sub_scaled = dom_adj
+        return dom_adj + sub_scaled
+    return dom_adj
+
 
 MAC_TO_USBIP = {}
 
@@ -126,6 +156,15 @@ def detach_all_usbip_devices():
 
 RUMBLE_WRITE_INTERVAL = 0.015
 SWITCH_RUMBLE_TIMEOUT = 0.150
+AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE = 128
+# DualSense 0x02 output-report bytes masked out of the traditional-rumble stop
+# signature: motors [3],[4] plus valid_flag0/1 [1],[2] and valid_flag2 [39].
+_TRAD_RUMBLE_SIG_MASK_OFFSETS = (1, 2, 3, 4, 39)
+# While another rumble source is present (audio_recent), an ambiguous
+# (non-exact-match) motor=0 stop is APPLIED only after the rumble owner has
+# been silent (no non-zero motor packet) for this long.  It never clears a
+# held value by itself - it only delays an explicitly received stop packet.
+TRAD_RUMBLE_STOP_DEFER_WINDOW = 0.30
 MAC_TO_PORT = {}
 
 def get_or_assign_port_for_mac(mac):
@@ -167,6 +206,7 @@ class VirtualController:
     def __init__(self, player_number: int, controllers=None, on_disconnected_callback=None, setup_usb=True):
         self._player_number = player_number
         self.controllers = controllers or []
+        self._refresh_controller_cache()
         
         self.on_disconnected_callback = on_disconnected_callback
         
@@ -198,6 +238,7 @@ class VirtualController:
         self.last_s2_az = 0
         self.next_vibration_event = None
         self.vg_controller = None
+        self.dualsense_audio_guard = None
         self.switch_vibrations_left = [VibrationData() for _ in range(3)]
         self.switch_vibrations_right = [VibrationData() for _ in range(3)]
         self.vibration_dirty_l = False
@@ -214,10 +255,29 @@ class VirtualController:
         self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
         self.frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
         self.frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.audio_haptic_latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
+        self.audio_haptic_latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
+        self.audio_haptic_frame_vibrations_l = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.audio_haptic_frame_vibrations_r = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
+        self.audio_haptic_vibration_dirty_l = False
+        self.audio_haptic_vibration_dirty_r = False
+        self.traditional_rumble_seq = 0
+        self.traditional_rumble_stop_seq = 0
+        self.trigger_effect_seq = 0
+        self.audio_haptic_seq = 0
         self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
         self.frame_vibrations = [VibrationData(lf_amp=0, hf_amp=0) for _ in range(3)]
         self.vibration_dirty = False
         self.last_rumble_active_time = 0.0
+        self.traditional_rumble_active = False
+        self.traditional_rumble_zero_keepalive_seen = False
+        self.traditional_rumble_last_zero_signature = None
+        self.traditional_rumble_last_flag_masked_signature = None
+        self._trad_rumble_stop_diag_logged = False
+        self._trad_rumble_pending_stop_at = None
+        self.traditional_rumble_last_motor_r = 0
+        self.traditional_rumble_last_motor_l = 0
+        self.last_usbip_audio_packet_time = 0.0
         self.vibration_changed_event = None
         self.active_vibration_task = None
         self.cycle_start_time = 0.0
@@ -241,6 +301,10 @@ class VirtualController:
         
         self.mode = getattr(CONFIG, "simulation_mode", "PS5")
         self.driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        self._usbip_reconnect_lock = threading.Lock()
+        self._usbip_reconnect_active = False
+        self._usbip_reconnect_generation = 0
+        self._suppress_usbip_reconnect = False
         if self.mode == "Switch1":
             self.hold_mode = "Vertical"
         if setup_usb:
@@ -260,11 +324,131 @@ class VirtualController:
         self.update_thread = threading.Thread(target=self._1000hz_loop, daemon=True)
         self.update_thread.start()
 
+    def _start_dualsense_audio_guard(self):
+        try:
+            if self.dualsense_audio_guard is None:
+                self.dualsense_audio_guard = DualSenseAudioEndpointGuard()
+            self.dualsense_audio_guard.start()
+        except Exception:
+            logger.debug("Failed to start DualSense audio default guard", exc_info=True)
+
+    def _stop_dualsense_audio_guard(self):
+        guard = getattr(self, 'dualsense_audio_guard', None)
+        if guard is None:
+            return
+        try:
+            guard.restore_now()
+            guard.stop()
+        except Exception:
+            logger.debug("Failed to stop DualSense audio default guard", exc_info=True)
+        finally:
+            self.dualsense_audio_guard = None
+
+    def _on_ps5_usbip_disconnected(self):
+        if getattr(self, 'mode', None) != "PS5" or getattr(self, 'driver_type', None) != "USBIP":
+            return
+        if getattr(self, '_suppress_usbip_reconnect', False):
+            return
+        if not getattr(self, 'running', False):
+            return
+        with self._usbip_reconnect_lock:
+            if self._usbip_reconnect_active:
+                return
+            self._usbip_reconnect_active = True
+            self._usbip_reconnect_generation += 1
+            generation = self._usbip_reconnect_generation
+        threading.Thread(
+            target=self._ps5_usbip_reconnect_worker,
+            args=(generation,),
+            name=f"PS5USBIPReconnectP{self.player_number}",
+            daemon=True,
+        ).start()
+
+    def _ps5_usbip_reconnect_worker(self, generation):
+        try:
+            import os
+            import subprocess
+
+            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
+            if not os.path.exists(usbip_exe):
+                logger.error("Cannot reconnect PS5 USBIP: usbip.exe not found at %s", usbip_exe)
+                return
+
+            for attempt, delay in enumerate((0.5, 1.0, 2.0), start=1):
+                if not getattr(self, 'running', False):
+                    return
+                time.sleep(delay)
+                if not getattr(self, 'running', False):
+                    return
+                with self._usbip_reconnect_lock:
+                    if generation != self._usbip_reconnect_generation:
+                        return
+
+                host = self.host_ip
+                port = self.server_port
+                bus = self.bus_id
+                try:
+                    logger.info(
+                        "PS5 USBIP reconnect attempt %d for Player %s on %s:%s bus=%s",
+                        attempt,
+                        self.player_number,
+                        host,
+                        port,
+                        bus,
+                    )
+                    detach_usbip_device(port)
+                    time.sleep(0.2)
+                    proc = subprocess.run(
+                        [usbip_exe, "-t", str(port), "attach", "-r", host, "-b", bus],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+                    )
+                    out = proc.stdout.decode(errors='replace').strip()
+                    err = proc.stderr.decode(errors='replace').strip()
+                    if out:
+                        logger.info("Player %s usbip reconnect stdout: %s", self.player_number, out)
+                    if err:
+                        logger.warning("Player %s usbip reconnect stderr: %s", self.player_number, err)
+                    if proc.returncode == 0:
+                        logger.info("Player %s PS5 USBIP reconnect OK on %s:%s bus=%s", self.player_number, host, port, bus)
+                        return
+                    logger.error(
+                        "Player %s PS5 USBIP reconnect failed attempt %d rc=%s",
+                        self.player_number,
+                        attempt,
+                        proc.returncode,
+                    )
+                except Exception as exc:
+                    logger.warning("Player %s PS5 USBIP reconnect attempt %d error: %s", self.player_number, attempt, exc)
+        finally:
+            with self._usbip_reconnect_lock:
+                if generation == self._usbip_reconnect_generation:
+                    self._usbip_reconnect_active = False
+
     def _controller_mix_key(self, controller):
         try:
             return controller.device.address
         except Exception:
             return str(id(controller))
+
+    def _refresh_controller_cache(self):
+        controllers = tuple(getattr(self, "controllers", ()) or ())
+        self._controllers_tuple = controllers
+        self._is_merged_pair = len(controllers) == 2
+        left = None
+        right = None
+        for c in controllers:
+            try:
+                if c.is_joycon_left():
+                    left = c
+                elif c.is_joycon_right():
+                    right = c
+            except Exception:
+                pass
+        self._merged_pair = (left, right)
+        self._controller_mix_keys = tuple(self._controller_mix_key(c) for c in controllers)
 
     def _clamp_stick_pair(self, stick):
         return (
@@ -310,17 +494,18 @@ class VirtualController:
             elif right_mode == "R Joystick" or right_mode == "Default":
                 right = (right[0] + inputData.right_stick[0], right[1] + inputData.right_stick[1])
 
-        self._merged_stick_contribs[self._controller_mix_key(controller)] = {"left": left, "right": right}
-        active_keys = {self._controller_mix_key(c) for c in self.controllers}
+        self._merged_stick_contribs[self._controller_mix_key(controller)] = (left, right)
+        active_keys = getattr(self, "_controller_mix_keys", None)
+        if active_keys is None:
+            self._refresh_controller_cache()
+            active_keys = self._controller_mix_keys
         for key in list(self._merged_stick_contribs.keys()):
             if key not in active_keys:
                 self._merged_stick_contribs.pop(key, None)
 
         sum_left = (0.0, 0.0)
         sum_right = (0.0, 0.0)
-        for contrib in self._merged_stick_contribs.values():
-            l = contrib.get("left", (0.0, 0.0))
-            r = contrib.get("right", (0.0, 0.0))
+        for l, r in self._merged_stick_contribs.values():
             sum_left = (sum_left[0] + l[0], sum_left[1] + l[1])
             sum_right = (sum_right[0] + r[0], sum_right[1] + r[1])
         return self._clamp_stick_pair(sum_left), self._clamp_stick_pair(sum_right)
@@ -367,8 +552,9 @@ class VirtualController:
                 self.djg_cached_gyro[side] = inputData.gyroscope
                 self.djg_cached_accel[side] = inputData.accelerometer
                 
-                dom_c = next((c for c in self.controllers if (c.is_joycon_left() and djg_dom_side == "Left") or (c.is_joycon_right() and djg_dom_side == "Right")), None)
-                sub_c = next((c for c in self.controllers if (c.is_joycon_left() and djg_sub_side == "Left") or (c.is_joycon_right() and djg_sub_side == "Right")), None)
+                left_c, right_c = getattr(self, "_merged_pair", (None, None))
+                dom_c = left_c if djg_dom_side == "Left" else right_c
+                sub_c = right_c if djg_dom_side == "Left" else left_c
                 
                 dom_on = getattr(dom_c, 'gyro_active', True) if dom_c else False
                 sub_on = getattr(sub_c, 'gyro_active', True) if sub_c else False
@@ -402,9 +588,6 @@ class VirtualController:
                 self.djg_last_dom_gyro_on = dom_on
                 self.djg_last_sub_gyro_on = sub_on
                 
-                fused_gyro = [0.0, 0.0, 0.0]
-                fused_accel = [0.0, 0.0, 0.0]
-                
                 dom_bias = dom_c.gyro_bias if dom_c else (0.0, 0.0, 0.0)
                 sub_bias = sub_c.gyro_bias if sub_c else (0.0, 0.0, 0.0)
                 my_bias = controller.gyro_bias
@@ -414,55 +597,61 @@ class VirtualController:
                     sub_g = self.djg_cached_gyro[djg_sub_side]
                     dom_a = self.djg_cached_accel[djg_dom_side]
                     
-                    import math
-                    dom_adj = [dom_g[i] - dom_bias[i] for i in range(3)]
-                    sub_adj = [sub_g[i] - sub_bias[i] for i in range(3)]
-                    dom_mag = math.sqrt(dom_adj[0]**2 + dom_adj[1]**2 + dom_adj[2]**2)
+                    d0 = dom_g[0] - dom_bias[0]
+                    d1 = dom_g[1] - dom_bias[1]
+                    d2 = dom_g[2] - dom_bias[2]
+                    s0 = sub_g[0] - sub_bias[0]
+                    s1 = sub_g[1] - sub_bias[1]
+                    s2 = sub_g[2] - sub_bias[2]
+                    dom_mag = math.sqrt(d0*d0 + d1*d1 + d2*d2)
                     
                     scale = 0.0
                     if dom_mag > 30.0:
                         scale = min(1.0, (dom_mag - 30.0) / 30.0)
-                    
-                    for i in range(3):
-                        if (dom_adj[i] > 0 and sub_adj[i] > 0) or (dom_adj[i] < 0 and sub_adj[i] < 0):
-                            sub_scaled = sub_adj[i] * scale
-                            if abs(sub_scaled) > abs(dom_adj[i]):
-                                sub_scaled = dom_adj[i]
-                            fused_adj = dom_adj[i] + sub_scaled
-                        else:
-                            fused_adj = dom_adj[i]
-                        
-                        fused_gyro[i] = fused_adj + my_bias[i]
-                        fused_accel[i] = dom_a[i] + self.djg_accel_offset[i]
+
+                    fused_gyro = (
+                        _fuse_djg_axis(d0, s0, scale) + my_bias[0],
+                        _fuse_djg_axis(d1, s1, scale) + my_bias[1],
+                        _fuse_djg_axis(d2, s2, scale) + my_bias[2],
+                    )
+                    off = self.djg_accel_offset
+                    fused_accel = (dom_a[0] + off[0], dom_a[1] + off[1], dom_a[2] + off[2])
                 elif dom_on:
                     dom_g = self.djg_cached_gyro[djg_dom_side]
                     dom_a = self.djg_cached_accel[djg_dom_side]
-                    for i in range(3):
-                        dom_adj = dom_g[i] - dom_bias[i]
-                        fused_gyro[i] = dom_adj + my_bias[i]
-                        fused_accel[i] = dom_a[i] + self.djg_accel_offset[i]
+                    off = self.djg_accel_offset
+                    fused_gyro = (
+                        dom_g[0] - dom_bias[0] + my_bias[0],
+                        dom_g[1] - dom_bias[1] + my_bias[1],
+                        dom_g[2] - dom_bias[2] + my_bias[2],
+                    )
+                    fused_accel = (dom_a[0] + off[0], dom_a[1] + off[1], dom_a[2] + off[2])
                 elif sub_on:
                     sub_g = self.djg_cached_gyro[djg_sub_side]
                     sub_a = self.djg_cached_accel[djg_sub_side]
-                    for i in range(3):
-                        sub_adj = sub_g[i] - sub_bias[i]
-                        fused_gyro[i] = sub_adj + my_bias[i]
-                        fused_accel[i] = sub_a[i]
+                    fused_gyro = (
+                        sub_g[0] - sub_bias[0] + my_bias[0],
+                        sub_g[1] - sub_bias[1] + my_bias[1],
+                        sub_g[2] - sub_bias[2] + my_bias[2],
+                    )
+                    fused_accel = (sub_a[0], sub_a[1], sub_a[2])
                 else:
-                    for i in range(3):
-                        fused_gyro[i] = my_bias[i]
-                        fused_accel[i] = 0.0
-                
-                for i in range(3):
-                    if abs(self.djg_accel_offset[i]) > 0.1:
-                        self.djg_accel_offset[i] *= 0.99
-                    else:
-                        self.djg_accel_offset[i] = 0.0
+                    fused_gyro = (my_bias[0], my_bias[1], my_bias[2])
+                    fused_accel = (0.0, 0.0, 0.0)
 
-                inputData.gyroscope = tuple(fused_gyro)
-                inputData.accelerometer = tuple(fused_accel)
+                off0, off1, off2 = self.djg_accel_offset
+                self.djg_accel_offset = [
+                    off0 * 0.99 if abs(off0) > 0.1 else 0.0,
+                    off1 * 0.99 if abs(off1) > 0.1 else 0.0,
+                    off2 * 0.99 if abs(off2) > 0.1 else 0.0,
+                ]
+
+                inputData.gyroscope = fused_gyro
+                inputData.accelerometer = fused_accel
 
     def cleanup_vg_controller(self):
+        self._suppress_usbip_reconnect = True
+        self._stop_dualsense_audio_guard()
         for suffix in ('', '_l', '_r', '_pro'):
             port_attr = f'server_port{suffix}' if suffix else 'server_port'
             server_attr = f'usbip_server{suffix}' if suffix else 'usbip_server'
@@ -532,6 +721,8 @@ class VirtualController:
             time.sleep(0.5)
         server_port = self.server_port
         # Detach first while server socket is still active
+        self._suppress_usbip_reconnect = True
+        self._stop_dualsense_audio_guard()
         detach_usbip_device(server_port)
         if hasattr(self, 'usbip_server') and self.usbip_server:
             try:
@@ -548,6 +739,7 @@ class VirtualController:
             time.sleep(0.5)
 
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        self._suppress_usbip_reconnect = False
 
         if self.mode in ("Switch1", "Switch2"):
             import os
@@ -751,7 +943,7 @@ class VirtualController:
                 import os
                 import subprocess
                 import time
-                from usbip_dualsense_server import USBIPDualSenseServer
+                from dualsense_server_proxy import DualSenseServerProxy
 
                 usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
                 mac_address = self.controllers[0].device.address if self.controllers else None
@@ -775,12 +967,15 @@ class VirtualController:
                             detach_usbip_device(port)
                             time.sleep(0.1)
 
-                        self.usbip_server = USBIPDualSenseServer(
+                        server_kwargs = dict(
                             host=host_ip, port=port,
                             on_rumble_callback=lambda d, p=port: self._dualsense_rumble_callback(d, side="Pro"),
                             bus_id=bus_id, mac_address=mac_address,
-                            on_audio_data_callback=self._usbip_audio_callback
+                            on_audio_data_callback=self._usbip_audio_callback,
+                            on_disconnect_callback=self._on_ps5_usbip_disconnected,
+                            on_haptic_callback=self._proxy_haptic_callback,
                         )
+                        self.usbip_server = DualSenseServerProxy(**server_kwargs)
                         self.usbip_server.start()
                         started = True
                         break
@@ -794,19 +989,9 @@ class VirtualController:
                             self.usbip_server = None
 
                 if started:
-                    threading.Thread(target=self._wasapi_loopback_thread, daemon=True).start()
-                    # Disable the virtual DualSense audio playback endpoint in Windows so
-                    # the game can drive the ISO-OUT haptic stream directly (an ENABLED
-                    # endpoint is claimed/mixed by the Windows audio engine and starves
-                    # the haptic channels).  Runs in the background with retries because
-                    # the endpoint appears a moment after USBIP attach.
-                    try:
-                        from dualsense_audio_endpoint import disable_dualsense_audio_endpoint_async
-                        disable_dualsense_audio_endpoint_async()
-                    except Exception:
-                        logger.debug("DualSense audio-endpoint auto-disable hook failed", exc_info=True)
                     if os.path.exists(usbip_exe):
                         try:
+                            self._start_dualsense_audio_guard()
                             detach_usbip_device(self.server_port)
                             time.sleep(0.2)
                             _attach_cmd = [usbip_exe, "-t", str(self.server_port), "attach", "-r", self.host_ip, "-b", self.bus_id]
@@ -826,6 +1011,12 @@ class VirtualController:
                                         logger.error(f"Player {player_num} usbip attach failed (rc={rc}) on {host}:{port} bus={bus}")
                                     else:
                                         logger.info(f"Player {player_num} usbip attach OK on {host}:{port} bus={bus}")
+                                        for delay in (0.5, 1.0, 1.5):
+                                            time.sleep(delay)
+                                            guard = getattr(self, 'dualsense_audio_guard', None)
+                                            if guard is None:
+                                                break
+                                            guard.restore_now()
                                 except Exception as ex:
                                     logger.warning(f"Player {player_num} usbip attach log error: {ex}")
                             threading.Thread(
@@ -835,8 +1026,10 @@ class VirtualController:
                             ).start()
                             logger.info(f"Attached virtual DualSense for Player {self.player_number} via USBIP on {self.host_ip}:{self.server_port} bus={self.bus_id}")
                         except Exception as e:
+                            self._stop_dualsense_audio_guard()
                             logger.error(f"Failed to attach PS5 USBIP device: {e}")
                     else:
+                        self._stop_dualsense_audio_guard()
                         logger.error(f"usbip.exe not found at {usbip_exe}!")
                 else:
                     logger.error(f"PS5 USBIP Server for Player {self.player_number} could not be started after retries.")
@@ -1019,6 +1212,126 @@ class VirtualController:
             self.vibration_dirty = True
             self.vibration_dirty_l = True
             self.vibration_dirty_r = True
+            self.traditional_rumble_seq = getattr(self, 'traditional_rumble_seq', 0) + 1
+
+    @staticmethod
+    def _audio_haptic_hold_candidate(vibration):
+        return max(int(getattr(vibration, 'lf_amp', 0)), int(getattr(vibration, 'hf_amp', 0))) >= AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE
+
+    def _usbip_audio_stream_recent(self, now=None):
+        if self.mode != "PS5" or self.driver_type != "USBIP":
+            return False
+        now = time.perf_counter() if now is None else now
+        last_packet = getattr(self, 'last_usbip_audio_packet_time', 0.0)
+        packet_recent = last_packet > 0 and now - last_packet <= 0.5
+        return packet_recent
+
+    def _clear_traditional_rumble_locked(self):
+        was_active = getattr(self, 'traditional_rumble_active', False)
+        self.traditional_rumble_active = False
+        self.traditional_rumble_zero_keepalive_seen = False
+        for f in self.frame_vibrations_l:
+            f.lf_amp = 0
+            f.hf_amp = 0
+        for f in self.frame_vibrations_r:
+            f.lf_amp = 0
+            f.hf_amp = 0
+        self.latest_vibration_l.lf_amp = 0
+        self.latest_vibration_l.hf_amp = 0
+        self.latest_vibration_r.lf_amp = 0
+        self.latest_vibration_r.hf_amp = 0
+        self.vibration_dirty_l = True
+        self.vibration_dirty_r = True
+        if was_active:
+            self.traditional_rumble_stop_seq = getattr(self, 'traditional_rumble_stop_seq', 0) + 1
+        # Drop the stored stop signatures so a stale signature from this rumble
+        # session can never match a zero packet in a later, unrelated session.
+        self.traditional_rumble_last_zero_signature = None
+        self.traditional_rumble_last_flag_masked_signature = None
+        self._trad_rumble_pending_stop_at = None
+
+    def get_usbip_ps5_rumble_source_state(self):
+        if self.mode != "PS5" or self.driver_type != "USBIP":
+            return {
+                'traditional_active': False,
+                'trigger_active_l': False,
+                'trigger_active_r': False,
+                'audio_active_l': False,
+                'audio_active_r': False,
+                'traditional_seq': getattr(self, 'traditional_rumble_seq', 0),
+                'traditional_stop_seq': getattr(self, 'traditional_rumble_stop_seq', 0),
+                'trigger_seq': getattr(self, 'trigger_effect_seq', 0),
+                'audio_seq': getattr(self, 'audio_haptic_seq', 0),
+            }
+
+        now = time.perf_counter()
+        with self.vibration_lock:
+            pending = getattr(self, '_trad_rumble_pending_stop_at', None)
+            if (pending is not None and now >= pending and
+                    getattr(self, 'traditional_rumble_active', False)):
+                logger.info("Traditional rumble deferred STOP applied (owner silent past window)")
+                self._clear_traditional_rumble_locked()
+
+            latest_l = self.latest_vibration_l
+            latest_r = self.latest_vibration_r
+            traditional_active = (
+                getattr(self, 'traditional_rumble_active', False) or
+                getattr(self, 'vibration_dirty_l', False) or
+                getattr(self, 'vibration_dirty_r', False) or
+                int(getattr(latest_l, 'lf_amp', 0)) > 0 or
+                int(getattr(latest_l, 'hf_amp', 0)) > 0 or
+                int(getattr(latest_r, 'lf_amp', 0)) > 0 or
+                int(getattr(latest_r, 'hf_amp', 0)) > 0
+            )
+
+            audio_latest_l = self.audio_haptic_latest_vibration_l
+            audio_latest_r = self.audio_haptic_latest_vibration_r
+            audio_dirty_l = getattr(self, 'audio_haptic_vibration_dirty_l', False)
+            audio_dirty_r = getattr(self, 'audio_haptic_vibration_dirty_r', False)
+            audio_hold_l = (
+                self._audio_haptic_hold_candidate(audio_latest_l) and
+                getattr(self, 'last_haptic_l_active_time', 0) > 0 and
+                now - getattr(self, 'last_haptic_l_active_time', 0) <= SWITCH_RUMBLE_TIMEOUT
+            )
+            audio_hold_r = (
+                self._audio_haptic_hold_candidate(audio_latest_r) and
+                getattr(self, 'last_haptic_r_active_time', 0) > 0 and
+                now - getattr(self, 'last_haptic_r_active_time', 0) <= SWITCH_RUMBLE_TIMEOUT
+            )
+
+            trigger_end_l = getattr(self, 'trigger_l_punch_end', 0)
+            trigger_end_r = getattr(self, 'trigger_r_punch_end', 0)
+
+            return {
+                'traditional_active': traditional_active,
+                'trigger_active_l': now < trigger_end_l,
+                'trigger_active_r': now < trigger_end_r,
+                'audio_active_l': audio_dirty_l or audio_hold_l,
+                'audio_active_r': audio_dirty_r or audio_hold_r,
+                'traditional_seq': getattr(self, 'traditional_rumble_seq', 0),
+                'traditional_stop_seq': getattr(self, 'traditional_rumble_stop_seq', 0),
+                'trigger_seq': getattr(self, 'trigger_effect_seq', 0),
+                'audio_seq': getattr(self, 'audio_haptic_seq', 0),
+            }
+
+    @staticmethod
+    def _traditional_rumble_zero_signature(out_data):
+        sig = bytearray(out_data)
+        if len(sig) > 4:
+            sig[3] = 0
+            sig[4] = 0
+        return bytes(sig)
+
+    @staticmethod
+    def _traditional_rumble_flag_masked_signature(out_data):
+        # DualSense 0x02 USB output report: [1],[2]=valid_flag0/1, [39]=valid_flag2.
+        # Steam Input sometimes clears these on its stop packet, so the stop-detection
+        # signature must ignore them too.  Motors [3],[4] are already masked.
+        sig = bytearray(out_data)
+        for i in _TRAD_RUMBLE_SIG_MASK_OFFSETS:
+            if i < len(sig):
+                sig[i] = 0
+        return bytes(sig)
 
     def get_current_vibration_frames(self, is_left=True):
         if self.mode == "Switch1":
@@ -1037,18 +1350,9 @@ class VirtualController:
                     self.switch_vibrations_left = [VibrationData() for _ in range(3)]
                     self.switch_vibrations_right = [VibrationData() for _ in range(3)]
                 else:
-                    v1 = VibrationData(
-                        lf_freq=vibs[0].lf_freq, lf_amp=vibs[0].lf_amp, lf_en_tone=vibs[0].lf_en_tone,
-                        hf_freq=vibs[0].hf_freq, hf_amp=vibs[0].hf_amp, hf_en_tone=vibs[0].hf_en_tone
-                    )
-                    v2 = VibrationData(
-                        lf_freq=vibs[1].lf_freq, lf_amp=vibs[1].lf_amp, lf_en_tone=vibs[1].lf_en_tone,
-                        hf_freq=vibs[1].hf_freq, hf_amp=vibs[1].hf_amp, hf_en_tone=vibs[1].hf_en_tone
-                    )
-                    v3 = VibrationData(
-                        lf_freq=vibs[2].lf_freq, lf_amp=vibs[2].lf_amp, lf_en_tone=vibs[2].lf_en_tone,
-                        hf_freq=vibs[2].hf_freq, hf_amp=vibs[2].hf_amp, hf_en_tone=vibs[2].hf_en_tone
-                    )
+                    v1 = _copy_vibration(vibs[0])
+                    v2 = _copy_vibration(vibs[1])
+                    v3 = _copy_vibration(vibs[2])
                 
                 if is_left:
                     self.vibration_dirty_l = False
@@ -1067,30 +1371,54 @@ class VirtualController:
                 last_active = getattr(self, 'last_rumble_active_time', 0)
                 last_time = max(last_received, last_active)
 
+                # Fallback application point for a deferred ambiguous stop: the owning
+                # source may go silent (send no more packets) after the stop, so apply it
+                # here once the window has elapsed.  This is NOT a staleness watchdog — it
+                # only fires when an explicit stop packet was received and deferred.
+                pending = getattr(self, '_trad_rumble_pending_stop_at', None)
+                if (pending is not None and current_time >= pending and
+                        getattr(self, 'traditional_rumble_active', False)):
+                    logger.info("Traditional rumble deferred STOP applied (owner silent past window)")
+                    self._clear_traditional_rumble_locked()
+
                 if is_left:
                     latest_vibration = self.latest_vibration_l
                     frame_vibrations = self.frame_vibrations_l
                     vibration_dirty = self.vibration_dirty_l
+                    no_update_attr = '_audio_haptic_no_update_l'
                 else:
                     latest_vibration = self.latest_vibration_r
                     frame_vibrations = self.frame_vibrations_r
                     vibration_dirty = self.vibration_dirty_r
+                    no_update_attr = '_audio_haptic_no_update_r'
 
                 if vibration_dirty:
-                    v1 = VibrationData(lf_amp=frame_vibrations[0].lf_amp, hf_amp=frame_vibrations[0].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
-                    v2 = VibrationData(lf_amp=frame_vibrations[1].lf_amp, hf_amp=frame_vibrations[1].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
-                    v3 = VibrationData(lf_amp=frame_vibrations[2].lf_amp, hf_amp=frame_vibrations[2].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                    setattr(self, no_update_attr, False)
+                    if getattr(self, 'rumble_host_mode', 'audio_haptics') == 'compatibility':
+                        v1 = VibrationData(lf_amp=frame_vibrations[0].lf_amp, hf_amp=frame_vibrations[0].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                        v2 = VibrationData(lf_amp=frame_vibrations[1].lf_amp, hf_amp=frame_vibrations[1].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                        v3 = VibrationData(lf_amp=frame_vibrations[2].lf_amp, hf_amp=frame_vibrations[2].hf_amp, lf_freq=latest_vibration.lf_freq, hf_freq=latest_vibration.hf_freq)
+                        if v1.lf_amp == 0 and v1.hf_amp == 0:
+                            v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
+                        if v2.lf_amp == 0 and v2.hf_amp == 0:
+                            v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                        if v3.lf_amp == 0 and v3.hf_amp == 0:
+                            v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+                    else:
+                        v1 = _copy_vibration(frame_vibrations[0])
+                        v2 = _copy_vibration(frame_vibrations[1])
+                        v3 = _copy_vibration(frame_vibrations[2])
+                        if v1.lf_amp == 0 and v1.hf_amp == 0:
+                            v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
+                            v1.lf_freq, v1.hf_freq = latest_vibration.lf_freq, latest_vibration.hf_freq
+                        if v2.lf_amp == 0 and v2.hf_amp == 0:
+                            v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                            v2.lf_freq, v2.hf_freq = v1.lf_freq, v1.hf_freq
+                        if v3.lf_amp == 0 and v3.hf_amp == 0:
+                            v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+                            v3.lf_freq, v3.hf_freq = v2.lf_freq, v2.hf_freq
 
-                    if v1.lf_amp == 0 and v1.hf_amp == 0:
-                        v1.lf_amp, v1.hf_amp = latest_vibration.lf_amp, latest_vibration.hf_amp
-                    if v2.lf_amp == 0 and v2.hf_amp == 0:
-                        v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
-                    if v3.lf_amp == 0 and v3.hf_amp == 0:
-                        v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
-
-                    for f in frame_vibrations:
-                        f.lf_amp = 0
-                        f.hf_amp = 0
+                    _clear_vibration_buffer(frame_vibrations)
 
                     if is_left:
                         self.vibration_dirty_l = False
@@ -1098,11 +1426,22 @@ class VirtualController:
                         self.vibration_dirty_r = False
                     self.cycle_start_time = time.perf_counter()
                 else:
-                    side_last_active = getattr(self,
-                        'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
-                    lv = latest_vibration
-                    if side_last_active > 0 and time.perf_counter() - side_last_active > SWITCH_RUMBLE_TIMEOUT:
-                        lv = VibrationData()
+                    if getattr(self, 'rumble_host_mode', 'audio_haptics') == 'compatibility':
+                        setattr(self, no_update_attr, False)
+                        lv = latest_vibration
+                    else:
+                        if USBIP_PS5_CONCURRENT_RUMBLE_TEST:
+                            hold_latest = getattr(self, 'traditional_rumble_active', False)
+                        else:
+                            side_last_active = getattr(self,
+                                'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
+                            hold_latest = (
+                                self._audio_haptic_hold_candidate(latest_vibration) and
+                                side_last_active > 0 and
+                                current_time - side_last_active <= SWITCH_RUMBLE_TIMEOUT
+                            )
+                        setattr(self, no_update_attr, False)
+                        lv = latest_vibration if hold_latest else VibrationData(lf_freq=0x0e1, hf_freq=0x1e1)
                     v1 = VibrationData(lf_amp=lv.lf_amp, hf_amp=lv.hf_amp, lf_freq=lv.lf_freq, hf_freq=lv.hf_freq)
                     v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
                     v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp, lf_freq=v1.lf_freq, hf_freq=v1.hf_freq)
@@ -1123,40 +1462,22 @@ class VirtualController:
                 side_latest = self.latest_vibration_r
                 side_dirty = self.vibration_dirty_r
 
-            if self.mode == "Switch2":
-                current_time = time.perf_counter()
-                last_active = getattr(self, 'last_rumble_active_time', 0)
-                if last_active and current_time - last_active > SWITCH_RUMBLE_TIMEOUT:
-                    self.frame_vibrations = [VibrationData() for _ in range(3)]
-                    self.frame_vibrations_l = [VibrationData() for _ in range(3)]
-                    self.frame_vibrations_r = [VibrationData() for _ in range(3)]
-                    self.latest_vibration = VibrationData(lf_amp=0, hf_amp=0)
-                    self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
-                    self.latest_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
-                    self.vibration_dirty = False
-                    self.vibration_dirty_l = False
-                    self.vibration_dirty_r = False
-                    self.cycle_start_time = current_time
-                    v1 = VibrationData()
-                    v2 = VibrationData()
-                    v3 = VibrationData()
-                    return v1, v2, v3, True
-
             if side_dirty:
-                v1 = VibrationData(lf_amp=side_frames[0].lf_amp, hf_amp=side_frames[0].hf_amp)
-                v2 = VibrationData(lf_amp=side_frames[1].lf_amp, hf_amp=side_frames[1].hf_amp)
-                v3 = VibrationData(lf_amp=side_frames[2].lf_amp, hf_amp=side_frames[2].hf_amp)
+                v1 = _copy_vibration(side_frames[0])
+                v2 = _copy_vibration(side_frames[1])
+                v3 = _copy_vibration(side_frames[2])
 
                 if v1.lf_amp == 0 and v1.hf_amp == 0:
                     v1.lf_amp, v1.hf_amp = side_latest.lf_amp, side_latest.hf_amp
+                    v1.lf_freq, v1.hf_freq = side_latest.lf_freq, side_latest.hf_freq
                 if v2.lf_amp == 0 and v2.hf_amp == 0:
                     v2.lf_amp, v2.hf_amp = v1.lf_amp, v1.hf_amp
+                    v2.lf_freq, v2.hf_freq = v1.lf_freq, v1.hf_freq
                 if v3.lf_amp == 0 and v3.hf_amp == 0:
                     v3.lf_amp, v3.hf_amp = v2.lf_amp, v2.hf_amp
+                    v3.lf_freq, v3.hf_freq = v2.lf_freq, v2.hf_freq
 
-                for f in side_frames:
-                    f.lf_amp = 0
-                    f.hf_amp = 0
+                _clear_vibration_buffer(side_frames)
                 if is_left:
                     self.vibration_dirty_l = False
                 else:
@@ -1167,11 +1488,78 @@ class VirtualController:
                     'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
                 sl = side_latest
                 if side_last_active > 0 and time.perf_counter() - side_last_active > SWITCH_RUMBLE_TIMEOUT:
-                    sl = VibrationData()
-                v1 = VibrationData(lf_amp=sl.lf_amp, hf_amp=sl.hf_amp)
-                v2 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
-                v3 = VibrationData(lf_amp=v1.lf_amp, hf_amp=v1.hf_amp)
+                    sl = _zero_vibration()
+                v1 = _copy_vibration(sl)
+                v2 = _copy_vibration(sl)
+                v3 = _copy_vibration(sl)
                 self.cycle_start_time = time.perf_counter()
+
+            is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
+            return v1, v2, v3, is_zero
+
+    def get_current_adaptive_trigger_frames(self, is_left=True):
+        if (
+            not USBIP_PS5_CONCURRENT_RUMBLE_TEST
+            or self.mode != "PS5"
+            or self.driver_type != "USBIP"
+        ):
+            empty = _zero_vibration(hf_freq=0x0e1)
+            return empty, _zero_vibration(hf_freq=0x0e1), _zero_vibration(hf_freq=0x0e1), True
+
+        current_time = time.perf_counter()
+        trigger_end = getattr(self, 'trigger_l_punch_end' if is_left else 'trigger_r_punch_end', 0)
+        if current_time >= trigger_end:
+            empty = _zero_vibration(hf_freq=0x0e1)
+            return empty, _zero_vibration(hf_freq=0x0e1), _zero_vibration(hf_freq=0x0e1), True
+
+        is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+        trigger_amp = int(800 * 0.5) if is_joycon else 800
+        v1 = VibrationData(lf_amp=trigger_amp, hf_amp=trigger_amp, lf_freq=0x0e1, hf_freq=0x0e1)
+        v2 = _copy_vibration(v1)
+        v3 = _copy_vibration(v1)
+        return v1, v2, v3, False
+
+    def get_current_audio_haptic_frames(self, is_left=True):
+        if (
+            not USBIP_PS5_CONCURRENT_RUMBLE_TEST
+            or self.mode != "PS5"
+            or self.driver_type != "USBIP"
+        ):
+            empty = _zero_vibration()
+            return empty, _zero_vibration(), _zero_vibration(), True
+
+        with self.vibration_lock:
+            current_time = time.perf_counter()
+            if is_left:
+                latest_vibration = self.audio_haptic_latest_vibration_l
+                frame_vibrations = self.audio_haptic_frame_vibrations_l
+                vibration_dirty = self.audio_haptic_vibration_dirty_l
+            else:
+                latest_vibration = self.audio_haptic_latest_vibration_r
+                frame_vibrations = self.audio_haptic_frame_vibrations_r
+                vibration_dirty = self.audio_haptic_vibration_dirty_r
+
+            if vibration_dirty:
+                v1 = _copy_vibration(frame_vibrations[0])
+                v2 = _copy_vibration(frame_vibrations[1])
+                v3 = _copy_vibration(frame_vibrations[2])
+                _clear_vibration_buffer(frame_vibrations)
+                if is_left:
+                    self.audio_haptic_vibration_dirty_l = False
+                else:
+                    self.audio_haptic_vibration_dirty_r = False
+            else:
+                side_last_active = getattr(self,
+                    'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
+                hold_latest = (
+                    self._audio_haptic_hold_candidate(latest_vibration) and
+                    side_last_active > 0 and
+                    current_time - side_last_active <= SWITCH_RUMBLE_TIMEOUT
+                )
+                lv = latest_vibration if hold_latest else _zero_vibration()
+                v1 = _copy_vibration(lv)
+                v2 = _copy_vibration(lv)
+                v3 = _copy_vibration(lv)
 
             is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
             return v1, v2, v3, is_zero
@@ -1304,8 +1692,13 @@ class VirtualController:
         controller.gyro_steering_origin_accel = None
         
         def input_report_callback(inputData: ControllerInputData, controller: Controller):
+            perf_start = time.perf_counter() if _PERF_DIAGNOSTICS else 0.0
             if self.vg_controller is None:
                 return
+            controllers = getattr(self, "_controllers_tuple", None)
+            if controllers is None or len(controllers) != len(self.controllers):
+                self._refresh_controller_cache()
+                controllers = self._controllers_tuple
                 
             # Xbox One, Xbox360, PS4, PS5: abxy_mode=="Switch" triggers Switch layout swap.
             # Switch2 uses abxy_mode=="Xbox" (inverted naming convention).
@@ -1314,7 +1707,7 @@ class VirtualController:
             else:
                 is_switch_layout = (CONFIG.abxy_mode == "Switch")
             
-            if len(self.controllers) == 2 or controller.is_pro_controller():
+            if len(controllers) == 2 or controller.is_pro_controller():
                 if getattr(CONFIG, "djg_enabled", False):
                     mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
                     if mode == "Switch Gyro Side":
@@ -1330,20 +1723,31 @@ class VirtualController:
             
             # In combined mode, share gyro trigger from any side to all controllers
             # Allows the gyro-active controller to receive the trigger signal
-            is_merged = (len(self.controllers) == 2)
-            for c in self.controllers:
+            is_merged = getattr(self, "_is_merged_pair", False)
+            for c in controllers:
                 c.is_merged = is_merged
 
             if is_merged:
+                left_c, right_c = getattr(self, "_merged_pair", (None, None))
+                other_c = right_c if controller is left_c else left_c
                 # Sync Gyro Trigger
                 if getattr(CONFIG, "djg_enabled", False):
                     shared_gyro = getattr(controller, '_own_gyro_trigger', False)
                 else:
-                    shared_gyro = any(getattr(c, '_own_gyro_trigger', False) for c in self.controllers)
+                    shared_gyro = (
+                        getattr(left_c, '_own_gyro_trigger', False) or
+                        getattr(right_c, '_own_gyro_trigger', False)
+                    )
                     
                 # Sync ZR/ZL for Gyro Mouse clicks
-                shared_zr = any(getattr(c, '_own_zr_pressed', False) for c in self.controllers)
-                shared_zl = any(getattr(c, '_own_zl_pressed', False) for c in self.controllers)
+                shared_zr = (
+                    getattr(left_c, '_own_zr_pressed', False) or
+                    getattr(right_c, '_own_zr_pressed', False)
+                )
+                shared_zl = (
+                    getattr(left_c, '_own_zl_pressed', False) or
+                    getattr(right_c, '_own_zl_pressed', False)
+                )
 
                 # Mode Shift back button: triggering it on either Joy-Con applies the Mode
                 # Shift mapping layer to both sides. Merged Joy-Cons use one shared Tap
@@ -1355,13 +1759,16 @@ class VirtualController:
                     self._mode_shift_shared_toggle = not self._mode_shift_shared_toggle
                     controller._own_mode_shift_tap_edge = False
                 shared_mode_shift_toggle = bool(self._mode_shift_shared_toggle)
-                shared_mode_shift_hold_pressed = any(getattr(c, '_own_mode_shift_hold_pressed', False) for c in self.controllers)
+                shared_mode_shift_hold_pressed = (
+                    getattr(left_c, '_own_mode_shift_hold_pressed', False) or
+                    getattr(right_c, '_own_mode_shift_hold_pressed', False)
+                )
                 shared_mode_shift = shared_mode_shift_toggle != shared_mode_shift_hold_pressed
 
                 # Sync activation state before sharing gyro-derived outputs. In Hold mode,
                 # the per-side gyro_mouse_enabled flag is driven by the shared trigger.
                 if getattr(CONFIG, 'gyro_activation_mode', 'Hold') == 'Hold':
-                    for c in self.controllers:
+                    for c in controllers:
                         if getattr(CONFIG, "djg_enabled", False):
                             c.gyro_mouse_enabled = getattr(c, '_own_gyro_trigger', False)
                         else:
@@ -1371,7 +1778,7 @@ class VirtualController:
                 shared_steer = 0.0
                 shared_rs = (0.0, 0.0)
                 shared_gyro_rs = (0.0, 0.0)
-                for c in self.controllers:
+                for c in controllers:
                     if getattr(c, 'gyro_active', False):
                         shared_steer = getattr(c, '_own_steer_value', 0.0)
                         if getattr(c, 'gyro_mouse_enabled', False) or shared_gyro:
@@ -1379,7 +1786,7 @@ class VirtualController:
                     if c.is_joycon_right():
                         shared_rs = inputData.right_stick if c == controller else getattr(c, '_last_rs', (0.0, 0.0))
 
-                for c in self.controllers:
+                for c in controllers:
                     if getattr(CONFIG, "djg_enabled", False):
                         c._shared_gyro_trigger = getattr(c, '_own_gyro_trigger', False)
                     else:
@@ -1411,7 +1818,11 @@ class VirtualController:
             
             # Mouse mappings consume stick input in controller.py. Gyro mouse alone should not
             # force-disable the virtual right stick.
-            any_mouse_active = any(getattr(c, 'jc_mouse_active', False) or getattr(c, 'joystick_mouse_active', False) for c in self.controllers)
+            any_mouse_active = False
+            for c in controllers:
+                if getattr(c, 'jc_mouse_active', False) or getattr(c, 'joystick_mouse_active', False):
+                    any_mouse_active = True
+                    break
             if any_mouse_active:
                 inputData.right_stick = (0.0, 0.0)
 
@@ -1660,10 +2071,52 @@ class VirtualController:
             
             # Record raw buttons for shared click logic in next report
             controller._last_raw_buttons = current_buttons
+            if _PERF_DIAGNOSTICS and perf_start:
+                elapsed_us = (time.perf_counter() - perf_start) * 1000000.0
+                samples = getattr(self, "_input_pipeline_samples", None)
+                if samples is None:
+                    samples = []
+                    self._input_pipeline_samples = samples
+                    self._input_pipeline_log_t = time.perf_counter()
+                samples.append(elapsed_us)
+                now_perf = time.perf_counter()
+                if now_perf - getattr(self, "_input_pipeline_log_t", 0.0) >= 1.0:
+                    ordered = sorted(samples)
+                    count = len(ordered)
+                    if count:
+                        p50 = ordered[min(count - 1, count // 2)]
+                        p95 = ordered[min(count - 1, int(count * 0.95))]
+                        logger.info(
+                            "Input pipeline perf: mode=%s merged=%d samples=%d p50=%.0fus p95=%.0fus max=%.0fus",
+                            self.mode,
+                            1 if is_merged else 0,
+                            count,
+                            p50,
+                            p95,
+                            ordered[-1],
+                        )
+                    samples.clear()
+                    self._input_pipeline_log_t = now_perf
 
         def wrapped_callback(inputData: ControllerInputData, controller: Controller):
             with self.state_lock:
                 input_report_callback(inputData, controller)
+            # TEMP diagnostic: confirms the base handler's forward reaches the virtual
+            # controller output, and whether vg_controller is ready. Compare its rate with
+            # the base handler's INPUT-RATE to see if the forward is being skipped.
+            try:
+                _now = time.perf_counter()
+                controller._vc_cb_count = getattr(controller, '_vc_cb_count', 0) + 1
+                if _now - getattr(controller, '_vc_cb_t0', 0.0) >= 1.0:
+                    logger.info("VC-CB-RATE addr=%s mode=%s vg=%s usbip=%s rate=%d/s",
+                                controller.device.address, self.mode,
+                                self.vg_controller is not None,
+                                getattr(self, 'usbip_server', None) is not None,
+                                controller._vc_cb_count)
+                    controller._vc_cb_count = 0
+                    controller._vc_cb_t0 = _now
+            except Exception:
+                pass
 
         controller.set_input_report_callback(wrapped_callback)
         controller.gyro_fusion_callback = self.gyro_fusion_callback
@@ -2429,7 +2882,12 @@ class VirtualController:
             # Phase 1: Button Mapping (Respects GUI layout setting)
             xb_btns = 0
             
-            if CONFIG.abxy_mode == "Xbox":
+            if getattr(controller.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+                if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["Y"]
+                if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["X"]
+                if buttons & SWITCH_BUTTONS["B"]: xb_btns |= XB_BUTTONS["B"]
+                if buttons & SWITCH_BUTTONS["A"]: xb_btns |= XB_BUTTONS["A"]
+            elif CONFIG.abxy_mode == "Xbox":
                 # When UI says "Xbox", we want "Switch layout" (positional match)
                 if buttons & SWITCH_BUTTONS["Y"]: xb_btns |= XB_BUTTONS["X"]
                 if buttons & SWITCH_BUTTONS["X"]: xb_btns |= XB_BUTTONS["Y"]
@@ -2545,6 +3003,7 @@ class VirtualController:
         
     def add_controller(self, c): 
         self.controllers.append(c)
+        self._refresh_controller_cache()
     
     def start_calibration(self):
         for c in self.controllers:
@@ -2782,6 +3241,7 @@ class VirtualController:
                         pass
                     
             self.controllers.clear()
+            self._refresh_controller_cache()
             logger.info(f"Player {self.player_number}: Cleanup complete.")
 
     def trigger_disconnect(self):
@@ -2795,6 +3255,7 @@ class VirtualController:
             return False
             
         self.controllers.remove(controller)
+        self._refresh_controller_cache()
         if clear_mac_port:
                 # Only clear the MAC->port mapping when the physical controller truly disconnects
                 # (BLE disconnect), NOT during merge/split operations where it stays connected.
@@ -2895,6 +3356,9 @@ class VirtualController:
                 
                 import math
                 with self.vibration_lock:
+                    lf_freq = 0x0e1
+                    hf_freq = 0x1e1
+
                     # Apply to Left (Xbox Rumble limit is 1000, so we use 700 + 300*tanh)
                     raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp
                     raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp
@@ -2902,6 +3366,8 @@ class VirtualController:
                     else: self.frame_vibrations_l[slot].lf_amp = int(700 + 300 * math.tanh((raw_lf_l - 700) / 300))
                     if raw_hf_l <= 700: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
                     else: self.frame_vibrations_l[slot].hf_amp = int(700 + 300 * math.tanh((raw_hf_l - 700) / 300))
+                    self.frame_vibrations_l[slot].lf_freq = lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = hf_freq
                     
                     # Apply to Right
                     raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp
@@ -2910,6 +3376,22 @@ class VirtualController:
                     else: self.frame_vibrations_r[slot].lf_amp = int(700 + 300 * math.tanh((raw_lf_r - 700) / 300))
                     if raw_hf_r <= 700: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
                     else: self.frame_vibrations_r[slot].hf_amp = int(700 + 300 * math.tanh((raw_hf_r - 700) / 300))
+                    self.frame_vibrations_r[slot].lf_freq = lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = hf_freq
+
+                    self.latest_vibration_l.lf_amp = lf_amp
+                    self.latest_vibration_l.hf_amp = hf_amp
+                    self.latest_vibration_l.lf_freq = lf_freq
+                    self.latest_vibration_l.hf_freq = hf_freq
+                    
+                    self.latest_vibration_r.lf_amp = lf_amp
+                    self.latest_vibration_r.hf_amp = hf_amp
+                    self.latest_vibration_r.lf_freq = lf_freq
+                    self.latest_vibration_r.hf_freq = hf_freq
+                    
+                    self.last_rumble_active_time = time.perf_counter()
+                    self.vibration_dirty_l = True
+                    self.vibration_dirty_r = True
 
         elif out_data[0] == 0x11:
             # Custom High-Fidelity Rumble Report (ID=0x11)
@@ -2973,19 +3455,188 @@ class VirtualController:
             # Switch 2 processes vibration by slicing byte arrays directly instead of ctypes.
             # Using direct indexing is much faster and prevents dropping packets in the high-frequency Audio Haptic / Rumble loop.
             if len(out_data) >= 5:
-                # If audio haptics are active, ignore standard rumble to prevent conflict!
-                import time
-                if hasattr(self, 'haptic_processor') and time.time() - self.haptic_processor.last_update_time < 0.2:
-                    self.last_rumble_received_time = time.perf_counter()
-                    return
+                # --- Rumble source arbitration (ported from y700-switch2-pro-bridge) ---
+                # The game signals its intent via the DualSense output-report valid_flag
+                # bits: enabling any compatible / rumble-emulation flag means it wants
+                # ordinary motor rumble; leaving them all off means it drives HD haptics
+                # through the audio endpoint (ch2/3).  We route exactly ONE source at a
+                # time (source arbitration, not byte-level mixing).  Adaptive-trigger FFB
+                # further below is independent of this and is always processed.
+                valid_flag0 = out_data[1] if len(out_data) > 1 else 0
+                valid_flag2 = out_data[39] if len(out_data) > 39 else 0
+                compat_v1 = (valid_flag0 & 0x01) != 0        # EnableRumbleEmulation
+                compat_v2 = (valid_flag2 & 0x04) != 0        # EnableImprovedRumbleEmulation
+                haptics_select = (valid_flag0 & 0x02) != 0   # UseRumbleNotHaptics
+                compatibility_selected = haptics_select or compat_v1 or compat_v2
+                motor_zero = (out_data[3] == 0 and out_data[4] == 0)
+                motor_active = not motor_zero
+                # Motor-aware passive locking arbitration:
+                # A 0x02 report with compat flags but ZERO motors is a DualSense
+                # feature-negotiation packet (audio filter setup etc.) and must NOT
+                # trigger compatibility mode — that causes an infinite flip-flop with
+                # concurrent audio-haptic SPECTRAL callbacks (observed: flag0=0x0d,
+                # motorR=0, motorL=0 during audio device test).
+                #
+                # Rules:
+                #   ENTER compat  : compat flags SET  *and* motors NON-ZERO
+                #   EXIT  compat  : motors become ZERO while already in compat (STOP packet)
+                #   IGNORE        : compat flags set but motors zero (feature packet)
+                _arb_now = time.perf_counter()
+                prev_mode = getattr(self, 'rumble_host_mode', 'audio_haptics')
+                if not hasattr(self, 'rumble_host_mode'):
+                    self.rumble_host_mode = prev_mode
+                mode_changed = False
+                last_audio_haptic_time = max(
+                    getattr(self, 'last_haptic_l_active_time', 0),
+                    getattr(self, 'last_haptic_r_active_time', 0),
+                )
+                # audio_recent = "another source is present" evidence.  An open audio ISO
+                # stream (even if silent) counts, as does recent converted haptic output.
+                # When another source is present, a motor=0 packet is only treated as a
+                # stop if it matches the rumble owner's signature/source fingerprint (below);
+                # otherwise it is a routine keepalive from the other source and is held.
+                audio_stream_recent = self._usbip_audio_stream_recent(_arb_now)
+                audio_recent = (
+                    USBIP_PS5_CONCURRENT_RUMBLE_TEST and
+                    (
+                        audio_stream_recent or
+                        (last_audio_haptic_time > 0 and
+                         _arb_now - last_audio_haptic_time <= SWITCH_RUMBLE_TIMEOUT)
+                    )
+                )
+                zero_signature = self._traditional_rumble_zero_signature(out_data)
+                flag_masked_signature = self._traditional_rumble_flag_masked_signature(out_data)
+                signature_match = (
+                    getattr(self, 'traditional_rumble_last_zero_signature', None) == zero_signature
+                )
+                flag_masked_match = (
+                    getattr(self, 'traditional_rumble_last_flag_masked_signature', None) == flag_masked_signature
+                )
+                # Source fingerprint: the stop must come from the same sender that STARTED
+                # the rumble.  Compare only the compat-relevant bits (flag0 & 0x03 = rumble
+                # emulation / haptics-select, flag2 & 0x04 = improved rumble emulation) —
+                # other bits in the flag bytes legitimately vary per packet.  A routine
+                # packet from the audio-haptics game (e.g. flag2=0x0c @60Hz) has different
+                # compat bits than the enter packet, so it can never be mistaken for a stop.
+                enter_bits = (
+                    (getattr(self, '_last_ordinary_flag0', 0) & 0x03) |
+                    ((getattr(self, '_last_ordinary_flag2', 0) & 0x04) << 8)
+                )
+                packet_bits = (valid_flag0 & 0x03) | ((valid_flag2 & 0x04) << 8)
+                source_fingerprint_stop = (
+                    packet_bits != 0 and (packet_bits & ~enter_bits) == 0
+                )
+                # A motor=0 packet is the host's explicit stop if it byte-matches the ping
+                # (exact), matches once valid_flag bytes are ignored (Steam drops them on
+                # stop), or carries compat bits that are a subset of the rumble owner's
+                # (same-source stop).
+                explicit_stop = (
+                    motor_zero and
+                    getattr(self, 'traditional_rumble_active', False) and
+                    (signature_match or flag_masked_match or source_fingerprint_stop)
+                )
+                # A stop that matched only by masked-signature or source fingerprint is
+                # AMBIGUOUS: another same-fingerprint source (e.g. Steam Ping shares the
+                # game's flag2=0x0c) can emit an identical-looking motor=0 report.  When
+                # another source is present and the rumble owner sent a non-zero motor
+                # within the defer window, hold the stop and schedule it for the owner's
+                # last-non-zero + window, so a burst rumble is not cut off mid-way.  A
+                # byte-exact match is unambiguous (same writer) and applies immediately.
+                stop_ambiguous = explicit_stop and not signature_match
+                last_nonzero = getattr(self, '_last_ordinary_rumble_time', 0)
+                defer_stop = (
+                    stop_ambiguous and audio_recent and
+                    _arb_now - last_nonzero < TRAD_RUMBLE_STOP_DEFER_WINDOW
+                )
+                zero_keepalive_for_audio = (
+                    motor_zero and
+                    audio_recent and
+                    getattr(self, 'traditional_rumble_active', False) and
+                    not explicit_stop
+                )
 
-                # Byte 3 is Right Motor (Weak), Byte 4 is Left Motor (Strong)
-                right_motor_weak = out_data[3]
-                left_motor_strong = out_data[4]
-                
-                lf_amp = int(800 * left_motor_strong / 256)
-                hf_amp = int(800 * right_motor_weak / 256)
-                
+                if compatibility_selected and motor_active:
+                    # Real rumble command — lock into compatibility mode.
+                    self._last_ordinary_rumble_time = _arb_now
+                    self._last_ordinary_flag0 = valid_flag0
+                    self._last_ordinary_flag2 = valid_flag2
+                    self.traditional_rumble_active = True
+                    self.traditional_rumble_zero_keepalive_seen = False
+                    self.traditional_rumble_last_zero_signature = zero_signature
+                    self.traditional_rumble_last_flag_masked_signature = flag_masked_signature
+                    self._trad_rumble_stop_diag_logged = False
+                    self._trad_rumble_pending_stop_at = None   # new motor value cancels a pending stop
+                    self.traditional_rumble_last_motor_r = out_data[3]
+                    self.traditional_rumble_last_motor_l = out_data[4]
+                elif defer_stop:
+                    # Hold the ambiguous stop; apply it once the owner has been silent for
+                    # the window (here, or via the getter fallback if no more packets come).
+                    if self._trad_rumble_pending_stop_at is None:
+                        self._trad_rumble_pending_stop_at = last_nonzero + TRAD_RUMBLE_STOP_DEFER_WINDOW
+                        logger.info(
+                            "Traditional rumble STOP deferred %.0fms (ambiguous stop while owner active): exact=%d flag_masked=%d fingerprint=%d (flag0=0x%02x flag2=0x%02x)",
+                            TRAD_RUMBLE_STOP_DEFER_WINDOW * 1000.0,
+                            int(signature_match), int(flag_masked_match), int(source_fingerprint_stop),
+                            valid_flag0, valid_flag2,
+                        )
+                elif zero_keepalive_for_audio:
+                    self.traditional_rumble_zero_keepalive_seen = True
+                    # One-shot dump per rumble session when a zero packet is held as a
+                    # keepalive, so drift beyond the flag bytes can be diagnosed later.
+                    if not getattr(self, '_trad_rumble_stop_diag_logged', False):
+                        self._trad_rumble_stop_diag_logged = True
+                        logger.debug(
+                            "Traditional rumble zero held as keepalive: packet=%s stored_sig=%s stored_masked=%s",
+                            bytes(out_data[:48]).hex(),
+                            (self.traditional_rumble_last_zero_signature or b'').hex(),
+                            (self.traditional_rumble_last_flag_masked_signature or b'').hex(),
+                        )
+                elif motor_zero and not zero_keepalive_for_audio and getattr(self, 'traditional_rumble_active', False):
+                    # Motors dropped to zero while ordinary rumble was the active source:
+                    # this is the host's stop.  Steam Input sends motor=0 to end rumble
+                    # and sometimes does NOT re-assert the compat flags, so the old
+                    # `if compatibility_selected` guard here swallowed the stop and the
+                    # rumble never ended.  Match the 0.12.1 traditional-rumble path: a zero
+                    # motor value clears ordinary rumble.  The traditional_rumble_active
+                    # guard keeps routine motor=0 reports (no rumble held) from log-spamming
+                    # and needlessly churning the vibration buffers.
+                    logger.info(
+                        "Traditional rumble STOP honored: exact=%d flag_masked=%d fingerprint=%d audio_recent=%d deferred=%d (flag0=0x%02x flag2=0x%02x)",
+                        int(signature_match), int(flag_masked_match), int(source_fingerprint_stop),
+                        int(audio_recent), int(getattr(self, '_trad_rumble_pending_stop_at', None) is not None),
+                        valid_flag0, valid_flag2,
+                    )
+                    with self.vibration_lock:
+                        self._clear_traditional_rumble_locked()
+
+                # Arbitration diagnostics: log immediately on a mode change, then a 3s
+                # heartbeat, so you can confirm which source each game selects.
+                if mode_changed or (_PERF_DIAGNOSTICS and _arb_now - getattr(self, '_arb_log_ts', 0) > 3.0):
+                    self._arb_log_ts = _arb_now
+                    logger.info(
+                        "Rumble source diag: mode=%s concurrent=%d ordinary_active=%d audio_recent=%d audio_stream_recent=%d zero_keepalive=%d explicit_stop=%d sig_match=%d sig_match_masked=%d fingerprint=%d pending=%d lastMotorR=%d lastMotorL=%d (flag0=0x%02x flag2=0x%02x v1=%d v2=%d haptics_select=%d) motorR=%d motorL=%d%s",
+                        self.rumble_host_mode, int(USBIP_PS5_CONCURRENT_RUMBLE_TEST),
+                        int(getattr(self, 'traditional_rumble_active', False)),
+                        int(audio_recent), int(audio_stream_recent), int(zero_keepalive_for_audio),
+                        int(explicit_stop), int(signature_match), int(flag_masked_match), int(source_fingerprint_stop),
+                        int(getattr(self, '_trad_rumble_pending_stop_at', None) is not None),
+                        getattr(self, 'traditional_rumble_last_motor_r', 0),
+                        getattr(self, 'traditional_rumble_last_motor_l', 0),
+                        valid_flag0, valid_flag2,
+                        int(compat_v1), int(compat_v2), int(haptics_select),
+                        out_data[3], out_data[4],
+                        " [MODE CHANGE]" if mode_changed else "",
+                    )
+
+                # Only feed the ordinary motors in compatibility mode;
+                # otherwise the HD audio-haptic path owns the rumble.
+                if compatibility_selected and motor_active:
+                    lf_amp = int(800 * out_data[4] / 256)
+                    hf_amp = int(800 * out_data[3] / 256)
+                else:
+                    lf_amp = 0
+                    hf_amp = 0
+
                 # Adaptive Trigger Translation (Mode 0x26 Vibration and 0x02 Weapon Recoil)
                 trigger_r_amp = 0
                 trigger_r_freq = 0x0e1
@@ -2993,7 +3644,6 @@ class VirtualController:
                 trigger_l_freq = 0x0e1
                 
                 if len(out_data) >= 33:
-                    import time
                     now = time.perf_counter()
                     
                     # Right Trigger FFB
@@ -3015,6 +3665,7 @@ class VirtualController:
                         self.trigger_r_prev_payload = rt_payload
                         if getattr(self, 'prev_zr_pressed', False) and rt_mode not in (0x00, 0x05):
                             self.trigger_r_punch_end = now + 0.150
+                            self.trigger_effect_seq = getattr(self, 'trigger_effect_seq', 0) + 1
                             
                     if now < getattr(self, 'trigger_r_punch_end', 0):
                         trigger_r_amp = trigger_amp_max
@@ -3036,9 +3687,17 @@ class VirtualController:
                         self.trigger_l_prev_payload = lt_payload
                         if getattr(self, 'prev_zl_pressed', False) and lt_mode not in (0x00, 0x05):
                             self.trigger_l_punch_end = now + 0.150
+                            self.trigger_effect_seq = getattr(self, 'trigger_effect_seq', 0) + 1
                     if now < getattr(self, 'trigger_l_punch_end', 0):
                         trigger_l_amp = trigger_amp_max
                         trigger_l_freq = 0x0e1
+
+                # In audio-haptics mode with no active trigger punch, don't touch the
+                # rumble frame at all — the HD audio-haptic path owns it.  Only ordinary
+                # motors (compatibility mode) or an active adaptive-trigger punch write here.
+                if motor_zero:
+                    self.last_rumble_received_time = time.perf_counter()
+                    return
 
                 dt = time.perf_counter() - self.cycle_start_time
                 slot_size = RUMBLE_WRITE_INTERVAL / 3.0
@@ -3053,38 +3712,40 @@ class VirtualController:
                     hf_freq = 0x1e1
                         
                     # Apply to Left (mix standard rumble with left trigger rumble)
-                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp + trigger_l_amp
-                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp + trigger_l_amp
+                    raw_lf_l = self.frame_vibrations_l[slot].lf_amp + lf_amp
+                    raw_hf_l = self.frame_vibrations_l[slot].hf_amp + hf_amp
                     if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
                     else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
                     if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
                     else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
-                    self.frame_vibrations_l[slot].lf_freq = trigger_l_freq if trigger_l_amp > 0 else lf_freq
-                    self.frame_vibrations_l[slot].hf_freq = trigger_l_freq if trigger_l_amp > 0 else hf_freq
+                    self.frame_vibrations_l[slot].lf_freq = lf_freq
+                    self.frame_vibrations_l[slot].hf_freq = hf_freq
                     
                     # Apply to Right (mix standard rumble with right trigger rumble)
-                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp + trigger_r_amp
-                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp + trigger_r_amp
+                    raw_lf_r = self.frame_vibrations_r[slot].lf_amp + lf_amp
+                    raw_hf_r = self.frame_vibrations_r[slot].hf_amp + hf_amp
                     if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
                     else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
                     if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
                     else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
-                    self.frame_vibrations_r[slot].lf_freq = trigger_r_freq if trigger_r_amp > 0 else lf_freq
-                    self.frame_vibrations_r[slot].hf_freq = trigger_r_freq if trigger_r_amp > 0 else hf_freq
+                    self.frame_vibrations_r[slot].lf_freq = lf_freq
+                    self.frame_vibrations_r[slot].hf_freq = hf_freq
 
-                    self.latest_vibration_l.lf_amp = min(1000, lf_amp + trigger_l_amp)
-                    self.latest_vibration_l.hf_amp = min(1000, hf_amp + trigger_l_amp)
-                    self.latest_vibration_l.lf_freq = trigger_l_freq if trigger_l_amp > 0 else lf_freq
-                    self.latest_vibration_l.hf_freq = trigger_l_freq if trigger_l_amp > 0 else hf_freq
+                    self.latest_vibration_l.lf_amp = min(1000, lf_amp)
+                    self.latest_vibration_l.hf_amp = min(1000, hf_amp)
+                    self.latest_vibration_l.lf_freq = lf_freq
+                    self.latest_vibration_l.hf_freq = hf_freq
                     
-                    self.latest_vibration_r.lf_amp = min(1000, lf_amp + trigger_r_amp)
-                    self.latest_vibration_r.hf_amp = min(1000, hf_amp + trigger_r_amp)
-                    self.latest_vibration_r.lf_freq = trigger_r_freq if trigger_r_amp > 0 else lf_freq
-                    self.latest_vibration_r.hf_freq = trigger_r_freq if trigger_r_amp > 0 else hf_freq
+                    self.latest_vibration_r.lf_amp = min(1000, lf_amp)
+                    self.latest_vibration_r.hf_amp = min(1000, hf_amp)
+                    self.latest_vibration_r.lf_freq = lf_freq
+                    self.latest_vibration_r.hf_freq = hf_freq
                     
                     self.last_rumble_active_time = time.perf_counter()
                     self.vibration_dirty_l = True
                     self.vibration_dirty_r = True
+                    if lf_amp > 0 or hf_amp > 0:
+                        self.traditional_rumble_seq = getattr(self, 'traditional_rumble_seq', 0) + 1
                     
                 # We can skip the LED/Audio flags check here to save time,
                 # as they are processed synchronously in the main _process_output_report thread
@@ -3093,93 +3754,102 @@ class VirtualController:
         self.last_rumble_received_time = time.perf_counter()
         return
 
-    def _wasapi_loopback_thread(self):
-        # Disabled: We now perfectly capture the raw 4-channel audio stream from the USB Isochronous OUT endpoint directly.
-        # Running WASAPI concurrently causes double-processing and audio sample interleaving which ruins haptics.
-        return
-        
-        try:
-            import soundcard as sc
-            import numpy as np
-        except ImportError:
-            logger.error("soundcard or numpy not installed, WASAPI loopback disabled")
-            return
-            
-        try:
-            logger.info("Starting WASAPI loopback for DualSense Audio...")
-            time.sleep(2)
-            
-            logger.info("Waiting for DualSense Audio to be activated by Windows/Game...")
-            
-            while getattr(self, 'usbip_server', None) is not None:
-                audio_active = getattr(self.usbip_server, 'audio_active', False)
-                if not audio_active:
-                    time.sleep(0.5)
-                    continue
-                    
-                try:
-                    microphones = sc.all_microphones(include_loopback=True)
-                    mic_names = [m.name for m in microphones]
-                    
-                    speaker = None
-                    for m in microphones:
-                        # We ONLY want the loopback device, not the physical microphone IN endpoint
-                        if "麥克風" in m.name or "MICROPHONE" in m.name.upper():
-                            continue
-                        # Filter for Speaker devices or loopback (if applicable)
-                        if "SPEAKER" in m.name.upper() or "喇叭" in m.name or "揚聲器" in m.name or "USB" in m.name.upper() or "DUALSENSE" in m.name.upper() or "WIRELESS" in m.name.upper() or "音訊" in m.name:
-                            try:
-                                with m.recorder(samplerate=48000) as test_mic:
-                                    speaker = m
-                                    break
-                            except Exception as e:
-                                if "DUALSENSE" in m.name.upper():
-                                    logger.error(f"WASAPI: Found {m.name} but failed to open: {e}")
-                                continue
-                                
-                    if speaker is None:
-                        logger.warning(f"WASAPI: Could not find any suitable USB speaker among {mic_names}")
-                        time.sleep(2)
-                        continue
-
-                    with speaker.recorder(samplerate=48000) as mic:
-                        logger.info(f"WASAPI: Successfully bound to speaker: {speaker.name} ({speaker.channels} channels, 48000 Hz), starting capture...")
-                        if speaker.channels < 4:
-                            logger.error("WASAPI: CRITICAL WARNING - Speaker is NOT 4 channels! Haptics will not work! Please set it to Quadraphonic in Windows Sound Control Panel!")
-                            
-                        while getattr(self, 'usbip_server', None) is not None:
-                            audio_active = getattr(self.usbip_server, 'audio_active', False)
-                            if not audio_active:
-                                logger.info("WASAPI: Audio streaming stopped, releasing capture...")
-                                if hasattr(self, 'haptic_processor'):
-                                    self.haptic_processor.reset()
-                                time.sleep(0.1)
-                                break
-                                
-                            data = mic.record(numframes=480) # 10ms at 48000Hz
-                            if len(data) > 0:
-                                # Ensure data is 4 channels by padding if necessary
-                                if data.shape[1] < 4:
-                                    pad = np.zeros((data.shape[0], 4 - data.shape[1]), dtype=data.dtype)
-                                    data = np.concatenate((data, pad), axis=1)
-                                elif data.shape[1] > 4:
-                                    data = data[:, :4]
-                                    
-                                data_int16 = (data * 32767).astype(np.int16)
-                                byte_data = data_int16.tobytes()
-                                self._usbip_audio_callback(byte_data)
-                except Exception as e:
-                    logger.error(f"WASAPI Loopback Exception: {e}")
-                    time.sleep(1)
-        except Exception as e:
-            logger.error(f"WASAPI Thread FATAL ERROR: {e}")
-
     def _usbip_audio_callback(self, data):
         """Handle 4-channel audio stream from DualSense USBIP ep=1 OUT"""
-        if len(data) > 0 and hasattr(self, 'haptic_processor'):
-            self.haptic_processor.process_audio_packet(data)
+        if hasattr(self, 'haptic_processor'):
+            if data is None or getattr(getattr(self, 'usbip_server', None), 'dualsense_haptics_blocked', False):
+                self.haptic_processor.reset()
+                self.last_usbip_audio_packet_time = 0.0
+                with self.vibration_lock:
+                    self.audio_haptic_frame_vibrations_l = [VibrationData() for _ in range(3)]
+                    self.audio_haptic_frame_vibrations_r = [VibrationData() for _ in range(3)]
+                    self.audio_haptic_latest_vibration_l = VibrationData()
+                    self.audio_haptic_latest_vibration_r = VibrationData()
+                    self.audio_haptic_vibration_dirty_l = True
+                    self.audio_haptic_vibration_dirty_r = True
+                    self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
+                return
+            if len(data) > 0:
+                self.last_usbip_audio_packet_time = time.perf_counter()
+                self.haptic_processor.process_audio_packet(data)
 
-    def _haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS"):
+    def _proxy_haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
+        self.last_usbip_audio_packet_time = time.perf_counter()
+        self._haptic_callback(left_intensity, right_intensity, mode, spectral=spectral)
+
+    def _haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
+        # Passive locking arbitration: AudioPcm path switches BACK to audio_haptics
+        # only when a genuine SPECTRAL haptic signal arrives from Ch3/Ch4.
+        # SILENCE callbacks never change the mode (avoid releasing the lock on quiet frames).
+
+        # Concurrent-rumble test: do not let the HID motor-rumble source lock out
+        # the audio-haptic source.  Both sources are merged later at BLE-frame scale.
+        # Arbitration diagnostics: confirm HD audio-haptics are actually driving the
+        # controller (throttled, only while producing output). Covers games that stream
+        # audio-haptics without ever sending output report 0x02.
+        if _PERF_DIAGNOSTICS and (left_intensity > 0 or right_intensity > 0):
+            _hd_now = time.time()
+            if _hd_now - getattr(self, '_hd_log_ts', 0) > 3.0:
+                self._hd_log_ts = _hd_now
+                logger.info(
+                    "Rumble arbiter: HD audio-haptics driving controller (mode=%s L=%d R=%d)",
+                    mode, left_intensity, right_intensity)
+
+        if spectral is not None:
+            now = time.perf_counter()
+            slot = 0
+
+            left_lf_amp = int(spectral.get("left_lf_amp", 0))
+            left_hf_amp = int(spectral.get("left_hf_amp", 0))
+            right_lf_amp = int(spectral.get("right_lf_amp", 0))
+            right_hf_amp = int(spectral.get("right_hf_amp", 0))
+            left_lf_freq = int(spectral.get("left_lf_freq", 0))
+            left_hf_freq = int(spectral.get("left_hf_freq", 0))
+            right_lf_freq = int(spectral.get("right_lf_freq", 0))
+            right_hf_freq = int(spectral.get("right_hf_freq", 0))
+
+            is_joycon = any(c.is_joycon() for c in getattr(self, 'controllers', []))
+            if is_joycon:
+                left_lf_amp = min(left_lf_amp, 480)
+                right_lf_amp = min(right_lf_amp, 480)
+
+            with self.vibration_lock:
+                # Match y700's HD packet shape: current spectral frame first,
+                # remaining two frames zero.  Phase-slotting or holding latest
+                # extends the previous frequency and is heard as residue.
+                _clear_vibration_buffer(self.audio_haptic_frame_vibrations_l)
+                _clear_vibration_buffer(self.audio_haptic_frame_vibrations_r)
+
+                self.audio_haptic_frame_vibrations_l[slot].lf_amp = left_lf_amp
+                self.audio_haptic_frame_vibrations_l[slot].hf_amp = left_hf_amp
+                self.audio_haptic_frame_vibrations_l[slot].lf_freq = left_lf_freq
+                self.audio_haptic_frame_vibrations_l[slot].hf_freq = left_hf_freq
+
+                self.audio_haptic_frame_vibrations_r[slot].lf_amp = right_lf_amp
+                self.audio_haptic_frame_vibrations_r[slot].hf_amp = right_hf_amp
+                self.audio_haptic_frame_vibrations_r[slot].lf_freq = right_lf_freq
+                self.audio_haptic_frame_vibrations_r[slot].hf_freq = right_hf_freq
+
+                self.audio_haptic_latest_vibration_l.lf_amp = left_lf_amp
+                self.audio_haptic_latest_vibration_l.hf_amp = left_hf_amp
+                self.audio_haptic_latest_vibration_l.lf_freq = left_lf_freq
+                self.audio_haptic_latest_vibration_l.hf_freq = left_hf_freq
+                if self._audio_haptic_hold_candidate(self.audio_haptic_latest_vibration_l):
+                    self.last_haptic_l_active_time = now
+
+                self.audio_haptic_latest_vibration_r.lf_amp = right_lf_amp
+                self.audio_haptic_latest_vibration_r.hf_amp = right_hf_amp
+                self.audio_haptic_latest_vibration_r.lf_freq = right_lf_freq
+                self.audio_haptic_latest_vibration_r.hf_freq = right_hf_freq
+                if self._audio_haptic_hold_candidate(self.audio_haptic_latest_vibration_r):
+                    self.last_haptic_r_active_time = now
+
+                self.audio_haptic_vibration_dirty_l = True
+                self.audio_haptic_vibration_dirty_r = True
+                self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
+                self.last_rumble_received_time = now
+            return
+
         def mix_freq(low, high, intensity):
             return int(low + ((high - low) * intensity + 127) // 255)
 
@@ -3239,24 +3909,24 @@ class VirtualController:
         with self.vibration_lock:
             # [Antigravity Fix] Applying slot-based summation for Audio Haptics
             # Apply to Left
-            raw_lf_l = self.frame_vibrations_l[slot].lf_amp + left_lf_amp
-            raw_hf_l = self.frame_vibrations_l[slot].hf_amp + left_hf_amp
-            if raw_lf_l <= 560: self.frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
-            else: self.frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
-            if raw_hf_l <= 560: self.frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
-            else: self.frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
-            self.frame_vibrations_l[slot].lf_freq = lf_freq
-            self.frame_vibrations_l[slot].hf_freq = hf_freq
+            raw_lf_l = self.audio_haptic_frame_vibrations_l[slot].lf_amp + left_lf_amp
+            raw_hf_l = self.audio_haptic_frame_vibrations_l[slot].hf_amp + left_hf_amp
+            if raw_lf_l <= 560: self.audio_haptic_frame_vibrations_l[slot].lf_amp = int(raw_lf_l)
+            else: self.audio_haptic_frame_vibrations_l[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_l - 560) / 240))
+            if raw_hf_l <= 560: self.audio_haptic_frame_vibrations_l[slot].hf_amp = int(raw_hf_l)
+            else: self.audio_haptic_frame_vibrations_l[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_l - 560) / 240))
+            self.audio_haptic_frame_vibrations_l[slot].lf_freq = lf_freq
+            self.audio_haptic_frame_vibrations_l[slot].hf_freq = hf_freq
             
             # Apply to Right
-            raw_lf_r = self.frame_vibrations_r[slot].lf_amp + right_lf_amp
-            raw_hf_r = self.frame_vibrations_r[slot].hf_amp + right_hf_amp
-            if raw_lf_r <= 560: self.frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
-            else: self.frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
-            if raw_hf_r <= 560: self.frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
-            else: self.frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
-            self.frame_vibrations_r[slot].lf_freq = lf_freq
-            self.frame_vibrations_r[slot].hf_freq = hf_freq
+            raw_lf_r = self.audio_haptic_frame_vibrations_r[slot].lf_amp + right_lf_amp
+            raw_hf_r = self.audio_haptic_frame_vibrations_r[slot].hf_amp + right_hf_amp
+            if raw_lf_r <= 560: self.audio_haptic_frame_vibrations_r[slot].lf_amp = int(raw_lf_r)
+            else: self.audio_haptic_frame_vibrations_r[slot].lf_amp = int(560 + 240 * math.tanh((raw_lf_r - 560) / 240))
+            if raw_hf_r <= 560: self.audio_haptic_frame_vibrations_r[slot].hf_amp = int(raw_hf_r)
+            else: self.audio_haptic_frame_vibrations_r[slot].hf_amp = int(560 + 240 * math.tanh((raw_hf_r - 560) / 240))
+            self.audio_haptic_frame_vibrations_r[slot].lf_freq = lf_freq
+            self.audio_haptic_frame_vibrations_r[slot].hf_freq = hf_freq
             
             now = time.perf_counter()
             # Only overwrite latest when amplitude is non-zero.  If the haptic
@@ -3267,21 +3937,22 @@ class VirtualController:
             # the motor sustain; a per-side 150ms watchdog in
             # get_current_vibration_frames stops it after true silence.
             if left_lf_amp > 0 or left_hf_amp > 0:
-                self.latest_vibration_l.lf_amp = left_lf_amp
-                self.latest_vibration_l.hf_amp = left_hf_amp
-                self.latest_vibration_l.lf_freq = lf_freq
-                self.latest_vibration_l.hf_freq = hf_freq
+                self.audio_haptic_latest_vibration_l.lf_amp = left_lf_amp
+                self.audio_haptic_latest_vibration_l.hf_amp = left_hf_amp
+                self.audio_haptic_latest_vibration_l.lf_freq = lf_freq
+                self.audio_haptic_latest_vibration_l.hf_freq = hf_freq
                 self.last_haptic_l_active_time = now
 
             if right_lf_amp > 0 or right_hf_amp > 0:
-                self.latest_vibration_r.lf_amp = right_lf_amp
-                self.latest_vibration_r.hf_amp = right_hf_amp
-                self.latest_vibration_r.lf_freq = lf_freq
-                self.latest_vibration_r.hf_freq = hf_freq
+                self.audio_haptic_latest_vibration_r.lf_amp = right_lf_amp
+                self.audio_haptic_latest_vibration_r.hf_amp = right_hf_amp
+                self.audio_haptic_latest_vibration_r.lf_freq = lf_freq
+                self.audio_haptic_latest_vibration_r.hf_freq = hf_freq
                 self.last_haptic_r_active_time = now
 
-            self.vibration_dirty_l = True
-            self.vibration_dirty_r = True
+            self.audio_haptic_vibration_dirty_l = True
+            self.audio_haptic_vibration_dirty_r = True
+            self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
             self.last_rumble_received_time = now
 
     def _usbip_rumble_callback(self, out_data, side="Left"):

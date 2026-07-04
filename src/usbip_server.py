@@ -7,6 +7,18 @@ import queue
 
 logger = logging.getLogger(__name__)
 
+SOCKET_DISCONNECT_ERRNOS = {32, 10038, 10053, 10054, 10058}
+
+
+def is_socket_disconnect(exc):
+    if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError)):
+        return True
+    return (
+        isinstance(exc, OSError) and
+        (getattr(exc, "winerror", None) in SOCKET_DISCONNECT_ERRNOS or
+         getattr(exc, "errno", None) in SOCKET_DISCONNECT_ERRNOS)
+    )
+
 
 
 # Switch 2 Pro Controller - HID Report Descriptor (31 Bytes)
@@ -29,11 +41,12 @@ USBIP_CMD_UNLINK = 0x00000002
 USBIP_RET_UNLINK = 0x00000004
 
 class USBIPServer:
-    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None, on_audio_data_callback=None):
+    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None, on_audio_data_callback=None, on_disconnect_callback=None):
         self.host = host
         self.port = port
         self.on_rumble_callback = on_rumble_callback
         self.on_audio_data_callback = on_audio_data_callback
+        self.on_disconnect_callback = on_disconnect_callback
         self.bus_id = bus_id
         
         # Extract devnum from bus_id
@@ -76,6 +89,17 @@ class USBIPServer:
         # Lock for thread safety
         self.lock = threading.Lock()
         self.send_lock = threading.Lock()
+
+        # Unlink / cancellation tracking.  Deferred URBs (HID IN, audio IN/OUT) are
+        # completed on background threads.  If the host UNLINKs one before we complete
+        # it, sending a late RET_SUBMIT is a protocol hazard, so every deferred path
+        # must claim its seqnum before replying and skip it if it was unlinked.  The
+        # UNLINK handler and the completion paths both go through _urb_lock so the
+        # decision is race-free, and the RET_UNLINK status reflects whether the URB was
+        # still pending (genuinely cancelled) or already gone.
+        self._pending_seqnums = set()
+        self._unlinked_seqnums = set()
+        self._urb_lock = threading.Lock()
 
     def start(self):
         self.running = True
@@ -132,18 +156,80 @@ class USBIPServer:
             buf += chunk
         return buf
 
+    def _reset_urb_tracking(self):
+        """Clear per-connection unlink state when a new client attaches."""
+        with self._urb_lock:
+            self._pending_seqnums.clear()
+            self._unlinked_seqnums.clear()
+
+    def _mark_urb_pending(self, seqnum):
+        """Record that a URB was deferred to a background completion thread."""
+        with self._urb_lock:
+            self._pending_seqnums.add(seqnum)
+            # Guard against leaks (e.g. a URB dropped when its socket died before the
+            # loop completed it).  seqnums are monotonic within a connection, so
+            # discarding the smallest entries is safe.
+            if len(self._pending_seqnums) > 4096:
+                for old in sorted(self._pending_seqnums)[:2048]:
+                    self._pending_seqnums.discard(old)
+
+    def _claim_urb_completion(self, seqnum):
+        """Called by a completion path just before it sends RET_SUBMIT.
+
+        Returns True if the reply should be sent, or False if the URB was UNLINKed
+        and the reply must be suppressed.  Either way the seqnum leaves both sets.
+        """
+        with self._urb_lock:
+            self._pending_seqnums.discard(seqnum)
+            if seqnum in self._unlinked_seqnums:
+                self._unlinked_seqnums.discard(seqnum)
+                return False
+            return True
+
+    def _mark_urb_unlinked(self, seqnum):
+        """Record an UNLINK request.
+
+        Returns True if the URB was still pending on a background thread (a genuine
+        cancellation -> RET_UNLINK status -ECONNRESET), or False if it had already
+        completed or was never deferred (-> status 0).
+        """
+        with self._urb_lock:
+            if seqnum in self._pending_seqnums:
+                self._unlinked_seqnums.add(seqnum)
+                if len(self._unlinked_seqnums) > 4096:
+                    for old in sorted(self._unlinked_seqnums)[:2048]:
+                        self._unlinked_seqnums.discard(old)
+                return True
+            return False
+
     def _accept_loop(self):
         while self.running:
             try:
                 client_sock, client_addr = self.server_socket.accept()
-                logger.info(f"USBIP connection accepted from {client_addr}")
+                # Expand socket buffers to 1MB to prevent blocking on bursts of peak data
+                try:
+                    import socket
+                    client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+                    client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                except Exception as ex:
+                    import logging
+                    logging.getLogger(__name__).debug(f"Failed to expand socket buffer size: {ex}")
+                import logging
+                logging.getLogger(__name__).info(f"USBIP connection accepted from {client_addr}")
                 self._handle_client(client_sock)
             except Exception as e:
                 if self.running:
-                    logger.debug(f"Accept loop error: {e}")
+                    import logging
+                    logging.getLogger(__name__).debug(f"Accept loop error: {e}")
+                import time
                 time.sleep(0.5)
 
     def _handle_client(self, sock):
+        if hasattr(self, '_mark_socket_alive'):
+            try:
+                self._mark_socket_alive(sock)
+            except Exception:
+                pass
         try:
             # 1. Handle handshakes (OP_REQ_DEVLIST or OP_REQ_IMPORT)
             while self.running:
@@ -170,8 +256,17 @@ class USBIPServer:
                     logger.warning(f"Unknown OP_REQ code: {code:#x}")
                     break
         except Exception as e:
-            logger.exception("Error in client handler")
+            if is_socket_disconnect(e):
+                logger.info(f"USBIP client disconnected: {e}")
+            else:
+                logger.exception("Error in client handler")
         finally:
+            should_notify_disconnect = self.running
+            if hasattr(self, '_mark_socket_dead'):
+                try:
+                    self._mark_socket_dead(sock)
+                except Exception:
+                    pass
             if self.on_rumble_callback:
                 try:
                     self.on_rumble_callback(bytearray(64))
@@ -181,6 +276,11 @@ class USBIPServer:
                 sock.close()
             except Exception:
                 pass
+            if should_notify_disconnect and self.on_disconnect_callback:
+                try:
+                    self.on_disconnect_callback()
+                except Exception:
+                    logger.debug("USBIP disconnect callback failed", exc_info=True)
             logger.info("USBIP connection closed.")
 
     def _get_device_desc(self):
@@ -229,7 +329,8 @@ class USBIPServer:
     def _data_phase_loop(self, sock):
         logger.info("Entered Data Phase loop")
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        
+        self._reset_urb_tracking()
+
         while self.running:
             # 1. Read common header: EXACTLY 20 bytes
             # CRITICAL: TCP is a stream protocol; recv() may return fewer bytes than requested.
@@ -255,14 +356,11 @@ class USBIPServer:
                     "!Iiiii 8s", submit_payload
                 )
                 
-                iso_descriptors = b""
-                if num_packets > 0:
-                    try:
-                        iso_descriptors = self._recvexact(sock, num_packets * 16)
-                    except ConnectionError as e:
-                        logger.info(f"Data loop exit reading ISO descriptors: {e}")
-                        break
-                
+                # usbip-win2 CMD_SUBMIT payload layout is:
+                #   OUT: transfer_buffer, then iso_packet_descriptor[]
+                #   IN:  iso_packet_descriptor[] only
+                # Reading descriptors before OUT data consumes PCM as descriptor bytes
+                # and makes Windows clear the audio endpoint.
                 out_data = b""
                 if direction == 0 and transfer_length > 0: # OUT transfer (host -> device)
                     # Read transfer data with exact byte count guarantee
@@ -271,9 +369,32 @@ class USBIPServer:
                     except ConnectionError as e:
                         logger.info(f"Data loop exit reading OUT data: {e}")
                         break
+
+                iso_descriptors = b""
+                if num_packets > 0:
+                    try:
+                        iso_descriptors = self._recvexact(sock, num_packets * 16)
+                    except ConnectionError as e:
+                        logger.info(f"Data loop exit reading ISO descriptors: {e}")
+                        break
                 
-                # Handle the USB Request
-                self._handle_submit(sock, seqnum, devid, direction, ep, transfer_length, setup, out_data, start_frame, num_packets, iso_descriptors)
+                # Handle the USB Request.  Time only the processing (not the blocking
+                # recvs above, which idle-wait for the next packet) so a stall here — the
+                # recv thread being frozen mid-handler, e.g. by a blocked console write —
+                # is surfaced.  A stalled recv thread stops reading ISO OUT submits and the
+                # audio endpoint halt-storms, so this is the direct diagnostic for it.
+                _handle_t0 = time.perf_counter()
+                try:
+                    self._handle_submit(sock, seqnum, devid, direction, ep, transfer_length, setup, out_data, start_frame, num_packets, iso_descriptors)
+                except Exception as e:
+                    if is_socket_disconnect(e):
+                        logger.info(f"Data loop exit while sending submit reply: {e}")
+                        break
+                    raise
+                _handle_dt = time.perf_counter() - _handle_t0
+                if _handle_dt > 0.025 and time.perf_counter() - getattr(self, '_last_recv_stall_log', 0) > 1.0:
+                    self._last_recv_stall_log = time.perf_counter()
+                    logger.warning("USBIP recv loop stalled %.0fms (ep=%d dir=%d)", _handle_dt * 1000.0, ep, direction)
                 
             elif command == USBIP_CMD_UNLINK:
                 # Read UNLINK specific payload: EXACTLY 28 bytes
@@ -285,10 +406,28 @@ class USBIPServer:
                 
                 seqnum_to_unlink = struct.unpack("!I", unlink_payload[:4])[0]
                 logger.debug(f"Unlink requested for seqnum {seqnum_to_unlink}")
-                
-                # Send RET_UNLINK
-                ret_header = struct.pack("!IIIII i 28s", USBIP_RET_UNLINK, seqnum, devid, direction, ep, 0, b"\x00" * 28)
-                sock.sendall(ret_header)
+
+                # If the victim URB is still queued on a background thread, mark it so
+                # its completion path suppresses the (now stale) RET_SUBMIT, and report
+                # -ECONNRESET.  If it already completed, report 0.
+                was_pending = self._mark_urb_unlinked(seqnum_to_unlink)
+                unlink_status = -104 if was_pending else 0  # -ECONNRESET
+                if hasattr(self, '_on_urb_unlink'):
+                    try:
+                        self._on_urb_unlink(seqnum_to_unlink, was_pending)
+                    except Exception:
+                        logger.debug("URB unlink hook failed", exc_info=True)
+
+                # Prefer a subclass TX writer when available so RET_UNLINK is ordered
+                # with deferred RET_SUBMIT/control replies on one serialized path.
+                ret_header = struct.pack("!IIIII i 24s", USBIP_RET_UNLINK, seqnum, devid, direction, ep, unlink_status, b"\x00" * 24)
+                if len(ret_header) != 48:
+                    logger.error("Invalid RET_UNLINK header length: %d", len(ret_header))
+                if hasattr(self, "_enqueue_tx"):
+                    self._enqueue_tx(sock, ret_header, 0)
+                else:
+                    with self.send_lock:
+                        sock.sendall(ret_header)
             else:
                 logger.warning(f"Unknown USBIP Command: {command:#010x}")
                 break
@@ -370,7 +509,9 @@ class USBIPServer:
                 if urb is None:
                     break
                 sock, seqnum, devid, direction, ep = urb
-                
+                if not self._claim_urb_completion(seqnum):
+                    continue  # UNLINKed before we got to it
+
                 now = time.perf_counter()
                 elapsed = now - last_send_time
                 if elapsed < 0.001:
@@ -806,6 +947,7 @@ class USBIPJoyConServer(USBIPServer):
         elif ep == 1: # HID
             if direction == 1: # IN
                 # Defer IN URB to background thread to avoid blocking Socket recv
+                self._mark_urb_pending(seqnum)
                 self.pending_in_urbs.put((sock, seqnum, devid, direction, ep))
                 return
             else: # OUT

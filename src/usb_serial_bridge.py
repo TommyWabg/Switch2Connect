@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+import ctypes
 from dataclasses import dataclass
 
 import win32com.client
@@ -38,13 +39,21 @@ ACTIVE_CLIENTS = []
 BRIDGE_SCAN_ACTIVE = False
 
 CDC_WAKE_DELAY_SECONDS = 0.1
+
+def _set_current_thread_priority(level):
+    try:
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
+    except Exception:
+        pass
 STATUS_PROBE_ATTEMPTS = 3
 STATUS_PROBE_RETRY_DELAY_SECONDS = 0.15
 STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "0.12.0"
+APP_FIRMWARE_VERSION = "0.12.2"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_1"
 MAX_ESP32S3_CHANNELS = 8
@@ -478,6 +487,7 @@ class ESP32S3SerialClient:
                 logger.exception("ESP32-S3 Serial input callback failed")
 
     def _read_loop(self):
+        _set_current_thread_priority(2)
         buf = bytearray()
         while not self._read_stop.is_set() and self.is_connected and self.handle:
             try:
