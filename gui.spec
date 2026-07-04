@@ -1,21 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/esp32s3', 'drivers/esp32s3'), ('drivers/tools', 'drivers/tools')]
 binaries = []
+if os.path.exists('drivers/dualsense_haptic_native.dll'):
+    binaries.append(('drivers/dualsense_haptic_native.dll', 'drivers'))
 hiddenimports = [
     'usbip_server',
     'usbip_dualsense_server',
     'dualsense_descriptors',
     'dualsense_structs',
     'dualsense_haptic',
+    'audio_endpoint_guard',
     'esp32s3_bridge',
+    'comtypes',
+    'comtypes.client',
+    'comtypes.automation',
     'win32com',
     'win32com.client',
 ]
 tmp_ret = collect_all('vgamepad')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('imufusion')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('comtypes')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
