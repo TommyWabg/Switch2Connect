@@ -107,15 +107,10 @@ button_remaps:
     vibration_strength_xbox: 5
 c_mapping: Default
 calibration_data:
-  '00': &id001
-  - 5.63625450180072
-  - -17.18687474989996
-  - 0.4113645458183273
-  849896F74C2D: *id001
-  E0:EF:BF:81:06:9F: &id002
-  - 5.4609375
-  - -18.1171875
-  - 0.171875
+  E0:EF:BF:81:06:9F: &id001
+  - 5.534351145038168
+  - -17.625954198473284
+  - 0.22900763358778625
   E0:EF:BF:EF:CC:BD:
   - 3.5403348554033487
   - -9.270928462709284
@@ -124,9 +119,9 @@ calibration_data:
   - -1.4772727272727273
   - 1.1348484848484848
   - 4.36969696969697
-  E0EFBF81069F: *id002
-  E10000066586: *id002
-  HEK10000066586: *id002
+  E0EFBF81069F: *id001
+  E10000066586: *id001
+  HEK10000066586: *id001
 capt_mapping: Default
 cemuhook_mac_to_pad:
   E0EFBF81069F: 2
@@ -156,119 +151,44 @@ gyro_bias_l:
 - 1.1348484848484848
 - 4.36969696969697
 gyro_bias_r:
-- 5.4609375
-- -18.1171875
-- 0.171875
+- 5.534351145038168
+- -17.625954198473284
+- 0.22900763358778625
 gyro_mode: World
 gyro_passthrough_mode: Cemuhook
 gyro_sensitivity: 4.0
+hidhide_hide_enabled: true
 hidhide_installed: true
 home_mapping: Default
-joycon_hold_mode: &id009 {}
-joystick_calibration_data:
-  '00': &id003
-    left:
-      center:
-      - 1991
-      - 2153
-      max:
-      - 1752
-      - 1517
-      min:
-      - 1667
-      - 1677
-    right:
-      center:
-      - 2147
-      - 2073
-      max:
-      - 1502
-      - 1609
-      min:
-      - 1658
-      - 1656
-  849896F74C2D: *id003
-  B11005178656: &id005
-    left:
-      center:
-      - 2041
-      - 2129
-      max:
-      - 1242
-      - 1223
-      min:
-      - 1192
-      - 1233
-  C11002354336: &id004
-    right:
-      center:
-      - 2050
-      - 2018
-      max:
-      - 1304
-      - 1244
-      min:
-      - 1288
-      - 1205
-  E0:EF:BF:81:06:9F: &id006
-    left:
-      center:
-      - 1983
-      - 2157
-      max:
-      - 1755
-      - 1496
-      min:
-      - 1652
-      - 1681
-    right:
-      center:
-      - 2132
-      - 2095
-      max:
-      - 1507
-      - 1636
-      min:
-      - 1651
-      - 1675
-  E0:EF:BF:EF:CC:BD: *id004
-  E0:EF:BF:F0:0E:17: *id005
-  E0EFBF81069F: *id006
-  E0EFBFEFCCBD: *id004
-  E0EFBFF00E17: *id005
-  E10000066586: *id006
-  HBK11005178656: *id005
-  HCK11002354336: *id004
-  HEK10000066586: *id006
+in_app_gyro_soft_deadzone: 0.0
+joycon_hold_mode: &id003 {}
+joystick_calibration_data: {}
 mag_calibration_data:
-  '00': &id007
-  - 0.0
-  - 0.0
-  - 0.0
-  849896F74C2D: *id007
-  E0:EF:BF:81:06:9F: &id008
-  - 130.5
-  - 66.0
-  - 19.0
+  E0:EF:BF:81:06:9F: &id002
+  - -14.5
+  - -98.0
+  - -46.0
   E0:EF:BF:EF:CC:BD:
   - -330.5
   - -11.0
   - -445.5
   E0:EF:BF:F0:0E:17:
-  - -52.5
-  - 238.0
-  - -208.0
-  E0EFBF81069F: *id008
-  E10000066586: *id008
-  HEK10000066586: *id008
+  - -179.5
+  - 231.5
+  - -264.0
+  E0EFBF81069F: *id002
+  E10000066586: *id002
+  HEK10000066586: *id002
 merged_gyro_side:
   E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
-  enabled: true
+  enabled: false
   ir_activate_threshold: 1
   sensitivity: 4.0
 open_when_startup: false
 profile_defaults:
+  adaptive_triggers_enabled: true
+  audio_haptics_enabled: true
   cemuhook_sensitivity: 1
   djg_activation: Hold
   djg_dominant_side: Right
@@ -279,6 +199,7 @@ profile_defaults:
   gyro_mode: World
   gyro_passthrough_mode: Default
   gyro_sensitivity: 4.0
+  in_app_gyro_soft_deadzone: 0.0
   r_joystick_gyro_sensitivity: 5.0
   stabilized_gyro: true
   steam_roll_compensation: false
@@ -287,7 +208,8 @@ profile_defaults:
 profile_switching_combo_trigger: ''
 profiles:
   DJG Demo:
-    audio_device_enable: true
+    adaptive_triggers_enabled: true
+    audio_haptics_enabled: true
     cemuhook_sensitivity: 1
     change_profile_list: true
     djg_activation: Hold
@@ -300,6 +222,7 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    in_app_gyro_soft_deadzone: 0.0
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -487,7 +410,7 @@ profiles:
       r_mapping: Default
       r_stk_mapping: Default
       right_mapping: Default
-      rumble_mode: Xbox
+      rumble_mode: PS5
       sll_mapping: PS_L_Touch
       slr_mapping: DJG
       srl_mapping: DJG
@@ -495,7 +418,7 @@ profiles:
       up_mapping: Default
       vibration_frequency: 10
       vibration_strength: 5
-      vibration_strength_ps5: 10
+      vibration_strength_ps5: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
       x_mapping: Default
@@ -593,7 +516,7 @@ profiles:
       r_mapping: Default
       r_stk_mapping: Default
       right_mapping: Default
-      rumble_mode: Xbox
+      rumble_mode: Switch
       sll_mapping: PS_L_Touch
       slr_mapping: DJG
       srl_mapping: DJG
@@ -914,7 +837,9 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
   Default:
+    adaptive_triggers_enabled: true
     assigned_apps: []
+    audio_haptics_enabled: true
     cemuhook_sensitivity: 1
     change_profile_list: true
     djg_activation: Hold
@@ -927,6 +852,7 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    in_app_gyro_soft_deadzone: 0.0
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -1191,7 +1117,7 @@ profiles:
         y_mapping: Default
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
-      joycon_hold_mode: *id009
+      joycon_hold_mode: *id003
       l_joystick_custom:
         down: Default
         left: Default
@@ -1542,8 +1468,9 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
   PS5 Audio Haptics:
+    adaptive_triggers_enabled: true
     assigned_apps: []
-    audio_device_enable: true
+    audio_haptics_enabled: true
     cemuhook_sensitivity: 1
     change_profile_list: true
     djg_activation: Hold
@@ -1556,6 +1483,7 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    in_app_gyro_soft_deadzone: 0.0
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -2167,8 +2095,9 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
   Switch 1 Emulator:
+    adaptive_triggers_enabled: true
     assigned_apps: []
-    audio_device_enable: true
+    audio_haptics_enabled: true
     cemuhook_sensitivity: 1
     change_profile_list: true
     djg_activation: Hold
@@ -2181,6 +2110,7 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    in_app_gyro_soft_deadzone: 0.0
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -2820,9 +2750,9 @@ vibration_strength_xbox: 5
 vigembus_installed: true
 vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
-window_height: 1238
+window_height: 1250
 window_width: 1270
-window_x: 1250
-window_y: 67
+window_x: 710
+window_y: 88
 winuhid_sim_mode: PS5
 wired_usb_enabled: true
