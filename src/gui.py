@@ -54,7 +54,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "0.12.3"
+APP_VERSION = "v0.12.3"
 
 def _set_current_thread_priority(level):
     try:
@@ -1453,7 +1453,7 @@ class CalibrationOverlay:
         frame = tk.Frame(self.window, bg="#1c1c1e", highlightbackground="#3a3a3c", highlightthickness=2, bd=0)
         frame.pack(fill="both", expand=True)
         
-        self.lbl_title = tk.Label(frame, text="Switch 2 Controller", fg="#0a84ff", bg="#1c1c1e", font=scale_font(("Segoe UI", 11, "bold")))
+        self.lbl_title = tk.Label(frame, text="Switch 2 Connect", fg="#0a84ff", bg="#1c1c1e", font=scale_font(("Segoe UI", 11, "bold")))
         self.lbl_title.pack(anchor="w", padx=int(20 * scaling_factor), pady=(int(12 * scaling_factor), int(2 * scaling_factor)))
         
         self.lbl_msg = tk.Label(frame, text="", fg="#ffffff", bg="#1c1c1e", font=scale_font(("Segoe UI", 11)), justify="left", wraplength=int(460 * scaling_factor))
@@ -1808,7 +1808,7 @@ class JoystickCalibrationWizard:
 
     def cancel(self):
         self._set_controller_flags(False)
-        utils.show_notification("Switch 2 Controller", "Calibration cancelled.")
+        utils.show_notification("Switch 2 Connect", "Calibration cancelled.")
         self.close()
 
     def close(self):
@@ -2016,7 +2016,7 @@ class ControllerWindow:
             for controller in getattr(virtual_controller, "controllers", []) or []:
                 controller.is_joystick_calibrating = False
                 controller.back_button_calibration_active = False
-        utils.show_notification("Switch 2 Controller", "Calibration cancelled.")
+        utils.show_notification("Switch 2 Connect", "Calibration cancelled.")
 
     def cancel_all_calibration_after_profile_switch(self):
         if threading.current_thread() != threading.main_thread():
@@ -3752,7 +3752,7 @@ class ControllerWindow:
             except:
                 pass
 
-        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Switch 2 Controllers')
+        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Switch 2 Connect')
         except: pass
         self.root = tk.Tk()
         self.root.tk.call('tk', 'scaling', 1.3333333333333333)
@@ -3783,7 +3783,7 @@ class ControllerWindow:
         if exe_name.lower().endswith('.exe'):
             self.root.title(os.path.splitext(exe_name)[0])
         else:
-            self.root.title(f"Switch2 Controllers v{APP_VERSION}")
+            self.root.title(f"Switch 2 Connect")
         
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1270 * window_resolution_ratio)
@@ -3928,6 +3928,16 @@ class ControllerWindow:
         self.header_frame = tk.Frame(self.root, bg=background_color, height=int(24 * scaling_factor))
         self.header_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(2 * scaling_factor)))
         self.header_frame.pack_propagate(False)
+        self.version_label = tk.Label(
+            self.header_frame,
+            text=APP_VERSION,
+            fg="#FFFFFF",
+            bg=background_color,
+            font=scale_font(("Arial", 9, "bold")),
+            anchor=tk.W,
+        )
+        self.version_label.pack(side=tk.LEFT, padx=(int(12 * scaling_factor), 0), fill=tk.Y)
+
         self.header_label = tk.Label(
             self.header_frame,
             text="Connecting Via: System BLE  |  Status: Ready",
