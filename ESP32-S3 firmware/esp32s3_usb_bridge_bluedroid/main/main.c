@@ -1,3 +1,24 @@
+/*
+ * Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+ * Copyright (C) 2026 TommyWabg
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Contact Information:
+ * Electronic Mail: tommyw9318@gmail.com
+ */
+
 // ESP32-S3 USB <-> BLE bridge for Switch 2 controllers — BLUEDROID variant.
 //
 // Goal: see whether Bluedroid's multi-task host (BTU/BTC) beats NimBLE's single-host-
@@ -24,6 +45,7 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gap_ble_api.h"
+#include "esp_timer.h"
 #include "esp_gattc_api.h"
 #include "esp_gatt_defs.h"
 #include "esp_gatt_common_api.h"
@@ -33,20 +55,14 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "0.12.2"
+#define APP_FIRMWARE_VERSION      "0.12.3"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_1"
 #define CDC_LINE_STATE_DTR        0x01
 #define NINTENDO_COMPANY_ID       0x0553
 #define MAX_CH                    8     // one GATTC app per channel
 #define REPORT_SIZE               64
-// NSO GameCube controller streams its compact native input report on the LEGACY
-// notify characteristic, NOT on FD2 (FD2 carries a different layout the GCN host
-// parser does not understand).  So for this product_id the bridge must prefer the
-// LEGACY characteristic as the input stream — the opposite of every other SW2
-// controller (Pro 2 / Joy-Con), which must use FD2.  See match_and_store_char +
-// the input-source decision in SEARCH_CMPL_EVT.
-#define NSO_GAMECUBE_PID          0x2073
+
 
 // --- Switch 2 GATT UUIDs (128-bit; little-endian in esp_bt_uuid_t = string reversed) ---
 #define UUID128(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15) \
@@ -90,31 +106,7 @@ typedef struct {
 } channel_t;
 static channel_t s_ch[MAX_CH];
 
-// --- product_id cache (MAC -> PID) ------------------------------------------
-// The firmware does not read controller memory, but the advertisement already
-// carries the Nintendo product_id (manufacturer data).  We cache it per MAC at
-// scan time so that, when the host asks us to connect that MAC, we know whether
-// it is an NSO GameCube controller (and therefore must subscribe to the LEGACY
-// input characteristic instead of FD2).  Small round-robin table is plenty —
-// only MACs we are about to connect matter.
-#define PID_CACHE_N 16
-static struct { esp_bd_addr_t bda; uint16_t pid; bool valid; } s_pid_cache[PID_CACHE_N];
-static void pid_cache_put(const esp_bd_addr_t bda, uint16_t pid) {
-    for (int i = 0; i < PID_CACHE_N; i++)
-        if (s_pid_cache[i].valid && memcmp(s_pid_cache[i].bda, bda, sizeof(esp_bd_addr_t)) == 0) {
-            s_pid_cache[i].pid = pid; return;
-        }
-    static int rr = 0;
-    memcpy(s_pid_cache[rr].bda, bda, sizeof(esp_bd_addr_t));
-    s_pid_cache[rr].pid = pid; s_pid_cache[rr].valid = true;
-    rr = (rr + 1) % PID_CACHE_N;
-}
-static uint16_t pid_cache_get(const esp_bd_addr_t bda) {
-    for (int i = 0; i < PID_CACHE_N; i++)
-        if (s_pid_cache[i].valid && memcmp(s_pid_cache[i].bda, bda, sizeof(esp_bd_addr_t)) == 0)
-            return s_pid_cache[i].pid;
-    return 0;
-}
+
 
 static volatile bool s_scan_mode = false;
 static int s_pending_conn = -1;   // channel waiting to open once the scan has stopped
@@ -230,6 +222,31 @@ static in_report_t s_in_shadow[MAX_CH];
 static volatile bool s_in_dirty[MAX_CH];
 static portMUX_TYPE s_in_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// --- Jitter Buffer (FIFO) for Audio Haptics ---
+#define RUMBLE_QUEUE_SIZE 5
+typedef struct {
+    int ch;
+    uint8_t data[64];
+    size_t len;
+} rumble_pkt_t;
+
+static QueueHandle_t s_rumble_queue;
+static TaskHandle_t s_rumble_task_h;
+
+static void rumble_playout_task(void *arg) {
+    rumble_pkt_t pkt;
+    while (1) {
+        if (xQueueReceive(s_rumble_queue, &pkt, portMAX_DELAY)) {
+            if (s_ch[pkt.ch].used && s_ch[pkt.ch].rumble_handle) {
+                esp_ble_gattc_write_char(s_ch[pkt.ch].gattc_if, s_ch[pkt.ch].conn_id, s_ch[pkt.ch].rumble_handle, pkt.len, pkt.data,
+                                         ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+            }
+            // Strict 15ms minimum gap between packets as requested
+            vTaskDelay(pdMS_TO_TICKS(15));
+        }
+    }
+}
+
 static bool cdc_host_ready(void) {
     return tud_cdc_connected() && (tud_cdc_get_line_state() & CDC_LINE_STATE_DTR);
 }
@@ -340,9 +357,7 @@ static void do_conn(char *args) {
     s_ch[ch].connecting = true;
     s_ch[ch].addr_type = (uint8_t)atoi(type_s);
     for (int i = 0; i < 6; i++) s_ch[ch].bda[i] = (uint8_t)m[i];
-    // NSO GameCube controller: its compact input report is on the LEGACY notify
-    // characteristic, so flag this channel to subscribe to legacy instead of FD2.
-    s_ch[ch].prefer_legacy = (pid_cache_get(s_ch[ch].bda) == NSO_GAMECUBE_PID);
+    s_ch[ch].prefer_legacy = false;
     {   // Diagnostic: which channel + how many links already live when this starts.
         char dbg[110];
         snprintf(dbg, sizeof(dbg),
@@ -556,10 +571,19 @@ static void do_rs(char *args) {  // rs <ch> <hex>
     if (!ch_s || !h_s) return;
     int ch = atoi(ch_s);
     if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || s_ch[ch].rumble_handle == 0) return;
-    uint8_t buf[64]; size_t len = parse_hex(h_s, buf, sizeof(buf));
-    if (len == 0) return;
-    esp_ble_gattc_write_char(s_ch[ch].gattc_if, s_ch[ch].conn_id, s_ch[ch].rumble_handle, len, buf,
-                             ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+    
+    rumble_pkt_t pkt;
+    pkt.ch = ch;
+    pkt.len = parse_hex(h_s, pkt.data, sizeof(pkt.data));
+    if (pkt.len == 0) return;
+    
+    if (s_rumble_queue) {
+        if (xQueueSend(s_rumble_queue, &pkt, 0) != pdTRUE) {
+            rumble_pkt_t dummy;
+            xQueueReceive(s_rumble_queue, &dummy, 0); // Drop oldest
+            xQueueSend(s_rumble_queue, &pkt, 0);      // Push newest
+        }
+    }
 }
 static void wr_one(int ch, char kind, const uint8_t *buf, size_t len) {
     if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || len == 0) return;
@@ -951,19 +975,7 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
         if (r->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) break;
         if (!s_scan_mode || !adv_is_nintendo(r->scan_rst.ble_adv)) break;
         const uint8_t *a = r->scan_rst.bda;
-        // Cache the advertised Nintendo product_id so do_conn knows whether this MAC is
-        // an NSO GameCube controller (LEGACY input) before GATT discovery runs.
-        // Manufacturer value layout: [company_id_lo, company_id_hi, payload...]; the
-        // host reads product_id from payload[5:7] => mfg[7]|(mfg[8]<<8) (little-endian).
-        {
-            uint8_t mlen = 0;
-            uint8_t *mfg = esp_ble_resolve_adv_data(r->scan_rst.ble_adv,
-                                ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mlen);
-            if (mfg && mlen >= 9) {
-                uint16_t pid = (uint16_t)mfg[7] | ((uint16_t)mfg[8] << 8);
-                pid_cache_put(a, pid);
-            }
-        }
+
         char data_hex[63]; int dl = r->scan_rst.adv_data_len; if (dl > 31) dl = 31;
         for (int i = 0; i < dl; i++) sprintf(&data_hex[i*2], "%02X", r->scan_rst.ble_adv[i]);
         data_hex[dl*2] = '\0';
@@ -1023,6 +1035,9 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(247));
     esp_ble_gap_set_scan_params(&s_scan_params);
+
+    s_rumble_queue = xQueueCreate(RUMBLE_QUEUE_SIZE, sizeof(rumble_pkt_t));
+    xTaskCreatePinnedToCore(rumble_playout_task, "rumble_task", 4096, NULL, 5, &s_rumble_task_h, 0);
 
     ESP_LOGI(TAG, "Bluedroid up, MAC=%s, %d GATTC apps. Waiting for host.", s_own_mac, MAX_CH);
 }
