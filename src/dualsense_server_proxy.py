@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import logging
 import os
 import socket
@@ -27,9 +46,11 @@ class DualSenseServerProxy:
         on_audio_data_callback=None,
         on_disconnect_callback=None,
         on_haptic_callback=None,
+        enable_audio=True,
     ):
         self.host = host
         self.port = int(port)
+        self.enable_audio = enable_audio
         self.bus_id = bus_id
         self.mac_address = mac_address or ""
         self.on_rumble_callback = on_rumble_callback
@@ -64,6 +85,8 @@ class DualSenseServerProxy:
             "--ctrl-port", str(self._child_port),
             "--parent-port", str(self._parent_port),
         ]
+        if not getattr(self, "enable_audio", True):
+            args.append("--disable-audio")
         if getattr(sys, "frozen", False):
             return [sys.executable, "--dualsense-server"] + args
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dualsense_server_process.py")

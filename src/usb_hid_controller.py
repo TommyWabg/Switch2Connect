@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 """Wired USB support for the Switch 2 Pro Controller 2.
 
 A physically-connected Pro Controller 2 (USB, VID 0x057E / PID 0x2069) is adapted
@@ -509,17 +528,106 @@ def initialize_pro_controller2_usb_reports() -> bool:
                 pass
 
 
-def _pro2_usb_output_body(data: bytes) -> bytes:
+def _limit_frame_amp_sum(frame: bytes, limit: int = 511) -> bytes:
+    """Enforce lf_amp + hf_amp <= limit on one 5-byte HD-rumble frame, scaling BOTH
+    amplitudes down proportionally (weighted) so their low/high ratio is preserved.
+    Frequency and tone bits are untouched. Frame layout:
+    Byte 0: hf_amp[0:7]
+    Byte 1: hf_amp[8] (bit 0), hf_freq[0:6] (bits 1-7)
+    Byte 2: lf_amp[0:7]
+    Byte 3: lf_amp[8] (bit 0), lf_freq[0:6] (bits 1-7)
+    Byte 4: padding"""
+    if len(frame) != 5:
+        return frame
+    
+    hf_amp = frame[0] + ((frame[1] & 0x01) << 8)
+    lf_amp = frame[2] + ((frame[3] & 0x01) << 8)
+    
+    total = lf_amp + hf_amp
+    if total <= limit:
+        return frame
+        
+    nhf = hf_amp * limit // total
+    nlf = lf_amp * limit // total
+    
+    out = bytearray(frame)
+    out[0] = nhf & 0xFF
+    out[1] = (out[1] & 0xFE) | ((nhf >> 8) & 0x01)
+    out[2] = nlf & 0xFF
+    out[3] = (out[3] & 0xFE) | ((nlf >> 8) & 0x01)
+    
+    return bytes(out)
+
+
+def _limit_combined_amp_sum(frame_l: bytes, frame_r: bytes, limit: int = 300) -> tuple[bytes, bytes]:
+    """Enforce total amplitude (left + right) <= limit across two frames to prevent USB power surges."""
+    if len(frame_l) != 5 or len(frame_r) != 5:
+        return frame_l, frame_r
+        
+    hf_amp_l = frame_l[0] + ((frame_l[1] & 0x01) << 8)
+    lf_amp_l = frame_l[2] + ((frame_l[3] & 0x01) << 8)
+    hf_amp_r = frame_r[0] + ((frame_r[1] & 0x01) << 8)
+    lf_amp_r = frame_r[2] + ((frame_r[3] & 0x01) << 8)
+    
+    total = lf_amp_l + hf_amp_l + lf_amp_r + hf_amp_r
+    if total <= limit:
+        return frame_l, frame_r
+        
+    nhf_l = hf_amp_l * limit // total
+    nlf_l = lf_amp_l * limit // total
+    nhf_r = hf_amp_r * limit // total
+    nlf_r = lf_amp_r * limit // total
+    
+    out_l = bytearray(frame_l)
+    out_l[0] = nhf_l & 0xFF
+    out_l[1] = (out_l[1] & 0xFE) | ((nhf_l >> 8) & 0x01)
+    out_l[2] = nlf_l & 0xFF
+    out_l[3] = (out_l[3] & 0xFE) | ((nlf_l >> 8) & 0x01)
+    
+    out_r = bytearray(frame_r)
+    out_r[0] = nhf_r & 0xFF
+    out_r[1] = (out_r[1] & 0xFE) | ((nhf_r >> 8) & 0x01)
+    out_r[2] = nlf_r & 0xFF
+    out_r[3] = (out_r[3] & 0xFE) | ((nlf_r >> 8) & 0x01)
+    
+    return bytes(out_l), bytes(out_r)
+
+
+def _pro2_usb_output_body(data: bytes, is_audio_active: bool = False) -> bytes:
     """Return a Pro Controller 2 USB output-report body in hid_reports.md order.
 
     ``set_vibration`` emits ``0x00 + LEFT(16) + RIGHT(16)`` (controller.py:1908-1914),
     which already matches Output Report 0x02 (hid_reports.md: 0x1=Left LRA, 0x11=Right
     LRA).  So we only strip the leading Bluetooth report-id byte (0x00) and keep the
     left-then-right order intact.  (Earlier code swapped the two 16-byte blocks, which
-    mirrored stereo audio haptics onto the wrong actuator.)"""
+    mirrored stereo audio haptics onto the wrong actuator.)
+
+    WIRED-ONLY rule: each frame's combined amplitude (traditional rumble + audio haptic
+    + adaptive trigger, already merged into these frames by ``set_vibration``) must not
+    exceed 511; over-limit frames are scaled down proportionally. This builder is used
+    ONLY for the wired Pro Controller 2, so Bluetooth output strength is never touched."""
     payload = bytes(data)
     if len(payload) >= 33 and payload[0] == 0x00:
         payload = payload[1:]
+    if len(payload) >= 32:
+        buf = bytearray(payload)
+        # Three 5-byte frames per 16-byte block: L @ 1/6/11, R @ 17/22/27.
+        for slot in range(3):
+            off_l = 1 + slot * 5
+            off_r = 17 + slot * 5
+            
+            # Step 1: hardware limit 511 per motor
+            frame_l = _limit_frame_amp_sum(bytes(buf[off_l:off_l + 5]), limit=511)
+            frame_r = _limit_frame_amp_sum(bytes(buf[off_r:off_r + 5]), limit=511)
+            
+            # Step 2: global combined limit 800 to prevent USB power surges (unlocked for Type-C)
+            if is_audio_active:
+                frame_l, frame_r = _limit_combined_amp_sum(frame_l, frame_r, limit=800)
+            
+            buf[off_l:off_l + 5] = frame_l
+            buf[off_r:off_r + 5] = frame_r
+            
+        payload = bytes(buf)
     return payload.ljust(PRO2_OUTPUT_REPORT_BODY_SIZE, b"\x00")
 
 
@@ -653,6 +761,9 @@ class _UsbHidClient:
         self._read_thread = None
         self._read_stop = threading.Event()
         self._write_lock = threading.Lock()
+        self.is_high_speed_usb = False
+        self._input_deltas = []
+        self._last_input_time = 0.0
         self._last_usb_rumble_active = None
         self._last_usb_rumble_refresh = 0.0
         self._last_usb_rumble_command = None
@@ -671,6 +782,16 @@ class _UsbHidClient:
         self._last_bulk_fallback = 0.0
         self._timer_res_raised = False
         self._last_rumble_write_warn = 0.0
+        # Audio-haptic rate gate: the controller sets this True whenever the emulated
+        # DualSense is receiving an audio-haptic PCM stream (any form, including all-zero
+        # frames). The write loop then caps at 40 Hz (25 ms); pure traditional rumble
+        # runs at 60 Hz (15 ms). Wired Audio Haptic halts the pad's OUT endpoint above
+        # ~40 Hz, so this cap is required.
+        self.is_audio_haptic_active = False
+        self._last_was_audio_haptic = False
+        # Lazily set by _write_rumble_frame on congestion; read by the loop only while
+        # _congested_until is in the future, so a default keeps the first read safe.
+        self._congest_interval = 0.025
         # Silence suppression: after a few inactive (zero-amplitude) frames, stop
         # re-sending silence so we only touch the interrupt OUT endpoint when the
         # motor actually needs data -- this keeps the controller's OUT queue from
@@ -762,9 +883,10 @@ class _UsbHidClient:
 
     def _rumble_write_loop(self):
         # Minimum spacing between wire writes. HD rumble frames carry 3x5 ms of
-        # actuator data, so ~15 ms cadence keeps the motor fed without overrunning
-        # the controller's OUT queue; faster-arriving payloads coalesce in the slot.
-        MIN_INTERVAL = 0.015
+        # We dynamically adjust the interval:
+        # - 15ms (66Hz) for traditional vibration (safe, proven)
+        # - 25ms (40Hz) for audio haptics (prevents USB buffer overrun from dense payloads)
+        # The interval is evaluated per frame based on the Controller state.
         # After this many consecutive inactive frames, stop re-sending silence.
         SILENCE_KEEP = 3
         last_write = 0.0
@@ -773,20 +895,27 @@ class _UsbHidClient:
             if self._rumble_stop.is_set():
                 break
             self._rumble_wake.clear()
-            # Congestion backoff widens the interval while the pad is backpressuring.
-            interval = MIN_INTERVAL
-            if time.perf_counter() < self._congested_until:
-                interval = max(interval, self._congest_interval)
-            now = time.perf_counter()
-            gap = now - last_write
-            if gap < interval:
-                time.sleep(interval - gap)
             with self._rumble_slot_lock:
                 data = self._rumble_slot
                 self._rumble_slot = None
             if data is None:
                 continue
 
+            interval = 0.015
+
+            if time.perf_counter() < self._congested_until:
+                interval = max(interval, self._congest_interval)
+            
+            now = time.perf_counter()
+            target_time = last_write + interval
+            if now < target_time:
+                sleep_amount = target_time - now
+                if sleep_amount > 0.002:
+                    # Sleep most of the way, leaving 2ms for spin-wait accuracy
+                    time.sleep(sleep_amount - 0.002)
+                # Spin-wait the remaining time to guarantee strict interval
+                while time.perf_counter() < target_time:
+                    pass
             # Silence suppression: keep the motor definitively stopped by sending a
             # few zero frames, then stop touching the wire until real motion returns.
             if _pro2_rumble_payload_is_active(data):
@@ -809,9 +938,14 @@ class _UsbHidClient:
         elapsed = time.perf_counter() - t0
         if elapsed > 1.0:
             now = time.time()
-            if now - self._last_rumble_write_warn >= 1.0:
+            if now - getattr(self, '_last_rumble_write_warn', 0.0) >= 1.0:
                 self._last_rumble_write_warn = now
                 logger.warning("Wired USB HID rumble write blocked for %.2fs", elapsed)
+                if hasattr(self, '_blackbox_history') and not getattr(self, '_blackbox_frozen', False):
+                    self._blackbox_frozen = True
+                    logger.warning("USB RUMBLE BLACKBOX (write blocked): last 32 wire writes ->")
+                    for _t, _wr, _ms, _rep in list(self._blackbox_history):
+                        logger.warning("  t=%.3f wr=%s ms=%.1f report=%s", _t, _wr, _ms, _rep)
 
         # Congestion backoff: a write that takes >40 ms means the pad is NAKing/
         # backpressuring the interrupt OUT endpoint. Widen the next few intervals so
@@ -830,18 +964,6 @@ class _UsbHidClient:
 
         self._hid_rumble_fail_streak += 1
 
-        # OUT-pipe stall self-heal: a run of writes that each burn hidapi's ~1 s
-        # internal timeout (elapsed > 0.5 s, non-positive return) means the pad has
-        # stopped draining the endpoint and will never recover on its own. Close and
-        # reopen the hid handle (software equivalent of a re-plug).
-        if written is not None and written <= 0 and elapsed > 0.5:
-            self._stall_streak += 1
-            if self._stall_streak >= 3:
-                self._recover_device()
-                return
-        else:
-            self._stall_streak = 0
-
         # Only fall back to the expensive Bulk/WinUSB path when the device has NEVER
         # accepted a hid report (init-time transport probe). Once hid writes have
         # succeeded, a failure is a stall to be healed by reopen -- not a reason to
@@ -850,39 +972,6 @@ class _UsbHidClient:
         if not self._hid_rumble_ok and now - self._last_bulk_fallback >= 0.5:
             self._last_bulk_fallback = now
             self.write_rumble_command(data)
-
-    def _recover_device(self):
-        """Close and reopen the hid handle to clear a stalled interrupt OUT pipe.
-        Runs on the writer thread; the read thread stands down via ``_io_pause``."""
-        now = time.time()
-        if now - self._last_recover < 5.0:
-            return
-        self._last_recover = now
-        self._recover_attempts += 1
-        if self._recover_attempts > 3:
-            logger.error("Wired USB rumble: OUT pipe still stalled after %d reopen attempts; "
-                         "giving up until controller is re-plugged", self._recover_attempts - 1)
-            return
-        logger.warning("Wired USB rumble: OUT pipe stalled, reopening hid handle (attempt %d)",
-                       self._recover_attempts)
-        self._io_pause.set()
-        try:
-            time.sleep(0.02)  # let any in-flight dev.read return
-            with self._write_lock:
-                dev = self.dev
-                self.dev = None
-                if dev is not None:
-                    try:
-                        dev.close()
-                    except Exception:
-                        logger.debug("Wired USB rumble: dev.close during recover failed", exc_info=True)
-                try:
-                    self.open()
-                except Exception:
-                    logger.warning("Wired USB rumble: reopen failed during recover", exc_info=True)
-        finally:
-            self._io_pause.clear()
-        self._stall_streak = 0
 
     def write_rumble_command(self, data):
         active = _pro2_rumble_payload_is_active(data)
@@ -907,13 +996,28 @@ class _UsbHidClient:
 
     def write_output_report(self, data, report_id=OUTPUT_REPORT_ID_PRO2):
         self.open()
-        payload = _pro2_usb_output_body(data)
+        is_audio = getattr(self, 'is_audio_haptic_active', False)
+        payload = _pro2_usb_output_body(data, is_audio_active=is_audio)
         report = bytes([report_id]) + payload
+            
         with self._write_lock:
             try:
+                t0 = time.perf_counter()
                 written = self.dev.write(report)
             except TypeError:
+                t0 = time.perf_counter()
                 written = self.dev.write(list(report))
+                
+        # BLACKBOX RECORD
+        if not getattr(self, "_blackbox_frozen", False):
+            if not hasattr(self, "_blackbox_history"):
+                self._blackbox_history = []
+                
+            elapsed = time.perf_counter() - t0
+            self._blackbox_history.append((time.time(), written, elapsed * 1000, report.hex()))
+            if len(self._blackbox_history) > 32:
+                self._blackbox_history.pop(0)
+            
         return written
 
     def write_command_report(self, command: bytes):
@@ -968,6 +1072,23 @@ class _UsbHidClient:
                 break
             if not data:
                 continue
+                
+            now = time.perf_counter()
+            if self._last_input_time > 0:
+                delta = now - self._last_input_time
+                if delta < 0.05:
+                    self._input_deltas.append(delta)
+                    if len(self._input_deltas) > 50:
+                        self._input_deltas.pop(0)
+                        avg_delta = sum(self._input_deltas) / 50.0
+                        new_is_high_speed_usb = (avg_delta <= 0.0015)
+                        if getattr(self, '_logged_speed', None) is None:
+                            self._logged_speed = True
+                            rate = 1.0 / avg_delta if avg_delta > 0 else 0
+                            logger.info(f"Wired USB Polling Rate Detected: {rate:.1f} Hz (avg interval: {avg_delta*1000:.2f} ms). High Speed: {new_is_high_speed_usb}")
+                        self.is_high_speed_usb = new_is_high_speed_usb
+            self._last_input_time = now
+            
             report_id = data[0]
             if report_id in INPUT_REPORT_IDS:
                 translated = translate_usb_report(data)

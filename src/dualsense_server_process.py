@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import argparse
 import logging
 import os
@@ -31,6 +50,7 @@ def main(argv=None):
     parser.add_argument("--mac-address", default="")
     parser.add_argument("--ctrl-port", type=int, required=True)
     parser.add_argument("--parent-port", type=int, required=True)
+    parser.add_argument("--disable-audio", action="store_true")
     args = parser.parse_args(argv)
 
     log_handlers = [logging.StreamHandler()]
@@ -107,6 +127,7 @@ def main(argv=None):
         mac_address=args.mac_address or None,
         on_audio_data_callback=on_audio_data,
         on_disconnect_callback=on_disconnect,
+        enable_audio=not args.disable_audio,
     )
 
     try:

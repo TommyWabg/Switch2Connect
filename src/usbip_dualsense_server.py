@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import struct
 import logging
 import time
@@ -31,6 +50,7 @@ from usbip_server import USBIPServer, USBIP_VERSION, OP_REP_DEVLIST, OP_REP_IMPO
 from dualsense_descriptors import (
     DUALSENSE_DEVICE_DESCRIPTOR, 
     DUALSENSE_CONFIGURATION_DESCRIPTOR, 
+    DUALSENSE_CONFIGURATION_DESCRIPTOR_NO_AUDIO,
     DUALSENSE_HID_REPORT_DESCRIPTOR,
     DUALSENSE_STRING_LANG,
     DUALSENSE_STRING_MANUFACTURER,
@@ -139,8 +159,9 @@ def _load_native_timing():
     return None
 
 class USBIPDualSenseServer(USBIPServer):
-    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None, on_audio_data_callback=None, on_disconnect_callback=None):
+    def __init__(self, host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None, on_audio_data_callback=None, on_disconnect_callback=None, enable_audio=True):
         super().__init__(host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address, on_audio_data_callback=on_audio_data_callback, on_disconnect_callback=on_disconnect_callback)
+        self.enable_audio = enable_audio
         
         # 徹底拆分 IN (麥克風) 與 OUT (喇叭/震動) 的佇列，避免互相阻塞
         self.pending_iso_out_urbs = queue.Queue()
@@ -1714,7 +1735,7 @@ class USBIPDualSenseServer(USBIPServer):
             0x00,   # bDeviceProtocol
             0x01,   # bConfigurationValue
             0x01,   # bNumConfigurations
-            0x04    # bNumInterfaces (UAC1 Control, Streaming OUT, Streaming IN mic, HID)
+            0x04 if self.enable_audio else 0x01 # bNumInterfaces (UAC1 Control, Streaming OUT, Streaming IN mic, HID) OR just HID
         )
 
     def _send_devlist(self, sock):
@@ -1726,8 +1747,13 @@ class USBIPDualSenseServer(USBIPServer):
         iface1 = struct.pack("!BBBB", 0x01, 0x02, 0x00, 0x00) # Interface 1: Audio Streaming OUT
         iface2 = struct.pack("!BBBB", 0x01, 0x02, 0x00, 0x00) # Interface 2: Audio Streaming IN (mic)
         iface3 = struct.pack("!BBBB", 0x03, 0x00, 0x00, 0x00) # Interface 3: HID
-
-        sock.sendall(reply_header + dev_desc + iface0 + iface1 + iface2 + iface3)
+        
+        if self.enable_audio:
+            sock.sendall(reply_header + dev_desc + iface0 + iface1 + iface2 + iface3)
+        else:
+            # Only 1 Interface: HID (must match Interface 0 in NO_AUDIO descriptor)
+            iface_hid_only = struct.pack("!BBBB", 0x03, 0x00, 0x00, 0x00)
+            sock.sendall(reply_header + dev_desc + iface_hid_only)
 
     def _handle_submit(self, sock, seqnum, devid, direction, ep, transfer_length, setup, out_data, start_frame=0, num_packets=0, iso_descriptors=b""):
         status = 0
@@ -1827,7 +1853,10 @@ class USBIPDualSenseServer(USBIPServer):
                 return DUALSENSE_DEVICE_DESCRIPTOR[:length]
                 
             elif desc_type == 0x02: # Configuration Descriptor
-                return DUALSENSE_CONFIGURATION_DESCRIPTOR[:length]
+                if self.enable_audio:
+                    return DUALSENSE_CONFIGURATION_DESCRIPTOR[:length]
+                else:
+                    return DUALSENSE_CONFIGURATION_DESCRIPTOR_NO_AUDIO[:length]
                 
             elif desc_type == 0x03: # String Descriptor
                 if desc_idx == 0:

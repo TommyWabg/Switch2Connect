@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import bleak
 from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic, BleakError
 from bleak.backends.device import BLEDevice
@@ -21,7 +40,7 @@ try:
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
 except Exception:
     pass
-from config import CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN
+from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN
 from utils import (
     apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
@@ -67,14 +86,14 @@ def _set_current_thread_priority(level):
             kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
     except Exception:
         pass
+JOYCON2_LEFT_PID = 0x2067
 
-USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL = 0.015
+USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL = 0.0166
 USBIP_PS5_CONCURRENT_RUMBLE_TEST = True
 
 # Controller identification info
 NINTENDO_VENDOR_ID = 0x057e
 JOYCON2_RIGHT_PID = 0x2066
-JOYCON2_LEFT_PID = 0x2067
 PRO_CONTROLLER2_PID = 0x2069
 NSO_GAMECUBE_CONTROLLER_PID = 0x2073
 PRO_CONTROLLER_PID = 0x2009
@@ -94,6 +113,200 @@ CONTROLER_NAMES = {
 _gc_debug_counter = 0
 
 
+def _hf_mask_at_strength5(hf_mapped, is_pro):
+    """High-frequency dynamic mask at Strength=5 (PS5 Emu Mode / Xbox Rumble curve).
+
+    hf_mapped is the 1..10 normalized high-frequency position.  Used by both the Xbox
+    rumble path and the Audio-Haptics direct path so the two never diverge.
+    """
+    if is_pro:
+        if hf_mapped <= 5.0:
+            return 0.25 - 0.0375 * (hf_mapped - 1.0)
+        return 0.1 + 0.028 * (hf_mapped - 5.0)
+    if hf_mapped <= 5.0:
+        return 0.19 - 0.02375 * (hf_mapped - 1.0)
+    return 0.095 + 0.00164 * (hf_mapped - 5.0)
+
+
+def _vib_map_y700_to_ble(value: int, direct_gain: float) -> int:
+    """Map a y700 raw02 physical amplitude (0..29000) to a BLE 10-bit amplitude (0..1023).
+
+    Extracted from set_vibration() so it is not redefined on every rumble tick.
+    Mirrors the original map_y700_switch_amp_to_ble() closure exactly.
+    """
+    mapped = float(max(0, int(value))) * 1023.0 * direct_gain / 29000.0
+    return min(1023, max(0, int(round(mapped))))
+
+
+def _vib_convert_y700_frame(v, direct_gain: float):
+    """Convert a y700 raw02 VibrationData frame through the BLE Switch rumble encoding.
+
+    Matches the original convert_y700_audio_haptic_frame() closure exactly.
+    Returns a new VibrationData with BLE-scaled fields.
+    """
+    high_freq = int(v.hf_freq) & 0x03ff
+    low_freq  = int(v.lf_freq) & 0x03ff
+    high_amp  = int(v.hf_amp)  & 0xffc0
+    low_amp   = int(v.lf_amp)  & 0xffc0
+
+    frame = bytearray(5)
+    frame[0] = high_freq & 0xff
+    frame[1] = ((high_freq >> 8) & 0x03) | ((high_amp >> 4) & 0xfc)
+    frame[2] = ((high_amp >> 12) & 0x0f) | ((low_freq & 0x0f) << 4)
+    frame[3] = ((low_freq >> 4) & 0x3f) | (low_amp & 0xc0)
+    frame[4] = (low_amp >> 8) & 0xff
+
+    decoded_high_freq = frame[0] | ((frame[1] & 0x03) << 8)
+    decoded_high_amp  = ((frame[1] & 0xfc) << 4) | ((frame[2] & 0x0f) << 12)
+    decoded_low_freq  = ((frame[2] & 0xf0) >> 4) | ((frame[3] & 0x3f) << 4)
+    decoded_low_amp   = (frame[3] & 0xc0) | (frame[4] << 8)
+
+    return VibrationData(
+        lf_freq=decoded_low_freq  & 0x01ff,
+        lf_amp=_vib_map_y700_to_ble(decoded_low_amp, direct_gain),
+        hf_freq=decoded_high_freq & 0x01ff,
+        hf_amp=_vib_map_y700_to_ble(decoded_high_amp, direct_gain),
+    )
+
+
+def _vib_merge_ble(*sources) -> "VibrationData":
+    """Merge multiple VibrationData sources: summed amplitude, winner frequency.
+
+    Extracted from merge_ble_vibrations() closure. Identical logic.
+    """
+    active_sources = [s for s in sources if s is not None]
+    lf_sources = [s for s in active_sources if int(getattr(s, 'lf_amp', 0)) > 0]
+    hf_sources = [s for s in active_sources if int(getattr(s, 'hf_amp', 0)) > 0]
+    lf_winner  = max(lf_sources, key=lambda s: int(s.lf_amp)) if lf_sources else None
+    hf_winner  = max(hf_sources, key=lambda s: int(s.hf_amp)) if hf_sources else None
+    return VibrationData(
+        lf_freq=lf_winner.lf_freq if lf_winner is not None else 0x0e1,
+        lf_en_tone=lf_winner.lf_en_tone if lf_winner is not None else 0,
+        lf_amp=min(1023, max(0, sum(int(getattr(s, 'lf_amp', 0)) for s in active_sources))),
+        hf_freq=hf_winner.hf_freq if hf_winner is not None else 0x1e1,
+        hf_en_tone=hf_winner.hf_en_tone if hf_winner is not None else 0,
+        hf_amp=min(1023, max(0, sum(int(getattr(s, 'hf_amp', 0)) for s in active_sources))),
+    )
+
+
+def _vib_merge_ble_source_aware(base=None, trigger=None, audio=None) -> "VibrationData":
+    """Merge amplitudes as before, but choose frequency by source priority.
+
+    Priority per band: trigger, traditional/base, audio. This preserves the
+    overlay amplitude behavior while keeping event sources from losing their
+    frequency identity to a stronger audio-haptic frame.
+    """
+    sources = [s for s in (base, trigger, audio) if s is not None]
+
+    def band_winner(attr):
+        for source in (trigger, base, audio):
+            if source is not None and int(getattr(source, attr, 0)) > 0:
+                return source
+        return None
+
+    lf_winner = band_winner('lf_amp')
+    hf_winner = band_winner('hf_amp')
+    return VibrationData(
+        lf_freq=lf_winner.lf_freq if lf_winner is not None else 0x0e1,
+        lf_en_tone=lf_winner.lf_en_tone if lf_winner is not None else 0,
+        lf_amp=min(1023, max(0, sum(int(getattr(s, 'lf_amp', 0)) for s in sources))),
+        hf_freq=hf_winner.hf_freq if hf_winner is not None else 0x1e1,
+        hf_en_tone=hf_winner.hf_en_tone if hf_winner is not None else 0,
+        hf_amp=min(1023, max(0, sum(int(getattr(s, 'hf_amp', 0)) for s in sources))),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Derived vibration-config cache
+# ---------------------------------------------------------------------------
+# Key: (strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+#       ignore_freq_scaling, direct_amplitude)
+# Value: (lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain)
+#
+# The cache is per-Controller-instance to avoid cross-instance aliasing, but
+# the computation is pure (no side effects) so a module-level helper is fine.
+
+def _compute_vibration_config(
+    strength, freq_setting, rumble_mode, simulation_mode, is_pro,
+    ignore_freq_scaling, direct_amplitude
+):
+    """Compute the (lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain)
+    tuple for the given controller/config settings.
+
+    This is the exact same logic that was previously inlined at the top of set_vibration()
+    on every call.  Moving it here lets callers cache the result by a settings tuple.
+    """
+    is_switch1 = simulation_mode == "Switch1"
+
+    if ignore_freq_scaling:
+        lf_multiplier = 1.3
+        hf_multiplier = 1.0 if is_pro else 0.6
+    elif is_switch1:
+        if is_pro:
+            if rumble_mode == "Switch":
+                lf_at_5 = 1.0 * (2.6 / 2.6)
+                hf_at_5 = 1.2 * (4.0 / 4.0)
+                if strength <= 5.0:
+                    lf_multiplier = (strength / 5.0) * lf_at_5
+                    hf_multiplier = (strength / 5.0) * hf_at_5
+                else:
+                    t = (strength - 5.0) / 5.0
+                    lf_multiplier = lf_at_5 + (2.6 - lf_at_5) * t
+                    hf_multiplier = hf_at_5 + (4.0 - hf_at_5) * t
+                lf_multiplier = min(2.6, lf_multiplier)
+                hf_multiplier = min(4.0, hf_multiplier)
+            else:
+                target_lf_mult  = (strength / 5.0) * 2.0
+                target_hf_scale = (strength / 5.0) * 1.0
+                target_lf_mult  *= (2.6 / 2.6)
+                target_hf_scale *= (2.0 / 2.0)
+                lf_multiplier = min(2.6, target_lf_mult)
+                hf_multiplier = min(2.0, target_hf_scale)
+        else:
+            if rumble_mode == "Switch":
+                if strength <= 5.0:
+                    lf_multiplier = (strength / 5.0) * 0.504
+                    hf_multiplier = (strength / 5.0) * 0.336
+                else:
+                    t = (strength - 5.0) / 5.0
+                    lf_multiplier = 0.504 + (0.84 - 0.504) * t
+                    hf_multiplier = 0.336 + (0.56 - 0.336) * t
+                lf_multiplier = min(0.84, lf_multiplier)
+                hf_multiplier = min(0.56, hf_multiplier)
+            else:
+                target_lf_mult  = (strength / 5.0) * 2.0
+                target_hf_scale = (strength / 5.0) * 1.0
+                target_lf_mult  *= 1.0
+                target_hf_scale *= 0.5
+                lf_multiplier = min(0.84, target_lf_mult)
+                hf_multiplier = min(0.56, target_hf_scale)
+    elif rumble_mode in ("Switch", "PS5"):
+        if is_pro:
+            if strength <= 5.0:
+                lf_multiplier = (strength / 5.0)
+                hf_multiplier = (strength / 5.0) * 0.6
+            else:
+                t = (strength - 5.0) / 5.0
+                lf_multiplier = 1.0 + (2.6 - 1.0) * t
+                hf_multiplier = 0.6 + (2.0 - 0.6) * t
+            lf_multiplier = min(2.6, lf_multiplier)
+            hf_multiplier = min(2.0, hf_multiplier)
+        else:
+            if strength <= 5.0:
+                lf_multiplier = (strength / 5.0) * 0.504
+                hf_multiplier = (strength / 5.0) * 0.672
+            else:
+                t = (strength - 5.0) / 5.0
+                lf_multiplier = 0.504 + (0.84 - 0.504) * t
+                hf_multiplier = 0.672 + (1.12 - 0.672) * t
+            lf_multiplier = min(0.84, lf_multiplier)
+            hf_multiplier = min(1.12, hf_multiplier)
+    else:
+        target_lf_mult  = (strength / 5.0) * 2.0
+        target_hf_scale = (strength / 5.0) * 1.0
+        if is_pro:
+            target_lf_mult  *= (2.6 / 2.6)
+            target_hf_scale *= (2.0 / 2.0)
 def _hf_mask_at_strength5(hf_mapped, is_pro):
     """High-frequency dynamic mask at Strength=5 (PS5 Emu Mode / Xbox Rumble curve).
 
@@ -1394,27 +1607,36 @@ class Controller:
         finally:
             self._rumble_task_running = False
 
-    async def _audio_haptic_send_worker(self, initial_payload, interval=USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL):
-        """Latest-only audio-haptic rumble loop worker.
+    def _audio_haptic_send_worker_thread(self, initial_payload, initial_interval):
+        """Latest-only audio-haptic rumble loop worker (Hardware Timer Thread).
 
-        Promoted from the per-tick inline `safe_send_latest` closure.
-        Drains _pending_audio_haptic_rumble after each send so the caller only
-        needs to poke _pending_audio_haptic_rumble to coalesce newer payloads.
-        Semantics (coalescing, interval pacing,
-        _audio_haptic_rumble_task_running flag) are identical to the original.
+        Runs on a dedicated OS thread to avoid Windows asyncio scheduler jitter.
+        Uses time.perf_counter() to accurately maintain the 15ms target interval.
         """
+        vc = getattr(self, 'virtual_controller', None)
+        loop = getattr(vc, 'loop', None) if vc else None
+        if not loop:
+            self._audio_haptic_rumble_task_running = False
+            return
+            
+        local_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(local_loop)
+            
         payload_to_send = initial_payload
+        interval = initial_interval
         try:
             while payload_to_send is not None:
                 send_started = time.perf_counter()
                 self._pending_audio_haptic_rumble = None
+                
                 (
                     v1_c_l, v2_c_l, v3_c_l, v1_c_r, v2_c_r, v3_c_r,
                     t1_c_l, t2_c_l, t3_c_l, t1_c_r, t2_c_r, t3_c_r,
                     a1_c_l, a2_c_l, a3_c_l, a1_c_r, a2_c_r, a3_c_r
                 ) = payload_to_send
+                
                 if self.is_pro_controller():
-                    await self.set_vibration(
+                    coro = self.set_vibration(
                         v1_c_l, v2_c_l, v3_c_l, False,
                         v1_c_r, v2_c_r, v3_c_r,
                         audio_overlay=(a1_c_l, a2_c_l, a3_c_l),
@@ -1422,32 +1644,45 @@ class Controller:
                         trigger_overlay=(t1_c_l, t2_c_l, t3_c_l),
                         trigger_overlay_r=(t1_c_r, t2_c_r, t3_c_r))
                 elif self.is_joycon_left():
-                    await self.set_vibration(
+                    coro = self.set_vibration(
                         v1_c_l, v2_c_l, v3_c_l,
                         audio_overlay=(a1_c_l, a2_c_l, a3_c_l),
                         trigger_overlay=(t1_c_l, t2_c_l, t3_c_l))
                 else:
-                    await self.set_vibration(
+                    coro = self.set_vibration(
                         v1_c_r, v2_c_r, v3_c_r,
                         audio_overlay=(a1_c_r, a2_c_r, a3_c_r),
                         trigger_overlay=(t1_c_r, t2_c_r, t3_c_r))
-                elapsed = time.perf_counter() - send_started
-                wait_time = interval - elapsed
-                while wait_time > 0:
+                
+                if not loop.is_closed():
+                    try:
+                        local_loop.run_until_complete(coro)
+                    except Exception as e:
+                        logger.debug(f"Audio haptic local loop error: {e}")
+                    
+                next_time = send_started + interval
+                while True:
                     if getattr(self, '_pending_audio_haptic_rumble_priority', False):
                         break
-                    await asyncio.sleep(min(wait_time, 0.001))
-                    wait_time = interval - (time.perf_counter() - send_started)
-                payload_to_send = getattr(self, '_pending_audio_haptic_rumble', None)
+                    now = time.perf_counter()
+                    if now >= next_time:
+                        break
+                    time_left = next_time - now
+                    if time_left > 0.002:
+                        time.sleep(0.001)
+                    else:
+                        pass # Spin-wait for extreme precision
+                        
+                payload_to_send = self._pending_audio_haptic_rumble
                 if payload_to_send is not None:
-                    interval = getattr(
-                        self,
-                        '_pending_audio_haptic_rumble_interval',
-                        USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL,
-                    )
+                    interval = getattr(self, '_pending_audio_haptic_rumble_interval', interval)
                     self._pending_audio_haptic_rumble_priority = False
         finally:
             self._audio_haptic_rumble_task_running = False
+            try:
+                local_loop.close()
+            except Exception:
+                pass
 
     async def _stereo_rumble_send_worker(
         self, v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
@@ -1501,6 +1736,17 @@ class Controller:
         if current_time - last_rumble_time < 0.007:
             return
         self.last_rumble_time = current_time
+
+        # Tell the wired-USB client whether an audio-haptic PCM stream is engaged (any
+        # form, including all-zero frames -- the stream keeps flowing while silent). The
+        # client's write loop caps at 40 Hz while this is True, else 60 Hz for pure
+        # traditional rumble. Only the wired _UsbHidClient exposes this attribute.
+        client = getattr(self, 'client', None)
+        if client is not None and hasattr(client, 'is_audio_haptic_active'):
+            try:
+                client.is_audio_haptic_active = vc._usbip_audio_stream_recent(current_time)
+            except Exception:
+                pass
 
         if getattr(vc, 'rumble_force_clear', False):
             self.rumble_stopped = False
@@ -1644,10 +1890,14 @@ class Controller:
             self._audio_haptic_rumble_task_running = True
             self._pending_audio_haptic_rumble_interval = send_interval
             self._pending_audio_haptic_rumble_priority = False
-            send_coro = self._audio_haptic_send_worker(pending_payload, send_interval)
-            if not dispatch_rumble_task(send_coro):
-                send_coro.close()
-                self._audio_haptic_rumble_task_running = False
+            self._pending_audio_haptic_rumble = pending_payload
+            
+            t = threading.Thread(
+                target=self._audio_haptic_send_worker_thread,
+                args=(pending_payload, send_interval),
+                daemon=True
+            )
+            t.start()
 
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None):
         if _PERF_DIAGNOSTICS:
@@ -1673,6 +1923,7 @@ class Controller:
         # Use direct_amplitude from the audio-haptics path to determine whether
         # the direct_gain needs to be included in the cache key.
         _use_direct = bool(direct_amplitude or audio_overlay is not None or audio_overlay_r is not None)
+        self.is_audio_haptic_active = _use_direct
 
         # Derived-config cache: keyed on all settings that influence multipliers/factors.
         # A settings change produces a new key -> automatic cache miss.
@@ -1728,13 +1979,15 @@ class Controller:
                     hf_mask = _hf_mask_at_strength5(hf_mapped, is_pro)
                 else:
                     hf_mask = 1.0
+                lf_scaled = v.lf_amp * lf_multiplier
+                hf_scaled = v.hf_amp * hf_mask * hf_multiplier
                 return VibrationData(
                     lf_freq=lf_f,
                     lf_en_tone=v.lf_en_tone,
-                    lf_amp=min(29000, max(0, int(v.lf_amp))),
+                    lf_amp=min(29000, max(0, int(lf_scaled))),
                     hf_freq=hf_f,
                     hf_en_tone=v.hf_en_tone,
-                    hf_amp=min(29000, max(0, int(v.hf_amp * hf_mask)))
+                    hf_amp=min(29000, max(0, int(hf_scaled)))
                 )
 
             if ignore_freq_scaling or (is_pure_switch_rumble and not is_switch1):
@@ -1841,7 +2094,6 @@ class Controller:
                         hf_mask *= 1.0
                 else:
                     hf_mask = 1.0
-
             scaled_lf = min(1023, max(0, int(v.lf_amp * lf_multiplier * lf_mask)))
             scaled_hf = min(1023, max(0, int(v.hf_amp * hf_multiplier * hf_mask)))
             
@@ -1862,8 +2114,12 @@ class Controller:
             scaled_trigger = scale_and_clamp(trigger, force_direct_amplitude=False) if trigger is not None else None
             scaled_audio = scaled_audio_frame(audio) if audio is not None else None
             if scaled_trigger is not None or scaled_audio is not None:
-                return _vib_merge_ble_source_aware(scaled_base, scaled_trigger, scaled_audio)
-            return merge_ble_vibrations(scaled_base)
+                final_vib = _vib_merge_ble_source_aware(scaled_base, scaled_trigger, scaled_audio)
+            else:
+                final_vib = merge_ble_vibrations(scaled_base)
+                
+                
+            return final_vib
 
         v1 = merge_scaled_frame(
             vibration,
@@ -2259,6 +2515,37 @@ class Controller:
             trigger_on_screen_keyboard = False
             trigger_media_action = None
             trigger_change_profile_btn = False
+            cp_map = {
+                "home_mapping": "HOME",
+                "capt_mapping": "CAPT",
+                "plus_mapping": "PLUS",
+                "minus_mapping": "MINUS",
+                "up_mapping": "UP",
+                "down_mapping": "DOWN",
+                "left_mapping": "LEFT",
+                "right_mapping": "RIGHT",
+                "l_stk": "L_STK",
+                "r_stk": "R_STK",
+                "sll_mapping": "SL_L",
+                "srl_mapping": "SR_L",
+                "slr_mapping": "SL_R",
+                "srr_mapping": "SR_R"
+            }
+            for mkey, bkey in cp_map.items():
+                if btn_states.get(bkey) and CONFIG.get_mapping_setting_scoped(mkey, "Default", self._in_app_gyro_mapping_scope()) == "Change Profile":
+                    trigger_change_profile_btn = True
+                    break
+            
+            if not trigger_change_profile_btn:
+                for j_key, stick in [("l_joystick", inputData.left_stick), ("r_joystick", inputData.right_stick)]:
+                    if CONFIG.get_mapping_setting_scoped(j_key, "Default", self._in_app_gyro_mapping_scope()) == "Custom":
+                        dirs, _ = self._stick_sector_state(stick)
+                        for d in dirs:
+                            if CONFIG.get_joystick_custom_scoped(j_key, self._in_app_gyro_mapping_scope()).get(d, "Default") == "Change Profile":
+                                trigger_change_profile_btn = True
+                                break
+                    if trigger_change_profile_btn:
+                        break
 
             mapping_pairs = [
                 # (is_pressed, mapping_key, original_bit, default_action, btn_id)
@@ -2396,11 +2683,26 @@ class Controller:
             if not hasattr(self, 'active_custom_mouse_wheel'):
                 self.active_custom_mouse_wheel = {}
 
+            if not getattr(self, "_ps_drain", False) and not getattr(utils, "profile_selection_active", False):
+                for j_key, stick in [("l_joystick", inputData.left_stick), ("r_joystick", inputData.right_stick)]:
+                    if CONFIG.get_mapping_setting_scoped(j_key, "Default", None) == "Custom":
+                        directions, _ = self._stick_sector_state(stick)
+                        for d in ("up", "down", "left", "right"):
+                            mapping_pairs.append((d in directions, f"{j_key}_{d}", 0, None, f"{j_key}_{d}"))
+
             def get_base_mapping_action(mapping_key):
                 if mapping_key == "gc_l_click" and getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max":
                     return "ZL"
                 if mapping_key == "gc_r_click" and getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max":
                     return "ZR"
+                if mapping_key.startswith("l_joystick_") or mapping_key.startswith("r_joystick_"):
+                    j_key, d = mapping_key.rsplit("_", 1)
+                    if CONFIG.get_mapping_setting(j_key, "Default") == "Custom":
+                        return CONFIG.get_joystick_custom(j_key).get(d, "Default")
+                if mapping_key == "l_stk" and CONFIG.get_mapping_setting("l_joystick_mapping", "Default") == "Custom":
+                    return CONFIG.get_joystick_custom("l_joystick").get("click", "Default")
+                if mapping_key == "r_stk" and CONFIG.get_mapping_setting("r_joystick_mapping", "Default") == "Custom":
+                    return CONFIG.get_joystick_custom("r_joystick").get("click", "Default")
                 return CONFIG.get_mapping_setting(mapping_key, "Default")
 
             # Single pre-pass over the base (Controller Mapping) actions to resolve both
@@ -2415,13 +2717,36 @@ class Controller:
                 self._mode_shift_armed = set(getattr(self, "_mode_shift_tap_held", set()))
             mode_shift_pressed_ids = set()
             mode_shift_tap_edge = False
+
+            in_app_gyro_hold_pressed = False
+            if not hasattr(self, "_in_app_gyro_armed"):
+                self._in_app_gyro_armed = set(getattr(self, "_in_app_gyro_tap_held", set()))
+            in_app_gyro_pressed_ids = set()
+            in_app_gyro_tap_edge = False
+            
+            in_app_gyro_newly_pressed_key = None
+            in_app_gyro_newly_held_key = None
+
             for is_pressed, mapping_key, _ms_bit, default_action, btn_id in mapping_pairs:
                 if btn_id in suppressed_btn_ids:
                     is_pressed = False
                 base_action = get_base_mapping_action(mapping_key)
                 base_resolved = default_action if base_action == "Default" else base_action
                 if is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
-                    trigger_gyro = True
+                    in_app_gyro_hold_pressed = True
+                
+                if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and CONFIG._is_in_app_gyro_value(base_resolved):
+                    if is_pressed:
+                        in_app_gyro_pressed_ids.add(btn_id)
+                    if base_resolved.startswith("Custom[Tap]:"):
+                        if is_pressed and btn_id not in self._in_app_gyro_armed:
+                            in_app_gyro_tap_edge = True
+                            in_app_gyro_newly_pressed_key = mapping_key
+                    else:  # Hold
+                        if is_pressed:
+                            in_app_gyro_hold_pressed = True
+                            if btn_id not in self._in_app_gyro_armed:
+                                in_app_gyro_newly_held_key = mapping_key
                 if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and base_resolved.endswith(":" + MODE_SHIFT_TOKEN):
                     if is_pressed:
                         mode_shift_pressed_ids.add(btn_id)
@@ -2437,6 +2762,26 @@ class Controller:
             self._mode_shift_armed = mode_shift_pressed_ids
             # Compatibility for any older runtime state readers.
             self._mode_shift_tap_held = self._mode_shift_armed
+
+            local_in_app_gyro_toggle = bool(getattr(self, "_in_app_gyro_toggle", False))
+            if in_app_gyro_tap_edge and not is_merged:
+                local_in_app_gyro_toggle = not local_in_app_gyro_toggle
+                self._in_app_gyro_toggle = local_in_app_gyro_toggle
+            self._in_app_gyro_armed = in_app_gyro_pressed_ids
+            self._in_app_gyro_tap_held = self._in_app_gyro_armed
+            
+            new_trigger_key = in_app_gyro_newly_pressed_key or in_app_gyro_newly_held_key
+            if new_trigger_key:
+                self._last_in_app_gyro_trigger_key = new_trigger_key
+                self._last_in_app_gyro_trigger_time = time.perf_counter()
+            
+            self._own_in_app_gyro_tap_edge = in_app_gyro_tap_edge
+            self._own_last_in_app_gyro_trigger_key = getattr(self, "_last_in_app_gyro_trigger_key", None)
+            self._own_last_in_app_gyro_trigger_time = getattr(self, "_last_in_app_gyro_trigger_time", 0.0)
+            self._own_in_app_gyro_hold_pressed = in_app_gyro_hold_pressed
+            self._own_in_app_gyro_toggle = local_in_app_gyro_toggle
+            trigger_gyro = local_in_app_gyro_toggle != in_app_gyro_hold_pressed
+
             local_mode_shift_toggle = bool(getattr(self, "_mode_shift_toggle", False))
             # Share the Mode Shift back-button state across a merged Joy-Con pair so pressing
             # it on EITHER Joy-Con applies the Mode Shift layer to BOTH sides. Publish the
@@ -2457,7 +2802,20 @@ class Controller:
             # In-app Gyro auto-applies the Mode Shift layer only when the per-(profile,
             # Gyro Control) Mode Shift toggle is On; the back button applies it regardless.
             in_app_gyro_active = getattr(self, "gyro_mouse_enabled", False) or trigger_gyro
-            mapping_scope_active = (in_app_gyro_active and CONFIG.mode_shift_enabled) or mode_shift_button_active
+            in_app_gyro_mode_shift = bool(in_app_gyro_active and CONFIG.mode_shift_enabled)
+            
+            prev_in_app_gyro_mode_shift = getattr(self, "_prev_in_app_gyro_mode_shift", False)
+            if prev_in_app_gyro_mode_shift and not in_app_gyro_mode_shift:
+                self._mode_shift_toggle = False
+                mode_shift_toggle = False
+                if is_merged:
+                    self._shared_mode_shift_toggle = False
+                    mode_shift_button_active = mode_shift_toggle != (mode_shift_hold_pressed or False)
+                else:
+                    mode_shift_button_active = mode_shift_toggle != mode_shift_hold_pressed
+            self._prev_in_app_gyro_mode_shift = in_app_gyro_mode_shift
+            
+            mapping_scope_active = in_app_gyro_mode_shift != mode_shift_button_active
             self._mode_shift_active = mapping_scope_active
             # Resolve the active In-app Gyro mapping dict once per report and index it
             # directly below, instead of calling a resolving getter for every button.
@@ -2472,12 +2830,25 @@ class Controller:
                 base_action = get_base_mapping_action(mapping_key)
                 base_resolved = default_action if base_action == "Default" else base_action
                 if is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
-                    trigger_gyro = True
-                # The Mode Shift trigger is handled in the pre-pass above; skip it here so
+                    pass # Handled in pre-pass
                 # it doesn't also emit whatever the shifted layer maps that button to.
                 if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and base_resolved.endswith(":" + MODE_SHIFT_TOKEN):
                     continue
-                action = mapping_scope_dict.get(f"{mapping_key}_mapping", "Default") if mapping_scope_dict is not None else base_action
+                if mapping_scope_dict is not None:
+                    if mapping_key.startswith("l_joystick_") or mapping_key.startswith("r_joystick_"):
+                        j_key, d = mapping_key.rsplit("_", 1)
+                        if mapping_scope_dict.get(f"{j_key}_mapping", "Default") == "Custom":
+                            action = CONFIG.get_joystick_custom_scoped(j_key, self._in_app_gyro_mapping_scope()).get(d, "Default")
+                        else:
+                            action = mapping_scope_dict.get(f"{mapping_key}_mapping", "Default")
+                    elif mapping_key == "l_stk" and mapping_scope_dict.get("l_joystick_mapping", "Default") == "Custom":
+                        action = CONFIG.get_joystick_custom_scoped("l_joystick", self._in_app_gyro_mapping_scope()).get("click", "Default")
+                    elif mapping_key == "r_stk" and mapping_scope_dict.get("r_joystick_mapping", "Default") == "Custom":
+                        action = CONFIG.get_joystick_custom_scoped("r_joystick", self._in_app_gyro_mapping_scope()).get("click", "Default")
+                    else:
+                        action = mapping_scope_dict.get(f"{mapping_key}_mapping", "Default")
+                else:
+                    action = base_action
                 resolved = default_action if action == "Default" else action
 
                 # In-app Gyro Lock: pause gyro control while staying in In-app Gyro mode.
@@ -2501,14 +2872,27 @@ class Controller:
                 if isinstance(resolved, str) and resolved.startswith("Custom") and resolved.endswith(":" + MODE_SHIFT_TOKEN):
                     continue
 
+                if isinstance(resolved, str) and resolved.startswith("Custom") and CONFIG._is_in_app_gyro_value(resolved):
+                    simul_action = CONFIG.get_mapping_setting(f"{mapping_key}_in_app_gyro_simul", "None")
+                    resolved = default_action if simul_action == "Default" else simul_action
+                    
                 if isinstance(resolved, str) and resolved.startswith("Custom"):
-                    is_custom = True
+                    is_joystick_dir = mapping_key.startswith("l_joystick_") or mapping_key.startswith("r_joystick_")
+                    is_custom = not is_joystick_dir
+                    
+                    if CONFIG._is_in_app_gyro_value(resolved) or resolved.endswith(":" + GYRO_LOCK_TOKEN):
+                        is_custom = False
+
                     if resolved.startswith("Custom[Tap]:"):
                         seq_str = resolved[12:]
                         mode = "Tap"
+                        is_internal_action = seq_str in ("CALIBRATE",)
+                        if is_internal_action: is_custom = True
                     elif resolved.startswith("Custom[Hold]:"):
                         seq_str = resolved[13:]
                         mode = "Hold"
+                        is_internal_action = seq_str in ("CALIBRATE",)
+                        if is_internal_action: is_custom = True
                     elif resolved.startswith("Custom:"):
                         seq_str = resolved[7:]
                         mode = "Hold"
@@ -2551,7 +2935,7 @@ class Controller:
                         self.physical_tap_held.remove(btn_id)
                 
                 if is_pressed and not (isinstance(resolved, str) and resolved.startswith("Custom")):
-                    if resolved in ("Gyro", "In-app Gyro"): trigger_gyro = True
+                    if resolved in ("Gyro", "In-app Gyro"): pass # Handled in pre-pass
                     elif resolved == "DJG": trigger_djg = True
                     elif resolved == "Home": inputData.buttons |= SWITCH_BUTTONS["HOME"]
                     elif resolved == "PrtSc": trigger_screenshot = True
@@ -2796,8 +3180,8 @@ class Controller:
             else:
                 # Record own trigger state and use shared trigger (for combined mode cross-controller activation)
                 self._own_gyro_trigger = trigger_gyro
-                self._own_zr_pressed = bool(inputData.buttons & SWITCH_BUTTONS.get("ZR", 0))
-                self._own_zl_pressed = bool(inputData.buttons & SWITCH_BUTTONS.get("ZL", 0))
+                self._own_zr_pressed = bool(current_buttons & SWITCH_BUTTONS.get("ZR", 0))
+                self._own_zl_pressed = bool(current_buttons & SWITCH_BUTTONS.get("ZL", 0))
                 
                 effective_gyro_trigger = trigger_gyro or getattr(self, '_shared_gyro_trigger', False)
                 effective_zr = self._own_zr_pressed or getattr(self, '_shared_zr_pressed', False)
@@ -2927,20 +3311,7 @@ class Controller:
                 # Subscribing gc_input_report_callback to COMMAND_RESPONSE_UUID would
                 # overwrite the command_response_callback registered during initialize(),
                 # causing all write_command() calls (including enableFeatures) to timeout.
-                # Directed advertising can hide the controller PID from the ESP32 scan
-                # cache, so force the bridge-side input source to the GCN legacy notify
-                # characteristic before routing its frames to the standard INPUT_REPORT_UUID.
-                try:
-                    channel = int(getattr(self, 'channel', getattr(self.client, 'channel', 0)))
-                    reply = await asyncio.to_thread(
-                        self.client.send_manager_command,
-                        f"inputsrc {channel} legacy",
-                        0.5,
-                    )
-                    logger.info("GCN via ESP32 bridge: forced legacy input source on channel %d (%s)", channel, reply.strip() or "no reply")
-                    await asyncio.sleep(0.05)
-                except Exception as e:
-                    logger.warning("GCN via ESP32 bridge: failed to force legacy input source: %s", e)
+
 
                 # Use the standard INPUT_REPORT_UUID subscription; the bridge router
                 # ensures GCN input frames reach this callback correctly.
@@ -3381,7 +3752,8 @@ class Controller:
                 self.gyro_moving_envelope = 0.0
             self.gyro_moving_envelope = 0.88 * self.gyro_moving_envelope + 0.12 * omega
             
-            base_dz = 2.0 if self.is_joycon() else 1.0
+            
+            base_dz = (2.0 if self.is_joycon() else 1.0) + float(getattr(CONFIG, 'in_app_gyro_soft_deadzone', 0.0))
             
             # Decay deadzone to 0 quickly (at 3.0 dps) to prevent asymmetric deadzone subtraction during slow turnarounds
             soft_dz = base_dz * (1.0 - min(1.0, self.gyro_moving_envelope / 3.0))
@@ -3465,10 +3837,39 @@ class Controller:
                 self._gyro_rstick_out = (0.0, 0.0)
                 return
             
+            gyro_dampening_multiplier = 1.0
+            trigger_key = getattr(self, "_own_last_in_app_gyro_trigger_key", None)
+            is_merged = getattr(self, "is_merged", False)
+            if is_merged:
+                trigger_key = getattr(self, "_shared_last_in_app_gyro_trigger_key", trigger_key)
+            
+            if zr_pressed:
+                self._last_zr_pressed_time = now
+            if zl_pressed:
+                self._last_zl_pressed_time = now
+                
+            eff_zr_damp = zr_pressed or (now - getattr(self, "_last_zr_pressed_time", 0.0) <= 0.050)
+            eff_zl_damp = zl_pressed or (now - getattr(self, "_last_zl_pressed_time", 0.0) <= 0.050)
+
+            if trigger_pressed and trigger_key:
+                damp_mode = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_mode", "Off", None)
+                if damp_mode != "Off":
+                    apply_damp = False
+                    if damp_mode == "ZR Dampening" and eff_zr_damp:
+                        apply_damp = True
+                    elif damp_mode == "ZL Dampening" and eff_zl_damp:
+                        apply_damp = True
+                    elif damp_mode == "Both Dampening" and (eff_zl_damp or eff_zr_damp):
+                        apply_damp = True
+                        
+                    if apply_damp:
+                        damp_amount = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_amount", 90, None)
+                        gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
+            
             gyro_deadzone = 0.2 
             
             if current_mode in ["World", "Yaw"]:
-                sensitivity = cfg["gyro_sensitivity_mouse"]
+                sensitivity = cfg["gyro_sensitivity_mouse"] * gyro_dampening_multiplier
                 accel_factor = 0.002
                 
                 # Determine vertical sign (invert for Right Joycon in H-mode if needed)
@@ -3510,7 +3911,7 @@ class Controller:
                     tilt_value -= orig_tilt
                 
                 tilt_normalized = tilt_value / 4000.0
-                sensitivity = cfg["gyro_sensitivity_roll"]
+                sensitivity = cfg["gyro_sensitivity_roll"] * gyro_dampening_multiplier
                 # Sensitivity * 1.0 (Inverted sign based on user feedback)
                 steer_value = max(-1.0, min(1.0, -tilt_normalized * sensitivity))
                 
@@ -3524,7 +3925,7 @@ class Controller:
             # is clamped to the right stick's maximum (unit magnitude).
             if gyro_control_mode == "R Joystick":
                 gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
-                rstick_conv = cfg["rstick_conv_scaled"]
+                rstick_conv = cfg["rstick_conv_scaled"] * gyro_dampening_multiplier
                 if current_mode in ["World", "Yaw"]:
                     v_sign = -1.0
                     if self.is_joycon_right() and self.hold_mode == "Horizontal":
@@ -3699,6 +4100,18 @@ class Controller:
             if btn_states.get(bkey) and CONFIG.get_mapping_setting_scoped(mkey, "Default", None) == "Change Profile":
                 cp_now = True
                 break
+        
+        if not cp_now:
+            for j_key, j_stick in [("l_joystick", (lx, ly)), ("r_joystick", (rx, ry))]:
+                if CONFIG.get_mapping_setting_scoped(j_key, "Default", None) == "Custom":
+                    dirs, _ = self._stick_sector_state(j_stick)
+                    for d in dirs:
+                        if CONFIG.get_joystick_custom(j_key).get(d, "Default") == "Change Profile":
+                            cp_now = True
+                            break
+                if cp_now:
+                    break
+
         if nav_button_now:
             cp_now = False
 
@@ -3740,19 +4153,36 @@ class Controller:
 
     def _joystick_direction_tokens(self, key, direction_names):
         scope_dict = CONFIG.get_mapping_scope_dict(self._in_app_gyro_mapping_scope())
-        mode = scope_dict.get(f"{key}_mapping", "Default")
+        mode = CONFIG.get_mapping_setting_scoped(key, "Default", self._in_app_gyro_mapping_scope())
         if mode == "KB Arrow Keys":
             defaults = {"up": "VK_UP", "down": "VK_DOWN", "left": "VK_LEFT", "right": "VK_RIGHT"}
         else:
             defaults = {"up": "VK_W", "down": "VK_S", "left": "VK_A", "right": "VK_D"}
-        custom = scope_dict.get(f"{key}_custom", {}) if mode == "Custom" else {}
+        custom = CONFIG.get_joystick_custom_scoped(key, self._in_app_gyro_mapping_scope()) if mode == "Custom" else {}
         hold_tokens = []
         tap_tokens_by_direction = {}
         for direction in direction_names:
-            action = custom.get(direction, "Default") if mode == "Custom" else "Default"
-            if action == "Custom":
+            if mode == "Custom":
                 action = scope_dict.get(f"{key}_{direction}_mapping", "Default")
+                if action == "Default" and custom.get(direction, "Default") != "Default":
+                    action = custom.get(direction)
+            else:
+                action = "Default"
             hold, tap = self._action_to_joystick_tokens(action, defaults.get(direction))
+            
+            if isinstance(action, str) and action.startswith("Custom") and CONFIG._is_in_app_gyro_value(action):
+                simul_action = CONFIG.get_mapping_setting(f"{key}_{direction}_in_app_gyro_simul", "None")
+                if simul_action not in ("None", "Default"):
+                    if isinstance(simul_action, str) and simul_action.startswith("Custom"):
+                        simul_hold, simul_tap = self._action_to_joystick_tokens(simul_action)
+                        hold.extend(simul_hold)
+                        tap.extend(simul_tap)
+                    elif simul_action in SWITCH_BUTTONS:
+                        hold.append(f"BTN_{simul_action}")
+                    elif simul_action == "Home": hold.append("BTN_HOME")
+                    elif simul_action == "Capture": hold.append("BTN_CAPT")
+                    elif simul_action == "PrtSc": hold.append("VK_SNAPSHOT")
+                    
             hold_tokens.extend(hold)
             if tap:
                 tap_tokens_by_direction[direction] = tap
@@ -3762,10 +4192,9 @@ class Controller:
         directions, _ = self._stick_sector_state(stick)
         return directions
 
-    def _stick_sector_state(self, stick):
+    def _stick_sector_state(self, stick, center_deadzone=0.40):
         x, y = stick
         magnitude = math.sqrt(x * x + y * y)
-        center_deadzone = 0.40
         if magnitude < center_deadzone:
             return [], None
         sector = int(round((math.atan2(y, x) - math.pi / 2) / (math.pi / 4))) % 8
@@ -3939,7 +4368,7 @@ class Controller:
         if now - self.joystick_scroll_last_time.get(key, 0.0) < 0.03:
             return
         magnitude = math.sqrt(stick[0] * stick[0] + stick[1] * stick[1])
-        deadzone = 0.05
+        deadzone = 0.08
         if magnitude <= deadzone:
             self.joystick_scroll_tap_armed.pop(key, None)
             return
@@ -3949,8 +4378,8 @@ class Controller:
         activation = CONFIG.get_joystick_setting_scoped(key, "scroll_activation", "Hold", scope)
         vertical = 0
         horizontal = 0
-        step = max(1, int(120 * normalized_mag))
-        directions, _ = self._stick_sector_state(stick)
+        step = max(30, int(150 * normalized_mag))
+        directions, _ = self._stick_sector_state(stick, center_deadzone=deadzone)
         input_state = "_".join(directions) if directions else None
         if activation == "Tap":
             if input_state is None or self.joystick_scroll_tap_armed.get(key) == input_state:
@@ -4004,9 +4433,8 @@ class Controller:
             self._tap_os_keys(vk)
 
     def _apply_shared_joystick_mapping(self, inputData):
-        scope_dict = CONFIG.get_mapping_scope_dict(self._in_app_gyro_mapping_scope())
-        left_mode = scope_dict.get("l_joystick_mapping", "Default")
-        right_mode = scope_dict.get("r_joystick_mapping", "Default")
+        left_mode = CONFIG.get_mapping_setting_scoped("l_joystick", "Default", self._in_app_gyro_mapping_scope())
+        right_mode = CONFIG.get_mapping_setting_scoped("r_joystick", "Default", self._in_app_gyro_mapping_scope())
         original_left = inputData.left_stick
         original_right = inputData.right_stick
         output_left = original_left

@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import asyncio
 import json
 import logging
@@ -53,7 +72,7 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "0.12.2"
+APP_FIRMWARE_VERSION = "0.12.3"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_1"
 MAX_ESP32S3_CHANNELS = 8

@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import logging
 import math
 import os
@@ -116,10 +135,17 @@ class DualSenseHapticProcessor:
     # raw range into 281..HF_OUTPUT_MAX_FREQUENCY so high-frequency detail survives.
     HF_RAW_MIN_FREQUENCY = 281
     HF_RAW_MAX_FREQUENCY = 609
+    # Low band peak-bin frequencies for LOW_BIN_MIN/MAX: round(2*3000/64)=94,
+    # round(5*3000/64)=234.  Redistribute that raw span into the full output range
+    # [70,300] (like _remap_hf_frequency) instead of hard-clamping to the same window.
+    LF_OUTPUT_MIN_FREQUENCY = 70
+    LF_OUTPUT_MAX_FREQUENCY = 300
+    LF_RAW_MIN_FREQUENCY = 94
+    LF_RAW_MAX_FREQUENCY = 234
 
     ACTIVITY_ENVELOPE_THRESHOLD = 512
     ACTIVITY_PEAK_THRESHOLD = 2048
-    SILENCE_PACKETS_BEFORE_STOP = 80
+    SILENCE_PACKETS_BEFORE_STOP = 30
     SAFE_MAXIMUM_AMPLITUDE = 29000
     ISOLATED_IMPULSE_PEAK_THRESHOLD = 30000
     ISOLATED_IMPULSE_NEIGHBOR_THRESHOLD = 64
@@ -238,6 +264,24 @@ class DualSenseHapticProcessor:
             if self.output_active and self.silence_packets >= self.SILENCE_PACKETS_BEFORE_STOP:
                 self.output_active = False
                 self._emit_silence()
+                return
+            
+            if self.output_active and hasattr(self, '_last_spectral'):
+                # Fade out phase (Release Gate):
+                # We freeze the frequencies to avoid noise-floor buzz, but smoothly decay
+                # the amplitudes to zero over the duration of the SILENCE_PACKETS_BEFORE_STOP window.
+                spectral = self._last_spectral.copy()
+                multiplier = max(0.0, 1.0 - (self.silence_packets / self.SILENCE_PACKETS_BEFORE_STOP))
+                
+                spectral["left_lf_amp"] = int(spectral["left_lf_amp"] * multiplier)
+                spectral["left_hf_amp"] = int(spectral["left_hf_amp"] * multiplier)
+                spectral["right_lf_amp"] = int(spectral["right_lf_amp"] * multiplier)
+                spectral["right_hf_amp"] = int(spectral["right_hf_amp"] * multiplier)
+                
+                left_intensity = self._to_legacy_intensity(max(spectral["left_lf_amp"], spectral["left_hf_amp"]))
+                right_intensity = self._to_legacy_intensity(max(spectral["right_lf_amp"], spectral["right_hf_amp"]))
+                
+                self.callback(left_intensity, right_intensity, "SPECTRAL", spectral=spectral)
             return
 
         self.silence_packets = 0
@@ -281,15 +325,16 @@ class DualSenseHapticProcessor:
 
         self.output_active = True
         spectral = {
-            "left_lf_freq": self._clamp_frequency(low_freq_left, 70, 300),
+            "left_lf_freq": self._remap_lf_frequency(low_freq_left),
             "left_lf_amp": low_amp_left,
             "left_hf_freq": self._remap_hf_frequency(high_freq_left),
             "left_hf_amp": high_amp_left,
-            "right_lf_freq": self._clamp_frequency(low_freq_right, 70, 300),
+            "right_lf_freq": self._remap_lf_frequency(low_freq_right),
             "right_lf_amp": low_amp_right,
             "right_hf_freq": self._remap_hf_frequency(high_freq_right),
             "right_hf_amp": high_amp_right,
         }
+        self._last_spectral = spectral
 
         left_intensity = self._to_legacy_intensity(max(low_amp_left, high_amp_left))
         right_intensity = self._to_legacy_intensity(max(low_amp_right, high_amp_right))
@@ -574,6 +619,22 @@ class DualSenseHapticProcessor:
         out_span = cls.HF_OUTPUT_MAX_FREQUENCY - raw_min
         mapped = raw_min + (frequency - raw_min) * out_span / raw_span
         return min(cls.HF_OUTPUT_MAX_FREQUENCY, max(1, int(round(mapped))))
+
+    @classmethod
+    def _remap_lf_frequency(cls, frequency):
+        """Linearly redistribute the raw LF band (94..234 Hz, bins 2..5) into the full
+        output range [70,300], so the discrete low bins spread across the range instead
+        of bunching at 94/141/188/234.  Mirrors _remap_hf_frequency in structure."""
+        raw_min = cls.LF_RAW_MIN_FREQUENCY
+        raw_span = cls.LF_RAW_MAX_FREQUENCY - raw_min
+        out_min = cls.LF_OUTPUT_MIN_FREQUENCY
+        out_span = cls.LF_OUTPUT_MAX_FREQUENCY - out_min
+        if raw_span <= 0:
+            return max(out_min, min(cls.LF_OUTPUT_MAX_FREQUENCY, int(round(frequency))))
+        if frequency <= raw_min:
+            return out_min
+        mapped = out_min + (frequency - raw_min) * out_span / raw_span
+        return min(cls.LF_OUTPUT_MAX_FREQUENCY, max(out_min, int(round(mapped))))
 
     @staticmethod
     def _to_legacy_intensity(amplitude):

@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 r"""Minimal Python wrapper for the HidHide kernel driver control interface.
 
 HidHide (github.com/nefarius/HidHide) hides selected HID devices from every process
@@ -40,6 +59,8 @@ IOCTL_GET_BLACKLIST = _ctl_code(2050)
 IOCTL_SET_BLACKLIST = _ctl_code(2051)
 IOCTL_GET_ACTIVE = _ctl_code(2052)
 IOCTL_SET_ACTIVE = _ctl_code(2053)
+IOCTL_GET_INVERSE = _ctl_code(2054)
+IOCTL_SET_INVERSE = _ctl_code(2055)
 
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
@@ -83,12 +104,9 @@ def _open_control():
 
 
 def is_available() -> bool:
-    """True if the HidHide driver is installed and its control device can be opened."""
-    handle = _open_control()
-    if handle is None:
-        return False
-    _k32.CloseHandle(handle)
-    return True
+    """True if the HidHide driver is installed."""
+    import os
+    return os.path.exists(r"C:\Windows\System32\drivers\HidHide.sys")
 
 
 def _ioctl_get_multisz(handle, code) -> list[str]:
@@ -152,6 +170,46 @@ def set_active(active: bool) -> bool:
         _k32.CloseHandle(handle)
 
 
+def _is_inverse(handle) -> bool:
+    val = ctypes.c_byte(0)
+    returned = wintypes.DWORD(0)
+    ok = _k32.DeviceIoControl(
+        handle, IOCTL_GET_INVERSE, None, 0, ctypes.byref(val), 1, ctypes.byref(returned), None
+    )
+    return bool(ok and val.value)
+
+
+def is_inverse() -> bool:
+    """True when HidHide Inverse Cloak (whitelist) is currently active."""
+    handle = _open_control()
+    if handle is None:
+        return False
+    try:
+        return _is_inverse(handle)
+    finally:
+        _k32.CloseHandle(handle)
+
+
+def _set_inverse(handle, active: bool) -> bool:
+    val = ctypes.c_byte(1 if active else 0)
+    returned = wintypes.DWORD(0)
+    ok = _k32.DeviceIoControl(
+        handle, IOCTL_SET_INVERSE, ctypes.byref(val), 1, None, 0, ctypes.byref(returned), None
+    )
+    return bool(ok)
+
+
+def set_inverse(active: bool) -> bool:
+    """Enable or disable HidHide Inverse Cloak (whitelist mode)."""
+    handle = _open_control()
+    if handle is None:
+        return False
+    try:
+        return _set_inverse(handle, active)
+    finally:
+        _k32.CloseHandle(handle)
+
+
 def _path_to_dos_device_path(path: str) -> str | None:
     """Convert e.g. ``C:\\App\\x.exe`` to ``\\Device\\HarddiskVolumeN\\App\\x.exe``.
 
@@ -193,7 +251,8 @@ def _self_image_path() -> str | None:
 
 def whitelist_self() -> bool:
     """Add this process's image to the HidHide application whitelist so it keeps access
-    to hidden devices. Preserves any existing whitelist entries."""
+    to hidden devices. Preserves any existing whitelist entries.
+    If Inverse Cloak is ON, the user prefers manual management, so we do NOT add ourselves."""
     handle = _open_control()
     if handle is None:
         return False
@@ -201,14 +260,20 @@ def whitelist_self() -> bool:
         dos = _self_image_path()
         if not dos:
             return False
+            
+        is_inverse_mode = _is_inverse(handle)
+        if is_inverse_mode:
+            # User wants to manually manage Inverse Cloak mode. Do not add ourselves.
+            return True
+            
         current = _ioctl_get_multisz(handle, IOCTL_GET_WHITELIST)
         if any(e.lower() == dos.lower() for e in current):
             return True
+            
         current.append(dos)
         return _ioctl_set_multisz(handle, IOCTL_SET_WHITELIST, current)
     finally:
         _k32.CloseHandle(handle)
-
 
 def hide_device(instance_id: str) -> bool:
     """Hide the given device instance: whitelist self, add the instance to the blacklist,

@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 # src/dualsense_descriptors.py
 #
 # Virtual DualSense USB descriptors.
@@ -98,6 +117,21 @@ DUALSENSE_CONFIGURATION_DESCRIPTOR = bytes.fromhex(
     "07 25 01 00 00 00 00"
     # --- Interface 3: HID (DualSense gamepad) ---
     "09 04 03 00 02 03 00 00 00"
+    # HID descriptor (bcdHID 1.11, report descriptor length 289 / 0x0121)
+    "09 21 11 01 00 01 22 21 01"
+    # Endpoint 0x84 IN: Interrupt, 64 bytes, bInterval 1
+    "07 05 84 03 40 00 01"
+    # Endpoint 0x03 OUT: Interrupt, 64 bytes, bInterval 1
+    "07 05 03 03 40 00 01"
+)
+
+# Configuration Descriptor without Audio Endpoints (41 bytes total / 0x0029, 1 interface):
+#  - Interface 0:          HID (DualSense, EP 0x84 IN, EP 0x03 OUT)
+DUALSENSE_CONFIGURATION_DESCRIPTOR_NO_AUDIO = bytes.fromhex(
+    # --- Configuration header (wTotalLength 0x0029 = 41, 1 interface) ---
+    "09 02 29 00 01 01 00 C0 FA"
+    # --- Interface 0: HID (DualSense gamepad) ---
+    "09 04 00 00 02 03 00 00 00"
     # HID descriptor (bcdHID 1.11, report descriptor length 289 / 0x0121)
     "09 21 11 01 00 01 22 21 01"
     # Endpoint 0x84 IN: Interrupt, 64 bytes, bInterval 1

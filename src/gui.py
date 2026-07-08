@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 import sys
 import tempfile, os
 with open(os.path.join(tempfile.gettempdir(), "argv_test.log"), "w") as f:
@@ -17,7 +36,7 @@ import re
 import ctypes
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, _YamlLoader, _YamlDumper
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -30,7 +49,12 @@ import win32gui
 import win32con
 from ctypes import wintypes
 
-APP_VERSION = "0.11.2"
+print("Switch2Connect  Copyright (C) 2026  TommyWabg")
+print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.")
+print("This is free software, and you are welcome to redistribute it")
+print("under certain conditions; type `show c' for details.")
+
+APP_VERSION = "0.12.3"
 
 def _set_current_thread_priority(level):
     try:
@@ -365,17 +389,16 @@ def refresh_ui_scaling(current_screen_height=None):
 
     ui_scale = getattr(CONFIG, 'ui_scale', 1.0)
     ui_dpi, ui_dpi_scale = _get_current_dpi_scale()
-    if screen_height > 1440:
-        resolution_ratio = (ui_dpi_scale / 1.25) * ui_scale
-        window_resolution_ratio = resolution_ratio
-        logger.info(
-            "UI scaling: 4K/high-res DPI mode screen_height=%s dpi=%s dpi_scale=%.3f resolution_ratio=%.3f",
-            screen_height, ui_dpi, ui_dpi_scale, resolution_ratio
-        )
-    elif screen_height == 1440:
+    if screen_height == 1440:
         resolution_ratio = (screen_height / 1440.0) * ui_scale
         window_resolution_ratio = (screen_height / 1440.0) * ui_scale
     else:
+        # Everything other than exactly 1440p — including 4K/high-res — uses the SAME physical,
+        # DPI-independent logic: window size tracks the physical screen height, content scale
+        # tracks the usable client height against the 1440p baseline. This keeps a constant
+        # physical size regardless of the Windows DPI scaling %, and (because it respects the
+        # usable work area) never pushes content off-screen. The old 4K-specific branch tied
+        # the ratio to ui_dpi_scale, which is exactly what caused the high-DPI overflow.
         window_resolution_ratio = (screen_height / 1440.0) * ui_scale
         effective_height = _get_effective_client_height(screen_height)
         try:
@@ -935,13 +958,13 @@ class PlayerInfoBlock:
             vib = VibrationData(lf_amp=800, hf_amp=800)
             off = VibrationData(lf_amp=0, hf_amp=0)
             for controller in self.current_vc.controllers:
-                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, ignore_freq_scaling=True), self.current_vc.loop)
+                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, vib, vib, ignore_freq_scaling=True), self.current_vc.loop)
                 self.parent.after(100, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True), loop))
                 self.parent.after(200, lambda c=controller, loop=self.current_vc.loop, v=vib: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, v, v, ignore_freq_scaling=True), loop))
                 self.parent.after(300, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True), loop))
             
             # Brief UI feedback (consistent size)
             if getattr(self, 'vibrate_frame', None):
@@ -3764,7 +3787,7 @@ class ControllerWindow:
         
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1270 * window_resolution_ratio)
-        default_h = int(1238 * window_resolution_ratio)
+        default_h = int(1250 * window_resolution_ratio)
         x = CONFIG.window_x if CONFIG.window_x is not None else 50
         y = CONFIG.window_y if CONFIG.window_y is not None else 50
         self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
@@ -4668,9 +4691,9 @@ bg_color=panel_bg, widths=[8, 10])
             sliderlength=int(15 * scaling_factor),
             width=int(15 * scaling_factor),
             font=scale_font(("Arial", 11, "bold")),
-            command=self.update_virtual_gyro_soft_deadzone_setting
+            command=self.update_in_app_gyro_soft_deadzone_setting
         )
-        self.in_app_deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
+        self.in_app_deadzone_scale.set(getattr(CONFIG, "in_app_gyro_soft_deadzone", 0.0))
         self.in_app_deadzone_scale.grid(row=3, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
         self.stick_assist_label = tk.Label(self.gyro_frame, text="Stick Assist:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
@@ -4771,18 +4794,14 @@ bg_color=panel_bg, widths=[8, 10])
         logger.info(f"Roll Compensation: {val}")
 
     def update_virtual_gyro_soft_deadzone_setting(self, val):
-        if getattr(self, "_updating_virtual_gyro_soft_deadzone", False):
-            return
         val = float(val)
         CONFIG.virtual_gyro_soft_deadzone = val
-        self._updating_virtual_gyro_soft_deadzone = True
-        try:
-            for attr in ("deadzone_scale", "in_app_deadzone_scale"):
-                scale = getattr(self, attr, None)
-                if scale is not None and abs(float(scale.get()) - val) > 0.001:
-                    scale.set(val)
-        finally:
-            self._updating_virtual_gyro_soft_deadzone = False
+        CONFIG.save_config()
+        logger.info(f"Gyro Pass-Through Deadzone: {val}")
+
+    def update_in_app_gyro_soft_deadzone_setting(self, val):
+        val = float(val)
+        CONFIG.in_app_gyro_soft_deadzone = val
         CONFIG.save_config()
         logger.info(f"In-app Gyro Deadzone: {val}")
 
@@ -4947,7 +4966,7 @@ bg_color=panel_bg, widths=[8, 10])
     def _mapping_attr(self, key, suffix):
         return f"{key}{suffix}"
 
-    def start_custom_recording(self, key, entry, combo, custom_frame, mode_var, mapping_scope=None):
+    def start_custom_recording(self, key, entry, combo, custom_frame, mode_var, mapping_scope=None, prefix=None):
         entry.config(state="normal")
         entry.delete(0, tk.END)
         entry.insert(0, "Recording...")
@@ -4989,7 +5008,7 @@ bg_color=panel_bg, widths=[8, 10])
 
             def sync_joystick_direction(value):
                 base_key, sep, direction = key.rpartition("_")
-                if sep and base_key in ("l_joystick", "r_joystick") and direction in ("up", "down", "left", "right"):
+                if sep and base_key in ("l_joystick", "r_joystick") and direction in ("up", "down", "left", "right", "click"):
                     current = CONFIG.get_joystick_custom_scoped(base_key, mapping_scope)
                     current[direction] = value
                     CONFIG.set_joystick_custom_scoped(base_key, current, mapping_scope)
@@ -5002,12 +5021,16 @@ bg_color=panel_bg, widths=[8, 10])
                 sync_joystick_direction("Default")
             else:
                 mode = mode_var.get()
-                val = f"Custom[{mode}]:" + "+".join(final_seq)
+                val_content = "+".join(final_seq)
+                if prefix:
+                    val = f"Custom[{mode}]:{prefix}+{val_content}"
+                else:
+                    val = f"Custom[{mode}]:{val_content}"
                 CONFIG.set_mapping_setting_scoped(key, val, mapping_scope)
                 sync_joystick_direction(val)
                 entry.config(state="normal")
                 entry.delete(0, tk.END)
-                display_val = format_input_display("+".join(final_seq))
+                display_val = format_input_display(val_content)
                 entry.insert(0, display_val)
                 entry.config(state="readonly")
             self.on_setting_changed()
@@ -5130,7 +5153,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         def sync_joystick_direction(value):
             base_key, sep, direction = key.rpartition("_")
-            if sep and base_key in ("l_joystick", "r_joystick") and direction in ("up", "down", "left", "right"):
+            if sep and base_key in ("l_joystick", "r_joystick") and direction in ("up", "down", "left", "right", "click"):
                 current = CONFIG.get_joystick_custom_scoped(base_key, mapping_scope)
                 current[direction] = value
                 CONFIG.set_joystick_custom_scoped(base_key, current, mapping_scope)
@@ -5161,16 +5184,29 @@ bg_color=panel_bg, widths=[8, 10])
         entry.pack(side=tk.LEFT, fill=tk.Y)
         # Hovering the (fixed-width, often clipped) recording shows its full content.
         Tooltip(entry, entry.get)
+        
         entry.restart_custom_recording_fn = lambda: self.start_custom_recording(key, entry, combo, custom_frame, mode_var, mapping_scope)
         # Gyro Lock / Mode Shift are fixed tokens, not recorded inputs, so don't re-record on click.
         entry.bind("<Button-1>", lambda e: None if combo.get() in (GYRO_LOCK_LABEL, MODE_SHIFT_LABEL) else entry.restart_custom_recording_fn())
         
+        in_app_gyro_btn = tk.Button(custom_frame, bg=button_gray, fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=lambda: show_in_app_gyro_popup())
+
+        def clear_in_app_gyro_settings():
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_mode", "Off", None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_amount", 90, None)
+
         def on_close():
             custom_frame.pack_forget()
+            if in_app_gyro_btn:
+                in_app_gyro_btn.pack_forget()
+            if entry:
+                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
             combo.pack(side=tk.LEFT)
             combo.set("Default")
             CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
             sync_joystick_direction("Default")
+            clear_in_app_gyro_settings()
             self.on_setting_changed()
             if hasattr(self, 'focus_outline') and getattr(self.focus_outline, 'target_widget', None) == close_btn:
                 try:
@@ -5193,6 +5229,7 @@ bg_color=panel_bg, widths=[8, 10])
             combo.set("Default")
             CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
             sync_joystick_direction("Default")
+            clear_in_app_gyro_settings()
             self.on_setting_changed()
 
         cp_close_btn = tk.Button(cp_frame, text="X", bg="#ff4444", fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=cp_close)
@@ -5205,42 +5242,74 @@ bg_color=panel_bg, widths=[8, 10])
             cp_frame.pack(side=tk.LEFT)
             self.on_setting_changed(event)
 
-        current_val = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
-        if current_val.startswith("Custom"):
-            entry.config(state="normal")
-            entry.delete(0, tk.END)
-
-            if current_val.startswith("Custom[Tap]:"):
-                mode_var.set("Tap")
-                mode_btn.config(text="Tap")
-                display_val = current_val[12:]
-            elif current_val.startswith("Custom[Hold]:"):
-                mode_var.set("Hold")
-                mode_btn.config(text="Hold")
-                display_val = current_val[13:]
+        def show_current():
+            base_key, sep, direction = key.rpartition("_")
+            if sep and base_key in ("l_joystick", "r_joystick") and direction in ("up", "down", "left", "right", "click"):
+                current_val = CONFIG.get_joystick_custom_scoped(base_key, mapping_scope).get(direction, "Default")
             else:
-                mode_var.set("Hold")
-                mode_btn.config(text="Hold")
-                display_val = current_val[7:]
+                current_val = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
+            
+            if isinstance(current_val, str) and current_val.startswith("Custom") and IN_APP_GYRO_TOKEN in current_val:
+                combo.pack_forget()
+                entry.pack_forget()
+                
+                simul_val = CONFIG.get_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
+                display_str = IN_APP_GYRO_LABEL
+                if simul_val not in ("None", "Default"):
+                    if isinstance(simul_val, str) and simul_val.startswith("Custom"):
+                        if "]:" in simul_val:
+                            display_str += " + " + format_input_display(simul_val.split("]:")[1])
+                        elif ":" in simul_val:
+                            display_str += " + " + format_input_display(simul_val.split(":")[1])
+                    else:
+                        if simul_val == "HOME": display_str += " + Home"
+                        elif simul_val == "CAPTURE": display_str += " + Capture"
+                        elif simul_val == "PRTSC": display_str += " + PrtSc"
+                        else: display_str += f" + {format_input_display(simul_val)}"
+                
+                in_app_gyro_btn.config(text=display_str)
+                in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+                custom_frame.pack(side=tk.LEFT)
+                combo.set(IN_APP_GYRO_LABEL)
+                return
 
-            if display_val == GYRO_LOCK_TOKEN:
-                entry.insert(0, GYRO_LOCK_LABEL)
-                combo.set(GYRO_LOCK_LABEL)
-            elif display_val == MODE_SHIFT_TOKEN:
-                entry.insert(0, MODE_SHIFT_LABEL)
-                combo.set(MODE_SHIFT_LABEL)
+            if current_val.startswith("Custom"):
+                entry.config(state="normal")
+                entry.delete(0, tk.END)
+
+                if current_val.startswith("Custom[Tap]:"):
+                    mode_var.set("Tap")
+                    mode_btn.config(text="Tap")
+                    display_val = current_val[12:]
+                elif current_val.startswith("Custom[Hold]:"):
+                    mode_var.set("Hold")
+                    mode_btn.config(text="Hold")
+                    display_val = current_val[13:]
+                else:
+                    mode_var.set("Hold")
+                    mode_btn.config(text="Hold")
+                    display_val = current_val[7:]
+
+                if display_val == GYRO_LOCK_TOKEN:
+                    entry.insert(0, GYRO_LOCK_LABEL)
+                    combo.set(GYRO_LOCK_LABEL)
+                elif display_val == MODE_SHIFT_TOKEN:
+                    entry.insert(0, MODE_SHIFT_LABEL)
+                    combo.set(MODE_SHIFT_LABEL)
+                else:
+                    display_val = format_input_display(display_val)
+                    entry.insert(0, display_val)
+                    combo.set("Custom")
+                entry.config(state="readonly")
+                custom_frame.pack(side=tk.LEFT)
+            elif current_val == "Change Profile":
+                combo.set("Change Profile")
+                cp_frame.pack(side=tk.LEFT)
             else:
-                display_val = format_input_display(display_val)
-                entry.insert(0, display_val)
-                combo.set("Custom")
-            entry.config(state="readonly")
-            custom_frame.pack(side=tk.LEFT)
-        elif current_val == "Change Profile":
-            combo.set("Change Profile")
-            cp_frame.pack(side=tk.LEFT)
-        else:
-            combo.set(current_val)
-            combo.pack(side=tk.LEFT)
+                combo.set(current_val)
+                combo.pack(side=tk.LEFT)
+
+        show_current()
 
         def show_token_mapping(token, label, event=None):
             mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
@@ -5248,6 +5317,10 @@ bg_color=panel_bg, widths=[8, 10])
             mode_btn.config(text=mode)
             CONFIG.set_mapping_setting_scoped(key, f"Custom[{mode}]:{token}", mapping_scope)
             sync_joystick_direction(f"Custom[{mode}]:{token}")
+            if in_app_gyro_btn:
+                in_app_gyro_btn.pack_forget()
+            if entry:
+                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
             entry.config(state="normal")
             entry.delete(0, tk.END)
             entry.insert(0, label)
@@ -5256,27 +5329,194 @@ bg_color=panel_bg, widths=[8, 10])
             custom_frame.pack(side=tk.LEFT)
             self.on_setting_changed(event)
 
+        def show_in_app_gyro_popup(event=None):
+            if self._toggle_in_app_gyro_popup(in_app_gyro_btn): return
+            self.close_in_app_gyro_popup()
+            
+            mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
+            mode_var.set(mode)
+            mode_btn.config(text=mode)
+            
+            spacing = int(10 * scaling_factor)
+            cell_padx = int(2 * scaling_factor)
+            popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=spacing - cell_padx, pady=spacing)
+            self.in_app_gyro_popup = popup
+            self.in_app_gyro_popup_anchor = in_app_gyro_btn
+            
+            row = tk.Frame(popup, bg=background_color)
+            row.pack(side=tk.TOP, fill=tk.X)
+            
+            tk.Label(row, text="Simultaneous Input:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+            
+            simul_cell = tk.Frame(row, bg=background_color)
+            simul_cell.pack(side=tk.LEFT)
+            
+            simul_key = f"{key}_in_app_gyro_simul"
+            self.create_mapping_widget(simul_cell, simul_key, "", None)
+            
+            suffix = self._mapping_scope_suffix(None)
+            simul_combo = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_combo", None)
+            simul_entry = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_entry", None)
+            simul_custom_frame = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_custom_frame", None)
+            simul_mode_btn = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_mode_btn", None)
+            simul_mode_var = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_mode_var", None)
+            
+            s_val = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
+            if simul_combo:
+                simul_combo.set(s_val)
+            
+            if isinstance(s_val, str) and s_val.startswith("Custom") and simul_combo and simul_custom_frame and simul_entry:
+                simul_combo.pack_forget()
+                simul_custom_frame.pack(side=tk.LEFT)
+                simul_entry.config(state="normal")
+                simul_entry.delete(0, tk.END)
+                if s_val.startswith("Custom[Tap]:"):
+                    if simul_mode_var: simul_mode_var.set("Tap")
+                    if simul_mode_btn: simul_mode_btn.config(text="Tap")
+                    display_val = s_val[12:]
+                elif s_val.startswith("Custom[Hold]:"):
+                    if simul_mode_var: simul_mode_var.set("Hold")
+                    if simul_mode_btn: simul_mode_btn.config(text="Hold")
+                    display_val = s_val[13:]
+                else:
+                    if simul_mode_var: simul_mode_var.set("Hold")
+                    if simul_mode_btn: simul_mode_btn.config(text="Hold")
+                    display_val = s_val[7:]
+                simul_entry.insert(0, format_input_display(display_val))
+                simul_entry.config(state="readonly")
+                
+            damp_row = tk.Frame(popup, bg=background_color)
+            damp_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
+            
+            tk.Label(damp_row, text="Trigger Dampening:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+            
+            damp_mode_key = f"{key}_in_app_gyro_dampening_mode"
+            damp_mode_val = CONFIG.get_mapping_setting_scoped(damp_mode_key, "Off", None)
+            
+            damp_combo = ttk.Combobox(damp_row, values=["Off", "ZR Dampening", "ZL Dampening", "Both Dampening"], font=scale_font(("Arial", 10, "bold")), state="readonly", width=14, justify="center")
+            damp_combo.set(damp_mode_val)
+            damp_combo.pack(side=tk.LEFT)
+    
+            damp_amt_row = tk.Frame(popup, bg=background_color)
+            
+            tk.Label(damp_amt_row, text="Dampening Amount %:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+            
+            damp_amt_key = f"{key}_in_app_gyro_dampening_amount"
+            damp_amt_val = CONFIG.get_mapping_setting_scoped(damp_amt_key, 90, None)
+            
+            def on_damp_amt_change(val):
+                CONFIG.set_mapping_setting_scoped(damp_amt_key, int(float(val)), None)
+                CONFIG.save_config()
+                
+            damp_scale = tk.Scale(damp_amt_row, from_=0, to=100, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 10, "bold")), command=on_damp_amt_change)
+            damp_scale.set(damp_amt_val)
+            damp_scale.pack(side=tk.LEFT)
+            
+            # Temporarily pack it to calculate the max size for the window boundary check
+            damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
+                
+            def on_damp_combo_change(e):
+                val = damp_combo.get()
+                CONFIG.set_mapping_setting_scoped(damp_mode_key, val, None)
+                CONFIG.save_config()
+                if val == "Off":
+                    damp_amt_row.pack_forget()
+                else:
+                    damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=damp_row)
+                    
+            damp_combo.bind("<<ComboboxSelected>>", on_damp_combo_change)
+            
+            def on_popup_destroy(e):
+                if str(e.widget) == str(popup):
+                    final_val = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
+                    display_str = IN_APP_GYRO_LABEL
+                    if final_val == "None":
+                        pass
+                    elif final_val == "Default":
+                        def get_key_name(k):
+                            return {"home": "Home", "capt": "Capture", "c": "Chat", "plus": "Plus", "minus": "Minus", "up": "Dpad Up", "down": "Dpad Down", "left": "Dpad Left", "right": "Dpad Right", "l_stk": "L Joystick Click", "r_stk": "R Joystick Click", "sll": "SL_L", "srl": "SR_L", "slr": "SL_R", "srr": "SR_R"}.get(k, k.upper())
+                        display_str += f" + {get_key_name(key)}"
+                    else:
+                        if isinstance(final_val, str) and final_val.startswith("Custom"):
+                            if "]:" in final_val:
+                                display_str += " + " + format_input_display(final_val.split("]:")[1])
+                            elif ":" in final_val:
+                                display_str += " + " + format_input_display(final_val.split(":")[1])
+                        else:
+                            if final_val == "HOME": display_str += " + Home"
+                            elif final_val == "CAPTURE": display_str += " + Capture"
+                            elif final_val == "PRTSC": display_str += " + PrtSc"
+                            else: display_str += f" + {format_input_display(final_val)}"
+                    if in_app_gyro_btn and in_app_gyro_btn.winfo_exists():
+                        in_app_gyro_btn.config(text=display_str)
+            
+            popup.bind("<Destroy>", on_popup_destroy, add="+")
+            
+            try:
+                ax = in_app_gyro_btn.winfo_rootx()
+                ay = in_app_gyro_btn.winfo_rooty()
+                aw = in_app_gyro_btn.winfo_width()
+                ah = in_app_gyro_btn.winfo_height()
+                anchor_coords = (ax, ay, aw, ah)
+            except Exception:
+                anchor_coords = None
+                
+            popup.update_idletasks()
+            self._place_popup_within_root_bounds(popup, in_app_gyro_btn, fallback_coords=anchor_coords)
+            
+            # If the initial mode is Off, hide the slider row *after* the boundary check
+            # This ensures we reserved enough space downwards for the slider if the user turns it on.
+            if damp_mode_val == "Off":
+                damp_amt_row.pack_forget()
+                
+            popup.lift()
+            
+            self.root.after(100, self.bind_in_app_gyro_popup_outside_click)
+
         def on_combo_selected(event):
+            if combo.get() != IN_APP_GYRO_LABEL:
+                clear_in_app_gyro_settings()
+                
             if combo.get() == "Custom":
                 combo.pack_forget()
+                in_app_gyro_btn.pack_forget()
+                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
                 custom_frame.pack(side=tk.LEFT)
                 self.start_custom_recording(key, entry, combo, custom_frame, mode_var, mapping_scope)
             elif combo.get() == GYRO_LOCK_LABEL:
                 show_token_mapping(GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, event)
             elif combo.get() == MODE_SHIFT_LABEL:
                 show_token_mapping(MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, event)
+            elif combo.get() == IN_APP_GYRO_LABEL:
+                mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
+                mode_var.set(mode)
+                mode_btn.config(text=mode)
+                CONFIG.set_mapping_setting_scoped(key, f"Custom[{mode}]:{IN_APP_GYRO_TOKEN}", mapping_scope)
+                sync_joystick_direction(f"Custom[{mode}]:{IN_APP_GYRO_TOKEN}")
+                self.on_setting_changed(event)
+                
+                combo.pack_forget()
+                entry.pack_forget()
+                in_app_gyro_btn.config(text=IN_APP_GYRO_LABEL)
+                in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+                custom_frame.pack(side=tk.LEFT)
+                show_in_app_gyro_popup(event)
             elif combo.get() == "Change Profile":
                 show_change_profile(event)
             else:
+                CONFIG.set_mapping_setting_scoped(key, combo.get(), mapping_scope)
+                sync_joystick_direction(combo.get())
                 self.on_setting_changed(event)
 
         combo.bind("<<ComboboxSelected>>", on_combo_selected)
         setattr(self, f"{attr_key}_combo", combo)
         setattr(self, f"{attr_key}_custom_frame", custom_frame)
         setattr(self, f"{attr_key}_entry", entry)
+        setattr(self, f"{attr_key}_in_app_gyro_btn", in_app_gyro_btn)
         setattr(self, f"{attr_key}_mode_btn", mode_btn)
         setattr(self, f"{attr_key}_mode_var", mode_var)
         setattr(self, f"{attr_key}_cp_frame", cp_frame)
+        setattr(self, f"{attr_key}_close_btn", close_btn)
 
     def create_joystick_mapping_widget(self, parent, key, label_text, mapping_scope=None):
         suffix = self._mapping_scope_suffix(mapping_scope)
@@ -5340,7 +5580,7 @@ bg_color=panel_bg, widths=[8, 10])
                 scroll_mode_btn.pack_forget()
                 custom_frame.pack_forget()
                 combo.pack(side=tk.LEFT)
-                combo.set(current_val if current_val in JOYSTICK_OPTIONS else "Default")
+                combo.set(current_val)
 
         def on_combo_selected(event):
             selected = combo.get()
@@ -5420,12 +5660,64 @@ bg_color=panel_bg, widths=[8, 10])
                 return
             if self._event_in_widget(current_popup, event):
                 return
+            # A Back Button Options popup opened from inside this popup is a separate frame
+            # on the root, so clicks inside it must not be treated as "outside".
+            if self._event_in_widget(getattr(self, "back_button_popup", None), event):
+                return
             # Leave clicks on the owning anchor to its command (toggles the popup closed).
             if self._event_in_widget(getattr(self, "joystick_custom_popup_anchor", None), event):
                 return
             self.close_joystick_custom_popup()
 
         self.joystick_custom_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
+
+    def _toggle_in_app_gyro_popup(self, anchor_widget):
+        existing = getattr(self, "in_app_gyro_popup", None)
+        if existing is not None and existing.winfo_exists() and getattr(self, "in_app_gyro_popup_anchor", None) is anchor_widget:
+            self.close_in_app_gyro_popup()
+            return True
+        return False
+
+    def close_in_app_gyro_popup(self):
+        popup = getattr(self, "in_app_gyro_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+        self.in_app_gyro_popup = None
+        self.in_app_gyro_popup_anchor = None
+        bind_id = getattr(self, "in_app_gyro_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except:
+                pass
+            self.in_app_gyro_popup_bind_id = None
+
+    def bind_in_app_gyro_popup_outside_click(self):
+        popup = getattr(self, "in_app_gyro_popup", None)
+        if popup is None or not popup.winfo_exists():
+            return
+        bind_id = getattr(self, "in_app_gyro_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except:
+                pass
+            self.in_app_gyro_popup_bind_id = None
+
+        def close_if_outside(event):
+            current_popup = getattr(self, "in_app_gyro_popup", None)
+            if current_popup is None or not current_popup.winfo_exists():
+                self.close_in_app_gyro_popup()
+                return
+            if self._event_in_widget(current_popup, event):
+                return
+            if self._event_in_widget(getattr(self, "back_button_popup", None), event):
+                return
+            if self._event_in_widget(getattr(self, "in_app_gyro_popup_anchor", None), event):
+                return
+            self.close_in_app_gyro_popup()
+
+        self.in_app_gyro_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
 
     def open_joystick_custom_popup(self, key, anchor_widget, mapping_scope=None):
         if self._toggle_joystick_popup(anchor_widget):
@@ -5452,14 +5744,6 @@ bg_color=panel_bg, widths=[8, 10])
             ("left",  "Left:",  1, 0),
             ("right", "Right:", 1, 2),
         ]
-        row_widgets = {}
-
-        def save_direction(direction, value):
-            current = CONFIG.get_joystick_custom_scoped(key, mapping_scope)
-            current[direction] = value
-            CONFIG.set_joystick_custom_scoped(key, current, mapping_scope)
-            CONFIG.save_config()
-
         row_pady = spacing
         col_gap  = int(8 * scaling_factor)
 
@@ -5472,12 +5756,6 @@ bg_color=panel_bg, widths=[8, 10])
             cell = tk.Frame(inner, bg=background_color)
             cell.grid(row=grow, column=lcol + 1, sticky=tk.W, pady=pady)
             self.create_mapping_widget(cell, f"{key}_{direction}", "", mapping_scope)
-            combo = getattr(self, f"{self._mapping_attr(f'{key}_{direction}', self._mapping_scope_suffix(mapping_scope))}_combo")
-            combo.set(values.get(direction, "Default"))
-            row_widgets[direction] = combo
-
-        for direction, combo in row_widgets.items():
-            combo.bind("<<ComboboxSelected>>", lambda e, d=direction, c=combo: save_direction(d, c.get()), add="+")
 
         def enable_outside_click_close():
             if popup.winfo_exists():
@@ -5498,12 +5776,24 @@ bg_color=panel_bg, widths=[8, 10])
             popup.lift()
         return popup
 
-    def _place_popup_within_root_bounds(self, popup, anchor_widget):
+    def _place_popup_within_root_bounds(self, popup, anchor_widget, fallback_coords=None):
         self.root.update_idletasks()
         popup.update_idletasks()
 
-        anchor_x = anchor_widget.winfo_rootx()
-        anchor_bottom = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+        if anchor_widget and anchor_widget.winfo_exists():
+            anchor_x = anchor_widget.winfo_rootx()
+            anchor_y = anchor_widget.winfo_rooty()
+            anchor_w = anchor_widget.winfo_width()
+            anchor_h = anchor_widget.winfo_height()
+            anchor_bottom = anchor_y + anchor_h
+            use_anchor = True
+        elif fallback_coords:
+            anchor_x, anchor_y, anchor_w, anchor_h = fallback_coords
+            anchor_bottom = anchor_y + anchor_h
+            use_anchor = False
+        else:
+            return
+
         root_right = self.root.winfo_rootx() + self.root.winfo_width()
         root_bottom = self.root.winfo_rooty() + self.root.winfo_height()
 
@@ -5515,20 +5805,50 @@ bg_color=panel_bg, widths=[8, 10])
         enough_right = anchor_x - x_offset + popup_w <= root_right
         enough_bottom = anchor_bottom + y_offset + popup_h <= root_bottom
 
-        if enough_right and enough_bottom:
-            popup.place(in_=anchor_widget, relx=0, rely=1, x=-x_offset, y=y_offset, anchor=tk.NW)
-        elif not enough_right and enough_bottom:
-            popup.place(in_=anchor_widget, relx=1, rely=1, x=x_offset, y=y_offset, anchor=tk.NE)
-        elif enough_right and not enough_bottom:
-            popup.place(in_=anchor_widget, relx=0, rely=0, x=-x_offset, y=-y_offset, anchor=tk.SW)
+        if use_anchor:
+            if enough_right and enough_bottom:
+                popup.place(in_=anchor_widget, relx=0, rely=1, x=-x_offset, y=y_offset, anchor=tk.NW)
+            elif not enough_right and enough_bottom:
+                popup.place(in_=anchor_widget, relx=1, rely=1, x=x_offset, y=y_offset, anchor=tk.NE)
+            elif enough_right and not enough_bottom:
+                popup.place(in_=anchor_widget, relx=0, rely=0, x=-x_offset, y=-y_offset, anchor=tk.SW)
+            else:
+                popup.place(in_=anchor_widget, relx=1, rely=0, x=x_offset, y=-y_offset, anchor=tk.SE)
         else:
-            popup.place(in_=anchor_widget, relx=1, rely=0, x=x_offset, y=-y_offset, anchor=tk.SE)
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            if enough_right and enough_bottom:
+                popup.place(in_=self.root, x=anchor_x - rx - x_offset, y=anchor_bottom - ry + y_offset, anchor=tk.NW)
+            elif not enough_right and enough_bottom:
+                popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset, y=anchor_bottom - ry + y_offset, anchor=tk.NE)
+            elif enough_right and not enough_bottom:
+                popup.place(in_=self.root, x=anchor_x - rx - x_offset, y=anchor_y - ry - y_offset, anchor=tk.SW)
+            else:
+                popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset, y=anchor_y - ry - y_offset, anchor=tk.SE)
         popup.lift()
 
     def open_change_profile_popup(self, anchor_widget):
-        if self._toggle_joystick_popup(anchor_widget):
+        existing = getattr(self, "change_profile_popup", None)
+        if existing is not None and existing.winfo_exists() and getattr(self, "change_profile_popup_anchor", None) is anchor_widget:
+            existing.destroy()
             return
-        popup = self._create_joystick_option_popup(anchor_widget, defer_place=True)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+            
+        try:
+            ax = anchor_widget.winfo_rootx()
+            ay = anchor_widget.winfo_rooty()
+            aw = anchor_widget.winfo_width()
+            ah = anchor_widget.winfo_height()
+            anchor_coords = (ax, ay, aw, ah)
+        except Exception:
+            anchor_coords = None
+            
+        spacing = int(10 * scaling_factor)
+        popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=spacing, pady=spacing)
+        self.change_profile_popup = popup
+        self.change_profile_popup_anchor = anchor_widget
+        
         row = tk.Frame(popup, bg=background_color)
         row.pack(side=tk.TOP, fill=tk.X)
         tk.Label(row, text="Select & Change Profile:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
@@ -5540,8 +5860,35 @@ bg_color=panel_bg, widths=[8, 10])
         switch = ToggleSwitch(row, ["Auto", "Manual"], ["Auto", "Manual"], getattr(CONFIG, "change_profile_mode", "Manual"), set_change_profile_mode, background_color)
         switch.pack(side=tk.LEFT)
         popup.update_idletasks()
-        self._place_popup_within_root_bounds(popup, anchor_widget)
-        self.root.after(100, self.bind_joystick_custom_popup_outside_click)
+        self._place_popup_within_root_bounds(popup, anchor_widget, fallback_coords=anchor_coords)
+        
+        def enable_outside_click_close():
+            if popup.winfo_exists():
+                bind_id = getattr(self, "change_profile_popup_bind_id", None)
+                if bind_id:
+                    try:
+                        self.root.unbind("<ButtonPress>", bind_id)
+                    except:
+                        pass
+                def close_if_outside(event):
+                    current_popup = getattr(self, "change_profile_popup", None)
+                    if current_popup and current_popup.winfo_exists():
+                        x, y, w, h = current_popup.winfo_rootx(), current_popup.winfo_rooty(), current_popup.winfo_width(), current_popup.winfo_height()
+                        if not (x <= event.x_root <= x + w and y <= event.y_root <= y + h):
+                            anchor = getattr(self, "change_profile_popup_anchor", None)
+                            if anchor and anchor.winfo_exists():
+                                ax, ay, aw, ah = anchor.winfo_rootx(), anchor.winfo_rooty(), anchor.winfo_width(), anchor.winfo_height()
+                                if ax <= event.x_root <= ax + aw and ay <= event.y_root <= ay + ah:
+                                    return
+                            current_popup.destroy()
+                            bid = getattr(self, "change_profile_popup_bind_id", None)
+                            if bid:
+                                try: self.root.unbind("<ButtonPress>", bid)
+                                except: pass
+                                self.change_profile_popup_bind_id = None
+                self.change_profile_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
+        
+        self.root.after(100, enable_outside_click_close)
 
     def close_back_button_popup(self):
         popup = getattr(self, "back_button_popup", None)
@@ -5561,6 +5908,10 @@ bg_color=panel_bg, widths=[8, 10])
             except:
                 pass
             self.back_button_popup_bind_id = None
+            if getattr(self, "in_app_gyro_popup", None) and self.in_app_gyro_popup.winfo_exists():
+                self.bind_in_app_gyro_popup_outside_click()
+            if getattr(self, "joystick_custom_popup", None) and self.joystick_custom_popup.winfo_exists():
+                self.bind_joystick_custom_popup_outside_click()
 
     def bind_back_button_popup_outside_click(self):
         popup = getattr(self, "back_button_popup", None)
@@ -6341,6 +6692,8 @@ bg_color=panel_bg, widths=[8, 10])
         tk.Label(row_vibration, text="Rumble Mode:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
         self.rumble_mode_switch = ToggleSwitch(row_vibration, ["Xbox", "Switch"], ["Xbox", "Switch"], getattr(CONFIG, "rumble_mode", "Xbox"), self.update_rumble_mode_setting, background_color)
         self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        self.audio_haptics_button = tk.Button(row_vibration, text="Audio Haptics Settings", command=lambda: self.open_audio_haptics_settings(self.audio_haptics_button), font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, activebackground=highlight_color, padx=int(10 * scaling_factor))
+        self.audio_haptics_button.pack(side=tk.LEFT, padx=(int(10 * scaling_factor), 0))
         self.update_dynamic_rumble_mode_options()
 
         self.strength_label = tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
@@ -6582,6 +6935,14 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_reset_in_app_gyro_mode_mapping(self):
         CONFIG.reset_in_app_gyro_mode_mapping()
+        mapping_keys = [
+            "home", "capt", "c", "plus", "minus", "a", "b", "x", "y",
+            "up", "down", "left", "right", "zl", "l", "zr", "r",
+            "l_stk", "r_stk", "gl", "gr", "sll", "srl", "slr", "srr",
+            "gc_l_click", "gc_r_click"
+        ]
+        for key in mapping_keys:
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
         CONFIG.save_config()
         self._refresh_mapping_comboboxes()
 
@@ -6616,6 +6977,43 @@ bg_color=panel_bg, widths=[8, 10])
             self.root.update_idletasks()
         except Exception:
             pass
+
+    def open_audio_haptics_settings(self, anchor_widget):
+        if self._toggle_joystick_popup(anchor_widget):
+            return
+        popup = self._create_joystick_option_popup(anchor_widget, defer_place=True)
+
+        content_frame = tk.Frame(popup, bg=background_color)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor))
+
+        def update_audio_haptics(val):
+            CONFIG.audio_haptics_enabled = val
+            CONFIG.save_config()
+            if hasattr(self, 'current_controllers'):
+                for vc in getattr(self, 'current_controllers', []):
+                    if vc is not None and getattr(vc, 'mode', '') == "PS5" and getattr(CONFIG, "driver_type", "WinUHid") == "USBIP":
+                        try:
+                            vc._setup_vg_controller()
+                        except Exception as e:
+                            pass
+
+        def update_adaptive_triggers(val):
+            CONFIG.adaptive_triggers_enabled = val
+            CONFIG.save_config()
+
+        row1 = tk.Frame(content_frame, bg=background_color)
+        row1.pack(fill=tk.X, pady=(0, int(15 * scaling_factor)))
+        tk.Label(row1, text="Audio Haptics:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, width=15, anchor="w").pack(side=tk.LEFT)
+        ToggleSwitch(row1, ["On", "Off"], [True, False], getattr(CONFIG, "audio_haptics_enabled", True), update_audio_haptics, background_color).pack(side=tk.RIGHT)
+
+        row2 = tk.Frame(content_frame, bg=background_color)
+        row2.pack(fill=tk.X)
+        tk.Label(row2, text="Adaptive Triggers:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, width=15, anchor="w").pack(side=tk.LEFT)
+        ToggleSwitch(row2, ["On", "Off"], [True, False], getattr(CONFIG, "adaptive_triggers_enabled", True), update_adaptive_triggers, background_color).pack(side=tk.RIGHT)
+
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(popup, anchor_widget)
+        self.root.after(100, self.bind_joystick_custom_popup_outside_click)
 
     def _prerender_settings_tabs(self):
         # Realize and paint every settings tab once (call while the window is invisible)
@@ -6846,6 +7244,11 @@ bg_color=panel_bg, widths=[8, 10])
             "gl", "gr", "sll", "srl", "slr", "srr",
             "gc_l_click", "gc_r_click"
         ]
+        for j_key in ("l_joystick", "r_joystick"):
+            for direction in ("up", "down", "left", "right"):
+                mapping_keys.append(f"{j_key}_{direction}")
+            mapping_keys.append(j_key)
+                
         active_scope = "in_app_gyro_mode_mappings" if getattr(self, "settings_active_tab", None) == "in_app_gyro_mode_mapping" else None
         for mapping_scope in (active_scope,):
             suffix = self._mapping_scope_suffix(mapping_scope)
@@ -6854,13 +7257,19 @@ bg_color=panel_bg, widths=[8, 10])
                 combo = getattr(self, f"{attr_key}_combo", None)
                 custom_frame = getattr(self, f"{attr_key}_custom_frame", None)
                 entry = getattr(self, f"{attr_key}_entry", None)
+                in_app_gyro_btn = getattr(self, f"{attr_key}_in_app_gyro_btn", None)
                 mode_btn = getattr(self, f"{attr_key}_mode_btn", None)
                 mode_var = getattr(self, f"{attr_key}_mode_var", None)
                 cp_frame = getattr(self, f"{attr_key}_cp_frame", None)
+                close_btn = getattr(self, f"{attr_key}_close_btn", None)
 
-                if not combo:
+                if not combo or not combo.winfo_exists():
                     continue
-                current_val = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
+                base_key, sep, direction = key.rpartition("_")
+                if sep and base_key in ("l_joystick", "r_joystick") and direction in ("up", "down", "left", "right", "click"):
+                    current_val = CONFIG.get_joystick_custom_scoped(base_key, mapping_scope).get(direction, "Default")
+                else:
+                    current_val = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
                 if current_val == "Gyro":
                     current_val = "In-app Gyro"
                 if cp_frame:
@@ -6890,18 +7299,53 @@ bg_color=panel_bg, widths=[8, 10])
                             mode_btn.config(text="Hold")
                             display_val = current_val[7:]
 
+                        if display_val != IN_APP_GYRO_TOKEN and not display_val.startswith(IN_APP_GYRO_TOKEN):
+                            if entry and in_app_gyro_btn and close_btn:
+                                in_app_gyro_btn.pack_forget()
+                                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
                         if display_val == GYRO_LOCK_TOKEN:
                             combo.set(GYRO_LOCK_LABEL)
                             entry.insert(0, GYRO_LOCK_LABEL)
                         elif display_val == MODE_SHIFT_TOKEN:
                             combo.set(MODE_SHIFT_LABEL)
                             entry.insert(0, MODE_SHIFT_LABEL)
+                        elif display_val.startswith(IN_APP_GYRO_TOKEN):
+                            combo.set(IN_APP_GYRO_LABEL)
+                            simul_val = CONFIG.get_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
+                            display_str = IN_APP_GYRO_LABEL
+                            if simul_val == "None":
+                                pass
+                            elif simul_val == "Default":
+                                def get_key_name(k):
+                                    return {"home": "Home", "capt": "Capture", "c": "Chat", "plus": "Plus", "minus": "Minus", "up": "Dpad Up", "down": "Dpad Down", "left": "Dpad Left", "right": "Dpad Right", "l_stk": "L Joystick Click", "r_stk": "R Joystick Click", "sll": "SL_L", "srl": "SR_L", "slr": "SL_R", "srr": "SR_R"}.get(k, k.upper())
+                                display_str += f" + {get_key_name(key)}"
+                            else:
+                                if isinstance(simul_val, str) and simul_val.startswith("Custom"):
+                                    if "]:" in simul_val:
+                                        display_str += " + " + format_input_display(simul_val.split("]:")[1])
+                                    elif ":" in simul_val:
+                                        display_str += " + " + format_input_display(simul_val.split(":")[1])
+                                else:
+                                    if simul_val == "HOME": display_str += " + Home"
+                                    elif simul_val == "CAPTURE": display_str += " + Capture"
+                                    elif simul_val == "PRTSC": display_str += " + PrtSc"
+                                    else: display_str += f" + {format_input_display(simul_val)}"
+                            if entry and in_app_gyro_btn and close_btn:
+                                entry.pack_forget()
+                                in_app_gyro_btn.config(text=display_str)
+                                in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
                         else:
                             combo.set("Custom")
+                            if entry and in_app_gyro_btn and close_btn:
+                                in_app_gyro_btn.pack_forget()
+                                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
                             display_val = format_input_display(display_val)
-                            entry.insert(0, display_val)
-                        entry.config(state="readonly")
-                        custom_frame.pack(side=tk.LEFT)
+                            if entry:
+                                entry.insert(0, display_val)
+                        if entry:
+                            entry.config(state="readonly")
+                        if custom_frame:
+                            custom_frame.pack(side=tk.LEFT)
                     else:
                         combo.set("Custom")
                 else:
@@ -7088,12 +7532,14 @@ bg_color=panel_bg, widths=[8, 10])
             
         if driver_type == "USBIP" and sim_mode == "PS5":
             self.rumble_mode_switch.update_options(["Xbox", "PS5 / HD Rumble"], ["Xbox", "PS5"], current_rumble, widths=[8, 16])
+            self.audio_haptics_button.pack(side=tk.LEFT, after=self.rumble_mode_switch, padx=(int(10 * scaling_factor), 0))
         else:
             if current_rumble == "PS5":
                 current_rumble = "Switch"
                 CONFIG.rumble_mode = "Switch"
                 CONFIG.save_config()
             self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
+            self.audio_haptics_button.pack_forget()
 
     def update_rumble_mode_ui(self, mode):
         if mode in ["Switch", "PS5"]:
@@ -7202,7 +7648,16 @@ bg_color=panel_bg, widths=[8, 10])
                     f"Filtering: {'Enabled' if hidhide_active else 'Disabled'}"
                 )
             )
-            buttons["active"].config(text=("Disable HidHide" if hidhide_active else "Enable HidHide"))
+            if "active" in buttons and buttons["active"].winfo_exists():
+                # While a toggle is being applied/verified the button stays locked so
+                # rapid re-clicks can't start a competing write.
+                if getattr(self, "_hidhide_toggle_in_progress", False):
+                    buttons["active"].config(text="Applying...", state=tk.DISABLED)
+                else:
+                    buttons["active"].config(
+                        text=("Disable HidHide" if hidhide_active else "Enable HidHide"),
+                        state=tk.NORMAL
+                    )
 
         def recheck_and_refresh():
             nonlocal hidhide_installed, hidhide_active
@@ -7223,18 +7678,70 @@ bg_color=panel_bg, widths=[8, 10])
             refresh()
 
         def toggle_hidhide_active():
+            # Guard against rapid re-clicks: only one toggle may be in flight. The button is
+            # locked for the whole lock → write → verify → unlock cycle so the displayed and
+            # stored state always reflects what was actually written to the driver.
+            if getattr(self, "_hidhide_toggle_in_progress", False):
+                return
+            if not ("active" in buttons and buttons["active"].winfo_exists()):
+                return
+            self._hidhide_toggle_in_progress = True
+            buttons["active"].config(state=tk.DISABLED, text="Applying...")
+            dialog.update_idletasks()
+
+            def unlock_and_refresh():
+                self._hidhide_toggle_in_progress = False
+                recheck_and_refresh()
+
+            # Capture the intended target once, from the current live driver state.
             try:
                 import hidhide
                 if not hidhide.is_available():
+                    unlock_and_refresh()
                     return
-                if hidhide.is_active():
-                    hidhide.set_active(False)
-                else:
-                    self._hide_detected_pro2_with_hidhide()
-                    hidhide.set_active(True)
+                target_active = not hidhide.is_active()
             except Exception as e:
-                self.show_centered_message("Error", f"Failed to change HidHide state: {e}")
-            recheck_and_refresh()
+                logger.error(f"Failed to read HidHide state: {e}")
+                unlock_and_refresh()
+                return
+
+            max_attempts = 5
+
+            def attempt(n):
+                success = False
+                try:
+                    import hidhide
+                    if target_active:
+                        self._hide_detected_pro2_with_hidhide()
+                        hidhide.set_active(True)
+                    else:
+                        self._unhide_detected_pro2_with_hidhide()
+                        hidhide.set_active(False)
+                    # Verify the write actually landed rather than trusting the IOCTL return.
+                    success = (hidhide.is_active() == target_active)
+                except Exception as e:
+                    logger.error(f"Failed to toggle HidHide (attempt {n}): {e}")
+
+                if success:
+                    # Persist the preference so the wired watcher won't re-hide (and thus
+                    # re-activate) the controller on the next replug after a Disable.
+                    CONFIG.hidhide_hide_enabled = target_active
+                    CONFIG.save_config()
+                    unlock_and_refresh()
+                    return
+                if n < max_attempts and dialog.winfo_exists():
+                    # Retry until the driver confirms the new state (or attempts run out).
+                    dialog.after(150, lambda: attempt(n + 1))
+                    return
+                unlock_and_refresh()
+                if dialog.winfo_exists():
+                    self.show_centered_message(
+                        "Error",
+                        "Failed to apply HidHide setting.\n\nPlease make sure 'HidHide Configuration Client' is CLOSED."
+                    )
+
+            # Give the kernel driver a moment before the first write/verify.
+            dialog.after(50, lambda: attempt(1))
 
         def uninstall_hidhide():
             # Close this modal options window first so its grab doesn't keep the app in
@@ -7279,6 +7786,17 @@ bg_color=panel_bg, widths=[8, 10])
                     hidhide.hide_device(instance_id)
         except Exception as e:
             logger.debug("Failed to add detected Pro Controller 2 to HidHide: %s", e)
+
+    def _unhide_detected_pro2_with_hidhide(self):
+        try:
+            import hidhide
+            from usb_hid_controller import enumerate_pro_controller2
+            for entry in enumerate_pro_controller2():
+                instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
+                if instance_id:
+                    hidhide.unhide_device(instance_id)
+        except Exception as e:
+            logger.debug("Failed to remove detected Pro Controller 2 from HidHide: %s", e)
 
     def _run_hidhide_script(self, script_name, wait_text):
         """Run a bundled HidHide install/uninstall PowerShell script elevated (runas),
@@ -8170,7 +8688,7 @@ bg_color=panel_bg, widths=[8, 10])
         if hasattr(self, 'deadzone_scale'):
             self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
         if hasattr(self, 'in_app_deadzone_scale'):
-            self.in_app_deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
+            self.in_app_deadzone_scale.set(getattr(CONFIG, "in_app_gyro_soft_deadzone", 0.0))
                 
         # Update Cemuhook Sensitivity
         if hasattr(self, 'cemuhook_sens_scale'):
@@ -8215,7 +8733,7 @@ bg_color=panel_bg, widths=[8, 10])
             combo = getattr(self, f"{attr_key}_combo", None)
             if combo is None: return "Default"
             val = combo.get()
-            if val in ("Custom", GYRO_LOCK_LABEL, MODE_SHIFT_LABEL):
+            if val in ("Custom", GYRO_LOCK_LABEL, MODE_SHIFT_LABEL, IN_APP_GYRO_LABEL):
                 curr = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
                 if curr.startswith("Custom"):
                     return curr
@@ -8679,6 +9197,7 @@ if __name__ == "__main__":
                 pass
             sys.exit(1)
         sys.exit(0)
+        
     disable_power_throttling()
     win = ControllerWindow()
     win.init_interface(); win.start()

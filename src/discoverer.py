@@ -1,3 +1,22 @@
+# Switch2Connect - A Python and ESP32-S3 bridge utility for Switch 2 controller inputs.
+# Copyright (C) 2026 TommyWabg
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Contact Information:
+# Electronic Mail: tommyw9318@gmail.com
+
 """A class used to find switch 2 controllers via Bluetooth
 """
 import threading
@@ -1295,6 +1314,10 @@ async def run_usb_hid_discovery(quit_event):
 
     known: dict = {}          # device key -> USBHidController
     connecting: set = set()
+    # Every physical HID instance we've added to the HidHide blacklist. Entries persist
+    # across unplug/replug so a reconnecting controller stays hidden the instant it
+    # reappears (never briefly visible to third-party software). Cleared only on teardown.
+    hidden_instances: set = set()
 
     def _device_key(entry):
         # The HID path is unique per physical device/port; Nintendo serials are all '00'.
@@ -1325,11 +1348,10 @@ async def run_usb_hid_discovery(quit_event):
             await controller.disconnect()
         except Exception:
             pass
-        if instance_id:
-            try:
-                hidhide.unhide_device(instance_id)
-            except Exception:
-                pass
+        # Intentionally do NOT unhide on unplug: leaving the instance blacklisted keeps the
+        # physical controller hidden from third-party software the moment it is replugged,
+        # instead of it being briefly visible until the watcher re-hides it. The blacklist
+        # entry is cleaned up on app teardown (see the finally block below).
 
     async def _add(entry, key):
         controller = None
@@ -1337,8 +1359,12 @@ async def run_usb_hid_discovery(quit_event):
         try:
             # Hide the physical HID first (whitelists our own process so we keep access).
             instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
-            if instance_id and hidhide.is_available():
+            # Only hide when the user hasn't disabled HidHide. hide_device() re-activates
+            # HidHide filtering, so hiding here regardless of preference would silently undo
+            # a Disable the next time the controller is replugged.
+            if instance_id and hidhide.is_available() and getattr(CONFIG, "hidhide_hide_enabled", True):
                 hidhide.hide_device(instance_id)
+                hidden_instances.add(instance_id)
 
             controller = USBHidController(entry)
             controller._hidhide_instance_id = instance_id
@@ -1356,6 +1382,7 @@ async def run_usb_hid_discovery(quit_event):
                     await controller.disconnect()
                     if instance_id:
                         hidhide.unhide_device(instance_id)
+                        hidden_instances.discard(instance_id)
                     return
                 vc = VirtualController(slot_index + 1, [controller], _on_disc, setup_usb=False)
                 VIRTUAL_CONTROLLERS[slot_index] = vc
@@ -1381,6 +1408,7 @@ async def run_usb_hid_discovery(quit_event):
             if instance_id:
                 try:
                     hidhide.unhide_device(instance_id)
+                    hidden_instances.discard(instance_id)
                 except Exception:
                     pass
         finally:
@@ -1416,14 +1444,15 @@ async def run_usb_hid_discovery(quit_event):
                 logger.exception("Wired USB discovery poll error")
             await asyncio.sleep(1.0)
     finally:
-        # Unhide anything we hid so devices aren't left invisible after teardown.
-        for controller in list(known.values()):
-            instance_id = getattr(controller, "_hidhide_instance_id", None)
-            if instance_id:
-                try:
-                    hidhide.unhide_device(instance_id)
-                except Exception:
-                    pass
+        # Unhide everything we ever hid — including instances whose controllers were already
+        # unplugged (and thus dropped from `known`) — so no device is left invisible to the
+        # system after teardown.
+        for instance_id in list(hidden_instances):
+            try:
+                hidhide.unhide_device(instance_id)
+            except Exception:
+                pass
+        hidden_instances.clear()
 
 
 def start_discoverer(update_controllers_threadsafe, quit_event):
