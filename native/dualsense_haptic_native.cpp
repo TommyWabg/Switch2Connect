@@ -45,9 +45,16 @@ public:
     static constexpr int HF_OUTPUT_MAX_FREQUENCY = 369;
     static constexpr int HF_RAW_MIN_FREQUENCY = 281;
     static constexpr int HF_RAW_MAX_FREQUENCY = 609;
+    // Low band peak-bin frequencies for LOW_BIN_MIN/MAX: round(2*3000/64)=94,
+    // round(5*3000/64)=234.  Redistribute that raw span into the full output range
+    // [70,300] (like remap_hf_frequency) instead of hard-clamping to the same window.
+    static constexpr int LF_OUTPUT_MIN_FREQUENCY = 70;
+    static constexpr int LF_OUTPUT_MAX_FREQUENCY = 300;
+    static constexpr int LF_RAW_MIN_FREQUENCY = 94;
+    static constexpr int LF_RAW_MAX_FREQUENCY = 234;
     static constexpr int ACTIVITY_ENVELOPE_THRESHOLD = 512;
     static constexpr int ACTIVITY_PEAK_THRESHOLD = 2048;
-    static constexpr int SILENCE_PACKETS_BEFORE_STOP = 80;
+    static constexpr int SILENCE_PACKETS_BEFORE_STOP = 1;
     static constexpr int SAFE_MAXIMUM_AMPLITUDE = 29000;
     static constexpr int ISOLATED_IMPULSE_PEAK_THRESHOLD = 30000;
     static constexpr int ISOLATED_IMPULSE_NEIGHBOR_THRESHOLD = 64;
@@ -124,6 +131,27 @@ public:
                 emit_silence(result);
                 return 2;
             }
+            if (output_active) {
+                double multiplier = std::max(0.0, 1.0 - (static_cast<double>(silence_packets) / SILENCE_PACKETS_BEFORE_STOP));
+                int faded_left_lf_amp = static_cast<int>(last_left_lf_amp * multiplier);
+                int faded_left_hf_amp = static_cast<int>(last_left_hf_amp * multiplier);
+                int faded_right_lf_amp = static_cast<int>(last_right_lf_amp * multiplier);
+                int faded_right_hf_amp = static_cast<int>(last_right_hf_amp * multiplier);
+
+                std::memset(result, 0, sizeof(*result));
+                result->mode = 1;
+                result->left_lf_freq = last_left_lf_freq;
+                result->left_lf_amp = faded_left_lf_amp;
+                result->left_hf_freq = last_left_hf_freq;
+                result->left_hf_amp = faded_left_hf_amp;
+                result->right_lf_freq = last_right_lf_freq;
+                result->right_lf_amp = faded_right_lf_amp;
+                result->right_hf_freq = last_right_hf_freq;
+                result->right_hf_amp = faded_right_hf_amp;
+                result->left_intensity = to_legacy_intensity(std::max(faded_left_lf_amp, faded_left_hf_amp));
+                result->right_intensity = to_legacy_intensity(std::max(faded_right_lf_amp, faded_right_hf_amp));
+                return 1;
+            }
             return 0;
         }
 
@@ -159,16 +187,26 @@ public:
         }
 
         output_active = true;
+        
+        last_left_lf_freq = remap_lf_frequency(low_l.frequency);
+        last_left_lf_amp = low_amp_left;
+        last_left_hf_freq = remap_hf_frequency(high_l.frequency);
+        last_left_hf_amp = high_amp_left;
+        last_right_lf_freq = remap_lf_frequency(low_r.frequency);
+        last_right_lf_amp = low_amp_right;
+        last_right_hf_freq = remap_hf_frequency(high_r.frequency);
+        last_right_hf_amp = high_amp_right;
+
         std::memset(result, 0, sizeof(*result));
         result->mode = 1;
-        result->left_lf_freq = clamp(low_l.frequency, 70, 300);
-        result->left_lf_amp = low_amp_left;
-        result->left_hf_freq = remap_hf_frequency(high_l.frequency);
-        result->left_hf_amp = high_amp_left;
-        result->right_lf_freq = clamp(low_r.frequency, 70, 300);
-        result->right_lf_amp = low_amp_right;
-        result->right_hf_freq = remap_hf_frequency(high_r.frequency);
-        result->right_hf_amp = high_amp_right;
+        result->left_lf_freq = last_left_lf_freq;
+        result->left_lf_amp = last_left_lf_amp;
+        result->left_hf_freq = last_left_hf_freq;
+        result->left_hf_amp = last_left_hf_amp;
+        result->right_lf_freq = last_right_lf_freq;
+        result->right_lf_amp = last_right_lf_amp;
+        result->right_hf_freq = last_right_hf_freq;
+        result->right_hf_amp = last_right_hf_amp;
         result->left_intensity = to_legacy_intensity(std::max(low_amp_left, high_amp_left));
         result->right_intensity = to_legacy_intensity(std::max(low_amp_right, high_amp_right));
         return 1;
@@ -190,6 +228,15 @@ private:
     int envelope_right = 0;
     int silence_packets = 0;
     bool output_active = false;
+
+    int last_left_lf_freq = 0;
+    int last_left_lf_amp = 0;
+    int last_left_hf_freq = 0;
+    int last_left_hf_amp = 0;
+    int last_right_lf_freq = 0;
+    int last_right_lf_amp = 0;
+    int last_right_hf_freq = 0;
+    int last_right_hf_amp = 0;
 
     static int16_t read_i16(const uint8_t* p) {
         return static_cast<int16_t>(static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8));
@@ -369,6 +416,20 @@ private:
         const double t = static_cast<double>(frequency - HF_RAW_MIN_FREQUENCY) / raw_span;
         return clamp(static_cast<int>(std::lround(HF_RAW_MIN_FREQUENCY + t * out_span)),
                      HF_RAW_MIN_FREQUENCY, HF_OUTPUT_MAX_FREQUENCY);
+    }
+
+    static int remap_lf_frequency(int frequency) {
+        // Linearly redistribute the raw LF band (94..234) into the full output range
+        // [70,300], so the 4 discrete low bins spread across the range instead of
+        // bunching at 94/141/188/234.  Mirrors remap_hf_frequency in structure.
+        constexpr int raw_span = LF_RAW_MAX_FREQUENCY - LF_RAW_MIN_FREQUENCY;
+        constexpr int out_span = LF_OUTPUT_MAX_FREQUENCY - LF_OUTPUT_MIN_FREQUENCY;
+        if (frequency <= LF_RAW_MIN_FREQUENCY) {
+            return LF_OUTPUT_MIN_FREQUENCY;
+        }
+        const double t = static_cast<double>(frequency - LF_RAW_MIN_FREQUENCY) / raw_span;
+        return clamp(static_cast<int>(std::lround(LF_OUTPUT_MIN_FREQUENCY + t * out_span)),
+                     LF_OUTPUT_MIN_FREQUENCY, LF_OUTPUT_MAX_FREQUENCY);
     }
 
     static int to_legacy_intensity(int amp) {
