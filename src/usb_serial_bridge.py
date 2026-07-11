@@ -72,7 +72,7 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "0.12.3"
+APP_FIRMWARE_VERSION = "0.12.4"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_1"
 MAX_ESP32S3_CHANNELS = 8
@@ -324,6 +324,24 @@ class ESP32S3SerialClient:
                 except queue.Empty:
                     continue
             return None
+
+    def send_command_line(self, command: str) -> bool:
+        """Fire-and-forget manager command (no response expected).
+
+        Used for commands like 'inputsrc <ch> legacy' whose firmware reply is a
+        debug JSON that never enters the response queue; send_manager_command
+        would always block until its timeout for those. Uses the lightweight
+        _write_lock (like send_ble_write) so it cannot stall rumble/status polls.
+        """
+        with self._write_lock:
+            self.open()
+            self._ensure_read_thread()
+            try:
+                self.handle.write((command.strip() + "\n").encode("ascii"))
+                return True
+            except Exception as e:
+                logger.debug("Failed to write ESP32-S3 command line %r: %s", command, e)
+                return False
 
     def send_ble_write(self, channel: int, uuid: str, data, mirror_channel=None):
         uuid_text = str(uuid).lower()
@@ -629,6 +647,9 @@ class ESP32S3ChannelClient:
 
     def send_manager_command(self, command: str, timeout=2.0):
         return self.shared_client.send_manager_command(command, timeout=timeout)
+
+    def send_command_line(self, command: str) -> bool:
+        return self.shared_client.send_command_line(command)
 
 def scan_serial_ports():
     ports_by_name = {}

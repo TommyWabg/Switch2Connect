@@ -54,7 +54,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v0.12.3"
+APP_VERSION = "v0.12.4"
 
 def _set_current_thread_priority(level):
     try:

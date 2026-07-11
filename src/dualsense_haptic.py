@@ -137,9 +137,9 @@ class DualSenseHapticProcessor:
     HF_RAW_MAX_FREQUENCY = 609
     # Low band peak-bin frequencies for LOW_BIN_MIN/MAX: round(2*3000/64)=94,
     # round(5*3000/64)=234.  Redistribute that raw span into the full output range
-    # [70,300] (like _remap_hf_frequency) instead of hard-clamping to the same window.
-    LF_OUTPUT_MIN_FREQUENCY = 70
-    LF_OUTPUT_MAX_FREQUENCY = 300
+    # [225,281] (like _remap_hf_frequency) instead of hard-clamping to the same window.
+    LF_OUTPUT_MIN_FREQUENCY = 225
+    LF_OUTPUT_MAX_FREQUENCY = 281
     LF_RAW_MIN_FREQUENCY = 94
     LF_RAW_MAX_FREQUENCY = 234
 
@@ -623,7 +623,7 @@ class DualSenseHapticProcessor:
     @classmethod
     def _remap_lf_frequency(cls, frequency):
         """Linearly redistribute the raw LF band (94..234 Hz, bins 2..5) into the full
-        output range [70,300], so the discrete low bins spread across the range instead
+        output range [225,281], so the discrete low bins spread across the range instead
         of bunching at 94/141/188/234.  Mirrors _remap_hf_frequency in structure."""
         raw_min = cls.LF_RAW_MIN_FREQUENCY
         raw_span = cls.LF_RAW_MAX_FREQUENCY - raw_min

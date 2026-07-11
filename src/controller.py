@@ -3313,9 +3313,32 @@ class Controller:
                 # causing all write_command() calls (including enableFeatures) to timeout.
 
 
+                # The GCN's compact native report lives on the LEGACY characteristic;
+                # the firmware subscribes FD2 by default (correct for Pro2/Joy-Con, but
+                # a different byte layout for the GCN: the right stick lands on the
+                # trigger byte and the gyro region reads non-IMU bytes -> "right stick
+                # bound to right trigger" and "gyro always in motion"). Switch this
+                # channel's input source to LEGACY so the bridge forwards the same
+                # compact report the WinRT path receives. Sent on every initialize()
+                # because the firmware resets prefer_legacy=false on each connect.
+                channel = getattr(self, 'channel', None)
+                if channel is None:
+                    channel = getattr(self.client, 'channel', 0)
+                if hasattr(self.client, 'send_command_line'):
+                    sent = await asyncio.to_thread(
+                        self.client.send_command_line, f"inputsrc {int(channel)} legacy")
+                    if sent:
+                        logger.info("GCN via ESP32 bridge: switched channel %d input source to LEGACY", channel)
+                    else:
+                        logger.warning("GCN via ESP32 bridge: failed to send inputsrc legacy for channel %d", channel)
+                    # Let the firmware unsubscribe FD2 / CCCD-subscribe LEGACY so the
+                    # first frames the parser sees are already compact-format.
+                    await asyncio.sleep(0.3)
+                else:
+                    logger.info("GCN via ESP32 bridge: client lacks send_command_line; using default input source")
+
                 # Use the standard INPUT_REPORT_UUID subscription; the bridge router
                 # ensures GCN input frames reach this callback correctly.
-                logger.info("GCN via ESP32 bridge: using standard INPUT_REPORT_UUID subscription")
                 await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
             else:
                 # WinRT BLE: The GCN controller may deliver input on any notify char in the
