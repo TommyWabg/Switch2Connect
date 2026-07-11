@@ -108,6 +108,51 @@ BACK_BUTTON_CATEGORIES = [
     ]),
 ]
 
+SWITCH_INPUT_DAMPENING_OPTIONS = [
+    "ZL", "L", "MINUS", "Capture", "L_STK", "A", "X",
+    "ZR", "R", "PLUS", "Home", "R_STK", "B", "Y",
+    "UP", "DOWN", "LEFT", "RIGHT", "Chat", "GL", "GR",
+]
+
+_DAMPENING_INPUT_ALIASES = {
+    "HOME": "Home",
+    "CAPT": "Capture",
+    "CAPTURE": "Capture",
+    "C": "Chat",
+    "CHAT": "Chat",
+}
+
+_LEGACY_DAMPENING_MODES = {
+    "Off": [],
+    "ZR Dampening": ["ZR"],
+    "ZL Dampening": ["ZL"],
+    "Both Dampening": ["ZL", "ZR"],
+}
+
+
+def normalize_dampening_inputs(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if value in _LEGACY_DAMPENING_MODES:
+            return list(_LEGACY_DAMPENING_MODES[value])
+        if value.strip() == "":
+            return []
+        raw_values = [part.strip() for part in value.replace("|", ",").split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        return []
+
+    valid = set(SWITCH_INPUT_DAMPENING_OPTIONS)
+    normalized = []
+    for item in raw_values:
+        token = str(item).strip()
+        token = _DAMPENING_INPUT_ALIASES.get(token.upper(), token)
+        if token in valid and token not in normalized:
+            normalized.append(token)
+    return normalized
+
 # Display labels for tokens whose stored name differs from what the user should see.
 # Tokens not listed here are shown verbatim (e.g. "Default", "A", "Home", "Gyro Lock").
 BACK_BUTTON_LABELS = {

@@ -40,7 +40,7 @@ try:
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
 except Exception:
     pass
-from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN
+from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs
 from utils import (
     apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
@@ -2685,7 +2685,13 @@ class Controller:
 
             if not getattr(self, "_ps_drain", False) and not getattr(utils, "profile_selection_active", False):
                 for j_key, stick in [("l_joystick", inputData.left_stick), ("r_joystick", inputData.right_stick)]:
-                    if CONFIG.get_mapping_setting_scoped(j_key, "Default", None) == "Custom":
+                    # Emit per-direction pairs when EITHER layer maps this stick to Custom.
+                    # The shifted (Mode Shift) layer needs them too: while Mode Shift is Off
+                    # the layers are independent, so a direction set to In-app Gyro (or any
+                    # Custom OS-key sequence) only in the shifted layer would otherwise have
+                    # no pair to resolve, and never trigger.
+                    if (CONFIG.get_mapping_setting_scoped(j_key, "Default", None) == "Custom"
+                            or CONFIG.get_mapping_setting_scoped(j_key, "Default", "in_app_gyro_mode_mappings") == "Custom"):
                         directions, _ = self._stick_sector_state(stick)
                         for d in ("up", "down", "left", "right"):
                             mapping_pairs.append((d in directions, f"{j_key}_{d}", 0, None, f"{j_key}_{d}"))
@@ -2705,6 +2711,26 @@ class Controller:
                     return CONFIG.get_joystick_custom("r_joystick").get("click", "Default")
                 return CONFIG.get_mapping_setting(mapping_key, "Default")
 
+            def get_scoped_mapping_action(mapping_key):
+                # Same resolution as get_base_mapping_action, but against the shifted
+                # (Mode Shift) In-app Gyro layer. Used only to detect a shifted-layer-only
+                # In-app Gyro activation button while Mode Shift is Off (the two layers are
+                # independent then, so such a button is invisible to the base pre-pass).
+                if mapping_key == "gc_l_click" and getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max":
+                    return "ZL"
+                if mapping_key == "gc_r_click" and getattr(CONFIG, "gc_trigger_mode", "100% at Bump") == "100% at Max":
+                    return "ZR"
+                if mapping_key.startswith("l_joystick_") or mapping_key.startswith("r_joystick_"):
+                    j_key, d = mapping_key.rsplit("_", 1)
+                    if in_app_gyro_scope_dict.get(f"{j_key}_mapping", "Default") == "Custom":
+                        return CONFIG.get_joystick_custom_scoped(j_key, "in_app_gyro_mode_mappings").get(d, "Default")
+                    return "Default"
+                if mapping_key == "l_stk" and in_app_gyro_scope_dict.get("l_joystick_mapping", "Default") == "Custom":
+                    return CONFIG.get_joystick_custom_scoped("l_joystick", "in_app_gyro_mode_mappings").get("click", "Default")
+                if mapping_key == "r_stk" and in_app_gyro_scope_dict.get("r_joystick_mapping", "Default") == "Custom":
+                    return CONFIG.get_joystick_custom_scoped("r_joystick", "in_app_gyro_mode_mappings").get("click", "Default")
+                return in_app_gyro_scope_dict.get(f"{mapping_key}_mapping", "Default")
+
             # Single pre-pass over the base (Controller Mapping) actions to resolve both
             # the In-app Gyro activation trigger and the "Mode Shift" back button state.
             # The Mode Shift trigger lives in the base layer so it can switch INTO the
@@ -2723,9 +2749,20 @@ class Controller:
                 self._in_app_gyro_armed = set(getattr(self, "_in_app_gyro_tap_held", set()))
             in_app_gyro_pressed_ids = set()
             in_app_gyro_tap_edge = False
-            
+
             in_app_gyro_newly_pressed_key = None
             in_app_gyro_newly_held_key = None
+
+            # Shifted-layer (Mode Shift) In-app Gyro activation, collected only while Mode
+            # Shift is Off (On keeps the layers synced, so the base pre-pass already sees
+            # it). Folded into the trigger below only while the shifted layer is active.
+            mode_shift_enabled = CONFIG.mode_shift_enabled
+            in_app_gyro_scope_dict = CONFIG.get_mapping_scope_dict("in_app_gyro_mode_mappings") if not mode_shift_enabled else None
+            scoped_in_app_gyro_hold_pressed = False
+            scoped_in_app_gyro_pressed_ids = set()
+            scoped_in_app_gyro_tap_edge = False
+            scoped_in_app_gyro_newly_pressed_key = None
+            scoped_in_app_gyro_newly_held_key = None
 
             for is_pressed, mapping_key, _ms_bit, default_action, btn_id in mapping_pairs:
                 if btn_id in suppressed_btn_ids:
@@ -2756,6 +2793,24 @@ class Controller:
                     else:  # Hold
                         if is_pressed:
                             mode_shift_hold_pressed = True
+
+                if not mode_shift_enabled:
+                    scoped_action = get_scoped_mapping_action(mapping_key)
+                    scoped_resolved = default_action if scoped_action == "Default" else scoped_action
+                    if is_pressed and scoped_resolved in ("Gyro", "In-app Gyro"):
+                        scoped_in_app_gyro_hold_pressed = True
+                    if isinstance(scoped_resolved, str) and scoped_resolved.startswith("Custom") and CONFIG._is_in_app_gyro_value(scoped_resolved):
+                        if is_pressed:
+                            scoped_in_app_gyro_pressed_ids.add(btn_id)
+                        if scoped_resolved.startswith("Custom[Tap]:"):
+                            if is_pressed and btn_id not in self._in_app_gyro_armed:
+                                scoped_in_app_gyro_tap_edge = True
+                                scoped_in_app_gyro_newly_pressed_key = mapping_key
+                        else:  # Hold
+                            if is_pressed:
+                                scoped_in_app_gyro_hold_pressed = True
+                                if btn_id not in self._in_app_gyro_armed:
+                                    scoped_in_app_gyro_newly_held_key = mapping_key
             is_merged = getattr(self, "is_merged", False)
             if mode_shift_tap_edge and not is_merged:
                 self._mode_shift_toggle = not getattr(self, "_mode_shift_toggle", False)
@@ -2763,23 +2818,17 @@ class Controller:
             # Compatibility for any older runtime state readers.
             self._mode_shift_tap_held = self._mode_shift_armed
 
+            # Base (Controller Mapping) In-app Gyro trigger. Finalized (and _own_* fields
+            # published) only after the Mode Shift layer is resolved below, so a
+            # shifted-layer-only In-app Gyro button can be folded in first. The base
+            # result is computed here because the Mode Shift reset block needs it (that
+            # block only matters while Mode Shift is On, where base == shifted anyway).
             local_in_app_gyro_toggle = bool(getattr(self, "_in_app_gyro_toggle", False))
             if in_app_gyro_tap_edge and not is_merged:
                 local_in_app_gyro_toggle = not local_in_app_gyro_toggle
                 self._in_app_gyro_toggle = local_in_app_gyro_toggle
-            self._in_app_gyro_armed = in_app_gyro_pressed_ids
-            self._in_app_gyro_tap_held = self._in_app_gyro_armed
-            
+            in_app_gyro_armed = set(in_app_gyro_pressed_ids)
             new_trigger_key = in_app_gyro_newly_pressed_key or in_app_gyro_newly_held_key
-            if new_trigger_key:
-                self._last_in_app_gyro_trigger_key = new_trigger_key
-                self._last_in_app_gyro_trigger_time = time.perf_counter()
-            
-            self._own_in_app_gyro_tap_edge = in_app_gyro_tap_edge
-            self._own_last_in_app_gyro_trigger_key = getattr(self, "_last_in_app_gyro_trigger_key", None)
-            self._own_last_in_app_gyro_trigger_time = getattr(self, "_last_in_app_gyro_trigger_time", 0.0)
-            self._own_in_app_gyro_hold_pressed = in_app_gyro_hold_pressed
-            self._own_in_app_gyro_toggle = local_in_app_gyro_toggle
             trigger_gyro = local_in_app_gyro_toggle != in_app_gyro_hold_pressed
 
             local_mode_shift_toggle = bool(getattr(self, "_mode_shift_toggle", False))
@@ -2802,8 +2851,8 @@ class Controller:
             # In-app Gyro auto-applies the Mode Shift layer only when the per-(profile,
             # Gyro Control) Mode Shift toggle is On; the back button applies it regardless.
             in_app_gyro_active = getattr(self, "gyro_mouse_enabled", False) or trigger_gyro
-            in_app_gyro_mode_shift = bool(in_app_gyro_active and CONFIG.mode_shift_enabled)
-            
+            in_app_gyro_mode_shift = bool(in_app_gyro_active and mode_shift_enabled)
+
             prev_in_app_gyro_mode_shift = getattr(self, "_prev_in_app_gyro_mode_shift", False)
             if prev_in_app_gyro_mode_shift and not in_app_gyro_mode_shift:
                 self._mode_shift_toggle = False
@@ -2817,6 +2866,37 @@ class Controller:
             
             mapping_scope_active = in_app_gyro_mode_shift != mode_shift_button_active
             self._mode_shift_active = mapping_scope_active
+
+            # Fold in an In-app Gyro activation button that lives only in the shifted
+            # (Mode Shift) layer. With Mode Shift Off the two layers are independent, so
+            # such a button is invisible to the base pre-pass and would never activate
+            # gyro; mirror it into the trigger while its layer is active. Hold: gyro stays
+            # on only while the button is held inside the layer. Tap: toggles the same
+            # In-app Gyro latch as a base-layer Tap button.
+            if mapping_scope_active and not mode_shift_enabled:
+                if scoped_in_app_gyro_tap_edge and not is_merged:
+                    local_in_app_gyro_toggle = not local_in_app_gyro_toggle
+                    self._in_app_gyro_toggle = local_in_app_gyro_toggle
+                in_app_gyro_hold_pressed = in_app_gyro_hold_pressed or scoped_in_app_gyro_hold_pressed
+                in_app_gyro_tap_edge = in_app_gyro_tap_edge or scoped_in_app_gyro_tap_edge
+                in_app_gyro_armed |= scoped_in_app_gyro_pressed_ids
+                if not new_trigger_key:
+                    new_trigger_key = scoped_in_app_gyro_newly_pressed_key or scoped_in_app_gyro_newly_held_key
+                trigger_gyro = local_in_app_gyro_toggle != in_app_gyro_hold_pressed
+
+            # Publish the (possibly folded) In-app Gyro trigger state. Merged Joy-Cons
+            # aggregate these _own_* fields in virtual_controller.
+            self._in_app_gyro_armed = in_app_gyro_armed
+            self._in_app_gyro_tap_held = self._in_app_gyro_armed
+            if new_trigger_key:
+                self._last_in_app_gyro_trigger_key = new_trigger_key
+                self._last_in_app_gyro_trigger_time = time.perf_counter()
+            self._own_in_app_gyro_tap_edge = in_app_gyro_tap_edge
+            self._own_last_in_app_gyro_trigger_key = getattr(self, "_last_in_app_gyro_trigger_key", None)
+            self._own_last_in_app_gyro_trigger_time = getattr(self, "_last_in_app_gyro_trigger_time", 0.0)
+            self._own_in_app_gyro_hold_pressed = in_app_gyro_hold_pressed
+            self._own_in_app_gyro_toggle = local_in_app_gyro_toggle
+
             # Resolve the active In-app Gyro mapping dict once per report and index it
             # directly below, instead of calling a resolving getter for every button.
             mapping_scope_dict = CONFIG.get_mapping_scope_dict("in_app_gyro_mode_mappings") if mapping_scope_active else None
@@ -3837,17 +3917,33 @@ class Controller:
             eff_zl_damp = zl_pressed or (now - getattr(self, "_last_zl_pressed_time", 0.0) <= 0.050)
 
             if trigger_pressed and trigger_key:
-                damp_mode = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_mode", "Off", None)
-                if damp_mode != "Off":
-                    apply_damp = False
-                    if damp_mode == "ZR Dampening" and eff_zr_damp:
-                        apply_damp = True
-                    elif damp_mode == "ZL Dampening" and eff_zl_damp:
-                        apply_damp = True
-                    elif damp_mode == "Both Dampening" and (eff_zl_damp or eff_zr_damp):
-                        apply_damp = True
-                        
-                    if apply_damp:
+                damp_inputs = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_mode", [], None))
+                if damp_inputs:
+                    button_bits = int(getattr(inputData, "buttons", 0) or 0)
+                    pressed = {
+                        "ZL": eff_zl_damp,
+                        "ZR": eff_zr_damp,
+                        "L": bool(button_bits & SWITCH_BUTTONS.get("L", 0)),
+                        "R": bool(button_bits & SWITCH_BUTTONS.get("R", 0)),
+                        "MINUS": bool(button_bits & SWITCH_BUTTONS.get("MINUS", 0)),
+                        "PLUS": bool(button_bits & SWITCH_BUTTONS.get("PLUS", 0)),
+                        "Capture": bool(button_bits & SWITCH_BUTTONS.get("CAPT", 0)),
+                        "Home": bool(button_bits & SWITCH_BUTTONS.get("HOME", 0)),
+                        "Chat": bool(button_bits & SWITCH_BUTTONS.get("C", 0)),
+                        "L_STK": bool(button_bits & SWITCH_BUTTONS.get("L_STK", 0)),
+                        "R_STK": bool(button_bits & SWITCH_BUTTONS.get("R_STK", 0)),
+                        "A": bool(button_bits & SWITCH_BUTTONS.get("A", 0)),
+                        "B": bool(button_bits & SWITCH_BUTTONS.get("B", 0)),
+                        "X": bool(button_bits & SWITCH_BUTTONS.get("X", 0)),
+                        "Y": bool(button_bits & SWITCH_BUTTONS.get("Y", 0)),
+                        "UP": bool(button_bits & SWITCH_BUTTONS.get("UP", 0)),
+                        "DOWN": bool(button_bits & SWITCH_BUTTONS.get("DOWN", 0)),
+                        "LEFT": bool(button_bits & SWITCH_BUTTONS.get("LEFT", 0)),
+                        "RIGHT": bool(button_bits & SWITCH_BUTTONS.get("RIGHT", 0)),
+                        "GL": bool(button_bits & SWITCH_BUTTONS.get("GL", 0)),
+                        "GR": bool(button_bits & SWITCH_BUTTONS.get("GR", 0)),
+                    }
+                    if any(pressed.get(token, False) for token in damp_inputs):
                         damp_amount = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_amount", 90, None)
                         gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
             

@@ -36,7 +36,7 @@ import re
 import ctypes
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, back_button_label, normalize_dampening_inputs
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -4457,7 +4457,7 @@ class ControllerWindow:
         self.deadzone_scale = tk.Scale(
             self.comp_frame,
             from_=0.0,
-            to=5.0,
+            to=10.0,
             resolution=0.5,
             orient=tk.HORIZONTAL,
             length=int(120 * scaling_factor),
@@ -4687,7 +4687,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.in_app_deadzone_scale = tk.Scale(
             self.gyro_frame,
             from_=0.0,
-            to=5.0,
+            to=10.0,
             resolution=0.5,
             orient=tk.HORIZONTAL,
             length=int(120 * scaling_factor),
@@ -5409,11 +5409,17 @@ bg_color=panel_bg, widths=[8, 10])
             tk.Label(damp_row, text="Trigger Dampening:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
             
             damp_mode_key = f"{key}_in_app_gyro_dampening_mode"
-            damp_mode_val = CONFIG.get_mapping_setting_scoped(damp_mode_key, "Off", None)
-            
-            damp_combo = ttk.Combobox(damp_row, values=["Off", "ZR Dampening", "ZL Dampening", "Both Dampening"], font=scale_font(("Arial", 10, "bold")), state="readonly", width=14, justify="center")
-            damp_combo.set(damp_mode_val)
-            damp_combo.pack(side=tk.LEFT)
+            damp_button_width = 14
+            damp_button = tk.Button(
+                damp_row,
+                bg=button_gray,
+                fg="white",
+                font=scale_font(("Arial", 10, "bold")),
+                bd=0,
+                relief=tk.FLAT,
+                width=damp_button_width,
+            )
+            damp_button.pack(side=tk.LEFT)
     
             damp_amt_row = tk.Frame(popup, bg=background_color)
             
@@ -5429,23 +5435,106 @@ bg_color=panel_bg, widths=[8, 10])
             damp_scale = tk.Scale(damp_amt_row, from_=0, to=100, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 10, "bold")), command=on_damp_amt_change)
             damp_scale.set(damp_amt_val)
             damp_scale.pack(side=tk.LEFT)
-            
-            # Temporarily pack it to calculate the max size for the window boundary check
-            damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
-                
-            def on_damp_combo_change(e):
-                val = damp_combo.get()
-                CONFIG.set_mapping_setting_scoped(damp_mode_key, val, None)
-                CONFIG.save_config()
-                if val == "Off":
-                    damp_amt_row.pack_forget()
+
+            def damp_display_text():
+                selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(damp_mode_key, [], None))
+                if not selected:
+                    return "None"
+                return " | ".join(back_button_label(token) for token in selected)
+
+            def refresh_damp_button():
+                selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(damp_mode_key, [], None))
+                damp_button.config(text=damp_display_text())
+                if selected:
+                    if not damp_amt_row.winfo_ismapped():
+                        damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=damp_row)
                 else:
-                    damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=damp_row)
+                    damp_amt_row.pack_forget()
+
+            Tooltip(damp_button, damp_display_text)
+
+            def close_dampening_input_popup():
+                damp_popup = getattr(self, "dampening_input_popup", None)
+                if damp_popup is not None and damp_popup.winfo_exists():
+                    damp_popup.destroy()
+                self.dampening_input_popup = None
+                self.dampening_input_popup_anchor = None
+
+            def open_dampening_input_popup():
+                existing = getattr(self, "dampening_input_popup", None)
+                if existing is not None and existing.winfo_exists() and getattr(self, "dampening_input_popup_anchor", None) is damp_button:
+                    close_dampening_input_popup()
+                    return
+                close_dampening_input_popup()
+                selected = set(normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(damp_mode_key, [], None)))
+                from config import BACK_BUTTON_CATEGORIES
+
+                spacing2 = int(10 * scaling_factor)
+                column_gap = int(8 * scaling_factor)
+                btn_gap = int(5 * scaling_factor)
+                btn_font = scale_font(("Arial", 9, "bold"))
+                measure = tkFont.Font(font=btn_font)
+                max_label_w = 0
+                for _title, rows in BACK_BUTTON_CATEGORIES:
+                    for row_values in rows:
+                        for token in row_values:
+                            max_label_w = max(max_label_w, measure.measure(back_button_label(token)))
+                btn_w = max_label_w + int(16 * scaling_factor)
+                btn_h = measure.metrics("linespace") + int(10 * scaling_factor)
+
+                damp_popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=column_gap, pady=spacing2)
+                self.dampening_input_popup = damp_popup
+                self.dampening_input_popup_anchor = damp_button
+                button_refs = {}
+
+                def set_button_state(token):
+                    frame, btn = button_refs[token]
+                    is_selected = token in selected
+                    bd = int(2 * scaling_factor) if is_selected else 0
+                    frame.config(bg=highlight_color if is_selected else background_color)
+                    btn.place(x=bd, y=bd, width=btn_w - 2 * bd, height=btn_h - 2 * bd)
+
+                def toggle_token(token):
+                    if token in selected:
+                        selected.remove(token)
+                    else:
+                        selected.add(token)
+                    ordered = [token for token in SWITCH_INPUT_DAMPENING_OPTIONS if token in selected]
+                    CONFIG.set_mapping_setting_scoped(damp_mode_key, ordered, None)
+                    CONFIG.save_config()
+                    set_button_state(token)
+                    refresh_damp_button()
+
+                cats = dict(BACK_BUTTON_CATEGORIES)
+                block = tk.Frame(damp_popup, bg=background_color)
+                block.pack(side=tk.TOP, anchor=tk.W)
+                for c_idx, col in enumerate(cats["Switch Input"]):
+                    for r_idx, token in enumerate(col):
+                        cell = tk.Frame(block, bg=background_color, width=btn_w, height=btn_h)
+                        cell.grid(row=r_idx, column=c_idx, padx=(0, btn_gap), pady=(0, btn_gap), sticky="nsew")
+                        cell.grid_propagate(False)
+                        btn = tk.Button(cell, text=back_button_label(token), font=btn_font,
+                                        bg=button_gray, fg="white", relief=tk.FLAT, bd=0,
+                                        highlightthickness=0, takefocus=0,
+                                        activebackground=highlight_color, activeforeground="white",
+                                        command=lambda t=token: toggle_token(t))
+                        button_refs[token] = (cell, btn)
+                        set_button_state(token)
+
+                damp_popup.place(in_=self.root, x=-10000, y=-10000)
+                damp_popup.update_idletasks()
+                self._place_popup_within_root_bounds(damp_popup, damp_button)
+
+            damp_button.config(command=open_dampening_input_popup)
+            refresh_damp_button()
+
+            # Temporarily pack it to calculate the max size for the window boundary check.
+            damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
+            refresh_damp_button()
                     
-            damp_combo.bind("<<ComboboxSelected>>", on_damp_combo_change)
-            
             def on_popup_destroy(e):
                 if str(e.widget) == str(popup):
+                    close_dampening_input_popup()
                     final_val = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
                     display_str = IN_APP_GYRO_LABEL
                     if final_val == "None":
@@ -5481,11 +5570,6 @@ bg_color=panel_bg, widths=[8, 10])
                 
             popup.update_idletasks()
             self._place_popup_within_root_bounds(popup, in_app_gyro_btn, fallback_coords=anchor_coords)
-            
-            # If the initial mode is Off, hide the slider row *after* the boundary check
-            # This ensures we reserved enough space downwards for the slider if the user turns it on.
-            if damp_mode_val == "Off":
-                damp_amt_row.pack_forget()
                 
             popup.lift()
             
@@ -5697,6 +5781,11 @@ bg_color=panel_bg, widths=[8, 10])
         return False
 
     def close_in_app_gyro_popup(self):
+        damp_popup = getattr(self, "dampening_input_popup", None)
+        if damp_popup is not None and damp_popup.winfo_exists():
+            damp_popup.destroy()
+        self.dampening_input_popup = None
+        self.dampening_input_popup_anchor = None
         popup = getattr(self, "in_app_gyro_popup", None)
         if popup is not None and popup.winfo_exists():
             popup.destroy()
@@ -5728,6 +5817,8 @@ bg_color=panel_bg, widths=[8, 10])
                 self.close_in_app_gyro_popup()
                 return
             if self._event_in_widget(current_popup, event):
+                return
+            if self._event_in_widget(getattr(self, "dampening_input_popup", None), event):
                 return
             if self._event_in_widget(getattr(self, "back_button_popup", None), event):
                 return
