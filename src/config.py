@@ -156,6 +156,7 @@ IN_APP_GYRO_LABEL = "In-app Gyro"
 # Gyro mode automatically applies the Mode Shift Mapping layer; when Off the layer is
 # applied only via the "Mode Shift" back button.
 MODE_SHIFT_ENABLED_DEFAULTS = {"Mouse": True, "R Joystick": False, "Steering": False}
+MODE_SHIFT_ENABLED_MIGRATION_KEY = "_mode_shift_enabled_migration_v1"
 
 SHARED_BUTTON_MAPPING_DEFAULTS = {
     "plus_mapping": "Default",
@@ -619,9 +620,41 @@ class Config:
         self.auto_disconnect_days = int(config.get("auto_disconnect_days", 0))
         self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
         self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
+        self._normalize_mode_shift_enabled_profiles()
+
         # abxy_mode, rumble_mode, vibration_strength, vibration_frequency are now properties managed per Emu Mode category
 
         logger.info(f"Config successfully loaded from {self.config_file_path}")
+
+    def _normalize_mode_shift_enabled_profiles(self):
+        """Normalize old packaged configs to the per-Gyro-Control Mode Shift shape.
+
+        Some packaged configs persisted every Mode Shift mode as False. Without a
+        marker, treat that exact all-off shape as the old baseline and restore the
+        Mouse default once. If the user later explicitly turns Mouse off, the marker
+        prevents future loads from changing it back.
+        """
+        if not isinstance(getattr(self, "profiles", None), dict):
+            return
+        expected_modes = tuple(MODE_SHIFT_ENABLED_DEFAULTS.keys())
+        for prof in self.profiles.values():
+            if not isinstance(prof, dict):
+                continue
+            stored = prof.get("mode_shift_enabled")
+            marker_set = bool(prof.get(MODE_SHIFT_ENABLED_MIGRATION_KEY, False))
+            normalized = dict(MODE_SHIFT_ENABLED_DEFAULTS)
+            if isinstance(stored, dict):
+                for mode in expected_modes:
+                    if mode in stored:
+                        normalized[mode] = bool(stored[mode])
+            elif isinstance(stored, bool):
+                normalized["Mouse"] = bool(stored)
+            all_modes_present = isinstance(stored, dict) and all(mode in stored for mode in expected_modes)
+            all_off = all_modes_present and not any(bool(stored.get(mode)) for mode in expected_modes)
+            if all_off and not marker_set:
+                normalized["Mouse"] = MODE_SHIFT_ENABLED_DEFAULTS["Mouse"]
+            prof["mode_shift_enabled"] = normalized
+            prof[MODE_SHIFT_ENABLED_MIGRATION_KEY] = True
 
     def _build_profile_setting_defaults(self, config):
         saved_defaults = config.get("profile_defaults", {})
@@ -782,7 +815,9 @@ class Config:
             "simulation_mode": "PS5",
             "assigned_apps": [],
             "change_profile_list": False,
-            "profile_switching_combo": ""
+            "profile_switching_combo": "",
+            "mode_shift_enabled": dict(MODE_SHIFT_ENABLED_DEFAULTS),
+            MODE_SHIFT_ENABLED_MIGRATION_KEY: True,
         }
         prof_data.update(self.get_default_profile_settings())
         for cat in categories:
@@ -894,47 +929,6 @@ class Config:
     def adaptive_triggers_enabled(self, value):
         self._set_profile_setting("adaptive_triggers_enabled", bool(value))
 
-
-    def active_in_app_gyro_scope(self):
-        """Physical In-app Gyro mapping store for the current Gyro Control mode."""
-        mode = self.gyro_control_mode
-        if mode == "Steering":
-            from config import MAPPING_SCOPE_IN_APP_GYRO_STEERING
-            return MAPPING_SCOPE_IN_APP_GYRO_STEERING
-        if mode == "R Joystick":
-            from config import MAPPING_SCOPE_IN_APP_GYRO_RSTICK
-            return MAPPING_SCOPE_IN_APP_GYRO_RSTICK
-        from config import MAPPING_SCOPE_IN_APP_GYRO
-        return MAPPING_SCOPE_IN_APP_GYRO
-
-    def _resolve_in_app_gyro_scope(self, scope):
-        if scope == "in_app_gyro":
-            return self.active_in_app_gyro_scope()
-        return scope
-
-
-    @property
-    def mode_shift_enabled(self):
-        """Whether entering In-app Gyro mode auto-applies the Mode Shift Mapping layer.
-        Stored per (profile, Gyro Control mode); defaults to On for Mouse and Off for
-        R Joystick / Steering."""
-        mode = self.gyro_control_mode
-        stored = self.profiles.get(self.active_profile, {}).get("mode_shift_enabled")
-        if isinstance(stored, dict) and mode in stored:
-            return bool(stored[mode])
-        return MODE_SHIFT_ENABLED_DEFAULTS.get(mode, False)
-
-    @mode_shift_enabled.setter
-    def mode_shift_enabled(self, value):
-        if self.active_profile not in self.profiles:
-            return
-        prof = self.profiles[self.active_profile]
-        stored = prof.get("mode_shift_enabled")
-        stored = dict(stored) if isinstance(stored, dict) else dict(MODE_SHIFT_ENABLED_DEFAULTS)
-        stored[self.gyro_control_mode] = bool(value)
-        prof["mode_shift_enabled"] = stored
-        self._bump_settings_generation()
-
     @property
     def djg_activation(self):
         return self._get_profile_setting("djg_activation")
@@ -1011,6 +1005,8 @@ class Config:
         stored = dict(stored) if isinstance(stored, dict) else dict(MODE_SHIFT_ENABLED_DEFAULTS)
         stored[self.gyro_control_mode] = bool(value)
         prof["mode_shift_enabled"] = stored
+        prof[MODE_SHIFT_ENABLED_MIGRATION_KEY] = True
+        self._bump_settings_generation()
 
     def active_in_app_gyro_scope(self):
         """Physical In-app Gyro mapping store for the current Gyro Control mode."""

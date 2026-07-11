@@ -4904,6 +4904,14 @@ bg_color=panel_bg, widths=[8, 10])
                 pack_kwargs["before"] = before_widgets[1]
             frame.pack(**pack_kwargs)
 
+    def _sync_active_mode_shift_mapping_ui(self, save=False):
+        try:
+            CONFIG.sync_active_in_app_gyro_activation()
+            if save:
+                CONFIG.save_config()
+        except Exception:
+            logger.exception("Failed to sync active Mode Shift mapping state")
+
     def update_mouse_sensitivity(self, val):
         new_sens = float(val)
         CONFIG.mouse_config.sensitivity = new_sens
@@ -8634,6 +8642,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def refresh_ui_for_profile(self):
         self._set_profile_button_text()
+        self._sync_active_mode_shift_mapping_ui(save=True)
         self.layout_switch.set_value(CONFIG.abxy_mode)
         self.rumble_mode_switch.set_value(getattr(CONFIG, "rumble_mode", "Xbox"))
         self.update_rumble_mode_ui(getattr(CONFIG, "rumble_mode", "Xbox"))
