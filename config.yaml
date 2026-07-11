@@ -2772,7 +2772,7 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1206
-window_y: 87
+window_x: 1238
+window_y: 46
 winuhid_sim_mode: PS5
 wired_usb_enabled: true
