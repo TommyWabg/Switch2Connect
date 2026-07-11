@@ -1,4 +1,4 @@
-# Switch 2 Connect
+# <img width="30" height="30" alt="icon" src="https://github.com/user-attachments/assets/a2b3be7e-851d-4c55-8803-3de00a85eaeb" /> Switch 2 Connect
 
 The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem. 
 
