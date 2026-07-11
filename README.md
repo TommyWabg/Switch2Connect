@@ -2,6 +2,14 @@
 
 This fork is heavily optimized for Windows 10/11 users, featuring a fully interactive GUI, advanced Gyro mouse aiming, and on-the-fly layout switching. 
 
+## Quick Start
+
+1. Download the `.exe` from the **[Releases](https://github.com/TommyWabg/switch2-controllers-windows10-gyro/releases)** page.
+2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
+3. Once the installation completes, the setup window will close automatically and the main application will launch.
+4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
+5. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
+
 ## Key Features
 
 * **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
@@ -43,14 +51,6 @@ This fork is heavily optimized for Windows 10/11 users, featuring a fully intera
 * **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for virtual gamepad emulation (supporting Xbox, PS4, and PS5/DualSense emulation). For the Switch2 emulation mode, the open-source [usbip-win2 driver](https://github.com/czgdp1807/usbip-win2) is required and used.
     * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid or USBIP) is missing and guide you through a one-click installation (requires administrator privileges).
 
-## Quick Start
-
-1. Download the `.exe` from the **[Releases](https://github.com/TommyWabg/switch2-controllers-windows10-gyro/releases)** page.
-2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
-3. Once the installation completes, the setup window will close automatically and the main application will launch.
-4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
-5. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
-
 ## Important Setting for Steam Users:
 Because this app emulates both Xbox One and PS4/PS5 controllers, Steam Input might try to "help" by applying its own layout overrides, which can double-swap your buttons and mess up your in-game controls! 
 **To ensure your layout stays consistent:**
@@ -75,37 +75,19 @@ To achieve drift-free 9-axis tracking, follow these steps to calibrate the magne
 3.  **Reference Video:** If you are unsure of the motion, click the [**'figure 8'** link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) in the UI to watch a short demonstration video.
 4.  **Save & Finish:** After performing the motion for about 5-10 seconds, click the **[Stop Mag Calib]** button to save the calibration data. The software will now use the new magnetic bias for stabilized orientation.
 
+## Support This Project
+
+Built with a user-experience-first mindset, this project has reached a mature and comprehensive state and will remain completely free to use forever.
+
+If you are highly satisfied when gaming with this app, please consider leaving a tip. Any financial "thank you" is incredibly appreciated!
+
+<div align="left">
+  <a href="https://ko-fi.com/tagayama">
+    <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi">
+  </a>
+</div>
+
+Happy gaming, and thank you for your generous support!
+
 ##
 **This project is developed based on and has been extensively modified from [Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers). I would like to thank the original author for her foundational work.**
-
----
-*(Below is the original project description)*
-
-# switch2 controllers
-An app to use switch 2 joycons on pc as gamepad and mouse
-
-### Usage
-
-No need to pair the controller in the bluetooth settings.
-
-Simply launch the app, and do what it says.
-
-If you already paired the joycons in windows bluetooth settings, remove it before attempting to use it with this app.
-
-### Using as a mouse
-
-By default the app switches a joycon to mouse mode when it detects it's being used a mouse (side of of the joycon against a flat surface)
-
-When in mouse mode, the following buttons are used as mouse buttons and no longer useable as gamepad buttons :
-L/R : left click
-ZL/ZR : right click
-joystick : mouse wheel and middle button (click)
-
-If you do not wish to use mouse mode, you can disable it in the config
-
-### Using joycons sideways
-
-By default, the app will always try to combine a right and left joycons together to make a single virtual controller.
-
-If you wish to use both joycons sideway, you can hold SL\SR while turning them on
-An other option is to set `combine_joycons` in the config to false so that the app will never try to combine joycons
