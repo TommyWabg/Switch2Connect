@@ -10,7 +10,7 @@ The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
 5. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
 
-## Key Features
+## Feature Descriptions
 
 * **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
 * **Low Latency Bluetooth Mode:** The application now forces Windows Bluetooth LE into `ThroughputOptimized` mode upon connection. This drastically drops the connection interval, massively reducing native Bluetooth input delay across the board.
