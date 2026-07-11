@@ -1,6 +1,6 @@
 {
     "packageVersion": "1.0.0",
-    "firmwareVersion": "0.12.3",
+    "firmwareVersion": "0.12.4",
     "target": "esp32s3",
     "flashMode": "dio",
     "flashFreq": "80m",
@@ -32,13 +32,13 @@
         {
             "id": "tinyusb_direct",
             "label": "ESP32-S3 Bluedroid Bridge (production)",
-            "version": "0.12.3",
+            "version": "0.12.4",
             "app": "esp32s3_bluedroid_bridge.bin",
             "assets": [
                 {
                     "offset": "0x0",
                     "path": "v1.0_bluedroid/bootloader.bin",
-                    "sha256": "fe89e5e509f1fd511f6d1a7c81fc9cf3aa9d0aa82ac732b5acffbd9360d0047d"
+                    "sha256": "73523d9b9379bf9c76d3d3b1aba645093d5b3b241dedaa612d0d425bccbd505f"
                 },
                 {
                     "offset": "0x8000",
@@ -48,10 +48,10 @@
                 {
                     "offset": "0x10000",
                     "path": "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
-                    "sha256": "760d6392e5ed0b9d660535d4d9080abaf6f56236c0e6e410f42445aabb079223"
+                    "sha256": "b1fe8c8c74eb2fea93a8c0c511c030fc57cf37ec3308d0d2cef0957e9b7984dd"
                 }
             ]
         }
     ],
-    "notes": "tinyusb_direct v0.12.3 (2026-07-07): \n0. NSO GameCube controller ESP32 byte-offset fix: The bridge now correctly uses the standard FD2 characteristic for the GCN controller, resolving the 1-byte offset issue that caused the Right Joystick to trigger the virtual ZR button.\n\ntinyusb_direct v0.12.2 (2026-07-04): \n0. NSO GameCube controller ESP32 input-source fix: the host now forces GCN channels to the LEGACY input notify source, and the Bluedroid bridge supports runtime inputsrc switching with old-notify disable/unregister. This fixes directed-advertising cases where the bridge cannot infer the GCN PID from manufacturer data and would otherwise subscribe to FD2, producing random inputs.\n\ntinyusb_direct v0.12.0 (2026-06-29): \n0. NSO GameCube controller fix: the bridge now subscribes to the LEGACY input notify characteristic (not FD2) for the GCN, matching the controller's compact native report layout. Previously the GCN streamed via the dev board but all mappings were wrong, sticks were pegged and buttons stuck, because FD2 carries a different byte layout the host GCN parser cannot read. The product_id is read from the advertisement at scan time to identify the GCN; all other controllers (Pro 2 / Joy-Con) still use FD2.\n\ntinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake."
+    "notes": "tinyusb_direct v0.12.4 (2026-07-10): \n0. NSO GameCube controller ESP32 input fix (regression of v0.12.3): the host now switches GCN bridge channels back to the LEGACY input notify source via the firmware 'inputsrc <ch> legacy' command right before subscribing. v0.12.3 had defaulted the GCN to FD2, but the host GCN parser reads the compact LEGACY report layout (right stick at data[8:11], right trigger at data[13], gyro at data[40:46]); feeding FD2 into it put the right stick on the right trigger and made the gyro read non-IMU bytes (always in motion, uncalibratable). This matches the working WinRT path, which delivers the LEGACY report. Firmware is unchanged from v0.12.3 apart from the version string; the fix is host-side plus the already-present runtime inputsrc switching.\n\ntinyusb_direct v0.12.3 (2026-07-07): \n0. NSO GameCube controller ESP32 byte-offset fix: The bridge now correctly uses the standard FD2 characteristic for the GCN controller, resolving the 1-byte offset issue that caused the Right Joystick to trigger the virtual ZR button.\n\ntinyusb_direct v0.12.2 (2026-07-04): \n0. NSO GameCube controller ESP32 input-source fix: the host now forces GCN channels to the LEGACY input notify source, and the Bluedroid bridge supports runtime inputsrc switching with old-notify disable/unregister. This fixes directed-advertising cases where the bridge cannot infer the GCN PID from manufacturer data and would otherwise subscribe to FD2, producing random inputs.\n\ntinyusb_direct v0.12.0 (2026-06-29): \n0. NSO GameCube controller fix: the bridge now subscribes to the LEGACY input notify characteristic (not FD2) for the GCN, matching the controller's compact native report layout. Previously the GCN streamed via the dev board but all mappings were wrong, sticks were pegged and buttons stuck, because FD2 carries a different byte layout the host GCN parser cannot read. The product_id is read from the advertisement at scan time to identify the GCN; all other controllers (Pro 2 / Joy-Con) still use FD2.\n\ntinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake."
 }
