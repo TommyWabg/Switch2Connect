@@ -1,57 +1,57 @@
-{
-    "packageVersion": "1.0.0",
-    "firmwareVersion": "0.12.4",
-    "target": "esp32s3",
-    "flashMode": "dio",
-    "flashFreq": "80m",
-    "flashSize": "16MB",
-    "defaultProfile": "tinyusb_direct",
-    "profiles": [
-        {
-            "id": "basic_ble_transport_0_10_5",
-            "label": "Basic BLE raw transport bridge",
-            "app": "esp32s3_switch2_bridge.bin",
-            "assets": [
-                {
-                    "offset": "0x0",
-                    "path": "pro2_bridge_v5_5/bootloader/bootloader.bin",
-                    "sha256": "578baa713024da5a9c8fd15398c6a96dc2d8edfbb2899aab6460d3a14a1dab5a"
-                },
-                {
-                    "offset": "0x8000",
-                    "path": "pro2_bridge_v5_5/partition_table/partition-table.bin",
-                    "sha256": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
-                },
-                {
-                    "offset": "0x10000",
-                    "path": "pro2_bridge_v5_5/esp32s3_switch2_bridge.bin",
-                    "sha256": "1fed5faa4f489be4b788c4338e8430c5ecc92781e2e827679bfe0726d06db5e0"
-                }
-            ]
-        },
-        {
-            "id": "tinyusb_direct",
-            "label": "ESP32-S3 Bluedroid Bridge (production)",
-            "version": "0.12.4",
-            "app": "esp32s3_bluedroid_bridge.bin",
-            "assets": [
-                {
-                    "offset": "0x0",
-                    "path": "v1.0_bluedroid/bootloader.bin",
-                    "sha256": "73523d9b9379bf9c76d3d3b1aba645093d5b3b241dedaa612d0d425bccbd505f"
-                },
-                {
-                    "offset": "0x8000",
-                    "path": "v1.0_bluedroid/partition-table.bin",
-                    "sha256": "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
-                },
-                {
-                    "offset": "0x10000",
-                    "path": "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
-                    "sha256": "b1fe8c8c74eb2fea93a8c0c511c030fc57cf37ec3308d0d2cef0957e9b7984dd"
-                }
-            ]
-        }
-    ],
-    "notes": "tinyusb_direct v0.12.4 (2026-07-10): \n0. NSO GameCube controller ESP32 input fix (regression of v0.12.3): the host now switches GCN bridge channels back to the LEGACY input notify source via the firmware 'inputsrc <ch> legacy' command right before subscribing. v0.12.3 had defaulted the GCN to FD2, but the host GCN parser reads the compact LEGACY report layout (right stick at data[8:11], right trigger at data[13], gyro at data[40:46]); feeding FD2 into it put the right stick on the right trigger and made the gyro read non-IMU bytes (always in motion, uncalibratable). This matches the working WinRT path, which delivers the LEGACY report. Firmware is unchanged from v0.12.3 apart from the version string; the fix is host-side plus the already-present runtime inputsrc switching.\n\ntinyusb_direct v0.12.3 (2026-07-07): \n0. NSO GameCube controller ESP32 byte-offset fix: The bridge now correctly uses the standard FD2 characteristic for the GCN controller, resolving the 1-byte offset issue that caused the Right Joystick to trigger the virtual ZR button.\n\ntinyusb_direct v0.12.2 (2026-07-04): \n0. NSO GameCube controller ESP32 input-source fix: the host now forces GCN channels to the LEGACY input notify source, and the Bluedroid bridge supports runtime inputsrc switching with old-notify disable/unregister. This fixes directed-advertising cases where the bridge cannot infer the GCN PID from manufacturer data and would otherwise subscribe to FD2, producing random inputs.\n\ntinyusb_direct v0.12.0 (2026-06-29): \n0. NSO GameCube controller fix: the bridge now subscribes to the LEGACY input notify characteristic (not FD2) for the GCN, matching the controller's compact native report layout. Previously the GCN streamed via the dev board but all mappings were wrong, sticks were pegged and buttons stuck, because FD2 carries a different byte layout the host GCN parser cannot read. The product_id is read from the advertisement at scan time to identify the GCN; all other controllers (Pro 2 / Joy-Con) still use FD2.\n\ntinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake."
+﻿{
+    "packageVersion":  "1.0.0",
+    "firmwareVersion":  "0.12.4",
+    "target":  "esp32s3",
+    "flashMode":  "dio",
+    "flashFreq":  "80m",
+    "flashSize":  "16MB",
+    "defaultProfile":  "tinyusb_direct",
+    "profiles":  [
+                     {
+                         "id":  "basic_ble_transport_0_10_5",
+                         "label":  "Basic BLE raw transport bridge",
+                         "app":  "esp32s3_switch2_bridge.bin",
+                         "assets":  [
+                                        {
+                                            "offset":  "0x0",
+                                            "path":  "pro2_bridge_v5_5/bootloader/bootloader.bin",
+                                            "sha256":  "578baa713024da5a9c8fd15398c6a96dc2d8edfbb2899aab6460d3a14a1dab5a"
+                                        },
+                                        {
+                                            "offset":  "0x8000",
+                                            "path":  "pro2_bridge_v5_5/partition_table/partition-table.bin",
+                                            "sha256":  "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
+                                        },
+                                        {
+                                            "offset":  "0x10000",
+                                            "path":  "pro2_bridge_v5_5/esp32s3_switch2_bridge.bin",
+                                            "sha256":  "1fed5faa4f489be4b788c4338e8430c5ecc92781e2e827679bfe0726d06db5e0"
+                                        }
+                                    ]
+                     },
+                     {
+                         "id":  "tinyusb_direct",
+                         "label":  "ESP32-S3 Bluedroid Bridge (production)",
+                         "version":  "0.12.4",
+                         "app":  "esp32s3_bluedroid_bridge.bin",
+                         "assets":  [
+                                        {
+                                            "offset":  "0x0",
+                                            "path":  "v1.0_bluedroid/bootloader.bin",
+                                            "sha256":  "73523d9b9379bf9c76d3d3b1aba645093d5b3b241dedaa612d0d425bccbd505f"
+                                        },
+                                        {
+                                            "offset":  "0x8000",
+                                            "path":  "v1.0_bluedroid/partition-table.bin",
+                                            "sha256":  "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
+                                        },
+                                        {
+                                            "offset":  "0x10000",
+                                            "path":  "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
+                                            "sha256":  "859f32988a2ebee793626b732b7a00ad661742eee4fa18e36bd98dcfe1627bb7"
+                                        }
+                                    ]
+                     }
+                 ],
+    "notes":  "tinyusb_direct v0.12.4 (2026-07-11 rev4): \n0. ESP32/WinRT GCN subscription parity: firmware now emits SW2 GATT characteristic metadata, forwards GCN/prefer_legacy notifications with source handles using CDC v2 frames, and keeps command responses in a handle-routed notify queue. Host bridge now builds dynamic mock GATT services, supports multiple callbacks per UUID, routes v2 notify frames by characteristic UUID, and uses the same all-SW2-notify subscription path as WinRT for NSO GameCube Controller.\n\ntinyusb_direct v0.12.4 (2026-07-11 rev3): \n0. GCN SW2 notify CCCD parity fix: the Bluedroid bridge now scopes SW2 service discovery with UUID ab7de9be-89fe-49ad-828f-118f09df7fd0, registers every SW2 notify characteristic only for GCN/prefer_legacy channels, drains CCCD writes sequentially with input_handle first, logs and skips handles whose CCCD write cannot be queued, and still forwards only input_handle notifications to the host parser. Synced firmware_bin and drivers/v5.9/v1.0_bluedroid app binaries to this build.\n\ntinyusb_direct v0.12.4 (2026-07-11 rev2): \n0. NSO GameCube controller ESP32 input TRUE root-cause fix. All prior GCN fixes (v0.12.0-0.12.4) chased \u0027LEGACY vs FD2\u0027 but used the WRONG UUID: the firmware\u0027s LEGACY char was 7492866c (the Pro Controller\u0027s handle-0x000E char), which the GameCube does NOT expose. So the GCN\u0027s legacy_handle stayed 0 and \u0027inputsrc legacy\u0027 always fell back to FD2 (handle 0x000A, Input Report 0x05: buttons=uint32@4, sticks@0xA-0xF, triggers@0x3C/0x3D) - the wrong byte layout for the host GCN parser (Input Report 0x0A: buttons@2-4, sticks@5-0xA, triggers@0xC/0xD), which is why the right stick landed on the trigger byte and the gyro read non-IMU bytes. The GameCube\u0027s real input char is 8261cba1-9435-420c-84d6-f0c75a2c8e4d (handle 0x000E, Input Report 0x0A). Fix: the Bluedroid firmware now recognizes that UUID in match_and_store_char and auto-selects it (prefer_legacy) on discovery - no host command needed, robust across reconnects - so the bridge delivers the exact same compact report the working WinRT path receives (WinRT gets it implicitly by subscribing to every notify char in the SW2 service, since handle 0x000E\u0027s UUID differs per controller model). The host GCN subscription was simplified accordingly (plain INPUT_REPORT_UUID subscribe; the fragile inputsrc round-trip removed). Pro 2 / Joy-Con 2 are unaffected (they use FD2 / Input Report 0x05).\n\ntinyusb_direct v0.12.3 (2026-07-07): \n0. NSO GameCube controller ESP32 byte-offset fix: The bridge now correctly uses the standard FD2 characteristic for the GCN controller, resolving the 1-byte offset issue that caused the Right Joystick to trigger the virtual ZR button.\n\ntinyusb_direct v0.12.2 (2026-07-04): \n0. NSO GameCube controller ESP32 input-source fix: the host now forces GCN channels to the LEGACY input notify source, and the Bluedroid bridge supports runtime inputsrc switching with old-notify disable/unregister. This fixes directed-advertising cases where the bridge cannot infer the GCN PID from manufacturer data and would otherwise subscribe to FD2, producing random inputs.\n\ntinyusb_direct v0.12.0 (2026-06-29): \n0. NSO GameCube controller fix: the bridge now subscribes to the LEGACY input notify characteristic (not FD2) for the GCN, matching the controller\u0027s compact native report layout. Previously the GCN streamed via the dev board but all mappings were wrong, sticks were pegged and buttons stuck, because FD2 carries a different byte layout the host GCN parser cannot read. The product_id is read from the advertisement at scan time to identify the GCN; all other controllers (Pro 2 / Joy-Con) still use FD2.\n\ntinyusb_direct v0.11.2 (2026-06-22): \n1. Switched ESP32-S3 firmware architecture from NimBLE to Bluedroid. This resolves the vibration stuttering issue and ensures stable 77Hz haptic signal transmission to all controllers. With 1-2 controllers connected, the polling rate is 133Hz for input and 77Hz for haptics. (Note: For 3 or more controllers, the polling rate automatically downscales to 77Hz to prevent ESP32-S3 crashes). \n2. Switch 1 Emu Mode: Joy-Con default gyro sensitivity is now matched to Cemuhook Sensitivity 3.\n3. NSO GCN controller haptics logic update: Implemented independent haptic signal processing to convert third-party haptic signals into PWM. Added a [Brake] test toggle to verify if the 0x02 instruction acts as a brake."
 }
