@@ -1,10 +1,10 @@
-# switch2-controllers (Windows 10 & Pro Features Fork)
+# Switch 2 Connect
 
-This fork is heavily optimized for Windows 10/11 users, featuring a fully interactive GUI, advanced Gyro mouse aiming, and on-the-fly layout switching. 
+The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem. 
 
 ## Quick Start
 
-1. Download the `.exe` from the **[Releases](https://github.com/TommyWabg/switch2-controllers-windows10-gyro/releases)** page.
+1. Download the `.exe` from the **[Releases](https://github.com/TommyWabg/Switch2Connect/releases)** page.
 2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
 3. Once the installation completes, the setup window will close automatically and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
@@ -57,7 +57,7 @@ Because this app emulates both Xbox One and PS4/PS5 controllers, Steam Input mig
 1. Go to **Steam** > **Settings** > **Controller** > **Show Advanced Settings**.
 2. Make sure "**Enable Steam Input for Xbox controllers**" is turned **ON**.
 3. Make sure "PlayStation Controller Support" is set to **Enabled**. (**NOT** Enabled in Games w/o Supports)
-4. Now theSwitch_2_Controllers app will handle the layout switching for you!
+4. Now the Switch2Connect app will handle the layout switching for you!
 
 ## Gyro Calibration Guide
 
