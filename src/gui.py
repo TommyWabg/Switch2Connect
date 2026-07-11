@@ -36,7 +36,7 @@ import re
 import ctypes
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
 from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, back_button_label, normalize_dampening_inputs
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -54,7 +54,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v0.12.4"
+APP_VERSION = "v0.12.6"
 
 def _set_current_thread_priority(level):
     try:
@@ -459,6 +459,33 @@ def format_input_display(text):
         else:
             parts.append(token)
     return "+".join(parts)
+
+
+MOUSE_CLICK_CUSTOM_TOKENS = {v: k for k, v in MOUSE_CLICK_BACK_BUTTON_TOKENS.items()}
+
+
+def parse_mouse_click_mapping(value):
+    if not isinstance(value, str):
+        return None
+    if value in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+        return value, "Hold"
+    if value.startswith("Custom[Tap]:"):
+        mode = "Tap"
+        payload = value[12:]
+    elif value.startswith("Custom[Hold]:"):
+        mode = "Hold"
+        payload = value[13:]
+    elif value.startswith("Custom:"):
+        mode = "Hold"
+        payload = value[7:]
+    else:
+        return None
+    if "+" in payload:
+        return None
+    option_token = MOUSE_CLICK_CUSTOM_TOKENS.get(payload)
+    if option_token is None:
+        return None
+    return option_token, mode
 
 
 class Tooltip:
@@ -4457,7 +4484,7 @@ class ControllerWindow:
         self.deadzone_scale = tk.Scale(
             self.comp_frame,
             from_=0.0,
-            to=10.0,
+            to=100.0,
             resolution=0.5,
             orient=tk.HORIZONTAL,
             length=int(120 * scaling_factor),
@@ -4687,7 +4714,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.in_app_deadzone_scale = tk.Scale(
             self.gyro_frame,
             from_=0.0,
-            to=10.0,
+            to=100.0,
             resolution=0.5,
             orient=tk.HORIZONTAL,
             length=int(120 * scaling_factor),
@@ -5186,7 +5213,14 @@ bg_color=panel_bg, widths=[8, 10])
             mode_var.set(new_mode)
             mode_btn.config(text=new_mode)
             current_val = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
-            if current_val.startswith("Custom"):
+            mouse_click_mapping = parse_mouse_click_mapping(current_val)
+            if mouse_click_mapping:
+                option_token, _mode = mouse_click_mapping
+                new_val = f"Custom[{new_mode}]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[option_token]}"
+                CONFIG.set_mapping_setting_scoped(key, new_val, mapping_scope)
+                sync_joystick_direction(new_val)
+                self.on_setting_changed()
+            elif isinstance(current_val, str) and current_val.startswith("Custom"):
                 if current_val.startswith("Custom[Tap]:") or current_val.startswith("Custom[Hold]:"):
                     new_val = f"Custom[{new_mode}]:{current_val.split(':', 1)[1]}"
                 else:
@@ -5208,6 +5242,22 @@ bg_color=panel_bg, widths=[8, 10])
         entry.bind("<Button-1>", lambda e: None if combo.get() in (GYRO_LOCK_LABEL, MODE_SHIFT_LABEL) else entry.restart_custom_recording_fn())
         
         in_app_gyro_btn = tk.Button(custom_frame, bg=button_gray, fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=lambda: show_in_app_gyro_popup())
+        mouse_click_btn = tk.Button(custom_frame, bg=button_gray, fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT)
+
+        def select_mouse_click_popup_value(value):
+            apply_back_button_selection(value)
+
+        mouse_click_btn._mouse_click_token = "Default"
+        mouse_click_btn.get = lambda: getattr(mouse_click_btn, "_mouse_click_token", "Default")
+        mouse_click_btn.select_value = select_mouse_click_popup_value
+        mouse_click_btn.config(command=lambda: self.open_back_button_popup(mouse_click_btn))
+
+        def clear_mouse_click_state(reset_mode=False):
+            mouse_click_btn._mouse_click_token = "Default"
+            mouse_click_btn.pack_forget()
+            if reset_mode:
+                mode_var.set("Hold")
+                mode_btn.config(text="Hold")
 
         def clear_in_app_gyro_settings():
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
@@ -5218,6 +5268,7 @@ bg_color=panel_bg, widths=[8, 10])
             custom_frame.pack_forget()
             if in_app_gyro_btn:
                 in_app_gyro_btn.pack_forget()
+            clear_mouse_click_state(reset_mode=True)
             if entry:
                 entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
             combo.pack(side=tk.LEFT)
@@ -5234,6 +5285,14 @@ bg_color=panel_bg, widths=[8, 10])
         close_btn = tk.Button(custom_frame, text="X", bg="#ff4444", fg="white", font=scale_font(("Arial", 10, "bold")), bd=0, relief=tk.FLAT, command=on_close)
         close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
 
+        def show_close_button():
+            if not close_btn.winfo_ismapped():
+                close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+
+        def hide_close_button():
+            if close_btn.winfo_ismapped():
+                close_btn.pack_forget()
+
         # "Change Profile" shows a button (opens an Auto/Manual popup) + X, like a
         # Joystick Custom mapping, instead of a plain combo selection.
         cp_frame = tk.Frame(container, bg=parent_bg)
@@ -5243,6 +5302,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         def cp_close():
             cp_frame.pack_forget()
+            clear_mouse_click_state(reset_mode=True)
             combo.pack(side=tk.LEFT)
             combo.set("Default")
             CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
@@ -5257,8 +5317,35 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.set_mapping_setting_scoped(key, "Change Profile", mapping_scope)
             sync_joystick_direction("Change Profile")
             combo.pack_forget()
+            custom_frame.pack_forget()
+            clear_mouse_click_state(reset_mode=True)
             cp_frame.pack(side=tk.LEFT)
             self.on_setting_changed(event)
+
+        def show_mouse_click_mapping(option_token, event=None, mode=None, preserve_mode=False, write_config=True):
+            custom_token = MOUSE_CLICK_BACK_BUTTON_TOKENS.get(option_token)
+            if custom_token is None:
+                return
+            if mode not in ("Hold", "Tap"):
+                mode = mode_var.get() if preserve_mode and mode_var.get() in ("Hold", "Tap") else "Hold"
+            mode_var.set(mode)
+            mode_btn.config(text=mode)
+            value = f"Custom[{mode}]:{custom_token}"
+            mouse_click_btn._mouse_click_token = option_token
+            mouse_click_btn.config(text=back_button_label(option_token))
+            if in_app_gyro_btn:
+                in_app_gyro_btn.pack_forget()
+            if entry:
+                entry.pack_forget()
+            combo.pack_forget()
+            hide_close_button()
+            mouse_click_btn.pack(side=tk.LEFT, fill=tk.Y)
+            custom_frame.pack(side=tk.LEFT)
+            combo.set(option_token)
+            if write_config:
+                CONFIG.set_mapping_setting_scoped(key, value, mapping_scope)
+                sync_joystick_direction(value)
+                self.on_setting_changed(event)
 
         def show_current():
             base_key, sep, direction = key.rpartition("_")
@@ -5266,10 +5353,22 @@ bg_color=panel_bg, widths=[8, 10])
                 current_val = CONFIG.get_joystick_custom_scoped(base_key, mapping_scope).get(direction, "Default")
             else:
                 current_val = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
+
+            mouse_click_mapping = parse_mouse_click_mapping(current_val)
+            if mouse_click_mapping:
+                option_token, mode = mouse_click_mapping
+                if current_val == option_token:
+                    value = f"Custom[{mode}]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[option_token]}"
+                    CONFIG.set_mapping_setting_scoped(key, value, mapping_scope)
+                    sync_joystick_direction(value)
+                show_mouse_click_mapping(option_token, mode=mode, write_config=False)
+                return
             
             if isinstance(current_val, str) and current_val.startswith("Custom") and IN_APP_GYRO_TOKEN in current_val:
                 combo.pack_forget()
                 entry.pack_forget()
+                clear_mouse_click_state()
+                show_close_button()
                 
                 simul_val = CONFIG.get_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
                 display_str = IN_APP_GYRO_LABEL
@@ -5291,7 +5390,9 @@ bg_color=panel_bg, widths=[8, 10])
                 combo.set(IN_APP_GYRO_LABEL)
                 return
 
-            if current_val.startswith("Custom"):
+            if isinstance(current_val, str) and current_val.startswith("Custom"):
+                clear_mouse_click_state()
+                show_close_button()
                 entry.config(state="normal")
                 entry.delete(0, tk.END)
 
@@ -5322,9 +5423,13 @@ bg_color=panel_bg, widths=[8, 10])
                 custom_frame.pack(side=tk.LEFT)
             elif current_val == "Change Profile":
                 combo.set("Change Profile")
+                custom_frame.pack_forget()
+                clear_mouse_click_state(reset_mode=True)
                 cp_frame.pack(side=tk.LEFT)
             else:
                 combo.set(current_val)
+                custom_frame.pack_forget()
+                clear_mouse_click_state(reset_mode=True)
                 combo.pack(side=tk.LEFT)
 
         show_current()
@@ -5337,6 +5442,8 @@ bg_color=panel_bg, widths=[8, 10])
             sync_joystick_direction(f"Custom[{mode}]:{token}")
             if in_app_gyro_btn:
                 in_app_gyro_btn.pack_forget()
+            clear_mouse_click_state()
+            show_close_button()
             if entry:
                 entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
             entry.config(state="normal")
@@ -5575,21 +5682,24 @@ bg_color=panel_bg, widths=[8, 10])
             
             self.root.after(100, self.bind_in_app_gyro_popup_outside_click)
 
-        def on_combo_selected(event):
-            if combo.get() != IN_APP_GYRO_LABEL:
+        def apply_back_button_selection(selected, event=None):
+            combo.set(selected)
+            if selected != IN_APP_GYRO_LABEL:
                 clear_in_app_gyro_settings()
                 
-            if combo.get() == "Custom":
+            if selected == "Custom":
                 combo.pack_forget()
                 in_app_gyro_btn.pack_forget()
+                clear_mouse_click_state()
+                show_close_button()
                 entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
                 custom_frame.pack(side=tk.LEFT)
                 self.start_custom_recording(key, entry, combo, custom_frame, mode_var, mapping_scope)
-            elif combo.get() == GYRO_LOCK_LABEL:
+            elif selected == GYRO_LOCK_LABEL:
                 show_token_mapping(GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, event)
-            elif combo.get() == MODE_SHIFT_LABEL:
+            elif selected == MODE_SHIFT_LABEL:
                 show_token_mapping(MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, event)
-            elif combo.get() == IN_APP_GYRO_LABEL:
+            elif selected == IN_APP_GYRO_LABEL:
                 mode = mode_var.get() if mode_var.get() in ("Hold", "Tap") else "Hold"
                 mode_var.set(mode)
                 mode_btn.config(text=mode)
@@ -5599,22 +5709,35 @@ bg_color=panel_bg, widths=[8, 10])
                 
                 combo.pack_forget()
                 entry.pack_forget()
+                clear_mouse_click_state()
+                show_close_button()
                 in_app_gyro_btn.config(text=IN_APP_GYRO_LABEL)
                 in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
                 custom_frame.pack(side=tk.LEFT)
                 show_in_app_gyro_popup(event)
-            elif combo.get() == "Change Profile":
+            elif selected == "Change Profile":
                 show_change_profile(event)
+            elif selected in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+                show_mouse_click_mapping(selected, event, preserve_mode=True)
             else:
-                CONFIG.set_mapping_setting_scoped(key, combo.get(), mapping_scope)
-                sync_joystick_direction(combo.get())
+                custom_frame.pack_forget()
+                cp_frame.pack_forget()
+                clear_mouse_click_state(reset_mode=True)
+                combo.set(selected)
+                combo.pack(side=tk.LEFT)
+                CONFIG.set_mapping_setting_scoped(key, selected, mapping_scope)
+                sync_joystick_direction(selected)
                 self.on_setting_changed(event)
+
+        def on_combo_selected(event):
+            apply_back_button_selection(combo.get(), event)
 
         combo.bind("<<ComboboxSelected>>", on_combo_selected)
         setattr(self, f"{attr_key}_combo", combo)
         setattr(self, f"{attr_key}_custom_frame", custom_frame)
         setattr(self, f"{attr_key}_entry", entry)
         setattr(self, f"{attr_key}_in_app_gyro_btn", in_app_gyro_btn)
+        setattr(self, f"{attr_key}_mouse_click_btn", mouse_click_btn)
         setattr(self, f"{attr_key}_mode_btn", mode_btn)
         setattr(self, f"{attr_key}_mode_var", mode_var)
         setattr(self, f"{attr_key}_cp_frame", cp_frame)
@@ -5903,34 +6026,65 @@ bg_color=panel_bg, widths=[8, 10])
         else:
             return
 
-        root_right = self.root.winfo_rootx() + self.root.winfo_width()
-        root_bottom = self.root.winfo_rooty() + self.root.winfo_height()
+        root_left = self.root.winfo_rootx()
+        root_top = self.root.winfo_rooty()
+        root_right = root_left + self.root.winfo_width()
+        root_bottom = root_top + self.root.winfo_height()
+        anchor_right = anchor_x + anchor_w
 
         popup_w = popup.winfo_reqwidth()
         popup_h = popup.winfo_reqheight()
         x_offset = int(3 * scaling_factor)
         y_offset = int(2 * scaling_factor)
 
-        enough_right = anchor_x - x_offset + popup_w <= root_right
+        # Prefer the four anchor-relative positions. Left-anchored (NW/SW) opens the popup
+        # rightward from the anchor's left edge; right-anchored (NE/SE) opens leftward from
+        # its right edge. If the popup is too wide to fit inside the window either way, fall
+        # back to sliding it horizontally so it sits flush within the window bounds.
+        fits_left_anchored = anchor_x - x_offset + popup_w <= root_right
+        fits_right_anchored = anchor_right + x_offset - popup_w >= root_left
         enough_bottom = anchor_bottom + y_offset + popup_h <= root_bottom
 
-        if use_anchor:
-            if enough_right and enough_bottom:
+        if fits_left_anchored:
+            h_mode = "left"
+        elif fits_right_anchored:
+            h_mode = "right"
+        else:
+            h_mode = "clamp"
+
+        if h_mode == "clamp":
+            # Slide horizontally to stay inside the window while keeping the vertical
+            # anchor identical to the normal below/above cases.
+            clamped_left = max(root_left, root_right - popup_w)
+            if use_anchor:
+                x_from_anchor_left = clamped_left - anchor_x
+                if enough_bottom:
+                    popup.place(in_=anchor_widget, relx=0, rely=1, x=x_from_anchor_left, y=y_offset, anchor=tk.NW)
+                else:
+                    popup.place(in_=anchor_widget, relx=0, rely=0, x=x_from_anchor_left, y=-y_offset, anchor=tk.SW)
+            else:
+                x_rel = clamped_left - root_left
+                if enough_bottom:
+                    popup.place(in_=self.root, x=x_rel, y=anchor_bottom + y_offset - root_top, anchor=tk.NW)
+                else:
+                    popup.place(in_=self.root, x=x_rel, y=anchor_y - y_offset - root_top, anchor=tk.SW)
+        elif use_anchor:
+            if h_mode == "left" and enough_bottom:
                 popup.place(in_=anchor_widget, relx=0, rely=1, x=-x_offset, y=y_offset, anchor=tk.NW)
-            elif not enough_right and enough_bottom:
+            elif h_mode == "right" and enough_bottom:
                 popup.place(in_=anchor_widget, relx=1, rely=1, x=x_offset, y=y_offset, anchor=tk.NE)
-            elif enough_right and not enough_bottom:
+            elif h_mode == "left" and not enough_bottom:
                 popup.place(in_=anchor_widget, relx=0, rely=0, x=-x_offset, y=-y_offset, anchor=tk.SW)
             else:
                 popup.place(in_=anchor_widget, relx=1, rely=0, x=x_offset, y=-y_offset, anchor=tk.SE)
         else:
-            rx = self.root.winfo_rootx()
-            ry = self.root.winfo_rooty()
-            if enough_right and enough_bottom:
+            rx = root_left
+            ry = root_top
+            if h_mode == "left" and enough_bottom:
                 popup.place(in_=self.root, x=anchor_x - rx - x_offset, y=anchor_bottom - ry + y_offset, anchor=tk.NW)
-            elif not enough_right and enough_bottom:
+            elif h_mode == "right" and enough_bottom:
                 popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset, y=anchor_bottom - ry + y_offset, anchor=tk.NE)
-            elif enough_right and not enough_bottom:
+            elif h_mode == "left" and not enough_bottom:
                 popup.place(in_=self.root, x=anchor_x - rx - x_offset, y=anchor_y - ry - y_offset, anchor=tk.SW)
             else:
                 popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset, y=anchor_y - ry - y_offset, anchor=tk.SE)
@@ -6128,7 +6282,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         top_row = tk.Frame(body, bg=background_color)
         top_row.pack(side=tk.TOP, anchor=tk.W)
-        for title in ("General", "In-app Gyro", "PS Input", "Windows"):
+        for title in ("General", "In-app Gyro", "PS Input", "Windows", "Mouse Click"):
             render_category(top_row, title)
 
         bottom_row = tk.Frame(body, bg=background_color)
@@ -7367,6 +7521,7 @@ bg_color=panel_bg, widths=[8, 10])
                 custom_frame = getattr(self, f"{attr_key}_custom_frame", None)
                 entry = getattr(self, f"{attr_key}_entry", None)
                 in_app_gyro_btn = getattr(self, f"{attr_key}_in_app_gyro_btn", None)
+                mouse_click_btn = getattr(self, f"{attr_key}_mouse_click_btn", None)
                 mode_btn = getattr(self, f"{attr_key}_mode_btn", None)
                 mode_var = getattr(self, f"{attr_key}_mode_var", None)
                 cp_frame = getattr(self, f"{attr_key}_cp_frame", None)
@@ -7388,80 +7543,123 @@ bg_color=panel_bg, widths=[8, 10])
                     combo.pack_forget()
                     if custom_frame:
                         custom_frame.pack_forget()
+                    if mouse_click_btn:
+                        mouse_click_btn._mouse_click_token = "Default"
+                        mouse_click_btn.pack_forget()
+                    if mode_var and mode_btn:
+                        mode_var.set("Hold")
+                        mode_btn.config(text="Hold")
                     cp_frame.pack(side=tk.LEFT)
-                elif current_val.startswith("Custom"):
-                    combo.pack_forget()
-                    if custom_frame and entry and mode_btn and mode_var:
-                        entry.config(state="normal")
-                        entry.delete(0, tk.END)
+                else:
+                    mouse_click_mapping = parse_mouse_click_mapping(current_val)
+                    if mouse_click_mapping and custom_frame and mouse_click_btn and mode_btn and mode_var and close_btn:
+                        option_token, mode = mouse_click_mapping
+                        combo.pack_forget()
+                        if entry:
+                            entry.pack_forget()
+                        if in_app_gyro_btn:
+                            in_app_gyro_btn.pack_forget()
+                        close_btn.pack_forget()
+                        mode_var.set(mode)
+                        mode_btn.config(text=mode)
+                        mouse_click_btn._mouse_click_token = option_token
+                        mouse_click_btn.config(text=back_button_label(option_token))
+                        combo.set(option_token)
+                        mouse_click_btn.pack(side=tk.LEFT, fill=tk.Y)
+                        custom_frame.pack(side=tk.LEFT)
+                        if current_val == option_token:
+                            value = f"Custom[{mode}]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[option_token]}"
+                            CONFIG.set_mapping_setting_scoped(key, value, mapping_scope)
+                    elif isinstance(current_val, str) and current_val.startswith("Custom"):
+                        combo.pack_forget()
+                        if custom_frame and entry and mode_btn and mode_var:
+                            if not close_btn.winfo_ismapped():
+                                close_btn.pack(side=tk.LEFT, padx=(int(2 * scaling_factor), 0), fill=tk.Y)
+                            entry.config(state="normal")
+                            entry.delete(0, tk.END)
 
-                        if current_val.startswith("Custom[Tap]:"):
-                            mode_var.set("Tap")
-                            mode_btn.config(text="Tap")
-                            display_val = current_val[12:]
-                        elif current_val.startswith("Custom[Hold]:"):
-                            mode_var.set("Hold")
-                            mode_btn.config(text="Hold")
-                            display_val = current_val[13:]
-                        else:
-                            mode_var.set("Hold")
-                            mode_btn.config(text="Hold")
-                            display_val = current_val[7:]
-
-                        if display_val != IN_APP_GYRO_TOKEN and not display_val.startswith(IN_APP_GYRO_TOKEN):
-                            if entry and in_app_gyro_btn and close_btn:
-                                in_app_gyro_btn.pack_forget()
-                                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
-                        if display_val == GYRO_LOCK_TOKEN:
-                            combo.set(GYRO_LOCK_LABEL)
-                            entry.insert(0, GYRO_LOCK_LABEL)
-                        elif display_val == MODE_SHIFT_TOKEN:
-                            combo.set(MODE_SHIFT_LABEL)
-                            entry.insert(0, MODE_SHIFT_LABEL)
-                        elif display_val.startswith(IN_APP_GYRO_TOKEN):
-                            combo.set(IN_APP_GYRO_LABEL)
-                            simul_val = CONFIG.get_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
-                            display_str = IN_APP_GYRO_LABEL
-                            if simul_val == "None":
-                                pass
-                            elif simul_val == "Default":
-                                def get_key_name(k):
-                                    return {"home": "Home", "capt": "Capture", "c": "Chat", "plus": "Plus", "minus": "Minus", "up": "Dpad Up", "down": "Dpad Down", "left": "Dpad Left", "right": "Dpad Right", "l_stk": "L Joystick Click", "r_stk": "R Joystick Click", "sll": "SL_L", "srl": "SR_L", "slr": "SL_R", "srr": "SR_R"}.get(k, k.upper())
-                                display_str += f" + {get_key_name(key)}"
+                            if current_val.startswith("Custom[Tap]:"):
+                                mode_var.set("Tap")
+                                mode_btn.config(text="Tap")
+                                display_val = current_val[12:]
+                            elif current_val.startswith("Custom[Hold]:"):
+                                mode_var.set("Hold")
+                                mode_btn.config(text="Hold")
+                                display_val = current_val[13:]
                             else:
-                                if isinstance(simul_val, str) and simul_val.startswith("Custom"):
-                                    if "]:" in simul_val:
-                                        display_str += " + " + format_input_display(simul_val.split("]:")[1])
-                                    elif ":" in simul_val:
-                                        display_str += " + " + format_input_display(simul_val.split(":")[1])
+                                mode_var.set("Hold")
+                                mode_btn.config(text="Hold")
+                                display_val = current_val[7:]
+
+                            if display_val != IN_APP_GYRO_TOKEN and not display_val.startswith(IN_APP_GYRO_TOKEN):
+                                if entry and in_app_gyro_btn and close_btn:
+                                    in_app_gyro_btn.pack_forget()
+                                    if mouse_click_btn:
+                                        mouse_click_btn._mouse_click_token = "Default"
+                                        mouse_click_btn.pack_forget()
+                                    entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+                            if display_val == GYRO_LOCK_TOKEN:
+                                combo.set(GYRO_LOCK_LABEL)
+                                entry.insert(0, GYRO_LOCK_LABEL)
+                            elif display_val == MODE_SHIFT_TOKEN:
+                                combo.set(MODE_SHIFT_LABEL)
+                                entry.insert(0, MODE_SHIFT_LABEL)
+                            elif display_val.startswith(IN_APP_GYRO_TOKEN):
+                                combo.set(IN_APP_GYRO_LABEL)
+                                simul_val = CONFIG.get_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
+                                display_str = IN_APP_GYRO_LABEL
+                                if simul_val == "None":
+                                    pass
+                                elif simul_val == "Default":
+                                    def get_key_name(k):
+                                        return {"home": "Home", "capt": "Capture", "c": "Chat", "plus": "Plus", "minus": "Minus", "up": "Dpad Up", "down": "Dpad Down", "left": "Dpad Left", "right": "Dpad Right", "l_stk": "L Joystick Click", "r_stk": "R Joystick Click", "sll": "SL_L", "srl": "SR_L", "slr": "SL_R", "srr": "SR_R"}.get(k, k.upper())
+                                    display_str += f" + {get_key_name(key)}"
                                 else:
-                                    if simul_val == "HOME": display_str += " + Home"
-                                    elif simul_val == "CAPTURE": display_str += " + Capture"
-                                    elif simul_val == "PRTSC": display_str += " + PrtSc"
-                                    else: display_str += f" + {format_input_display(simul_val)}"
-                            if entry and in_app_gyro_btn and close_btn:
-                                entry.pack_forget()
-                                in_app_gyro_btn.config(text=display_str)
-                                in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+                                    if isinstance(simul_val, str) and simul_val.startswith("Custom"):
+                                        if "]:" in simul_val:
+                                            display_str += " + " + format_input_display(simul_val.split("]:")[1])
+                                        elif ":" in simul_val:
+                                            display_str += " + " + format_input_display(simul_val.split(":")[1])
+                                    else:
+                                        if simul_val == "HOME": display_str += " + Home"
+                                        elif simul_val == "CAPTURE": display_str += " + Capture"
+                                        elif simul_val == "PRTSC": display_str += " + PrtSc"
+                                        else: display_str += f" + {format_input_display(simul_val)}"
+                                if entry and in_app_gyro_btn and close_btn:
+                                    entry.pack_forget()
+                                    if mouse_click_btn:
+                                        mouse_click_btn._mouse_click_token = "Default"
+                                        mouse_click_btn.pack_forget()
+                                    in_app_gyro_btn.config(text=display_str)
+                                    in_app_gyro_btn.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+                            else:
+                                combo.set("Custom")
+                                if entry and in_app_gyro_btn and close_btn:
+                                    in_app_gyro_btn.pack_forget()
+                                    if mouse_click_btn:
+                                        mouse_click_btn._mouse_click_token = "Default"
+                                        mouse_click_btn.pack_forget()
+                                    entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
+                                display_val = format_input_display(display_val)
+                                if entry:
+                                    entry.insert(0, display_val)
+                            if entry:
+                                entry.config(state="readonly")
+                            if custom_frame:
+                                custom_frame.pack(side=tk.LEFT)
                         else:
                             combo.set("Custom")
-                            if entry and in_app_gyro_btn and close_btn:
-                                in_app_gyro_btn.pack_forget()
-                                entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
-                            display_val = format_input_display(display_val)
-                            if entry:
-                                entry.insert(0, display_val)
-                        if entry:
-                            entry.config(state="readonly")
-                        if custom_frame:
-                            custom_frame.pack(side=tk.LEFT)
                     else:
-                        combo.set("Custom")
-                else:
-                    combo.set(current_val)
-                    if custom_frame:
-                        custom_frame.pack_forget()
-                    combo.pack(side=tk.LEFT)
+                        combo.set(current_val)
+                        if custom_frame:
+                            custom_frame.pack_forget()
+                        if mouse_click_btn:
+                            mouse_click_btn._mouse_click_token = "Default"
+                            mouse_click_btn.pack_forget()
+                        if mode_var and mode_btn:
+                            mode_var.set("Hold")
+                            mode_btn.config(text="Hold")
+                        combo.pack(side=tk.LEFT)
 
         for mapping_scope in (None, "in_app_gyro_mode_mappings"):
             suffix = self._mapping_scope_suffix(mapping_scope)
@@ -8843,6 +9041,14 @@ bg_color=panel_bg, widths=[8, 10])
             combo = getattr(self, f"{attr_key}_combo", None)
             if combo is None: return "Default"
             val = combo.get()
+            if val in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+                curr = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
+                mouse_click_mapping = parse_mouse_click_mapping(curr)
+                if mouse_click_mapping:
+                    option_token, mode = mouse_click_mapping
+                    if option_token == val:
+                        return f"Custom[{mode}]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[option_token]}"
+                return f"Custom[Hold]:{MOUSE_CLICK_BACK_BUTTON_TOKENS[val]}"
             if val in ("Custom", GYRO_LOCK_LABEL, MODE_SHIFT_LABEL, IN_APP_GYRO_LABEL):
                 curr = CONFIG.get_mapping_setting_scoped(key, "Default", mapping_scope)
                 if curr.startswith("Custom"):

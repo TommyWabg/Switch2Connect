@@ -40,7 +40,7 @@ try:
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
 except Exception:
     pass
-from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs
+from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
 from utils import (
     apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
@@ -2605,7 +2605,8 @@ class Controller:
                         btn_num = int(token[3:])
                     except ValueError:
                         return False
-                    vk_map = {1: win32con.VK_LBUTTON, 2: win32con.VK_MBUTTON, 3: win32con.VK_RBUTTON}
+                    vk_map = {1: win32con.VK_LBUTTON, 2: win32con.VK_MBUTTON, 3: win32con.VK_RBUTTON,
+                              4: win32con.VK_XBUTTON1, 5: win32con.VK_XBUTTON2}
                     vk = vk_map.get(btn_num)
                     try:
                         return bool(vk and (win32api.GetAsyncKeyState(vk) & 0x8000))
@@ -2930,6 +2931,12 @@ class Controller:
                 else:
                     action = base_action
                 resolved = default_action if action == "Default" else action
+
+                # Mouse Click back-button presets run through the existing Custom mouse
+                # path (Hold = held while pressed), so a single stored token drives real
+                # mouse down/up via _trigger_custom_os_key.
+                if isinstance(resolved, str) and resolved in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+                    resolved = "Custom[Hold]:" + MOUSE_CLICK_BACK_BUTTON_TOKENS[resolved]
 
                 # In-app Gyro Lock: pause gyro control while staying in In-app Gyro mode.
                 # Stored as a Custom-form pseudo-mapping "Custom[Hold|Tap]:GYRO_LOCK".
@@ -3919,31 +3926,29 @@ class Controller:
             if trigger_pressed and trigger_key:
                 damp_inputs = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_mode", [], None))
                 if damp_inputs:
-                    button_bits = int(getattr(inputData, "buttons", 0) or 0)
-                    pressed = {
-                        "ZL": eff_zl_damp,
-                        "ZR": eff_zr_damp,
-                        "L": bool(button_bits & SWITCH_BUTTONS.get("L", 0)),
-                        "R": bool(button_bits & SWITCH_BUTTONS.get("R", 0)),
-                        "MINUS": bool(button_bits & SWITCH_BUTTONS.get("MINUS", 0)),
-                        "PLUS": bool(button_bits & SWITCH_BUTTONS.get("PLUS", 0)),
-                        "Capture": bool(button_bits & SWITCH_BUTTONS.get("CAPT", 0)),
-                        "Home": bool(button_bits & SWITCH_BUTTONS.get("HOME", 0)),
-                        "Chat": bool(button_bits & SWITCH_BUTTONS.get("C", 0)),
-                        "L_STK": bool(button_bits & SWITCH_BUTTONS.get("L_STK", 0)),
-                        "R_STK": bool(button_bits & SWITCH_BUTTONS.get("R_STK", 0)),
-                        "A": bool(button_bits & SWITCH_BUTTONS.get("A", 0)),
-                        "B": bool(button_bits & SWITCH_BUTTONS.get("B", 0)),
-                        "X": bool(button_bits & SWITCH_BUTTONS.get("X", 0)),
-                        "Y": bool(button_bits & SWITCH_BUTTONS.get("Y", 0)),
-                        "UP": bool(button_bits & SWITCH_BUTTONS.get("UP", 0)),
-                        "DOWN": bool(button_bits & SWITCH_BUTTONS.get("DOWN", 0)),
-                        "LEFT": bool(button_bits & SWITCH_BUTTONS.get("LEFT", 0)),
-                        "RIGHT": bool(button_bits & SWITCH_BUTTONS.get("RIGHT", 0)),
-                        "GL": bool(button_bits & SWITCH_BUTTONS.get("GL", 0)),
-                        "GR": bool(button_bits & SWITCH_BUTTONS.get("GR", 0)),
-                    }
-                    if any(pressed.get(token, False) for token in damp_inputs):
+                    # Match dampening inputs against the PHYSICAL buttons, not the
+                    # post-remap virtual output bits. _profile_combo_btn_states is the raw
+                    # pre-remap snapshot (built each report before button bits are cleared/
+                    # rebuilt), so a remapped button no longer causes a wrong dampening
+                    # match. ZL/ZR keep their dedicated physical path (with the 50ms latch
+                    # and merged-shared state).
+                    states = dict(getattr(self, "_profile_combo_btn_states", {}) or {})
+                    if is_merged:
+                        vc = getattr(self, "virtual_controller", None)
+                        for c in (getattr(vc, "controllers", []) if vc else []):
+                            if c is not self:
+                                for k, v in (getattr(c, "_profile_combo_btn_states", {}) or {}).items():
+                                    states[k] = bool(states.get(k, False) or v)
+                    token_alias = {"Capture": "CAPT", "Home": "HOME", "Chat": "C"}
+
+                    def damp_pressed(token):
+                        if token == "ZL":
+                            return eff_zl_damp
+                        if token == "ZR":
+                            return eff_zr_damp
+                        return bool(states.get(token_alias.get(token, token), False))
+
+                    if any(damp_pressed(token) for token in damp_inputs):
                         damp_amount = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_amount", 90, None)
                         gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
             
@@ -4081,6 +4086,8 @@ class Controller:
             "Volume Up": "VK_VOLUME_UP",
             "Volume Down": "VK_VOLUME_DOWN",
         }
+        if action in MOUSE_CLICK_BACK_BUTTON_TOKENS:
+            return [MOUSE_CLICK_BACK_BUTTON_TOKENS[action]], []
         token = named.get(action)
         return ([token] if token else []), []
 
@@ -4650,11 +4657,17 @@ class Controller:
             import win32con
             import win32api
             flags = 0
+            mouse_data = 0
             if btn == "1": flags = win32con.MOUSEEVENTF_LEFTDOWN if is_down else win32con.MOUSEEVENTF_LEFTUP
             elif btn == "2": flags = win32con.MOUSEEVENTF_MIDDLEDOWN if is_down else win32con.MOUSEEVENTF_MIDDLEUP
             elif btn == "3": flags = win32con.MOUSEEVENTF_RIGHTDOWN if is_down else win32con.MOUSEEVENTF_RIGHTUP
+            elif btn in ("4", "5"):
+                # XBUTTON1/XBUTTON2 (back/forward). mouse_event needs the button in mouse_data.
+                MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP = 0x0080, 0x0100
+                flags = MOUSEEVENTF_XDOWN if is_down else MOUSEEVENTF_XUP
+                mouse_data = 1 if btn == "4" else 2
             if flags:
-                win32api.mouse_event(flags, 0, 0, 0, 0)
+                win32api.mouse_event(flags, 0, 0, mouse_data, 0)
 
     def _interpolation_thread_loop(self):
         last_time = time.perf_counter()
