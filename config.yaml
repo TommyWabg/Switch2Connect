@@ -208,6 +208,7 @@ profile_defaults:
 profile_switching_combo_trigger: ''
 profiles:
   DJG Demo:
+    _mode_shift_enabled_migration_v1: true
     adaptive_triggers_enabled: true
     audio_haptics_enabled: true
     cemuhook_sensitivity: 1
@@ -223,6 +224,10 @@ profiles:
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
     in_app_gyro_soft_deadzone: 0.0
+    mode_shift_enabled:
+      Mouse: true
+      R Joystick: false
+      Steering: false
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -837,6 +842,7 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
   Default:
+    _mode_shift_enabled_migration_v1: true
     adaptive_triggers_enabled: true
     assigned_apps: []
     audio_haptics_enabled: true
@@ -853,6 +859,10 @@ profiles:
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
     in_app_gyro_soft_deadzone: 0.0
+    mode_shift_enabled:
+      Mouse: true
+      R Joystick: false
+      Steering: false
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -1468,6 +1478,7 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
   PS5 Audio Haptics:
+    _mode_shift_enabled_migration_v1: true
     adaptive_triggers_enabled: true
     assigned_apps: []
     audio_haptics_enabled: true
@@ -1484,6 +1495,10 @@ profiles:
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
     in_app_gyro_soft_deadzone: 0.0
+    mode_shift_enabled:
+      Mouse: true
+      R Joystick: false
+      Steering: false
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -2095,6 +2110,7 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
   Switch 1 Emulator:
+    _mode_shift_enabled_migration_v1: true
     adaptive_triggers_enabled: true
     assigned_apps: []
     audio_haptics_enabled: true
@@ -2111,6 +2127,10 @@ profiles:
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
     in_app_gyro_soft_deadzone: 0.0
+    mode_shift_enabled:
+      Mouse: true
+      R Joystick: false
+      Steering: false
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -2752,7 +2772,7 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 710
-window_y: 88
+window_x: 1206
+window_y: 87
 winuhid_sim_mode: PS5
 wired_usb_enabled: true
