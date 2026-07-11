@@ -140,6 +140,9 @@ class ESP32S3SerialClient:
         self._read_stop = threading.Event()
         self.event_callback = None
         self._notify_callbacks = {}
+        self._gatt_lock = threading.RLock()
+        self._gatt_chars = {}
+        self._gatt_done_channels = set()
         self._write_lock = threading.Lock()
         self._write_count = 0
         self._response_queue = queue.Queue()
@@ -236,16 +239,76 @@ class ESP32S3SerialClient:
     async def stop_notify(self, _uuid):
         self._read_stop.set()
 
+    @staticmethod
+    def _norm_uuid(uuid):
+        return str(uuid).lower()
+
+    def _handle_gatt_event(self, event):
+        try:
+            channel = int(event.get("channel", 0))
+        except Exception:
+            return
+        cmd = event.get("cmd")
+        with self._gatt_lock:
+            if cmd == "gatt_char":
+                handle = int(event.get("handle", 0))
+                uuid = self._norm_uuid(event.get("uuid", ""))
+                props_text = str(event.get("props", "") or "")
+                if not handle or not uuid:
+                    return
+                properties = []
+                if "n" in props_text:
+                    properties.append("notify")
+                if "w" in props_text:
+                    properties.append("write-without-response")
+                if "W" in props_text:
+                    properties.append("write")
+                if "r" in props_text:
+                    properties.append("read")
+                service = self._norm_uuid(event.get("service", "ab7de9be-89fe-49ad-828f-118f09df7fd0"))
+                self._gatt_chars.setdefault(channel, {})[handle] = {
+                    "uuid": uuid,
+                    "properties": properties,
+                    "service": service,
+                    "handle": handle,
+                }
+            elif cmd == "gatt_done":
+                self._gatt_done_channels.add(channel)
+
+    def get_channel_services(self, channel):
+        channel = int(channel)
+        with self._gatt_lock:
+            chars = list((self._gatt_chars.get(channel) or {}).values())
+        if not chars:
+            return [MockService("ab7de9be-89fe-49ad-828f-118f09df7fd2")]
+
+        by_service = {}
+        for char in sorted(chars, key=lambda c: c.get("handle", 0)):
+            by_service.setdefault(char["service"], []).append(
+                MockCharacteristic(char["uuid"], char["properties"], handle=char["handle"])
+            )
+        return [MockService(service_uuid, characteristics) for service_uuid, characteristics in by_service.items()]
+
+    def _uuid_for_handle(self, channel, handle):
+        with self._gatt_lock:
+            char = (self._gatt_chars.get(int(channel)) or {}).get(int(handle))
+        return char.get("uuid") if char else None
+
     async def start_channel_notify(self, channel, uuid, callback):
         self.open()
+        channel = int(channel)
         if channel not in self._notify_callbacks:
-            self._notify_callbacks[int(channel)] = {}
-        self._notify_callbacks[int(channel)][uuid] = callback
+            self._notify_callbacks[channel] = {}
+        key = self._norm_uuid(uuid)
+        callbacks = self._notify_callbacks[channel].setdefault(key, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
         self._ensure_read_thread()
         
     async def stop_channel_notify(self, channel, uuid):
+        channel = int(channel)
         if channel in self._notify_callbacks:
-            self._notify_callbacks[int(channel)].pop(uuid, None)
+            self._notify_callbacks[channel].pop(self._norm_uuid(uuid), None)
 
     async def write_gatt_char(self, _uuid, data, response=False):
         await self.write_channel_gatt_char(0, _uuid, data, response=response)
@@ -457,6 +520,12 @@ class ESP32S3SerialClient:
         else:
             text = text[start:]
         if text:
+            if ('"cmd":"gatt_char"' in text or '"cmd":"gatt_done"' in text):
+                try:
+                    self._handle_gatt_event(json.loads(text))
+                except Exception:
+                    logger.debug("Failed to parse ESP32-S3 GATT metadata: %s", text, exc_info=True)
+                return
             if ('"cmd":"scan_result"' in text or '"cmd":"connected"' in text
                     or '"cmd":"connect_fail"' in text or '"cmd":"connect_busy"' in text
                     or '"cmd":"disconnected"' in text):
@@ -489,39 +558,50 @@ class ESP32S3SerialClient:
 
         self.last_input_time = time.time()
 
-        # High bit of the channel byte flags a command/ack response (vs an input
-        # report). Command/ack notifications must NOT reach the input parser or they
-        # are misparsed as random buttons/sticks on connect.
+        # High bit flags command/ack frames. 0x40 flags v2 handle-routed notify
+        # frames: <0x40|channel> <handle_le16> <payload...>.
         is_command = bool(data[0] & 0x80)
-        chan_id = data[0] & 0x7F
+        has_handle = bool(data[0] & 0x40) and not is_command
+        chan_id = data[0] & (0x3F if has_handle else 0x7F)
 
         if 1 <= chan_id <= MAX_ESP32S3_CHANNELS:
             channel = chan_id - 1
-            report_payload = data[1:]
+            source_uuid = None
+            if has_handle:
+                if len(data) < 3:
+                    return
+                handle = data[1] | (data[2] << 8)
+                source_uuid = self._uuid_for_handle(channel, handle)
+                report_payload = data[3:]
+            else:
+                report_payload = data[1:]
 
             channel_callbacks = self._notify_callbacks.get(channel, {})
-            for uuid, cb in list(channel_callbacks.items()):
-                # Route command/ack frames away from the input characteristic's
-                # callback (the SW2 input stream lives on the ab7de9be… UUID).
-                if is_command and str(uuid).lower().startswith(INPUT_UUID_PREFIX):
+            for uuid, callbacks in list(channel_callbacks.items()):
+                uuid_text = str(uuid).lower()
+                if source_uuid is not None and uuid_text != source_uuid:
                     continue
-                if not is_command and not str(uuid).lower().startswith(INPUT_UUID_PREFIX):
+                if is_command and uuid_text.startswith(INPUT_UUID_PREFIX):
                     continue
-                try:
-                    cb(None, bytearray(report_payload))
-                except Exception:
-                    logger.exception("ESP32-S3 Serial input callback failed channel=%d", channel)
+                if not is_command and source_uuid is None and not uuid_text.startswith(INPUT_UUID_PREFIX):
+                    continue
+                for cb in list(callbacks):
+                    try:
+                        cb(None, bytearray(report_payload))
+                    except Exception:
+                        logger.exception("ESP32-S3 Serial callback failed channel=%d uuid=%s", channel, uuid_text)
             return
 
         if data[0] == NINTENDO_INPUT_REPORT_ID:
             data = data[1:]
         
         channel_0_callbacks = self._notify_callbacks.get(0, {})
-        for cb in list(channel_0_callbacks.values()):
-            try:
-                cb(None, bytearray(data))
-            except Exception:
-                logger.exception("ESP32-S3 Serial input callback failed")
+        for callbacks in list(channel_0_callbacks.values()):
+            for cb in list(callbacks):
+                try:
+                    cb(None, bytearray(data))
+                except Exception:
+                    logger.exception("ESP32-S3 Serial input callback failed")
 
     def _read_loop(self):
         _set_current_thread_priority(2)
@@ -606,18 +686,18 @@ class ESP32S3SerialClient:
                 break
 
 class MockCharacteristic:
-    def __init__(self, uuid, properties):
+    def __init__(self, uuid, properties, handle=1):
         self.uuid = uuid
         self.properties = properties
-        self.handle = 1
+        self.handle = int(handle)
 
 class MockService:
-    def __init__(self, uuid):
+    def __init__(self, uuid, characteristics=None):
         self.uuid = uuid
-        self.characteristics = [
-            MockCharacteristic(COMMAND_WRITE_UUID, ["write-without-response"]),
-            MockCharacteristic(INPUT_REPORT_UUID, ["notify"]),
-            MockCharacteristic(COMMAND_RESPONSE_UUID, ["notify"]),
+        self.characteristics = characteristics if characteristics is not None else [
+            MockCharacteristic(COMMAND_WRITE_UUID, ["write-without-response"], handle=1),
+            MockCharacteristic(INPUT_REPORT_UUID, ["notify"], handle=2),
+            MockCharacteristic(COMMAND_RESPONSE_UUID, ["notify"], handle=3),
         ]
 
 class ESP32S3ChannelClient:
@@ -627,7 +707,12 @@ class ESP32S3ChannelClient:
         # When set (merged Joy-Con pair), rumble writes fan out to both channels in one
         # command so both motors fire in-phase from a single dispatch.
         self.mirror_channel = None
-        self.services = [MockService("ab7de9be-89fe-49ad-828f-118f09df7fd2")]
+        self._fallback_services = [MockService("ab7de9be-89fe-49ad-828f-118f09df7fd2")]
+
+    @property
+    def services(self):
+        services = self.shared_client.get_channel_services(self.channel)
+        return services or self._fallback_services
 
     @property
     def is_connected(self):

@@ -3304,68 +3304,30 @@ class Controller:
                     return
                 input_report_callback(sender, data)
 
-            if getattr(self, 'is_esp32s3_bridge', False):
-                # ESP32 bridge: the _dispatch_binary_packet() router already separates
-                # command/ack frames from input frames by UUID prefix.  The MockService
-                # only exposes INPUT_REPORT_UUID and COMMAND_RESPONSE_UUID as notify chars.
-                # Subscribing gc_input_report_callback to COMMAND_RESPONSE_UUID would
-                # overwrite the command_response_callback registered during initialize(),
-                # causing all write_command() calls (including enableFeatures) to timeout.
-
-
-                # The GCN's compact native report lives on the LEGACY characteristic;
-                # the firmware subscribes FD2 by default (correct for Pro2/Joy-Con, but
-                # a different byte layout for the GCN: the right stick lands on the
-                # trigger byte and the gyro region reads non-IMU bytes -> "right stick
-                # bound to right trigger" and "gyro always in motion"). Switch this
-                # channel's input source to LEGACY so the bridge forwards the same
-                # compact report the WinRT path receives. Sent on every initialize()
-                # because the firmware resets prefer_legacy=false on each connect.
-                channel = getattr(self, 'channel', None)
-                if channel is None:
-                    channel = getattr(self.client, 'channel', 0)
-                if hasattr(self.client, 'send_command_line'):
-                    sent = await asyncio.to_thread(
-                        self.client.send_command_line, f"inputsrc {int(channel)} legacy")
-                    if sent:
-                        logger.info("GCN via ESP32 bridge: switched channel %d input source to LEGACY", channel)
-                    else:
-                        logger.warning("GCN via ESP32 bridge: failed to send inputsrc legacy for channel %d", channel)
-                    # Let the firmware unsubscribe FD2 / CCCD-subscribe LEGACY so the
-                    # first frames the parser sees are already compact-format.
-                    await asyncio.sleep(0.3)
-                else:
-                    logger.info("GCN via ESP32 bridge: client lacks send_command_line; using default input source")
-
-                # Use the standard INPUT_REPORT_UUID subscription; the bridge router
-                # ensures GCN input frames reach this callback correctly.
-                await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
-            else:
-                # WinRT BLE: The GCN controller may deliver input on any notify char in the
-                # SW2 service (Windows may re-index handles).  Subscribe to all of them so
-                # input is never missed; the gc_input_report_callback length-filter handles
-                # non-input frames that also arrive on the subscribed characteristics.
-                try:
-                    notify_chars = []
-                    for service in self.client.services:
-                        if "ab7de9be" in str(service.uuid).lower():
-                            for char in service.characteristics:
-                                if "notify" in char.properties:
-                                    notify_chars.append(char)
-                    
-                    if not notify_chars:
-                        logger.warning("No notify characteristics found for GameCube! Falling back.")
-                        await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
-                    else:
-                        for char in notify_chars:
-                            try:
-                                logger.info(f"Subscribing to GameCube notify characteristic: {char.uuid}")
-                                await self.client.start_notify(char.uuid, gc_input_report_callback)
-                            except Exception as e:
-                                logger.warning(f"Failed to subscribe to {char.uuid}: {e}")
-                except Exception as e:
-                    logger.warning(f"Error subscribing to GameCube characteristics: {e}")
+            # The GCN controller may deliver input on any notify char in the SW2 service.
+            # ESP32-S3 exposes firmware-discovered SW2 characteristics through its mock
+            # GATT service, so WinRT and ESP32 use the same all-notify subscription path.
+            try:
+                notify_chars = []
+                for service in self.client.services:
+                    if "ab7de9be" in str(service.uuid).lower():
+                        for char in service.characteristics:
+                            if "notify" in char.properties:
+                                notify_chars.append(char)
+                
+                if not notify_chars:
+                    logger.warning("No notify characteristics found for GameCube! Falling back.")
                     await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
+                else:
+                    for char in notify_chars:
+                        try:
+                            logger.info(f"Subscribing to GameCube notify characteristic: {char.uuid}")
+                            await self.client.start_notify(char.uuid, gc_input_report_callback)
+                        except Exception as e:
+                            logger.warning(f"Failed to subscribe to {char.uuid}: {e}")
+            except Exception as e:
+                logger.warning(f"Error subscribing to GameCube characteristics: {e}")
+                await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
         else:
             await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
 
