@@ -72,6 +72,18 @@ static const esp_bt_uuid_t UUID_NOTIFY_FD2 =
     UUID128(0xab,0x7d,0xe9,0xbe,0x89,0xfe,0x49,0xad,0x82,0x8f,0x11,0x8f,0x09,0xdf,0x7f,0xd2);
 static const esp_bt_uuid_t UUID_NOTIFY_LEGACY =
     UUID128(0x74,0x92,0x86,0x6c,0xec,0x3e,0x46,0x19,0x82,0x58,0x32,0x75,0x5f,0xfc,0xc0,0xf8);
+// NSO GameCube: model-specific input notify char (GATT handle 0x000E, Input Report 0x0A).
+// This is NOT the same UUID as UUID_NOTIFY_LEGACY (7492866c…) — that one is the Pro
+// Controller's 0x000E char (Input Report 0x09) and is absent on the GameCube.  The GCN's
+// usable compact report (buttons@2-4, sticks@5-A, triggers@C/D) lives ONLY here, so the
+// generic FD2 char (0x000A, Input Report 0x05) is the wrong byte layout for the GCN.
+static const esp_bt_uuid_t UUID_NOTIFY_GC =
+    UUID128(0x82,0x61,0xcb,0xa1,0x94,0x35,0x42,0x0c,0x84,0xd6,0xf0,0xc7,0x5a,0x2c,0x8e,0x4d);
+// SW2 primary service (…fd0, NOT the input char …fd2).  Used to scope the GCN "enable
+// every notify CCCD" behaviour to this service only — mirroring the WinRT GCN path, which
+// subscribes to every notify characteristic in the ab7de9be… service.
+static const esp_bt_uuid_t UUID_SVC_SW2 =
+    UUID128(0xab,0x7d,0xe9,0xbe,0x89,0xfe,0x49,0xad,0x82,0x8f,0x11,0x8f,0x09,0xdf,0x7f,0xd0);
 static const esp_bt_uuid_t UUID_ACK =
     UUID128(0xc7,0x65,0xa9,0x61,0xd9,0xd8,0x4d,0x36,0xa2,0x0a,0x53,0x15,0xb1,0x11,0x83,0x6a);
 static const esp_bt_uuid_t UUID_CMD =
@@ -103,6 +115,15 @@ typedef struct {
     uint16_t itvl;           // connection interval in 1.25 ms units (6=7.5ms, 12=15ms)
     uint8_t  input_src;      // which UUID set input_handle: 1=FD2, 2=legacy (diagnostic)
     bool     prefer_legacy;  // NSO GameCube: input is on the LEGACY char, not FD2
+    // GCN only: every NOTIFY char handle in the SW2 service (collected during discovery).
+    // For the GameCube we CCCD-enable all of them — like the WinRT path — so the controller
+    // is happy to stream on 0x000E; NOTIFY_EVT still forwards only input_handle, so the extra
+    // streams never reach the host parser.  CCCDs are written one at a time (cccd_idx) driven
+    // by WRITE_DESCR_EVT to avoid back-to-back GATT-write congestion.
+    uint16_t notify_handles[8];
+    uint8_t  notify_count;
+    uint8_t  cccd_idx;
+    bool     cccd_draining;
 } channel_t;
 static channel_t s_ch[MAX_CH];
 
@@ -212,10 +233,11 @@ static void ch_count(int *used, int *ready) {
 // --- USB-CDC transport ---
 static QueueHandle_t s_cmd_queue;   // inbound command lines
 static QueueHandle_t s_ack_queue;   // ack/cmd notifications (P0)
+static QueueHandle_t s_notify_queue; // handle-routed notifications for GCN/WinRT parity
 static QueueHandle_t s_out_queue;   // outbound JSON lines from BLE callbacks
 static volatile bool s_request_status = false;
 typedef struct { char text[256]; } line_t;
-typedef struct { uint8_t ch; uint8_t len; uint8_t data[REPORT_SIZE]; } in_report_t;
+typedef struct { uint8_t ch; uint8_t len; uint16_t handle; uint8_t data[REPORT_SIZE]; } in_report_t;
 static char s_rx_buf[512];
 static int  s_rx_len = 0;
 static in_report_t s_in_shadow[MAX_CH];
@@ -290,11 +312,38 @@ static void send_report_frame(uint8_t channel, const uint8_t *payload, uint8_t p
     safe_cdc_write(hdr, 4);
     safe_cdc_write(payload, plen);
 }
+// CDC v2 notify frame: 0xaa 0x55 <len=payload+3> <0x40|chan> <handle_le16> <payload...>
+static void send_notify_handle_frame(uint8_t channel, uint16_t handle, const uint8_t *payload, uint8_t plen) {
+    if (plen > REPORT_SIZE) plen = REPORT_SIZE;
+    uint8_t hdr[6] = {
+        0xaa, 0x55, (uint8_t)(plen + 3), (uint8_t)(0x40 | (channel + 1)),
+        (uint8_t)(handle & 0xff), (uint8_t)(handle >> 8)
+    };
+    safe_cdc_write(hdr, sizeof(hdr));
+    safe_cdc_write(payload, plen);
+}
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
+}
+
+static void uuid_to_str(const esp_bt_uuid_t *uuid, char *out, size_t out_len) {
+    if (!uuid || !out || out_len == 0) return;
+    if (uuid->len == ESP_UUID_LEN_16) {
+        snprintf(out, out_len, "%04x", uuid->uuid.uuid16);
+        return;
+    }
+    if (uuid->len == ESP_UUID_LEN_128) {
+        const uint8_t *u = uuid->uuid.uuid128;
+        snprintf(out, out_len,
+                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 u[15], u[14], u[13], u[12], u[11], u[10], u[9], u[8],
+                 u[7], u[6], u[5], u[4], u[3], u[2], u[1], u[0]);
+        return;
+    }
+    snprintf(out, out_len, "unknown");
 }
 static size_t parse_hex(const char *s, uint8_t *out, size_t max) {
     size_t n = 0;
@@ -306,17 +355,19 @@ static size_t parse_hex(const char *s, uint8_t *out, size_t max) {
     return n;
 }
 
-static void write_cccd_value(int ch, uint16_t handle, bool enable) {
-    if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || handle == 0) return;
+static bool write_cccd_value(int ch, uint16_t handle, bool enable) {
+    if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || handle == 0) return false;
     esp_gattc_descr_elem_t descr;
     uint16_t got = 1;
     if (esp_ble_gattc_get_descr_by_char_handle(s_ch[ch].gattc_if, s_ch[ch].conn_id,
-                                               handle, UUID_CCCD, &descr, &got) == ESP_OK && got > 0) {
+                                                handle, UUID_CCCD, &descr, &got) == ESP_OK && got > 0) {
         uint8_t v[2] = { enable ? 0x01 : 0x00, 0x00 };
-        esp_ble_gattc_write_char_descr(s_ch[ch].gattc_if, s_ch[ch].conn_id,
-                                       descr.handle, sizeof(v), v,
-                                       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+        esp_err_t err = esp_ble_gattc_write_char_descr(s_ch[ch].gattc_if, s_ch[ch].conn_id,
+                                                       descr.handle, sizeof(v), v,
+                                                       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+        return err == ESP_OK;
     }
+    return false;
 }
 
 static uint16_t choose_input_handle(int ch, bool prefer_legacy, uint8_t *src) {
@@ -358,6 +409,9 @@ static void do_conn(char *args) {
     s_ch[ch].addr_type = (uint8_t)atoi(type_s);
     for (int i = 0; i < 6; i++) s_ch[ch].bda[i] = (uint8_t)m[i];
     s_ch[ch].prefer_legacy = false;
+    s_ch[ch].notify_count = 0;      // fresh discovery — clear the GCN notify list / drain state
+    s_ch[ch].cccd_idx = 0;
+    s_ch[ch].cccd_draining = false;
     {   // Diagnostic: which channel + how many links already live when this starts.
         char dbg[110];
         snprintf(dbg, sizeof(dbg),
@@ -432,17 +486,16 @@ static void do_inputsrc(char *args) {  // inputsrc <ch> <fd2|legacy>
         return;
     }
 
-    uint16_t old_handle = s_ch[ch].input_handle;
-    if (old_handle && old_handle != new_handle) {
-        write_cccd_value(ch, old_handle, false);
-        esp_ble_gattc_unregister_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, old_handle);
-    }
-
+    // Retarget which stream we forward.  Do NOT disable the old handle's CCCD: for the GCN we
+    // deliberately keep EVERY SW2 notify CCCD enabled (see enable_notifications), and other
+    // controllers keep FD2 enabled — disabling here would fight that and can silently kill input.
+    // Register the new handle (idempotent) as a safety net for a switch to a not-yet-enabled char;
+    // for non-GCN, REG_FOR_NOTIFY_EVT then writes its CCCD. (Host no longer calls this; kept for
+    // backward compatibility.)
+    if (s_ch[ch].input_handle != new_handle)
+        esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, new_handle);
     s_ch[ch].input_handle = new_handle;
     s_ch[ch].input_src = new_src;
-    if (!old_handle || old_handle != new_handle) {
-        esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, new_handle);
-    }
 
     char dbg[128];
     snprintf(dbg, sizeof(dbg), "inputsrc ch=%d mode=%s input=0x%04x(src=%u prefer_legacy=%d)",
@@ -670,6 +723,8 @@ static void cdc_task(void *arg) {
             kick_disc_queue();
         in_report_t ack;
         if (xQueueReceive(s_ack_queue, &ack, 0) == pdTRUE) send_report_frame(ack.ch, ack.data, ack.len, true);
+        in_report_t ntf;
+        if (xQueueReceive(s_notify_queue, &ntf, 0) == pdTRUE) send_notify_handle_frame(ntf.ch, ntf.handle, ntf.data, ntf.len);
         line_t out;
         if (xQueueReceive(s_out_queue, &out, 0) == pdTRUE) safe_cdc_write((const uint8_t *)out.text, strlen(out.text));
         line_t L;
@@ -679,7 +734,10 @@ static void cdc_task(void *arg) {
             portENTER_CRITICAL(&s_in_mux);
             if (s_in_dirty[i]) { r = s_in_shadow[i]; s_in_dirty[i] = false; dirty = true; }
             portEXIT_CRITICAL(&s_in_mux);
-            if (dirty) send_report_frame(r.ch, r.data, r.len, false);
+            if (dirty) {
+                if (r.handle) send_notify_handle_frame(r.ch, r.handle, r.data, r.len);
+                else send_report_frame(r.ch, r.data, r.len, false);
+            }
         }
     }
 }
@@ -688,13 +746,20 @@ static void cdc_task(void *arg) {
 static void match_and_store_char(int ch, const esp_bt_uuid_t *uuid, uint16_t val_handle) {
     // Record both input notify characteristics; the actual input_handle is chosen in
     // SEARCH_CMPL_EVT once discovery is complete (order-independent).
-    // FD2 (ab7de9be…) is the canonical Switch 2 input stream for the Pro 2 / Joy-Cons.
-    // The Pro 2 ALSO exposes the legacy notify characteristic with a DIFFERENT byte
-    // layout — parsing that as an FD2 report gives random buttons/sticks — so for
-    // those controllers FD2 wins.  The NSO GameCube controller is the exception: its
-    // compact native report is on the LEGACY characteristic, so prefer_legacy flips
-    // the choice for it.
+    // FD2 (ab7de9be…, handle 0x000A, Input Report 0x05) is the canonical Switch 2 input
+    // stream for the Pro 2 / Joy-Cons.  The NSO GameCube controller is the exception: its
+    // usable report is Input Report 0x0A on its own model-specific char (8261cba1…, handle
+    // 0x000E).  Parsing FD2 (0x05) with the GCN 0x0A byte layout puts the right stick on the
+    // trigger byte and reads non-IMU bytes as gyro.  So when the GCN char is present we store
+    // it as the input source and auto-prefer it (prefer_legacy) — matching what the WinRT path
+    // does implicitly by subscribing to every notify char in the SW2 service.
+    // NOTE: 7492866c… (UUID_NOTIFY_LEGACY) is the *Pro Controller's* 0x000E char, not the
+    // GameCube's; it is stored here only for completeness and never auto-preferred.
     if (memcmp(uuid, &UUID_NOTIFY_FD2, sizeof(*uuid)) == 0)         s_ch[ch].fd2_handle = val_handle;
+    else if (memcmp(uuid, &UUID_NOTIFY_GC, sizeof(*uuid)) == 0) {
+        s_ch[ch].legacy_handle = val_handle;   // GCN model-specific input (Input Report 0x0A)
+        s_ch[ch].prefer_legacy = true;         // the generic FD2 (0x05) is the wrong layout for the GCN
+    }
     else if (memcmp(uuid, &UUID_NOTIFY_LEGACY, sizeof(*uuid)) == 0) s_ch[ch].legacy_handle = val_handle;
     else if (memcmp(uuid, &UUID_ACK, sizeof(*uuid)) == 0)      s_ch[ch].ack_handle = val_handle;
     else if (memcmp(uuid, &UUID_CMD, sizeof(*uuid)) == 0)      s_ch[ch].cmd_handle = val_handle;
@@ -702,7 +767,16 @@ static void match_and_store_char(int ch, const esp_bt_uuid_t *uuid, uint16_t val
              memcmp(uuid, &UUID_RUMBLE_JOYCON_R, sizeof(*uuid)) == 0 ||
              memcmp(uuid, &UUID_RUMBLE_JOYCON_L, sizeof(*uuid)) == 0) s_ch[ch].rumble_handle = val_handle;
 }
-static void scan_service_chars(int ch, uint16_t start, uint16_t end) {
+// Record a SW2-service NOTIFY characteristic handle for the GCN "enable all CCCDs" pass.
+static void note_notify_handle(int ch, uint16_t handle) {
+    if (handle == 0) return;
+    for (int i = 0; i < s_ch[ch].notify_count; i++)
+        if (s_ch[ch].notify_handles[i] == handle) return;   // dedup
+    const uint8_t cap = (uint8_t)(sizeof(s_ch[ch].notify_handles) / sizeof(s_ch[ch].notify_handles[0]));
+    if (s_ch[ch].notify_count >= cap) { out_debug("notify_handles full; SW2 notify char dropped"); return; }
+    s_ch[ch].notify_handles[s_ch[ch].notify_count++] = handle;
+}
+static void scan_service_chars(int ch, uint16_t start, uint16_t end, bool is_sw2) {
     uint16_t count = 0;
     if (esp_ble_gattc_get_attr_count(s_ch[ch].gattc_if, s_ch[ch].conn_id, ESP_GATT_DB_CHARACTERISTIC,
                                      start, end, 0, &count) != ESP_OK || count == 0) return;
@@ -710,10 +784,76 @@ static void scan_service_chars(int ch, uint16_t start, uint16_t end) {
     if (!elems) return;
     uint16_t got = count;
     if (esp_ble_gattc_get_all_char(s_ch[ch].gattc_if, s_ch[ch].conn_id, start, end, elems, &got, 0) == ESP_OK)
-        for (int i = 0; i < got; i++) match_and_store_char(ch, &elems[i].uuid, elems[i].char_handle);
+        for (int i = 0; i < got; i++) {
+            match_and_store_char(ch, &elems[i].uuid, elems[i].char_handle);
+            if (is_sw2) {
+                char uuid_s[40];
+                char props[8];
+                int pi = 0;
+                uuid_to_str(&elems[i].uuid, uuid_s, sizeof(uuid_s));
+                if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) props[pi++] = 'n';
+                if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) props[pi++] = 'w';
+                if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_WRITE) props[pi++] = 'W';
+                if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_READ) props[pi++] = 'r';
+                props[pi] = '\0';
+
+                char msg[220];
+                snprintf(msg, sizeof(msg),
+                         "{\"cmd\":\"gatt_char\",\"channel\":%d,\"service\":\"ab7de9be-89fe-49ad-828f-118f09df7fd0\",\"handle\":%u,\"uuid\":\"%s\",\"props\":\"%s\"}\n",
+                         ch, elems[i].char_handle, uuid_s, props);
+                out_json(msg);
+
+                if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY)
+                    note_notify_handle(ch, elems[i].char_handle);
+            }
+        }
     free(elems);
 }
+// Write the next pending CCCD in the GCN notify list, one at a time.  Each completion
+// (WRITE_DESCR_EVT) advances to the next, so we never issue back-to-back descriptor writes.
+static void cccd_drain_step(int ch) {
+    while (s_ch[ch].cccd_idx < s_ch[ch].notify_count) {
+        uint16_t handle = s_ch[ch].notify_handles[s_ch[ch].cccd_idx];
+        if (write_cccd_value(ch, handle, true)) return;
+
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "GCN CCCD drain skipped ch=%d handle=0x%04x idx=%u/%u",
+                 ch, handle, s_ch[ch].cccd_idx, s_ch[ch].notify_count);
+        out_debug(dbg);
+        s_ch[ch].cccd_idx++;
+    }
+    s_ch[ch].cccd_draining = false;
+}
+// Begin CCCD-enabling every collected SW2 notify char (GCN).  input_handle is moved to the
+// front so the input stream is enabled first.
+static void start_cccd_drain(int ch) {
+    for (int i = 1; i < s_ch[ch].notify_count; i++) {
+        if (s_ch[ch].notify_handles[i] == s_ch[ch].input_handle) {
+            uint16_t t = s_ch[ch].notify_handles[0];
+            s_ch[ch].notify_handles[0] = s_ch[ch].notify_handles[i];
+            s_ch[ch].notify_handles[i] = t;
+            break;
+        }
+    }
+    s_ch[ch].cccd_idx = 0;
+    s_ch[ch].cccd_draining = true;
+    cccd_drain_step(ch);
+}
+// True for a GameCube channel that uses the "enable every SW2 notify CCCD" path.
+static inline bool ch_uses_notify_all(int ch) {
+    return s_ch[ch].prefer_legacy && s_ch[ch].notify_count > 0;
+}
 static void enable_notifications(int ch) {
+    if (ch_uses_notify_all(ch)) {
+        // GameCube: register for notify on EVERY SW2 notify char (input, ack, and any
+        // model-specific/extra input chars), matching the WinRT GCN subscription.  Then the
+        // sequential drain writes each CCCD in turn.  NOTIFY_EVT still forwards only
+        // input_handle, so the extra streams never reach the host parser.
+        for (int i = 0; i < s_ch[ch].notify_count; i++)
+            esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, s_ch[ch].notify_handles[i]);
+        start_cccd_drain(ch);
+        return;
+    }
     if (s_ch[ch].ack_handle)   esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, s_ch[ch].ack_handle);
     if (s_ch[ch].input_handle) esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, s_ch[ch].input_handle);
 }
@@ -840,33 +980,44 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         esp_ble_gattc_search_service(gattc_if, param->open.conn_id, NULL);
         break;
 
-    case ESP_GATTC_SEARCH_RES_EVT:
-        scan_service_chars(ch, param->search_res.start_handle, param->search_res.end_handle);
+    case ESP_GATTC_SEARCH_RES_EVT: {
+        const esp_bt_uuid_t *su = &param->search_res.srvc_id.uuid;
+        bool is_sw2 = (su->len == ESP_UUID_LEN_128 &&
+                       memcmp(su->uuid.uuid128, UUID_SVC_SW2.uuid.uuid128, ESP_UUID_LEN_128) == 0);
+        scan_service_chars(ch, param->search_res.start_handle, param->search_res.end_handle, is_sw2);
         break;
+    }
 
     case ESP_GATTC_SEARCH_CMPL_EVT: {
         // Choose the input stream now that all characteristics are known.  The NSO
         // GameCube controller (prefer_legacy) uses the LEGACY characteristic; every
         // other SW2 controller uses FD2.  Fall back to whichever is present.
         s_ch[ch].input_handle = choose_input_handle(ch, s_ch[ch].prefer_legacy, &s_ch[ch].input_src);
-        char b[160];
-        snprintf(b, sizeof(b), "discovered ch=%d input=0x%04x(src=%u prefer_legacy=%d fd2=0x%04x legacy=0x%04x) ack=0x%04x cmd=0x%04x rumble=0x%04x",
-                 ch, s_ch[ch].input_handle, s_ch[ch].input_src, s_ch[ch].prefer_legacy,
+        char b[176];
+        snprintf(b, sizeof(b), "discovered ch=%d input=0x%04x(src=%u prefer_legacy=%d notify=%u fd2=0x%04x legacy=0x%04x) ack=0x%04x cmd=0x%04x rumble=0x%04x",
+                 ch, s_ch[ch].input_handle, s_ch[ch].input_src, s_ch[ch].prefer_legacy, s_ch[ch].notify_count,
                  s_ch[ch].fd2_handle, s_ch[ch].legacy_handle,
                  s_ch[ch].ack_handle, s_ch[ch].cmd_handle, s_ch[ch].rumble_handle);
         out_debug(b);
+        snprintf(b, sizeof(b), "{\"cmd\":\"gatt_done\",\"channel\":%d}\n", ch);
+        out_json(b);
         enable_notifications(ch);
         break;
     }
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
         uint16_t h = param->reg_for_notify.handle;
-        esp_gattc_descr_elem_t descr; uint16_t got = 1;
-        if (esp_ble_gattc_get_descr_by_char_handle(gattc_if, s_ch[ch].conn_id, h, UUID_CCCD,
-                                                   &descr, &got) == ESP_OK && got > 0) {
-            uint8_t v[2] = {0x01, 0x00};
-            esp_ble_gattc_write_char_descr(gattc_if, s_ch[ch].conn_id, descr.handle, sizeof(v), v,
-                                           ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+        // Non-GCN: enable this char's CCCD immediately (unchanged).  GCN channels enable every
+        // SW2 notify CCCD via the sequential drain instead (start_cccd_drain), so skip here to
+        // avoid issuing a descriptor write on top of the drain's in-flight write.
+        if (!ch_uses_notify_all(ch)) {
+            esp_gattc_descr_elem_t descr; uint16_t got = 1;
+            if (esp_ble_gattc_get_descr_by_char_handle(gattc_if, s_ch[ch].conn_id, h, UUID_CCCD,
+                                                       &descr, &got) == ESP_OK && got > 0) {
+                uint8_t v[2] = {0x01, 0x00};
+                esp_ble_gattc_write_char_descr(gattc_if, s_ch[ch].conn_id, descr.handle, sizeof(v), v,
+                                               ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+            }
         }
         if (h == s_ch[ch].input_handle && !s_ch[ch].ready) {
             s_ch[ch].ready = true;
@@ -895,9 +1046,15 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_NOTIFY_EVT: {
         uint8_t len = param->notify.value_len > REPORT_SIZE ? REPORT_SIZE : param->notify.value_len;
-        if (param->notify.handle == s_ch[ch].input_handle) {
+        if (ch_uses_notify_all(ch)) {
+            in_report_t n;
+            n.ch = ch; n.len = len; n.handle = param->notify.handle;
+            memcpy(n.data, param->notify.value, len);
+            if (s_notify_queue) xQueueSend(s_notify_queue, &n, 0);
+        } else if (param->notify.handle == s_ch[ch].input_handle) {
             portENTER_CRITICAL(&s_in_mux);
             s_in_shadow[ch].ch = ch; s_in_shadow[ch].len = len;
+            s_in_shadow[ch].handle = 0;
             memcpy(s_in_shadow[ch].data, param->notify.value, len);
             s_in_dirty[ch] = true;
             portEXIT_CRITICAL(&s_in_mux);
@@ -907,6 +1064,14 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         }
         break;
     }
+
+    case ESP_GATTC_WRITE_DESCR_EVT:
+        // GCN CCCD drain: one descriptor write completed (ok or not) -> enable the next.
+        if (s_ch[ch].cccd_draining) {
+            s_ch[ch].cccd_idx++;
+            cccd_drain_step(ch);
+        }
+        break;
 
     // ESP_GATTC_DISCONNECT_EVT is handled above (routed by remote_bda, not gattc_if).
 
@@ -1003,6 +1168,7 @@ void app_main(void) {
 
     s_cmd_queue = xQueueCreate(16, sizeof(line_t));
     s_ack_queue = xQueueCreate(16, sizeof(in_report_t));
+    s_notify_queue = xQueueCreate(32, sizeof(in_report_t));
     s_out_queue = xQueueCreate(24, sizeof(line_t));
 
     tinyusb_config_t tusb_cfg = { 0 };
