@@ -182,7 +182,7 @@ mag_calibration_data:
 merged_gyro_side:
   E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
-  enabled: false
+  enabled: true
   ir_activate_threshold: 1
   sensitivity: 4.0
 open_when_startup: false
@@ -521,7 +521,7 @@ profiles:
       r_mapping: Default
       r_stk_mapping: Default
       right_mapping: Default
-      rumble_mode: Switch
+      rumble_mode: Xbox
       sll_mapping: PS_L_Touch
       slr_mapping: DJG
       srl_mapping: DJG
@@ -2761,7 +2761,7 @@ stick_r_bias:
 - 0.0
 - 0.0
 ui_scale: 1.0
-usbip_sim_mode: PS5
+usbip_sim_mode: Switch1
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_ps5: 10
@@ -2772,7 +2772,7 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1238
-window_y: 46
+window_x: 1261
+window_y: 69
 winuhid_sim_mode: PS5
 wired_usb_enabled: true
