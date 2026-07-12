@@ -79,17 +79,17 @@ BACK_BUTTON_OPTIONS = [
     "Default", "Custom", "In-app Gyro", "Gyro Lock", "DJG", "Mode Shift", "Calibration", "Task Manager", "Change Profile", "None", "Home", "Capture", "PrtSc", "On-Screen Keyboard", "Chat", "Mute", "Game Bar", "HDR Toggle", "Play/Pause", "Stop", "Next Track", "Previous Track", "Volume Up", "Volume Down", "Media Mute", "PS_L_Touch", "PS_R_Touch", "PS_C_Click",
     "A", "B", "X", "Y", "L", "R", "ZL", "ZR",
     "MINUS", "PLUS", "L_STK", "R_STK", "UP", "DOWN", "LEFT", "RIGHT", "GL", "GR",
-    "m Left Click", "m Right Click", "m Middle Click", "m Button 4", "m Button 5",
+    "m1 Left Click", "m2 Middle Click", "m3 Right Click", "m4 Backward", "m5 Forward",
 ]
 
 # Back Button Option "Mouse Click" tokens -> the Custom mouse-button token they run as.
 # Tk mouse numbering: MB_1=left, MB_2=middle, MB_3=right; MB_4/MB_5 = XBUTTON1/2.
 MOUSE_CLICK_BACK_BUTTON_TOKENS = {
-    "m Left Click": "MB_1",
-    "m Right Click": "MB_3",
-    "m Middle Click": "MB_2",
-    "m Button 4": "MB_4",
-    "m Button 5": "MB_5",
+    "m1 Left Click": "MB_1",
+    "m2 Middle Click": "MB_2",
+    "m3 Right Click": "MB_3",
+    "m4 Backward": "MB_4",
+    "m5 Forward": "MB_5",
 }
 
 # Back Button Option floating selector layout. Each entry is (category title, rows),
@@ -118,7 +118,7 @@ BACK_BUTTON_CATEGORIES = [
         ["Game Bar", "PrtSc", "On-Screen Keyboard", "Task Manager", "HDR Toggle"],
     ]),
     ("Mouse Click", [
-        ["m Left Click", "m Right Click", "m Middle Click", "m Button 4", "m Button 5"],
+        ["m1 Left Click", "m2 Middle Click", "m3 Right Click", "m4 Backward", "m5 Forward"],
     ]),
 ]
 

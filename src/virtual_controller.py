@@ -317,6 +317,8 @@ class VirtualController:
         self.djg_accel_offset = [0.0, 0.0, 0.0]
         self.djg_cached_gyro = {'Left': [0.0, 0.0, 0.0], 'Right': [0.0, 0.0, 0.0]}
         self.djg_cached_accel = {'Left': [0.0, 0.0, 0.0], 'Right': [0.0, 0.0, 0.0]}
+        self.djg_direct_cached_gyro = {'Left': (0.0, 0.0, 0.0), 'Right': (0.0, 0.0, 0.0)}
+        self.djg_direct_cached_accel = {'Left': (0.0, 0.0, 0.0), 'Right': (0.0, 0.0, 0.0)}
         self.djg_left_active = True
         self.djg_right_active = True
         
@@ -477,6 +479,32 @@ class VirtualController:
             max(-1.0, min(1.0, stick[1])),
         )
 
+    def _is_djg_direct_merge(self):
+        return bool(
+            getattr(CONFIG, "djg_enabled", False) and
+            getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Direct Merge"
+        )
+
+    def _direct_merged_motion(self, inputData):
+        left_g = self.djg_direct_cached_gyro.get("Left", (0.0, 0.0, 0.0))
+        right_g = self.djg_direct_cached_gyro.get("Right", (0.0, 0.0, 0.0))
+        left_a = self.djg_direct_cached_accel.get("Left", (0.0, 0.0, 0.0))
+        right_a = self.djg_direct_cached_accel.get("Right", (0.0, 0.0, 0.0))
+        merged_g = (
+            left_g[0] + right_g[0],
+            left_g[1] + right_g[1],
+            left_g[2] + right_g[2],
+        )
+        if left_a != (0.0, 0.0, 0.0) and right_a != (0.0, 0.0, 0.0):
+            merged_a = (
+                (left_a[0] + right_a[0]) * 0.5,
+                (left_a[1] + right_a[1]) * 0.5,
+                (left_a[2] + right_a[2]) * 0.5,
+            )
+        else:
+            merged_a = left_a if left_a != (0.0, 0.0, 0.0) else (right_a if right_a != (0.0, 0.0, 0.0) else inputData.accelerometer)
+        return merged_g, merged_a
+
     def _controller_mapping_scope(self, controller):
         active = (
             getattr(controller, "gyro_mouse_enabled", False) or
@@ -532,6 +560,12 @@ class VirtualController:
         return self._clamp_stick_pair(sum_left), self._clamp_stick_pair(sum_right)
 
     def handle_djg_trigger(self, controller, pressed=True):
+        if self._is_djg_direct_merge():
+            import utils
+            if hasattr(utils, 'force_ui_update_callback') and utils.force_ui_update_callback:
+                utils.force_ui_update_callback()
+            return
+
         activation = getattr(CONFIG, "djg_activation", "Toggle")
         if activation == "Toggle" and not pressed:
             return
@@ -565,6 +599,32 @@ class VirtualController:
                 controller._skip_gyro_mouse = False
                 return
 
+            controllers = getattr(self, "_controllers_tuple", None)
+            if controllers is None or len(controllers) != len(self.controllers):
+                self._refresh_controller_cache()
+                controllers = self._controllers_tuple
+
+            is_merged = len(controllers) == 2
+            for c in controllers:
+                c.is_merged = is_merged
+
+            if is_merged:
+                merged_dampening_states = {}
+                for c in controllers:
+                    for key, pressed in (getattr(c, "_profile_combo_btn_states", {}) or {}).items():
+                        merged_dampening_states[key] = bool(merged_dampening_states.get(key, False) or pressed)
+                for c in controllers:
+                    c._shared_dampening_btn_states = merged_dampening_states
+            else:
+                controller._shared_dampening_btn_states = dict(getattr(controller, "_profile_combo_btn_states", {}) or {})
+
+            direct_merge = is_merged and self._is_djg_direct_merge()
+            if direct_merge:
+                for c in controllers:
+                    c.gyro_active = True
+                    c._skip_gyro_mouse = False
+                return
+
             if len(self.controllers) == 2 and getattr(CONFIG, "djg_enabled", False):
                 djg_dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
                 djg_sub_side = "Right" if djg_dom_side == "Left" else "Left"
@@ -580,8 +640,15 @@ class VirtualController:
                 dom_on = getattr(dom_c, 'gyro_active', True) if dom_c else False
                 sub_on = getattr(sub_c, 'gyro_active', True) if sub_c else False
                 
-                # Check skip gyro mouse flag
-                if dom_on and sub_on and getattr(CONFIG, "gyro_activation_mode", "Toggle") == "Always On":
+                # When both Joy-Cons feed the gyro, gyro_fusion_callback fuses their motion
+                # into one identical gyro stream for both controllers. Each controller runs
+                # its own gyro-mouse interpolation thread, so letting both emit would double
+                # the cursor movement. The sub (non-dominant) side therefore skips its own
+                # gyro-mouse emission and only the dominant side emits the fused motion. This
+                # applies in every activation mode: the In-App Gyro trigger is now shared, so
+                # in Hold/Toggle both sides would otherwise be enabled at once (not just in
+                # Always On as before).
+                if dom_on and sub_on:
                     if (controller.is_joycon_left() and djg_sub_side == "Left") or (controller.is_joycon_right() and djg_sub_side == "Right"):
                         controller._skip_gyro_mouse = True
                     else:
@@ -1700,6 +1767,7 @@ class VirtualController:
         controller._shared_mode_shift_active = False
         controller._shared_in_app_gyro_toggle = False
         controller._shared_in_app_gyro_hold_pressed = False
+        controller._shared_dampening_btn_states = {}
         controller.gyro_target_vx = 0.0
         controller.gyro_target_vy = 0.0
         controller.current_vx = 0.0
@@ -1727,7 +1795,9 @@ class VirtualController:
             if len(controllers) == 2 or controller.is_pro_controller():
                 if getattr(CONFIG, "djg_enabled", False):
                     mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
-                    if mode == "Switch Gyro Side":
+                    if mode == "Direct Merge":
+                        controller.gyro_active = controller.is_joycon_left() or controller.is_joycon_right() or controller.is_pro_controller()
+                    elif mode == "Switch Gyro Side":
                         controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
                     else:
                         controller.gyro_active = (controller.is_joycon_left() and getattr(self, 'djg_left_active', True)) or (controller.is_joycon_right() and getattr(self, 'djg_right_active', True))
@@ -1747,6 +1817,16 @@ class VirtualController:
             if is_merged:
                 left_c, right_c = getattr(self, "_merged_pair", (None, None))
                 other_c = right_c if controller is left_c else left_c
+                direct_merge = self._is_djg_direct_merge()
+                # The In-App Gyro activation trigger is shared across both Joy-Cons in every
+                # merged mode: a trigger button on either side activates gyro regardless of
+                # which Joy-Con's IMU is currently feeding the output. Previously DJG modes
+                # used a per-side trigger, which made a button on the non-gyro side (Switch
+                # Gyro Side) or the toggled-off / non-dominant side (Single Side Toggle /
+                # Switch Dominant Side) unable to activate gyro at all. Double mouse output
+                # when both sides are gyro-active is prevented in gyro_fusion_callback, which
+                # makes the non-dominant (sub) side skip its own gyro-mouse emission so only
+                # the dominant side emits the fused motion.
                 # Sync Gyro Trigger
                 if not hasattr(self, '_in_app_gyro_shared_toggle'):
                     self._in_app_gyro_shared_toggle = False
@@ -1759,19 +1839,45 @@ class VirtualController:
                     getattr(right_c, '_own_in_app_gyro_hold_pressed', False)
                 )
                 
+                shared_in_app_gyro = shared_in_app_gyro_toggle != shared_in_app_gyro_hold_pressed
+
+                # Commit the Trigger Dampening / Trigger Deadzone source key only when the
+                # shared In-app Gyro state transitions off->on. The controller whose report
+                # is being processed is the one that caused the activation, so its pending key
+                # (the button just pressed this report) becomes the shared source. A press
+                # while gyro is already active, or a Tap that closes gyro, must not change it.
+                prev_shared_active = getattr(self, "_prev_shared_in_app_gyro_active", False)
+                if shared_in_app_gyro and not prev_shared_active:
+                    # The two Joy-Con callbacks run on separate threads, so the one that first
+                    # observes the off->on edge may not be the side that pressed. Attribute the
+                    # commit to whichever side actually has a fresh pending key (prefer the
+                    # current controller). Each side's pending key is set every report to its
+                    # own new_trigger_key (None when not pressing), so exactly the presser holds
+                    # one at the activation edge.
+                    commit_c = None
+                    for cand in (controller, left_c, right_c):
+                        if cand is not None and getattr(cand, "_pending_in_app_gyro_trigger_key", None):
+                            commit_c = cand
+                            break
+                    if commit_c is not None:
+                        pending_key = commit_c._pending_in_app_gyro_trigger_key
+                        commit_time = time.perf_counter()
+                        commit_c._last_in_app_gyro_trigger_key = pending_key
+                        commit_c._last_in_app_gyro_trigger_time = commit_time
+                        commit_c._own_last_in_app_gyro_trigger_key = pending_key
+                        commit_c._own_last_in_app_gyro_trigger_time = commit_time
+                self._prev_shared_in_app_gyro_active = shared_in_app_gyro
+
+                # Pick the shared source key from whichever side most recently activated.
                 left_time = getattr(left_c, '_own_last_in_app_gyro_trigger_time', 0.0)
                 right_time = getattr(right_c, '_own_last_in_app_gyro_trigger_time', 0.0)
                 if left_time >= right_time:
                     shared_last_in_app_gyro_trigger_key = getattr(left_c, '_own_last_in_app_gyro_trigger_key', None)
                 else:
                     shared_last_in_app_gyro_trigger_key = getattr(right_c, '_own_last_in_app_gyro_trigger_key', None)
-                shared_in_app_gyro = shared_in_app_gyro_toggle != shared_in_app_gyro_hold_pressed
-                
-                if getattr(CONFIG, "djg_enabled", False):
-                    shared_gyro = getattr(controller, '_own_gyro_trigger', False)
-                else:
-                    shared_gyro = shared_in_app_gyro
-                    
+
+                shared_gyro = shared_in_app_gyro
+
                 # Sync ZR/ZL for Gyro Mouse clicks
                 shared_zr = (
                     getattr(left_c, '_own_zr_pressed', False) or
@@ -1808,31 +1914,39 @@ class VirtualController:
                 # the per-side gyro_mouse_enabled flag is driven by the shared trigger.
                 if getattr(CONFIG, 'gyro_activation_mode', 'Hold') == 'Hold':
                     for c in controllers:
-                        if getattr(CONFIG, "djg_enabled", False):
-                            c.gyro_mouse_enabled = getattr(c, '_own_gyro_trigger', False)
-                        else:
-                            c.gyro_mouse_enabled = shared_gyro
+                        c.gyro_mouse_enabled = shared_gyro
                 
-                # Sync Steer Value (From the gyro-active controller)
+                # Sync Steer Value and gyro-driven right stick output.
                 shared_steer = 0.0
                 shared_rs = (0.0, 0.0)
                 shared_gyro_rs = (0.0, 0.0)
                 for c in controllers:
-                    if getattr(c, 'gyro_active', False):
-                        shared_steer = getattr(c, '_own_steer_value', 0.0)
+                    # A sub side that skipped gyro-mouse emission (both sides active) has zeroed
+                    # its own steer/rstick output; exclude it so it can't clobber the dominant
+                    # side's fused output when it is iterated last.
+                    if getattr(c, 'gyro_active', False) and not getattr(c, '_skip_gyro_mouse', False):
+                        own_steer = getattr(c, '_own_steer_value', 0.0)
+                        if direct_merge:
+                            shared_steer += own_steer
+                        else:
+                            shared_steer = own_steer
                         if getattr(c, 'gyro_mouse_enabled', False) or shared_gyro:
-                            shared_gyro_rs = getattr(c, '_gyro_rstick_out', (0.0, 0.0))
+                            own_rs = getattr(c, '_gyro_rstick_out', (0.0, 0.0))
+                            if direct_merge:
+                                shared_gyro_rs = (shared_gyro_rs[0] + own_rs[0], shared_gyro_rs[1] + own_rs[1])
+                            else:
+                                shared_gyro_rs = own_rs
                     if c.is_joycon_right():
                         shared_rs = inputData.right_stick if c == controller else getattr(c, '_last_rs', (0.0, 0.0))
+                if direct_merge:
+                    shared_steer = max(-1.0, min(1.0, shared_steer))
+                    shared_gyro_rs = self._clamp_stick_pair(shared_gyro_rs)
 
                 for c in controllers:
-                    if getattr(CONFIG, "djg_enabled", False):
-                        c._shared_gyro_trigger = getattr(c, '_own_gyro_trigger', False)
-                    else:
-                        c._shared_gyro_trigger = shared_gyro
-                        c._shared_in_app_gyro_toggle = shared_in_app_gyro_toggle
-                        c._shared_in_app_gyro_hold_pressed = shared_in_app_gyro_hold_pressed
-                        c._shared_last_in_app_gyro_trigger_key = shared_last_in_app_gyro_trigger_key
+                    c._shared_gyro_trigger = shared_gyro
+                    c._shared_in_app_gyro_toggle = shared_in_app_gyro_toggle
+                    c._shared_in_app_gyro_hold_pressed = shared_in_app_gyro_hold_pressed
+                    c._shared_last_in_app_gyro_trigger_key = shared_last_in_app_gyro_trigger_key
                     c._shared_zr_pressed = shared_zr
                     c._shared_zl_pressed = shared_zl
                     c._shared_mode_shift_toggle = shared_mode_shift_toggle
@@ -1860,6 +1974,11 @@ class VirtualController:
                 controller._shared_mode_shift_active = getattr(controller, '_own_mode_shift_active', False)
                 
             current_buttons = inputData.buttons 
+            if is_merged and self._is_djg_direct_merge():
+                side = "Left" if controller.is_joycon_left() else ("Right" if controller.is_joycon_right() else None)
+                if side:
+                    self.djg_direct_cached_gyro[side] = inputData.gyroscope
+                    self.djg_direct_cached_accel[side] = inputData.accelerometer
             
             # Mouse mappings consume stick input in controller.py. Gyro mouse alone should not
             # force-disable the virtual right stick.
@@ -2029,7 +2148,9 @@ class VirtualController:
                     send_cemuhook = True
                 else:
                     send_cemuhook = False
-                    if getattr(CONFIG, "djg_enabled", False):
+                    if self._is_djg_direct_merge():
+                        send_cemuhook = controller.is_joycon_right()
+                    elif getattr(CONFIG, "djg_enabled", False):
                         dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
                         if controller.is_joycon_left() and dom_side == "Left":
                             send_cemuhook = True
@@ -2068,8 +2189,12 @@ class VirtualController:
                         # 1. 統一為標準的 V mode 物理軸向
                         # 根據實測，Joy-Con 2 (左/右) 與 Pro Controller 的原始 IMU 座標系完全一致
                         # 皆需要反轉三軸的重力向量 (X, Y, Z)，才能在 Yuzu 等模擬器中得到正確的旋轉方向與重力向量
-                        base_gyro = (inputData.gyroscope[0], -inputData.gyroscope[1], -inputData.gyroscope[2])
-                        base_accel = (-inputData.accelerometer[0], -inputData.accelerometer[1], -inputData.accelerometer[2])
+                        if self._is_djg_direct_merge():
+                            source_gyro, source_accel = self._direct_merged_motion(inputData)
+                        else:
+                            source_gyro, source_accel = inputData.gyroscope, inputData.accelerometer
+                        base_gyro = (source_gyro[0], -source_gyro[1], -source_gyro[2])
+                        base_accel = (-source_accel[0], -source_accel[1], -source_accel[2])
 
                         # 2. 如果使用者選擇水平握持 (H mode)，套用對應的 90 度旋轉
                         if hold_mode == "Horizontal" and not controller.is_pro_controller():
@@ -2599,26 +2724,35 @@ class VirtualController:
                 self.last_rx = float_to_byte(mixed_right[0])
                 self.last_ry = float_to_byte(-mixed_right[1])
 
-                is_passthrough_source = False
-                if getattr(CONFIG, "djg_enabled", False):
-                    dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
-                    if controller.is_joycon_left() and dom_side == "Left":
-                        is_passthrough_source = True
-                    elif controller.is_joycon_right() and dom_side == "Right":
-                        is_passthrough_source = True
+                if self._is_djg_direct_merge():
+                    merged_g, merged_a = self._direct_merged_motion(inputData)
+                    self.last_gx = merged_g[0]
+                    self.last_gy = merged_g[2]
+                    self.last_gz = -merged_g[1]
+                    self.last_ax = merged_a[0]
+                    self.last_ay = merged_a[2]
+                    self.last_az = -merged_a[1]
                 else:
-                    if controller.is_joycon_left() and self.active_gyro_side == "Left":
-                        is_passthrough_source = True
-                    elif controller.is_joycon_right() and self.active_gyro_side == "Right":
-                        is_passthrough_source = True
+                    is_passthrough_source = False
+                    if getattr(CONFIG, "djg_enabled", False):
+                        dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                        if controller.is_joycon_left() and dom_side == "Left":
+                            is_passthrough_source = True
+                        elif controller.is_joycon_right() and dom_side == "Right":
+                            is_passthrough_source = True
+                    else:
+                        if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                            is_passthrough_source = True
+                        elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                            is_passthrough_source = True
 
-                if is_passthrough_source:
-                    self.last_gx = inputData.gyroscope[0]
-                    self.last_gy = inputData.gyroscope[2]
-                    self.last_gz = -inputData.gyroscope[1]
-                    self.last_ax = inputData.accelerometer[0]
-                    self.last_ay = inputData.accelerometer[2]
-                    self.last_az = -inputData.accelerometer[1]
+                    if is_passthrough_source:
+                        self.last_gx = inputData.gyroscope[0]
+                        self.last_gy = inputData.gyroscope[2]
+                        self.last_gz = -inputData.gyroscope[1]
+                        self.last_ax = inputData.accelerometer[0]
+                        self.last_ay = inputData.accelerometer[2]
+                        self.last_az = -inputData.accelerometer[1]
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
@@ -2825,26 +2959,35 @@ class VirtualController:
             self.last_rx = float_to_byte(mixed_right[0])
             self.last_ry = float_to_byte(-mixed_right[1])
 
-            is_passthrough_source = False
-            if getattr(CONFIG, "djg_enabled", False):
-                dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
-                if controller.is_joycon_left() and dom_side == "Left":
-                    is_passthrough_source = True
-                elif controller.is_joycon_right() and dom_side == "Right":
-                    is_passthrough_source = True
+            if self._is_djg_direct_merge():
+                merged_g, merged_a = self._direct_merged_motion(inputData)
+                self.last_gx = merged_g[0]
+                self.last_gy = merged_g[2]
+                self.last_gz = -merged_g[1]
+                self.last_ax = merged_a[0]
+                self.last_ay = merged_a[2]
+                self.last_az = -merged_a[1]
             else:
-                if controller.is_joycon_left() and self.active_gyro_side == "Left":
-                    is_passthrough_source = True
-                elif controller.is_joycon_right() and self.active_gyro_side == "Right":
-                    is_passthrough_source = True
-                    
-            if is_passthrough_source:
-                self.last_gx = inputData.gyroscope[0]
-                self.last_gy = inputData.gyroscope[2]
-                self.last_gz = -inputData.gyroscope[1]
-                self.last_ax = inputData.accelerometer[0]
-                self.last_ay = inputData.accelerometer[2]
-                self.last_az = -inputData.accelerometer[1]
+                is_passthrough_source = False
+                if getattr(CONFIG, "djg_enabled", False):
+                    dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                    if controller.is_joycon_left() and dom_side == "Left":
+                        is_passthrough_source = True
+                    elif controller.is_joycon_right() and dom_side == "Right":
+                        is_passthrough_source = True
+                else:
+                    if controller.is_joycon_left() and self.active_gyro_side == "Left":
+                        is_passthrough_source = True
+                    elif controller.is_joycon_right() and self.active_gyro_side == "Right":
+                        is_passthrough_source = True
+                        
+                if is_passthrough_source:
+                    self.last_gx = inputData.gyroscope[0]
+                    self.last_gy = inputData.gyroscope[2]
+                    self.last_gz = -inputData.gyroscope[1]
+                    self.last_ax = inputData.accelerometer[0]
+                    self.last_ay = inputData.accelerometer[2]
+                    self.last_az = -inputData.accelerometer[1]
 
         if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
             steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
@@ -4354,7 +4497,15 @@ class VirtualController:
             self.last_s2_rx = mixed_right[0]
             self.last_s2_ry = mixed_right[1]
                 
-            if getattr(controller, 'gyro_active', False):
+            if self._is_djg_direct_merge():
+                merged_g, merged_a = self._direct_merged_motion(inputData)
+                self.last_s2_gx = merged_g[0]
+                self.last_s2_gy = merged_g[2]
+                self.last_s2_gz = -merged_g[1]
+                self.last_s2_ax = merged_a[0]
+                self.last_s2_ay = merged_a[2]
+                self.last_s2_az = -merged_a[1]
+            elif getattr(controller, 'gyro_active', False):
                 self.last_s2_gx = inputData.gyroscope[0]
                 self.last_s2_gy = inputData.gyroscope[2]
                 self.last_s2_gz = -inputData.gyroscope[1]

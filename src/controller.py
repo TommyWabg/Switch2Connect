@@ -2889,9 +2889,20 @@ class Controller:
             # aggregate these _own_* fields in virtual_controller.
             self._in_app_gyro_armed = in_app_gyro_armed
             self._in_app_gyro_tap_held = self._in_app_gyro_armed
-            if new_trigger_key:
-                self._last_in_app_gyro_trigger_key = new_trigger_key
-                self._last_in_app_gyro_trigger_time = time.perf_counter()
+            # The Trigger Dampening / Trigger Deadzone settings follow the button that last
+            # ACTIVATED In-app Gyro (turned it off->on), not merely the last In-app Gyro
+            # button pressed. So only commit the trigger key when gyro transitions off->on
+            # with a fresh press this report. A Tap that closes gyro, or a second In-app Gyro
+            # button pressed while gyro is already active, must not change the settings source.
+            # Merged Joy-Cons defer the commit to virtual_controller (which owns the shared
+            # activation edge); here we just expose the candidate for it to consume.
+            self._pending_in_app_gyro_trigger_key = new_trigger_key
+            if not is_merged:
+                prev_trigger_active = getattr(self, "_prev_in_app_gyro_trigger_state", False)
+                if new_trigger_key and trigger_gyro and not prev_trigger_active:
+                    self._last_in_app_gyro_trigger_key = new_trigger_key
+                    self._last_in_app_gyro_trigger_time = time.perf_counter()
+                self._prev_in_app_gyro_trigger_state = trigger_gyro
             self._own_in_app_gyro_tap_edge = in_app_gyro_tap_edge
             self._own_last_in_app_gyro_trigger_key = getattr(self, "_last_in_app_gyro_trigger_key", None)
             self._own_last_in_app_gyro_trigger_time = getattr(self, "_last_in_app_gyro_trigger_time", 0.0)
@@ -3640,6 +3651,62 @@ class Controller:
                 press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
             self.previous_mouse_state = None
 
+    # How long a matched In-App Gyro modifier button keeps counting as "pressed" after it
+    # is physically released (Trigger Dampening / Trigger Deadzone release-latch).
+    IN_APP_GYRO_INPUT_LATCH_SECONDS = 0.200
+
+    # How long Gyro control is fully frozen after a Trigger Deadzone button's press or
+    # release edge (kills cursor drift from the hand jolt of pressing/releasing the button).
+    IN_APP_GYRO_DZ_FREEZE_SECONDS = 0.100
+
+    def _in_app_gyro_raw_tokens_pressed(self, tokens, zr_pressed, zl_pressed):
+        # Return the frozenset of tokens whose PHYSICAL button is pressed RIGHT NOW (no
+        # release-latch). Matches against _profile_combo_btn_states (the raw pre-remap
+        # snapshot) rather than post-remap virtual bits, so a remapped button never causes a
+        # wrong match. ZL/ZR fold in their dedicated merged-aware pressed state. Used both for
+        # the latched Dampening/Deadzone matching and for edge-detecting the Deadzone freeze.
+        states = dict(getattr(self, "_profile_combo_btn_states", {}) or {})
+        if getattr(self, "is_merged", False):
+            shared_states = getattr(self, "_shared_dampening_btn_states", None)
+            if shared_states:
+                states = dict(shared_states)
+            else:
+                vc = getattr(self, "virtual_controller", None)
+                for c in (getattr(vc, "controllers", []) if vc else []):
+                    if c is not self:
+                        for k, v in (getattr(c, "_profile_combo_btn_states", {}) or {}).items():
+                            states[k] = bool(states.get(k, False) or v)
+        token_alias = {"Capture": "CAPT", "Home": "HOME", "Chat": "C"}
+
+        pressed = set()
+        for token in tokens:
+            raw = bool(states.get(token_alias.get(token, token), False))
+            if token == "ZR":
+                raw = raw or zr_pressed
+            elif token == "ZL":
+                raw = raw or zl_pressed
+            if raw:
+                pressed.add(token)
+        return frozenset(pressed)
+
+    def _in_app_gyro_inputs_pressed(self, tokens, zr_pressed, zl_pressed):
+        # True if any token is pressed now OR within the release-latch window after release,
+        # so brief gaps in the button state don't drop the effect. Shared by Trigger
+        # Dampening and Trigger Deadzone.
+        raw_pressed = self._in_app_gyro_raw_tokens_pressed(tokens, zr_pressed, zl_pressed)
+        now = time.perf_counter()
+        latch = self.__dict__.get("_in_app_gyro_input_latch")
+        if latch is None:
+            latch = {}
+            self._in_app_gyro_input_latch = latch
+        latch_seconds = self.IN_APP_GYRO_INPUT_LATCH_SECONDS
+
+        for token in tokens:
+            if token in raw_pressed:
+                latch[token] = now
+                return True
+        return any((now - latch.get(token, 0.0)) <= latch_seconds for token in tokens)
+
     def simulate_gyro_mouse(self, inputData: ControllerInputData, trigger_pressed: bool = False, zr_pressed: bool = False, zl_pressed: bool = False):
         cfg = self._get_gyro_config_snapshot()
 
@@ -3786,6 +3853,35 @@ class Controller:
         self.eff_h_final = 0.0
         self.eff_v_final = 0.0
 
+        # Trigger Deadzone (resolved mode-independently so both effects work in every gyro
+        # mode). Two effects:
+        #  1) Freeze: on any assigned button's press OR release edge, fully stop gyro for
+        #     IN_APP_GYRO_DZ_FREEZE_SECONDS to kill the cursor drift from the hand jolt of
+        #     pressing/releasing the button. Edge detection uses the RAW (unlatched) pressed
+        #     set; applied at the suppression gate inside the gyro_mouse_enabled block below.
+        #  2) Deadzone amount override (World/Yaw only, where a soft deadzone exists): while a
+        #     button is held or within the release-latch window, raise the soft deadzone.
+        in_app_soft_dz = float(getattr(CONFIG, 'in_app_gyro_soft_deadzone', 0.0))
+        dz_trigger_key = getattr(self, "_own_last_in_app_gyro_trigger_key", None)
+        if getattr(self, "is_merged", False):
+            dz_trigger_key = getattr(self, "_shared_last_in_app_gyro_trigger_key", dz_trigger_key)
+        dz_active = False
+        if trigger_pressed and dz_trigger_key:
+            dz_inputs = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(f"{dz_trigger_key}_in_app_gyro_deadzone_mode", [], None))
+            if dz_inputs:
+                dz_active = True
+                raw_pressed = self._in_app_gyro_raw_tokens_pressed(dz_inputs, zr_pressed, zl_pressed)
+                prev_pressed = getattr(self, "_dz_freeze_prev_pressed", None)
+                if prev_pressed is not None and raw_pressed != prev_pressed:
+                    self._gyro_freeze_until = time.perf_counter() + self.IN_APP_GYRO_DZ_FREEZE_SECONDS
+                self._dz_freeze_prev_pressed = raw_pressed
+                if self._in_app_gyro_inputs_pressed(dz_inputs, zr_pressed, zl_pressed):
+                    in_app_soft_dz = float(CONFIG.get_mapping_setting_scoped(f"{dz_trigger_key}_in_app_gyro_deadzone_amount", 15.0, None))
+        if not dz_active:
+            # Reset the edge baseline so re-entering (button reassigned / gyro re-triggered)
+            # only records the first frame instead of firing a spurious freeze.
+            self._dz_freeze_prev_pressed = None
+
         if current_mode in ["World", "Yaw"]:
             if self.is_pro_controller() or self.hold_mode == "Vertical":
                 g_local = (gyro_x, 0.0, gyro_z)
@@ -3825,8 +3921,9 @@ class Controller:
             self.gyro_moving_envelope = 0.88 * self.gyro_moving_envelope + 0.12 * omega
             
             
-            base_dz = (2.0 if self.is_joycon() else 1.0) + float(getattr(CONFIG, 'in_app_gyro_soft_deadzone', 0.0))
-            
+            # in_app_soft_dz (incl. any active Trigger Deadzone override) resolved above.
+            base_dz = (2.0 if self.is_joycon() else 1.0) + in_app_soft_dz
+
             # Decay deadzone to 0 quickly (at 3.0 dps) to prevent asymmetric deadzone subtraction during slow turnarounds
             soft_dz = base_dz * (1.0 - min(1.0, self.gyro_moving_envelope / 3.0))
             
@@ -3902,8 +3999,10 @@ class Controller:
             if gyro_control_mode == "Steering":
                 current_mode = "Roll"
 
-            # Suppress movement ONLY during gyro startup (Auto-Leveling period)
-            if now - self.gyro_start_time < 0.05:
+            # Suppress movement during gyro startup (Auto-Leveling period) OR while the
+            # Trigger Deadzone freeze window (set on a button press/release edge above) is
+            # active, fully stopping gyro output.
+            if now - self.gyro_start_time < 0.05 or now < getattr(self, "_gyro_freeze_until", 0.0):
                 self.gyro_target_vx = 0.0
                 self.gyro_target_vy = 0.0
                 self._gyro_rstick_out = (0.0, 0.0)
@@ -3915,42 +4014,11 @@ class Controller:
             if is_merged:
                 trigger_key = getattr(self, "_shared_last_in_app_gyro_trigger_key", trigger_key)
             
-            if zr_pressed:
-                self._last_zr_pressed_time = now
-            if zl_pressed:
-                self._last_zl_pressed_time = now
-                
-            eff_zr_damp = zr_pressed or (now - getattr(self, "_last_zr_pressed_time", 0.0) <= 0.050)
-            eff_zl_damp = zl_pressed or (now - getattr(self, "_last_zl_pressed_time", 0.0) <= 0.050)
-
             if trigger_pressed and trigger_key:
                 damp_inputs = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_mode", [], None))
-                if damp_inputs:
-                    # Match dampening inputs against the PHYSICAL buttons, not the
-                    # post-remap virtual output bits. _profile_combo_btn_states is the raw
-                    # pre-remap snapshot (built each report before button bits are cleared/
-                    # rebuilt), so a remapped button no longer causes a wrong dampening
-                    # match. ZL/ZR keep their dedicated physical path (with the 50ms latch
-                    # and merged-shared state).
-                    states = dict(getattr(self, "_profile_combo_btn_states", {}) or {})
-                    if is_merged:
-                        vc = getattr(self, "virtual_controller", None)
-                        for c in (getattr(vc, "controllers", []) if vc else []):
-                            if c is not self:
-                                for k, v in (getattr(c, "_profile_combo_btn_states", {}) or {}).items():
-                                    states[k] = bool(states.get(k, False) or v)
-                    token_alias = {"Capture": "CAPT", "Home": "HOME", "Chat": "C"}
-
-                    def damp_pressed(token):
-                        if token == "ZL":
-                            return eff_zl_damp
-                        if token == "ZR":
-                            return eff_zr_damp
-                        return bool(states.get(token_alias.get(token, token), False))
-
-                    if any(damp_pressed(token) for token in damp_inputs):
-                        damp_amount = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_amount", 90, None)
-                        gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
+                if damp_inputs and self._in_app_gyro_inputs_pressed(damp_inputs, zr_pressed, zl_pressed):
+                    damp_amount = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_amount", 90, None)
+                    gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
             
             gyro_deadzone = 0.2 
             

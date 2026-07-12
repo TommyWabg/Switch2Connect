@@ -54,7 +54,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v0.12.6"
+APP_VERSION = "v0.12.7"
 
 def _set_current_thread_priority(level):
     try:
@@ -1016,6 +1016,12 @@ class PlayerInfoBlock:
         if self.current_vc is not None:
             djg_enabled = getattr(CONFIG, "djg_enabled", False)
             djg_mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
+
+            if djg_enabled and djg_mode == "Direct Merge":
+                for c in getattr(self.current_vc, "controllers", []):
+                    c.gyro_active = True
+                self.window.force_refresh_player_slots()
+                return
             
             if djg_enabled and djg_mode != "Switch Gyro Side":
                 if val == "Left":
@@ -1342,7 +1348,10 @@ class PlayerInfoBlock:
     
                 self.gyro_frame_l.place(relx=0.04, rely=0.5, anchor=tk.W)
                 self.gyro_frame_r.place(relx=0.96, rely=0.5, anchor=tk.E)
-                if getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") != "Switch Gyro Side":
+                if getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Direct Merge":
+                    self.gyro_frame_l.config(bg=highlight_color)
+                    self.gyro_frame_r.config(bg=highlight_color)
+                elif getattr(CONFIG, "djg_enabled", False) and getattr(CONFIG, "djg_mode", "Single Side Toggle") != "Switch Gyro Side":
                     self.gyro_frame_l.config(bg=highlight_color if getattr(virtualController, 'djg_left_active', True) else button_gray)
                     self.gyro_frame_r.config(bg=highlight_color if getattr(virtualController, 'djg_right_active', True) else button_gray)
                 elif virtualController.active_gyro_side == "Left":
@@ -4571,14 +4580,15 @@ bg_color=panel_bg, widths=[8, 10])
         self.djg_enabled_switch = ToggleSwitch(self.djg_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "djg_enabled", False), command=self.update_djg_enabled_setting, bg_color=panel_bg)
         self.djg_enabled_switch.grid(row=0, column=1, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
         
-        tk.Label(self.djg_frame, text="Dominant Side:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        self.djg_dominant_label = tk.Label(self.djg_frame, text="Dominant Side:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.djg_dominant_label.grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.djg_dominant_switch = ToggleSwitch(self.djg_frame, labels=["Left", "Right"], values=["Left", "Right"], initial_value=getattr(CONFIG, "djg_dominant_side", "Left"), command=self.update_djg_dominant_setting, bg_color=panel_bg)
         self.djg_dominant_switch.grid(row=0, column=4, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
         
         tk.Label(self.djg_frame, text="Mode:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=6, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         
         self.djg_mode_var = tk.StringVar(value=getattr(CONFIG, "djg_mode", "Single Side Toggle"))
-        djg_modes = ["Single Side Toggle", "Switch Dominant Side", "Switch Gyro Side"]
+        djg_modes = ["Single Side Toggle", "Switch Dominant Side", "Switch Gyro Side", "Direct Merge"]
         
         # Calculate max width for dropdown
         max_mode_len = max(len(m) for m in djg_modes)
@@ -4587,15 +4597,36 @@ bg_color=panel_bg, widths=[8, 10])
         self.djg_mode_combo.grid(row=0, column=7, padx=int(5 * scaling_factor), sticky="w")
         self.djg_mode_combo.bind("<<ComboboxSelected>>", lambda e: self.update_djg_mode_setting(self.djg_mode_var.get()))
 
-        tk.Label(self.djg_frame, text="Activation:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=8, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
+        self.djg_activation_label = tk.Label(self.djg_frame, text="Activation:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
+        self.djg_activation_label.grid(row=0, column=8, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.djg_activation_switch = ToggleSwitch(self.djg_frame, labels=["Hold", "Toggle"], values=["Hold", "Toggle"], initial_value=getattr(CONFIG, "djg_activation", "Toggle"), command=self.update_djg_activation_setting, bg_color=panel_bg)
         self.djg_activation_switch.grid(row=0, column=9, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
 
+        self._apply_djg_mode_ui_state()
         self._update_djg_panel_visibility()
+
+    def _apply_djg_mode_ui_state(self):
+        if not hasattr(self, 'djg_mode_var'):
+            return
+        direct_merge = self.djg_mode_var.get() == "Direct Merge"
+        widgets = [
+            getattr(self, "djg_dominant_label", None),
+            getattr(self, "djg_dominant_switch", None),
+            getattr(self, "djg_activation_label", None),
+            getattr(self, "djg_activation_switch", None),
+        ]
+        for widget in widgets:
+            if widget is None:
+                continue
+            if direct_merge:
+                widget.grid_remove()
+            else:
+                widget.grid()
 
     def _update_djg_panel_visibility(self):
         if not hasattr(self, 'djg_frame'):
             return
+        self._apply_djg_mode_ui_state()
         if hasattr(self, "settings_active_tab"):
             self.show_settings_tab(self.settings_active_tab)
         elif getattr(CONFIG, 'simulation_mode', '') == "Switch1":
@@ -4616,6 +4647,14 @@ bg_color=panel_bg, widths=[8, 10])
         CONFIG.djg_mode = val
         CONFIG.save_config()
         logger.info(f"DJG Mode: {val}")
+        if hasattr(self, "djg_mode_var"):
+            self.djg_mode_var.set(val)
+        self._apply_djg_mode_ui_state()
+        if val == "Direct Merge":
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc and len(getattr(vc, "controllers", [])) == 2:
+                    for c in vc.controllers:
+                        c.gyro_active = True
         self.force_refresh_player_slots()
 
 
@@ -4623,7 +4662,12 @@ bg_color=panel_bg, widths=[8, 10])
         CONFIG.djg_enabled = val
         CONFIG.save_config()
         logger.info(f"DJG Enabled: {val}")
-        if not val:
+        if val and getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Direct Merge":
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc and len(getattr(vc, "controllers", [])) == 2:
+                    for c in vc.controllers:
+                        c.gyro_active = True
+        elif not val:
             for vc in VIRTUAL_CONTROLLERS:
                 if vc:
                     vc.active_gyro_side = getattr(CONFIG, "djg_dominant_side", "Left")
@@ -5263,6 +5307,8 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_mode", "Off", None)
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_amount", 90, None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_mode", [], None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_amount", 15.0, None)
 
         def on_close():
             custom_frame.pack_forget()
@@ -5510,9 +5556,133 @@ bg_color=panel_bg, widths=[8, 10])
                 simul_entry.insert(0, format_input_display(display_val))
                 simul_entry.config(state="readonly")
                 
+            dz_row = tk.Frame(popup, bg=background_color)
+            dz_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
+
+            tk.Label(dz_row, text="Trigger Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+
+            dz_mode_key = f"{key}_in_app_gyro_deadzone_mode"
+            dz_button = tk.Button(
+                dz_row,
+                bg=button_gray,
+                fg="white",
+                font=scale_font(("Arial", 10, "bold")),
+                bd=0,
+                relief=tk.FLAT,
+                width=14,
+            )
+            dz_button.pack(side=tk.LEFT)
+
+            dz_amt_row = tk.Frame(popup, bg=background_color)
+
+            tk.Label(dz_amt_row, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+
+            dz_amt_key = f"{key}_in_app_gyro_deadzone_amount"
+            dz_amt_val = CONFIG.get_mapping_setting_scoped(dz_amt_key, 15.0, None)
+
+            def on_dz_amt_change(val):
+                CONFIG.set_mapping_setting_scoped(dz_amt_key, float(val), None)
+                CONFIG.save_config()
+
+            dz_scale = tk.Scale(dz_amt_row, from_=0.0, to=100.0, resolution=0.5, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 10, "bold")), command=on_dz_amt_change)
+            dz_scale.set(dz_amt_val)
+            dz_scale.pack(side=tk.LEFT)
+
+            def dz_display_text():
+                selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(dz_mode_key, [], None))
+                if not selected:
+                    return "None"
+                return " | ".join(back_button_label(token) for token in selected)
+
+            def refresh_dz_button():
+                selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(dz_mode_key, [], None))
+                dz_button.config(text=dz_display_text())
+                if selected:
+                    if not dz_amt_row.winfo_ismapped():
+                        dz_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=dz_row)
+                else:
+                    dz_amt_row.pack_forget()
+
+            Tooltip(dz_button, dz_display_text)
+
+            def close_deadzone_input_popup():
+                dz_popup = getattr(self, "deadzone_input_popup", None)
+                if dz_popup is not None and dz_popup.winfo_exists():
+                    dz_popup.destroy()
+                self.deadzone_input_popup = None
+                self.deadzone_input_popup_anchor = None
+
+            def open_deadzone_input_popup():
+                existing = getattr(self, "deadzone_input_popup", None)
+                if existing is not None and existing.winfo_exists() and getattr(self, "deadzone_input_popup_anchor", None) is dz_button:
+                    close_deadzone_input_popup()
+                    return
+                close_deadzone_input_popup()
+                selected = set(normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(dz_mode_key, [], None)))
+                from config import BACK_BUTTON_CATEGORIES
+
+                spacing2 = int(10 * scaling_factor)
+                column_gap = int(8 * scaling_factor)
+                btn_gap = int(5 * scaling_factor)
+                btn_font = scale_font(("Arial", 9, "bold"))
+                measure = tkFont.Font(font=btn_font)
+                max_label_w = 0
+                for _title, rows in BACK_BUTTON_CATEGORIES:
+                    for row_values in rows:
+                        for token in row_values:
+                            max_label_w = max(max_label_w, measure.measure(back_button_label(token)))
+                btn_w = max_label_w + int(16 * scaling_factor)
+                btn_h = measure.metrics("linespace") + int(10 * scaling_factor)
+
+                dz_popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=column_gap, pady=spacing2)
+                self.deadzone_input_popup = dz_popup
+                self.deadzone_input_popup_anchor = dz_button
+                button_refs = {}
+
+                def set_button_state(token):
+                    frame, btn = button_refs[token]
+                    is_selected = token in selected
+                    bd = int(2 * scaling_factor) if is_selected else 0
+                    frame.config(bg=highlight_color if is_selected else background_color)
+                    btn.place(x=bd, y=bd, width=btn_w - 2 * bd, height=btn_h - 2 * bd)
+
+                def toggle_token(token):
+                    if token in selected:
+                        selected.remove(token)
+                    else:
+                        selected.add(token)
+                    ordered = [token for token in SWITCH_INPUT_DAMPENING_OPTIONS if token in selected]
+                    CONFIG.set_mapping_setting_scoped(dz_mode_key, ordered, None)
+                    CONFIG.save_config()
+                    set_button_state(token)
+                    refresh_dz_button()
+
+                cats = dict(BACK_BUTTON_CATEGORIES)
+                block = tk.Frame(dz_popup, bg=background_color)
+                block.pack(side=tk.TOP, anchor=tk.W)
+                for c_idx, col in enumerate(cats["Switch Input"]):
+                    for r_idx, token in enumerate(col):
+                        cell = tk.Frame(block, bg=background_color, width=btn_w, height=btn_h)
+                        cell.grid(row=r_idx, column=c_idx, padx=(0, btn_gap), pady=(0, btn_gap), sticky="nsew")
+                        cell.grid_propagate(False)
+                        btn = tk.Button(cell, text=back_button_label(token), font=btn_font,
+                                        bg=button_gray, fg="white", relief=tk.FLAT, bd=0,
+                                        highlightthickness=0, takefocus=0,
+                                        activebackground=highlight_color, activeforeground="white",
+                                        command=lambda t=token: toggle_token(t))
+                        button_refs[token] = (cell, btn)
+                        set_button_state(token)
+
+                dz_popup.place(in_=self.root, x=-10000, y=-10000)
+                dz_popup.update_idletasks()
+                self._place_popup_within_root_bounds(dz_popup, dz_button)
+
+            dz_button.config(command=open_deadzone_input_popup)
+            refresh_dz_button()
+
             damp_row = tk.Frame(popup, bg=background_color)
             damp_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
-            
+
             tk.Label(damp_row, text="Trigger Dampening:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
             
             damp_mode_key = f"{key}_in_app_gyro_dampening_mode"
@@ -5635,12 +5805,16 @@ bg_color=panel_bg, widths=[8, 10])
             damp_button.config(command=open_dampening_input_popup)
             refresh_damp_button()
 
-            # Temporarily pack it to calculate the max size for the window boundary check.
+            # Temporarily pack the amount rows so the popup is positioned using its FULL
+            # height (all content visible). They are refreshed/hidden only AFTER placement
+            # below, so a later expansion (selecting a modifier reveals its slider) cannot
+            # push the popup past the window's bottom edge.
+            dz_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=dz_row)
             damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
-            refresh_damp_button()
-                    
+
             def on_popup_destroy(e):
                 if str(e.widget) == str(popup):
+                    close_deadzone_input_popup()
                     close_dampening_input_popup()
                     final_val = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
                     display_str = IN_APP_GYRO_LABEL
@@ -5677,7 +5851,12 @@ bg_color=panel_bg, widths=[8, 10])
                 
             popup.update_idletasks()
             self._place_popup_within_root_bounds(popup, in_app_gyro_btn, fallback_coords=anchor_coords)
-                
+
+            # Now that placement used the full height, collapse the amount rows that have no
+            # modifier selected.
+            refresh_dz_button()
+            refresh_damp_button()
+
             popup.lift()
             
             self.root.after(100, self.bind_in_app_gyro_popup_outside_click)
@@ -5904,6 +6083,11 @@ bg_color=panel_bg, widths=[8, 10])
         return False
 
     def close_in_app_gyro_popup(self):
+        dz_popup = getattr(self, "deadzone_input_popup", None)
+        if dz_popup is not None and dz_popup.winfo_exists():
+            dz_popup.destroy()
+        self.deadzone_input_popup = None
+        self.deadzone_input_popup_anchor = None
         damp_popup = getattr(self, "dampening_input_popup", None)
         if damp_popup is not None and damp_popup.winfo_exists():
             damp_popup.destroy()
@@ -5939,7 +6123,29 @@ bg_color=panel_bg, widths=[8, 10])
             if current_popup is None or not current_popup.winfo_exists():
                 self.close_in_app_gyro_popup()
                 return
+
+            # Auto-close an open Trigger Deadzone / Trigger Dampening sub-menu whenever the
+            # click lands outside that sub-menu and outside its own toggle button (the
+            # button's command handles clicks on itself). The sub-menus are separate frames
+            # on the root, so this covers clicks elsewhere inside the main In-app Gyro popup.
+            def _dismiss_sub_menu(attr):
+                menu = getattr(self, attr, None)
+                if menu is None or not menu.winfo_exists():
+                    return
+                if self._event_in_widget(menu, event):
+                    return
+                if self._event_in_widget(getattr(self, attr + "_anchor", None), event):
+                    return
+                menu.destroy()
+                setattr(self, attr, None)
+                setattr(self, attr + "_anchor", None)
+
+            _dismiss_sub_menu("deadzone_input_popup")
+            _dismiss_sub_menu("dampening_input_popup")
+
             if self._event_in_widget(current_popup, event):
+                return
+            if self._event_in_widget(getattr(self, "deadzone_input_popup", None), event):
                 return
             if self._event_in_widget(getattr(self, "dampening_input_popup", None), event):
                 return
