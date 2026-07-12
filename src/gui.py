@@ -3400,6 +3400,7 @@ class ControllerWindow:
         scaling_factor = getattr(self, 'scaling_factor', 1.0)
         
         # First, unpack all frames from top_btn_frame to preserve order
+        if hasattr(self, 'wired_discovery_frame'): self.wired_discovery_frame.pack_forget()
         if hasattr(self, 'driver_frame'): self.driver_frame.pack_forget()
         if hasattr(self, 'esp32s3_frame'): self.esp32s3_frame.pack_forget()
         if hasattr(self, 'hidhide_frame'): self.hidhide_frame.pack_forget()
@@ -3409,6 +3410,10 @@ class ControllerWindow:
         if hasattr(self, 'hide_frame'): self.hide_frame.pack_forget()
         
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+
+        if hasattr(self, 'wired_discovery_frame'):
+            self.update_wired_discovery_button()
+            self.wired_discovery_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Pack the active driver button
         if driver_type == "USBIP":
@@ -3998,6 +4003,23 @@ class ControllerWindow:
         # New centralized button row above Gyro Settings
         self.top_btn_frame = tk.Frame(self.root, bg=background_color)
         self.top_btn_frame.pack(side=tk.BOTTOM, pady=(0, int(5 * scaling_factor)))
+
+        # Wired Controller Discovery Button
+        wired_enabled = bool(getattr(CONFIG, 'wired_usb_enabled', True))
+        wired_color = button_gray
+        self.wired_discovery_frame = tk.Frame(self.top_btn_frame, bg=wired_color)
+        wired_text = f"Wired Controller Discovery: {'On' if wired_enabled else 'Off'}"
+        self.wired_discovery_btn = tk.Button(
+            self.wired_discovery_frame,
+            text=wired_text,
+            bg=wired_color,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")),
+            command=self.toggle_wired_discovery
+        )
+        self.wired_discovery_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         # Driver Install/Uninstall Button
         self.driver_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
@@ -8079,6 +8101,26 @@ bg_color=panel_bg, widths=[8, 10])
         if hasattr(self, 'min_frame'):
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
+    def update_wired_discovery_button(self):
+        if not hasattr(self, 'wired_discovery_btn') or not self.wired_discovery_btn:
+            return
+        enabled = bool(getattr(CONFIG, 'wired_usb_enabled', True))
+        text = f"Wired Controller Discovery: {'On' if enabled else 'Off'}"
+        color = button_gray
+        self.wired_discovery_btn.config(text=text, bg=color)
+        if hasattr(self, 'wired_discovery_frame'):
+            self.wired_discovery_frame.config(bg=color)
+
+    def toggle_wired_discovery(self):
+        enabled = not bool(getattr(CONFIG, 'wired_usb_enabled', True))
+        CONFIG.wired_usb_enabled = enabled
+        CONFIG.save_config()
+        if not enabled:
+            self.wired_pro2_detected = False
+            self._hidhide_installed_cached = False
+        self.update_wired_discovery_button()
+        self.update_driver_buttons_visibility()
+
     def on_hidhide_button(self):
         try:
             import hidhide
@@ -9552,6 +9594,12 @@ bg_color=panel_bg, widths=[8, 10])
         auto-installed by the controller (MS OS descriptor), so it isn't managed here —
         we only keep an internal check as a safety-net warning. When a pad is present and
         HidHide is absent, prompt to install HidHide once per session."""
+        if not getattr(CONFIG, 'wired_usb_enabled', True):
+            self.wired_pro2_detected = False
+            self._hidhide_installed_cached = False
+            self._wired_pro2_refresh_running = False
+            self.update_driver_buttons_visibility()
+            return
         if getattr(self, '_wired_pro2_refresh_running', False) or getattr(self, 'is_quitting', False):
             return
         self._wired_pro2_refresh_running = True
@@ -9577,6 +9625,11 @@ bg_color=panel_bg, widths=[8, 10])
 
             def apply():
                 self._wired_pro2_refresh_running = False
+                if not getattr(CONFIG, 'wired_usb_enabled', True):
+                    self.wired_pro2_detected = False
+                    self._hidhide_installed_cached = False
+                    self.update_driver_buttons_visibility()
+                    return
                 self.wired_pro2_detected = detected
                 self._hidhide_installed_cached = hh_installed
                 self.update_driver_buttons_visibility()

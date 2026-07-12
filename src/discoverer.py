@@ -1357,6 +1357,8 @@ async def run_usb_hid_discovery(quit_event):
         controller = None
         instance_id = None
         try:
+            if not getattr(CONFIG, "wired_usb_enabled", True):
+                return
             # Hide the physical HID first (whitelists our own process so we keep access).
             instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
             # Only hide when the user hasn't disabled HidHide. hide_device() re-activates
@@ -1417,6 +1419,14 @@ async def run_usb_hid_discovery(quit_event):
     try:
         while not quit_event.is_set():
             try:
+                if not getattr(CONFIG, "wired_usb_enabled", True):
+                    for key in list(known):
+                        controller = known.get(key)
+                        if controller is not None:
+                            await _remove(controller, key)
+                    connecting.clear()
+                    await asyncio.sleep(1.0)
+                    continue
                 chosen = {}
                 # hidapi enumeration is a blocking syscall. When no wired pad is
                 # present (the common case for wireless-only users) it always falls
