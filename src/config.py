@@ -615,7 +615,13 @@ class Config:
         self.start_minimized = config.get("start_minimized", False)
         self.driver_installed = config.get("driver_installed", False)
         # Wired USB Pro Controller 2 support + auto-hide of its physical HID via HidHide.
-        self.wired_usb_enabled = config.get("wired_usb_enabled", True)
+        self.wired_auto_scan_enabled = config.get(
+            "wired_auto_scan_enabled",
+            config.get("wired_usb_enabled", True),
+        )
+        # Backward-compatible alias for older code/configs. Semantically this now means
+        # automatic wired discovery, not whether manual wired support exists.
+        self.wired_usb_enabled = self.wired_auto_scan_enabled
         self.hidhide_installed = config.get("hidhide_installed", False)
         # User preference: whether the physical Pro Controller 2 HID should be hidden via
         # HidHide when connected. Disabling in the HidHide window sets this False so a later
@@ -1185,7 +1191,8 @@ class Config:
         # Snapshot config values in the calling thread
         data = {
             'driver_installed': self.driver_installed,
-            'wired_usb_enabled': self.wired_usb_enabled,
+            'wired_auto_scan_enabled': self.wired_auto_scan_enabled,
+            'wired_usb_enabled': self.wired_auto_scan_enabled,
             'hidhide_installed': self.hidhide_installed,
             'hidhide_hide_enabled': self.hidhide_hide_enabled,
             'driver_type': self.driver_type,

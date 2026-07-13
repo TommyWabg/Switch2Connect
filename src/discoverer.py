@@ -51,6 +51,25 @@ CONNECTION_LOCK = None
 # Set to False while the BLE scanner is in the error-retry loop (Bluetooth off/unavailable).
 # The GUI header reads this to show "Disconnect" instead of "Ready" for the system BLE route.
 _SYSTEM_BT_AVAILABLE = True
+WIRED_RESCAN_EVENT = None
+WIRED_RESCAN_REQUESTS = []
+WIRED_RESCAN_LOCK = threading.Lock()
+
+def request_wired_rescan(reason: str = "manual_refresh", candidate_path=None, manual: bool = False):
+    """Request one wired Pro Controller discovery pass from any thread."""
+    global WIRED_RESCAN_EVENT
+    with WIRED_RESCAN_LOCK:
+        WIRED_RESCAN_REQUESTS.append((reason, candidate_path, bool(manual)))
+    loop = DISCOVERER_LOOP
+    event = WIRED_RESCAN_EVENT
+    if loop and event and loop.is_running():
+        loop.call_soon_threadsafe(event.set)
+
+def set_wired_auto_scan_enabled(enabled: bool):
+    CONFIG.wired_auto_scan_enabled = bool(enabled)
+    CONFIG.wired_usb_enabled = bool(enabled)
+    if enabled:
+        request_wired_rescan("toggle_on")
 
 def is_system_bluetooth_available() -> bool:
     return _SYSTEM_BT_AVAILABLE
@@ -1304,16 +1323,25 @@ async def run_usb_hid_discovery(quit_event):
     through the shared Controller pipeline, and occupies a normal player slot. Always
     runs in the background alongside whichever BLE route ``run_discovery`` is using.
     """
+    global WIRED_RESCAN_EVENT
+    WIRED_RESCAN_EVENT = asyncio.Event()
+    with WIRED_RESCAN_LOCK:
+        if getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
+            WIRED_RESCAN_REQUESTS.append(("startup", None, False))
+        if WIRED_RESCAN_REQUESTS:
+            WIRED_RESCAN_EVENT.set()
+
     try:
         from usb_hid_controller import USBHidController, enumerate_pro_controller2
         import hidhide
     except Exception as e:
         logger.info("Wired USB support unavailable (missing hidapi?): %s", e)
         return
-    logger.info("Wired USB watcher started (polling for Pro Controller 2, VID 057E/PID 2069).")
+    logger.info("Wired USB watcher started (event-driven, VID 057E/PID 2069).")
 
     known: dict = {}          # device key -> USBHidController
     connecting: set = set()
+    removing: set = set()
     # Every physical HID instance we've added to the HidHide blacklist. Entries persist
     # across unplug/replug so a reconnecting controller stays hidden the instant it
     # reappears (never briefly visible to third-party software). Cleared only on teardown.
@@ -1326,28 +1354,45 @@ async def run_usb_hid_discovery(quit_event):
             return path if isinstance(path, str) else bytes(path)
         return (entry.get("serial_number") or "").strip().upper()
 
+    def _controller_transport_dead(controller):
+        client = getattr(controller, "client", None)
+        if client is None:
+            return True
+        if not getattr(client, "is_connected", False):
+            return True
+        read_thread = getattr(client, "_read_thread", None)
+        if read_thread is not None and not read_thread.is_alive():
+            return True
+        return False
+
     async def _remove(controller, key):
-        known.pop(key, None)
-        instance_id = getattr(controller, "_hidhide_instance_id", None)
-        async with GLOBAL_LOCK:
-            for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
-                if vc is not None and controller in getattr(vc, "controllers", []):
-                    try:
-                        became_empty = await vc.remove_controller(controller)
-                    except Exception:
-                        logger.exception("Failed to remove wired USB controller")
-                        became_empty = True
-                    if became_empty:
-                        VIRTUAL_CONTROLLERS[i] = None
-            if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
-                reorder_controllers()
-                if UPDATE_CALLBACK is not None:
-                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
-                await update_all_player_leds()
+        if key in removing:
+            return
+        removing.add(key)
         try:
-            await controller.disconnect()
-        except Exception:
-            pass
+            known.pop(key, None)
+            instance_id = getattr(controller, "_hidhide_instance_id", None)
+            async with GLOBAL_LOCK:
+                for i, vc in enumerate(VIRTUAL_CONTROLLERS[:]):
+                    if vc is not None and controller in getattr(vc, "controllers", []):
+                        try:
+                            became_empty = await vc.remove_controller(controller)
+                        except Exception:
+                            logger.exception("Failed to remove wired USB controller")
+                            became_empty = True
+                        if became_empty:
+                            VIRTUAL_CONTROLLERS[i] = None
+                if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+                    reorder_controllers()
+                    if UPDATE_CALLBACK is not None:
+                        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                    await update_all_player_leds()
+            try:
+                await controller.disconnect()
+            except Exception:
+                pass
+        finally:
+            removing.discard(key)
         # Intentionally do NOT unhide on unplug: leaving the instance blacklisted keeps the
         # physical controller hidden from third-party software the moment it is replugged,
         # instead of it being briefly visible until the watcher re-hides it. The blacklist
@@ -1357,8 +1402,6 @@ async def run_usb_hid_discovery(quit_event):
         controller = None
         instance_id = None
         try:
-            if not getattr(CONFIG, "wired_usb_enabled", True):
-                return
             # Hide the physical HID first (whitelists our own process so we keep access).
             instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
             # Only hide when the user hasn't disabled HidHide. hide_device() re-activates
@@ -1419,23 +1462,36 @@ async def run_usb_hid_discovery(quit_event):
     try:
         while not quit_event.is_set():
             try:
-                if not getattr(CONFIG, "wired_usb_enabled", True):
-                    for key in list(known):
-                        controller = known.get(key)
-                        if controller is not None:
+                try:
+                    await asyncio.wait_for(WIRED_RESCAN_EVENT.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    for key, controller in list(known.items()):
+                        if _controller_transport_dead(controller):
+                            logger.info("Wired USB controller transport ended; removing stale controller (%s)", getattr(controller.device, "address", key))
                             await _remove(controller, key)
-                    connecting.clear()
-                    await asyncio.sleep(1.0)
                     continue
+                WIRED_RESCAN_EVENT.clear()
+                await asyncio.sleep(0.5)
+                with WIRED_RESCAN_LOCK:
+                    requests = list(WIRED_RESCAN_REQUESTS)
+                    WIRED_RESCAN_REQUESTS.clear()
+                if not requests:
+                    continue
+                manual_requested = any(manual or reason == "manual_refresh" for reason, _path, manual in requests)
+                removal_requested = any(reason == "device_removal" for reason, _path, _manual in requests)
+                auto_enabled = getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True))
+                if not auto_enabled and not manual_requested and not removal_requested:
+                    logger.debug("Ignoring wired auto scan while Auto Scan is Off: %s", requests)
+                    continue
+                reason = "+".join(sorted({str(reason) for reason, _path, _manual in requests}))
+                candidate_path = next((path for _reason, path, _manual in reversed(requests) if path), None)
                 chosen = {}
-                # hidapi enumeration is a blocking syscall. When no wired pad is
-                # present (the common case for wireless-only users) it always falls
-                # back to enumerating every HID device on the system, which can take
-                # tens of milliseconds. Running it inline on this event loop stalls
-                # the BLE rumble dispatch that shares the loop, producing an even ~1Hz
-                # gap in continuous vibration. Offload it to a thread so the wireless
-                # rumble timing matches 0.12.1 (which had no wired watcher at all).
-                entries = await asyncio.to_thread(enumerate_pro_controller2)
+                entries = await asyncio.to_thread(
+                    enumerate_pro_controller2,
+                    reason,
+                    candidate_path,
+                    False,
+                )
                 for entry in entries:
                     key = _device_key(entry)
                     if key and key not in chosen:
@@ -1445,15 +1501,16 @@ async def run_usb_hid_discovery(quit_event):
                         continue
                     connecting.add(key)
                     asyncio.create_task(_add(entry, key))
-                for key in list(known):
-                    if key not in chosen:
-                        controller = known.get(key)
-                        if controller is not None:
-                            await _remove(controller, key)
+                if removal_requested or manual_requested:
+                    for key in list(known):
+                        if key not in chosen:
+                            controller = known.get(key)
+                            if controller is not None:
+                                await _remove(controller, key)
             except Exception:
-                logger.exception("Wired USB discovery poll error")
-            await asyncio.sleep(1.0)
+                logger.exception("Wired USB discovery scan error")
     finally:
+        WIRED_RESCAN_EVENT = None
         # Unhide everything we ever hid — including instances whose controllers were already
         # unplugged (and thus dropped from `known`) — so no device is left invisible to the
         # system after teardown.

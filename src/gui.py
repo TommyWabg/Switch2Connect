@@ -35,7 +35,14 @@ import os
 import re
 import ctypes
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
-from discoverer import start_discoverer, set_shutting_down, set_suspending, emergency_cleanup
+from discoverer import (
+    start_discoverer,
+    set_shutting_down,
+    set_suspending,
+    emergency_cleanup,
+    request_wired_rescan,
+    set_wired_auto_scan_enabled,
+)
 from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
@@ -54,7 +61,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v0.12.7"
+APP_VERSION = "v0.12.9"
 
 def _set_current_thread_priority(level):
     try:
@@ -494,10 +501,11 @@ class Tooltip:
     recording in a fixed-width entry) can still be read in full. The text is resolved
     lazily through text_getter on each hover so it always reflects the current value."""
 
-    def __init__(self, widget, text_getter, delay_ms=350):
+    def __init__(self, widget, text_getter, delay_ms=350, position_adjust=None):
         self.widget = widget
         self.text_getter = text_getter
         self.delay_ms = delay_ms
+        self.position_adjust = position_adjust if position_adjust is not None else (2, -2)
         self.tip = None
         self.after_id = None
         widget.bind("<Enter>", self._schedule, add="+")
@@ -563,6 +571,8 @@ class Tooltip:
 
         x = (anchor_x - x_offset) if enough_right else (anchor_right + x_offset - tip_w)
         y = (anchor_bottom + y_offset) if enough_bottom else (anchor_top - y_offset - tip_h)
+        x += self.position_adjust[0]
+        y += self.position_adjust[1]
 
         tip.wm_geometry(f"+{int(x)}+{int(y)}")
         self.tip = tip
@@ -673,6 +683,84 @@ class PowerListener:
             self.callback(wparam)
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
+class WiredDeviceChangeListener:
+    WM_DEVICECHANGE = 0x0219
+    DBT_DEVICEARRIVAL = 0x8000
+    DBT_DEVICEREMOVECOMPLETE = 0x8004
+
+    def __init__(self, event_queue):
+        self.event_queue = event_queue
+        self.hwnd = None
+        self.thread = None
+        self._stop_event = threading.Event()
+        self._class_name = f"Switch2WiredDeviceChangeWindow_{id(self)}"
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self._stop_event.clear()
+        self.thread = threading.Thread(target=self._listen, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        hwnd = self.hwnd
+        if hwnd:
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        self.thread = None
+        self.hwnd = None
+
+    def _listen(self):
+        wc = win32gui.WNDCLASS()
+        wc.lpfnWndProc = self._wndproc
+        wc.lpszClassName = self._class_name
+        hinstance = win32gui.GetModuleHandle(None)
+        wc.hInstance = hinstance
+        try:
+            class_atom = win32gui.RegisterClass(wc)
+            self.hwnd = win32gui.CreateWindow(class_atom, self._class_name, 0, 0, 0, 0, 0, 0, 0, hinstance, None)
+            win32gui.PumpMessages()
+        except Exception as e:
+            logger.debug("Wired device change listener failed: %s", e)
+        finally:
+            self.hwnd = None
+            try:
+                win32gui.UnregisterClass(self._class_name, hinstance)
+            except Exception:
+                pass
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == self.WM_DEVICECHANGE:
+            reason = None
+            if int(wparam) == self.DBT_DEVICEARRIVAL:
+                reason = "device_arrival"
+            elif int(wparam) == self.DBT_DEVICEREMOVECOMPLETE:
+                reason = "device_removal"
+            if reason:
+                try:
+                    self.event_queue.put_nowait({
+                        "reason": reason,
+                        "path": None,
+                        "timestamp": time.time(),
+                    })
+                except Exception:
+                    pass
+        elif msg == win32con.WM_CLOSE:
+            try:
+                win32gui.DestroyWindow(hwnd)
+            except Exception:
+                pass
+            return 0
+        elif msg == win32con.WM_DESTROY:
+            win32gui.PostQuitMessage(0)
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
 # Current Color Scheme (Space Gray / Cyan Accent)
 background_color = "#2D2D2D"
 tab_black = "#1E1E1E"
@@ -765,10 +853,11 @@ class BackButtonSelector(tk.Button):
     code relies on: get()/set() plus a <<ComboboxSelected>> event fired when the user
     picks an option, so on_combo_selected and the refresh paths keep working unchanged."""
 
-    def __init__(self, parent, gui, font=None):
+    def __init__(self, parent, gui, font=None, auto_fit=True):
         self._gui = gui
         self._value = "Default"
         self._font = font or scale_font(("Arial", 11, "bold"))
+        self._auto_fit = auto_fit
         # Width auto-fits each label so it is never clipped, but never shrinks below the
         # width of the "Default" label. tk.Button width is in character units, so both the
         # minimum and the per-label widths are derived from the font's character width.
@@ -803,7 +892,10 @@ class BackButtonSelector(tk.Button):
         from config import back_button_label
         label = back_button_label(value)
         self._value = value
-        self.config(text=label, width=max(self._min_chars, self._fit_chars(label)))
+        if self._auto_fit:
+            self.config(text=label, width=max(self._min_chars, self._fit_chars(label)))
+        else:
+            self.config(text=label)
 
     def select_value(self, value):
         # Picking an option in the popup updates the value and fires the same event the
@@ -1984,6 +2076,9 @@ class ControllerWindow:
         self._wired_pro2_refresh_running = False
         self._wired_pro2_prompt_shown = False
         self._winusb_warn_shown = False
+        self.wired_device_event_queue = queue.Queue()
+        self.wired_device_listener = WiredDeviceChangeListener(self.wired_device_event_queue)
+        self._wired_device_change_after_id = None
         self._esp32s3_refresh_running = False
         self._esp32s3_auto_firmware_running = False
         self._esp32s3_auto_firmware_attempted = set()
@@ -3400,8 +3495,8 @@ class ControllerWindow:
         scaling_factor = getattr(self, 'scaling_factor', 1.0)
         
         # First, unpack all frames from top_btn_frame to preserve order
-        if hasattr(self, 'wired_discovery_frame'): self.wired_discovery_frame.pack_forget()
         if hasattr(self, 'driver_frame'): self.driver_frame.pack_forget()
+        if hasattr(self, 'wired_pro_settings_frame'): self.wired_pro_settings_frame.pack_forget()
         if hasattr(self, 'esp32s3_frame'): self.esp32s3_frame.pack_forget()
         if hasattr(self, 'hidhide_frame'): self.hidhide_frame.pack_forget()
         if hasattr(self, 'usbip_frame'): self.usbip_frame.pack_forget()
@@ -3410,10 +3505,6 @@ class ControllerWindow:
         if hasattr(self, 'hide_frame'): self.hide_frame.pack_forget()
         
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
-
-        if hasattr(self, 'wired_discovery_frame'):
-            self.update_wired_discovery_button()
-            self.wired_discovery_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Pack the active driver button
         if driver_type == "USBIP":
@@ -3444,16 +3535,8 @@ class ControllerWindow:
                 self.esp32s3_btn.config(text=btn_text, bg=btn_color)
             self.esp32s3_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
-        # Wired Pro Controller 2 button: shown only when a wired pad is present. WinUSB is
-        # auto-installed by the controller's MS OS descriptor, so the only optional driver
-        # here is HidHide. Orange "Install HidHide" when missing, gray "HidHide" once present.
-        if getattr(self, 'wired_pro2_detected', False) and hasattr(self, 'hidhide_frame'):
-            hh_installed = getattr(self, '_hidhide_installed_cached', False)
-            hh_color = button_gray if hh_installed else "#CC5500"
-            hh_text = "HidHide" if hh_installed else "Install HidHide"
-            self.hidhide_frame.config(bg=hh_color)
-            self.hidhide_btn.config(text=hh_text, bg=hh_color)
-            self.hidhide_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+        if hasattr(self, 'wired_pro_settings_frame'):
+            self.wired_pro_settings_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
         # Pack the rest of the buttons
         if hasattr(self, 'startup_frame'): self.startup_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
@@ -4004,23 +4087,6 @@ class ControllerWindow:
         self.top_btn_frame = tk.Frame(self.root, bg=background_color)
         self.top_btn_frame.pack(side=tk.BOTTOM, pady=(0, int(5 * scaling_factor)))
 
-        # Wired Controller Discovery Button
-        wired_enabled = bool(getattr(CONFIG, 'wired_usb_enabled', True))
-        wired_color = button_gray
-        self.wired_discovery_frame = tk.Frame(self.top_btn_frame, bg=wired_color)
-        wired_text = f"Wired Controller Discovery: {'On' if wired_enabled else 'Off'}"
-        self.wired_discovery_btn = tk.Button(
-            self.wired_discovery_frame,
-            text=wired_text,
-            bg=wired_color,
-            fg=text_color,
-            bd=0,
-            relief=tk.FLAT,
-            font=scale_font(("Arial", 10, "bold")),
-            command=self.toggle_wired_discovery
-        )
-        self.wired_discovery_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
-
         # Driver Install/Uninstall Button
         self.driver_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
         self.driver_btn = tk.Button(self.driver_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.on_driver_btn_clicked)
@@ -4030,6 +4096,20 @@ class ControllerWindow:
         self.usbip_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
         self.usbip_btn = tk.Button(self.usbip_frame, text="", bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT, font=scale_font(("Arial", 10, "bold")), command=self.on_usbip_btn_clicked)
         self.usbip_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        # Wired Pro Controller Button
+        self.wired_pro_settings_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
+        self.wired_pro_settings_btn = tk.Button(
+            self.wired_pro_settings_frame,
+            text="Wired Pro Controller",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")),
+            command=lambda: self.open_wired_pro_controller_settings_popup(self.wired_pro_settings_frame)
+        )
+        self.wired_pro_settings_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         # ESP32-S3 N16R8 Firmware Button
         self.esp32s3_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
@@ -5253,14 +5333,25 @@ bg_color=panel_bg, widths=[8, 10])
             
         poll_controller()
 
-    def create_mapping_widget(self, parent, key, label_text, mapping_scope=None):
+    def create_mapping_widget(self, parent, key, label_text, mapping_scope=None, compact=False, fixed_size=None):
         suffix = self._mapping_scope_suffix(mapping_scope)
         attr_key = self._mapping_attr(key, suffix)
         parent_bg = parent.cget("bg") if hasattr(parent, "cget") else background_color
         if label_text:
             tk.Label(parent, text=label_text, bg=parent_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(5 * scaling_factor), int(2 * scaling_factor)))
         container = tk.Frame(parent, bg=parent_bg)
-        container.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+        if fixed_size is not None:
+            container.config(width=fixed_size[0], height=fixed_size[1])
+            container.pack(side=tk.LEFT)
+            container.pack_propagate(False)
+        else:
+            container.pack(side=tk.LEFT, padx=0 if compact else int(2 * scaling_factor))
+
+        def pack_combo():
+            if fixed_size is not None:
+                combo.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            else:
+                combo.pack(side=tk.LEFT)
 
         def sync_joystick_direction(value):
             base_key, sep, direction = key.rpartition("_")
@@ -5269,7 +5360,7 @@ bg_color=panel_bg, widths=[8, 10])
                 current[direction] = value
                 CONFIG.set_joystick_custom_scoped(base_key, current, mapping_scope)
         
-        combo = BackButtonSelector(container, self, font=scale_font(("Arial", 11, "bold")))
+        combo = BackButtonSelector(container, self, font=scale_font(("Arial", 11, "bold")), auto_fit=fixed_size is None)
 
         custom_frame = tk.Frame(container, bg=parent_bg)
         
@@ -5329,8 +5420,12 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_simul", "None", None)
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_mode", "Off", None)
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_amount", 90, None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_dampening_effect_after_released_ms", 200, None)
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_mode", [], None)
             CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_amount", 15.0, None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_pause_after_pressed_ms", 100, None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_pause_after_released_ms", 100, None)
+            CONFIG.set_mapping_setting_scoped(f"{key}_in_app_gyro_deadzone_effect_after_released_ms", 200, None)
 
         def on_close():
             custom_frame.pack_forget()
@@ -5339,7 +5434,7 @@ bg_color=panel_bg, widths=[8, 10])
             clear_mouse_click_state(reset_mode=True)
             if entry:
                 entry.pack(side=tk.LEFT, fill=tk.Y, before=close_btn)
-            combo.pack(side=tk.LEFT)
+            pack_combo()
             combo.set("Default")
             CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
             sync_joystick_direction("Default")
@@ -5371,7 +5466,7 @@ bg_color=panel_bg, widths=[8, 10])
         def cp_close():
             cp_frame.pack_forget()
             clear_mouse_click_state(reset_mode=True)
-            combo.pack(side=tk.LEFT)
+            pack_combo()
             combo.set("Default")
             CONFIG.set_mapping_setting_scoped(key, "Default", mapping_scope)
             sync_joystick_direction("Default")
@@ -5498,7 +5593,7 @@ bg_color=panel_bg, widths=[8, 10])
                 combo.set(current_val)
                 custom_frame.pack_forget()
                 clear_mouse_click_state(reset_mode=True)
-                combo.pack(side=tk.LEFT)
+                pack_combo()
 
         show_current()
 
@@ -5531,21 +5626,135 @@ bg_color=panel_bg, widths=[8, 10])
             mode_btn.config(text=mode)
             
             spacing = int(10 * scaling_factor)
-            cell_padx = int(2 * scaling_factor)
-            popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=spacing - cell_padx, pady=spacing)
+            row_gap = int(8 * scaling_factor)
+            section_gap = int(10 * scaling_factor)
+            popup_padding = spacing
+            popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=popup_padding, pady=popup_padding)
             self.in_app_gyro_popup = popup
             self.in_app_gyro_popup_anchor = in_app_gyro_btn
-            
-            row = tk.Frame(popup, bg=background_color)
-            row.pack(side=tk.TOP, fill=tk.X)
-            
-            tk.Label(row, text="Simultaneous Input:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
-            
-            simul_cell = tk.Frame(row, bg=background_color)
-            simul_cell.pack(side=tk.LEFT)
+
+            content_frame = tk.Frame(popup, bg=background_color)
+            content_frame.pack(side=tk.TOP, anchor=tk.CENTER)
+            popup_control_font = scale_font(("Arial", 10, "bold"))
+            popup_control_measure = tkFont.Font(font=popup_control_font)
+            popup_control_width = popup_control_measure.measure("0" * 14) + int(18 * scaling_factor)
+            popup_control_height = popup_control_measure.metrics("linespace") + int(10 * scaling_factor)
+            placement_state = {"anchor_coords": None, "full_size": None, "ready": False}
+            popup_rows = []
+            popup_row_meta = {}
+            popup_separators = []
+            numeric_committers = []
+            numeric_commit_state = {"done": False}
+
+            def create_aligned_popup_row(label_text, pady_top=0, pack_now=True):
+                row = tk.Frame(content_frame, bg=background_color)
+                row_index = len(popup_rows) + len(popup_separators)
+                label_widget = tk.Label(
+                    content_frame,
+                    text=label_text,
+                    bg=background_color,
+                    fg=text_color,
+                    font=scale_font(("Arial", 11, "bold")),
+                    anchor="e",
+                )
+                control_cell = tk.Frame(content_frame, bg=background_color, width=popup_control_width, height=popup_control_height)
+                control_cell.grid_propagate(False)
+                meta = {
+                    "row": row,
+                    "row_index": row_index,
+                    "label": label_widget,
+                    "control_cell": control_cell,
+                    "pady_top": int(pady_top * scaling_factor),
+                    "visible": False,
+                }
+                popup_rows.append(meta)
+                popup_row_meta[row] = meta
+                if pack_now:
+                    show_popup_row(row)
+                return row, control_cell
+
+            def create_popup_separator(pady_top=None, pack_now=True):
+                row_index = len(popup_rows) + len(popup_separators)
+                line = tk.Frame(content_frame, bg=button_gray, height=1)
+                meta = {
+                    "row_index": row_index,
+                    "line": line,
+                    "pady_top": section_gap if pady_top is None else int(pady_top * scaling_factor),
+                    "visible": False,
+                }
+                popup_separators.append(meta)
+                if pack_now:
+                    show_popup_separator(meta)
+                return meta
+
+            def show_popup_separator(meta):
+                meta["line"].grid(row=meta["row_index"], column=0, columnspan=2, sticky=tk.EW, pady=(meta["pady_top"], 0))
+                meta["visible"] = True
+
+            def show_popup_row(row):
+                meta = popup_row_meta[row]
+                pady = (meta["pady_top"], 0)
+                meta["label"].grid(row=meta["row_index"], column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=pady)
+                meta["control_cell"].grid(row=meta["row_index"], column=1, sticky=tk.E, pady=pady)
+                meta["visible"] = True
+
+            def hide_popup_row(row):
+                meta = popup_row_meta[row]
+                meta["label"].grid_remove()
+                meta["control_cell"].grid_remove()
+                meta["visible"] = False
+
+            def sync_in_app_popup_layout(force_all=False):
+                active_rows = popup_rows if force_all else [meta for meta in popup_rows if meta["visible"]]
+                if not active_rows:
+                    return
+                popup.update_idletasks()
+                label_col_width = max(meta["label"].winfo_reqwidth() for meta in active_rows)
+                content_frame.grid_columnconfigure(0, minsize=label_col_width)
+                content_frame.grid_columnconfigure(1, minsize=popup_control_width)
+                content_width = label_col_width + int(5 * scaling_factor) + popup_control_width
+                for meta in popup_rows:
+                    meta["label"].config(width=0)
+                    meta["control_cell"].config(width=popup_control_width, height=popup_control_height)
+                for meta in popup_separators:
+                    meta["line"].config(width=content_width, height=1)
+                popup.update_idletasks()
+
+            def _place_in_app_gyro_popup():
+                if not placement_state["ready"]:
+                    return
+                sync_in_app_popup_layout()
+                popup.update_idletasks()
+                self._place_popup_within_root_bounds(
+                    popup,
+                    in_app_gyro_btn,
+                    fallback_coords=placement_state["anchor_coords"],
+                    requested_size=placement_state["full_size"],
+                )
+                for menu_attr, anchor_attr in (
+                    ("deadzone_input_popup", "deadzone_input_popup_anchor"),
+                    ("dampening_input_popup", "dampening_input_popup_anchor"),
+                ):
+                    menu = getattr(self, menu_attr, None)
+                    anchor = getattr(self, anchor_attr, None)
+                    if menu is not None and menu.winfo_exists():
+                        if anchor is not None and anchor.winfo_exists():
+                            self._place_popup_within_root_bounds(menu, anchor)
+                        menu.lift()
+
+            _row, simul_cell = create_aligned_popup_row("Simultaneous Input:", pady_top=0)
+            simul_inner = tk.Frame(simul_cell, bg=background_color)
+            simul_inner.pack(side=tk.RIGHT)
             
             simul_key = f"{key}_in_app_gyro_simul"
-            self.create_mapping_widget(simul_cell, simul_key, "", None)
+            self.create_mapping_widget(
+                simul_inner,
+                simul_key,
+                "",
+                None,
+                compact=True,
+                fixed_size=(popup_control_width, popup_control_height),
+            )
             
             suffix = self._mapping_scope_suffix(None)
             simul_combo = getattr(self, f"{self._mapping_attr(simul_key, suffix)}_combo", None)
@@ -5557,6 +5766,7 @@ bg_color=panel_bg, widths=[8, 10])
             s_val = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
             if simul_combo:
                 simul_combo.set(s_val)
+                Tooltip(simul_combo, lambda: simul_combo.cget("text"))
             
             if isinstance(s_val, str) and s_val.startswith("Custom") and simul_combo and simul_custom_frame and simul_entry:
                 simul_combo.pack_forget()
@@ -5577,38 +5787,116 @@ bg_color=panel_bg, widths=[8, 10])
                     display_val = s_val[7:]
                 simul_entry.insert(0, format_input_display(display_val))
                 simul_entry.config(state="readonly")
-                
-            dz_row = tk.Frame(popup, bg=background_color)
-            dz_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
 
-            tk.Label(dz_row, text="Trigger Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+            create_popup_separator()
+            dz_row, dz_control_cell = create_aligned_popup_row("Trigger Deadzone:", pady_top=section_gap / scaling_factor)
 
             dz_mode_key = f"{key}_in_app_gyro_deadzone_mode"
+            dz_button_group = tk.Frame(dz_control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
+            dz_button_group.pack(side=tk.RIGHT)
+            dz_button_group.pack_propagate(False)
             dz_button = tk.Button(
-                dz_row,
+                dz_button_group,
                 bg=button_gray,
                 fg="white",
-                font=scale_font(("Arial", 10, "bold")),
+                font=popup_control_font,
                 bd=0,
                 relief=tk.FLAT,
                 width=14,
             )
-            dz_button.pack(side=tk.LEFT)
+            dz_button.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-            dz_amt_row = tk.Frame(popup, bg=background_color)
+            def create_numeric_setting_row(label_text, setting_key, default_value, min_value=0.0, max_value=None, integer=False, suffix_text=""):
+                row, control_cell = create_aligned_popup_row(label_text, pady_top=row_gap / scaling_factor, pack_now=False)
+                try:
+                    initial_value = float(CONFIG.get_mapping_setting_scoped(setting_key, default_value, None))
+                except Exception:
+                    initial_value = float(default_value)
+                if integer:
+                    initial_text = str(int(round(initial_value)))
+                elif initial_value.is_integer():
+                    initial_text = str(int(initial_value))
+                else:
+                    initial_text = str(initial_value)
+                var = tk.StringVar(value=initial_text)
+                input_group = tk.Frame(control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
+                input_group.pack(side=tk.RIGHT)
+                input_group.pack_propagate(False)
+                entry_widget = tk.Entry(
+                    input_group,
+                    textvariable=var,
+                    bg=button_gray,
+                    fg=text_color,
+                    insertbackground=text_color,
+                    relief=tk.FLAT,
+                    bd=0,
+                    font=popup_control_font,
+                    justify=tk.CENTER,
+                )
+                if suffix_text:
+                    suffix_label = tk.Label(input_group, text=suffix_text, bg=background_color, fg=text_color, font=popup_control_font)
+                    suffix_label.pack(side=tk.RIGHT, fill=tk.Y, padx=(int(4 * scaling_factor), 0))
+                    entry_widget.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+                else:
+                    entry_widget.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-            tk.Label(dz_amt_row, text="Deadzone:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+                def commit_value(event=None, normalize_text=True):
+                    try:
+                        value = float(var.get())
+                    except Exception:
+                        value = float(default_value)
+                    value = max(float(min_value), value)
+                    if max_value is not None:
+                        value = min(float(max_value), value)
+                    stored = int(round(value)) if integer else float(value)
+                    CONFIG.set_mapping_setting_scoped(setting_key, stored, None)
+                    CONFIG.save_config()
+                    if normalize_text:
+                        if isinstance(stored, float) and stored.is_integer():
+                            var.set(str(int(stored)))
+                        else:
+                            var.set(str(stored))
+
+                def commit_on_change(*_args):
+                    try:
+                        float(var.get())
+                    except Exception:
+                        return
+                    commit_value(normalize_text=False)
+
+                entry_widget.bind("<FocusOut>", commit_value)
+                entry_widget.bind("<Return>", commit_value)
+                var.trace_add("write", commit_on_change)
+                numeric_committers.append(commit_value)
+                return row, commit_value
+
+            def commit_numeric_settings():
+                if numeric_commit_state["done"]:
+                    return
+                numeric_commit_state["done"] = True
+                for commit in numeric_committers:
+                    try:
+                        commit()
+                    except Exception:
+                        pass
+
+            self.in_app_gyro_popup_commit_numeric = commit_numeric_settings
 
             dz_amt_key = f"{key}_in_app_gyro_deadzone_amount"
-            dz_amt_val = CONFIG.get_mapping_setting_scoped(dz_amt_key, 15.0, None)
+            dz_pause_pressed_key = f"{key}_in_app_gyro_deadzone_pause_after_pressed_ms"
+            dz_pause_released_key = f"{key}_in_app_gyro_deadzone_pause_after_released_ms"
+            dz_effect_released_key = f"{key}_in_app_gyro_deadzone_effect_after_released_ms"
 
-            def on_dz_amt_change(val):
-                CONFIG.set_mapping_setting_scoped(dz_amt_key, float(val), None)
-                CONFIG.save_config()
-
-            dz_scale = tk.Scale(dz_amt_row, from_=0.0, to=100.0, resolution=0.5, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 10, "bold")), command=on_dz_amt_change)
-            dz_scale.set(dz_amt_val)
-            dz_scale.pack(side=tk.LEFT)
+            dz_amt_row, _commit_dz_amt = create_numeric_setting_row("Deadzone:", dz_amt_key, 15.0, 0.0, None, False)
+            dz_pause_pressed_row, _commit_dz_pause_pressed = create_numeric_setting_row("Gyro Pause After Pressed:", dz_pause_pressed_key, 100, 0, None, True, "ms")
+            dz_pause_released_row, _commit_dz_pause_released = create_numeric_setting_row("Gyro Pause After Released:", dz_pause_released_key, 100, 0, None, True, "ms")
+            dz_effect_released_row, _commit_dz_effect_released = create_numeric_setting_row("Deadzone Effect After Released:", dz_effect_released_key, 200, 0, None, True, "ms")
+            dz_setting_rows = [
+                dz_amt_row,
+                dz_pause_pressed_row,
+                dz_pause_released_row,
+                dz_effect_released_row,
+            ]
 
             def dz_display_text():
                 selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(dz_mode_key, [], None))
@@ -5620,10 +5908,12 @@ bg_color=panel_bg, widths=[8, 10])
                 selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(dz_mode_key, [], None))
                 dz_button.config(text=dz_display_text())
                 if selected:
-                    if not dz_amt_row.winfo_ismapped():
-                        dz_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=dz_row)
+                    for setting_row in dz_setting_rows:
+                        show_popup_row(setting_row)
                 else:
-                    dz_amt_row.pack_forget()
+                    for setting_row in dz_setting_rows:
+                        hide_popup_row(setting_row)
+                _place_in_app_gyro_popup()
 
             Tooltip(dz_button, dz_display_text)
 
@@ -5702,27 +5992,26 @@ bg_color=panel_bg, widths=[8, 10])
             dz_button.config(command=open_deadzone_input_popup)
             refresh_dz_button()
 
-            damp_row = tk.Frame(popup, bg=background_color)
-            damp_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
-
-            tk.Label(damp_row, text="Trigger Dampening:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+            create_popup_separator()
+            damp_row, damp_control_cell = create_aligned_popup_row("Trigger Dampening:", pady_top=section_gap / scaling_factor)
             
             damp_mode_key = f"{key}_in_app_gyro_dampening_mode"
             damp_button_width = 14
+            damp_button_group = tk.Frame(damp_control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
+            damp_button_group.pack(side=tk.RIGHT)
+            damp_button_group.pack_propagate(False)
             damp_button = tk.Button(
-                damp_row,
+                damp_button_group,
                 bg=button_gray,
                 fg="white",
-                font=scale_font(("Arial", 10, "bold")),
+                font=popup_control_font,
                 bd=0,
                 relief=tk.FLAT,
                 width=damp_button_width,
             )
-            damp_button.pack(side=tk.LEFT)
+            damp_button.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
     
-            damp_amt_row = tk.Frame(popup, bg=background_color)
-            
-            tk.Label(damp_amt_row, text="Dampening Amount %:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), width=18, anchor="e").pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+            damp_amt_row, damp_amt_control_cell = create_aligned_popup_row("Dampening Amount %:", pady_top=row_gap / scaling_factor, pack_now=False)
             
             damp_amt_key = f"{key}_in_app_gyro_dampening_amount"
             damp_amt_val = CONFIG.get_mapping_setting_scoped(damp_amt_key, 90, None)
@@ -5731,9 +6020,21 @@ bg_color=panel_bg, widths=[8, 10])
                 CONFIG.set_mapping_setting_scoped(damp_amt_key, int(float(val)), None)
                 CONFIG.save_config()
                 
-            damp_scale = tk.Scale(damp_amt_row, from_=0, to=100, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 10, "bold")), command=on_damp_amt_change)
+            damp_scale = tk.Scale(damp_amt_control_cell, from_=0, to=100, resolution=1, orient=tk.HORIZONTAL, length=popup_control_width, bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=popup_control_font, command=on_damp_amt_change)
             damp_scale.set(damp_amt_val)
-            damp_scale.pack(side=tk.LEFT)
+            damp_scale.pack(side=tk.RIGHT)
+
+            damp_effect_released_key = f"{key}_in_app_gyro_dampening_effect_after_released_ms"
+            damp_effect_released_row, _commit_damp_effect_released = create_numeric_setting_row(
+                "Dampening Effect After Released:",
+                damp_effect_released_key,
+                200,
+                0,
+                None,
+                True,
+                "ms",
+            )
+            damp_setting_rows = [damp_amt_row, damp_effect_released_row]
 
             def damp_display_text():
                 selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(damp_mode_key, [], None))
@@ -5745,10 +6046,12 @@ bg_color=panel_bg, widths=[8, 10])
                 selected = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(damp_mode_key, [], None))
                 damp_button.config(text=damp_display_text())
                 if selected:
-                    if not damp_amt_row.winfo_ismapped():
-                        damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=damp_row)
+                    for setting_row in damp_setting_rows:
+                        show_popup_row(setting_row)
                 else:
-                    damp_amt_row.pack_forget()
+                    for setting_row in damp_setting_rows:
+                        hide_popup_row(setting_row)
+                _place_in_app_gyro_popup()
 
             Tooltip(damp_button, damp_display_text)
 
@@ -5827,15 +6130,9 @@ bg_color=panel_bg, widths=[8, 10])
             damp_button.config(command=open_dampening_input_popup)
             refresh_damp_button()
 
-            # Temporarily pack the amount rows so the popup is positioned using its FULL
-            # height (all content visible). They are refreshed/hidden only AFTER placement
-            # below, so a later expansion (selecting a modifier reveals its slider) cannot
-            # push the popup past the window's bottom edge.
-            dz_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0), after=dz_row)
-            damp_amt_row.pack(side=tk.TOP, fill=tk.X, pady=(int(5 * scaling_factor), 0))
-
             def on_popup_destroy(e):
                 if str(e.widget) == str(popup):
+                    commit_numeric_settings()
                     close_deadzone_input_popup()
                     close_dampening_input_popup()
                     final_val = CONFIG.get_mapping_setting_scoped(simul_key, "None", None)
@@ -5871,13 +6168,28 @@ bg_color=panel_bg, widths=[8, 10])
             except Exception:
                 anchor_coords = None
                 
+            for setting_row in dz_setting_rows:
+                show_popup_row(setting_row)
+            for setting_row in damp_setting_rows:
+                show_popup_row(setting_row)
+            sync_in_app_popup_layout(force_all=True)
             popup.update_idletasks()
-            self._place_popup_within_root_bounds(popup, in_app_gyro_btn, fallback_coords=anchor_coords)
+            placement_state["anchor_coords"] = anchor_coords
+            placement_state["full_size"] = (popup.winfo_reqwidth(), popup.winfo_reqheight())
 
-            # Now that placement used the full height, collapse the amount rows that have no
-            # modifier selected.
+            # Measure the full expansion size before the popup is placed, then collapse to
+            # the actual current state before the first visible placement to avoid flicker.
             refresh_dz_button()
             refresh_damp_button()
+            sync_in_app_popup_layout()
+
+            placement_state["ready"] = True
+            self._place_popup_within_root_bounds(
+                popup,
+                in_app_gyro_btn,
+                fallback_coords=anchor_coords,
+                requested_size=placement_state["full_size"],
+            )
 
             popup.lift()
             
@@ -5925,7 +6237,7 @@ bg_color=panel_bg, widths=[8, 10])
                 cp_frame.pack_forget()
                 clear_mouse_click_state(reset_mode=True)
                 combo.set(selected)
-                combo.pack(side=tk.LEFT)
+                pack_combo()
                 CONFIG.set_mapping_setting_scoped(key, selected, mapping_scope)
                 sync_joystick_direction(selected)
                 self.on_setting_changed(event)
@@ -6105,6 +6417,12 @@ bg_color=panel_bg, widths=[8, 10])
         return False
 
     def close_in_app_gyro_popup(self):
+        commit_numeric = getattr(self, "in_app_gyro_popup_commit_numeric", None)
+        if commit_numeric:
+            try:
+                commit_numeric()
+            except Exception:
+                pass
         dz_popup = getattr(self, "deadzone_input_popup", None)
         if dz_popup is not None and dz_popup.winfo_exists():
             dz_popup.destroy()
@@ -6120,6 +6438,7 @@ bg_color=panel_bg, widths=[8, 10])
             popup.destroy()
         self.in_app_gyro_popup = None
         self.in_app_gyro_popup_anchor = None
+        self.in_app_gyro_popup_commit_numeric = None
         bind_id = getattr(self, "in_app_gyro_popup_bind_id", None)
         if bind_id:
             try:
@@ -6236,7 +6555,7 @@ bg_color=panel_bg, widths=[8, 10])
             popup.lift()
         return popup
 
-    def _place_popup_within_root_bounds(self, popup, anchor_widget, fallback_coords=None):
+    def _place_popup_within_root_bounds(self, popup, anchor_widget, fallback_coords=None, requested_size=None, position_adjust=(0, 0)):
         self.root.update_idletasks()
         popup.update_idletasks()
 
@@ -6260,10 +6579,14 @@ bg_color=panel_bg, widths=[8, 10])
         root_bottom = root_top + self.root.winfo_height()
         anchor_right = anchor_x + anchor_w
 
-        popup_w = popup.winfo_reqwidth()
-        popup_h = popup.winfo_reqheight()
+        if requested_size:
+            popup_w, popup_h = requested_size
+        else:
+            popup_w = popup.winfo_reqwidth()
+            popup_h = popup.winfo_reqheight()
         x_offset = int(3 * scaling_factor)
         y_offset = int(2 * scaling_factor)
+        x_adjust, y_adjust = position_adjust
 
         # Prefer the four anchor-relative positions. Left-anchored (NW/SW) opens the popup
         # rightward from the anchor's left edge; right-anchored (NE/SE) opens leftward from
@@ -6287,35 +6610,35 @@ bg_color=panel_bg, widths=[8, 10])
             if use_anchor:
                 x_from_anchor_left = clamped_left - anchor_x
                 if enough_bottom:
-                    popup.place(in_=anchor_widget, relx=0, rely=1, x=x_from_anchor_left, y=y_offset, anchor=tk.NW)
+                    popup.place(in_=anchor_widget, relx=0, rely=1, x=x_from_anchor_left + x_adjust, y=y_offset + y_adjust, anchor=tk.NW)
                 else:
-                    popup.place(in_=anchor_widget, relx=0, rely=0, x=x_from_anchor_left, y=-y_offset, anchor=tk.SW)
+                    popup.place(in_=anchor_widget, relx=0, rely=0, x=x_from_anchor_left + x_adjust, y=-y_offset + y_adjust, anchor=tk.SW)
             else:
                 x_rel = clamped_left - root_left
                 if enough_bottom:
-                    popup.place(in_=self.root, x=x_rel, y=anchor_bottom + y_offset - root_top, anchor=tk.NW)
+                    popup.place(in_=self.root, x=x_rel + x_adjust, y=anchor_bottom + y_offset - root_top + y_adjust, anchor=tk.NW)
                 else:
-                    popup.place(in_=self.root, x=x_rel, y=anchor_y - y_offset - root_top, anchor=tk.SW)
+                    popup.place(in_=self.root, x=x_rel + x_adjust, y=anchor_y - y_offset - root_top + y_adjust, anchor=tk.SW)
         elif use_anchor:
             if h_mode == "left" and enough_bottom:
-                popup.place(in_=anchor_widget, relx=0, rely=1, x=-x_offset, y=y_offset, anchor=tk.NW)
+                popup.place(in_=anchor_widget, relx=0, rely=1, x=-x_offset + x_adjust, y=y_offset + y_adjust, anchor=tk.NW)
             elif h_mode == "right" and enough_bottom:
-                popup.place(in_=anchor_widget, relx=1, rely=1, x=x_offset, y=y_offset, anchor=tk.NE)
+                popup.place(in_=anchor_widget, relx=1, rely=1, x=x_offset + x_adjust, y=y_offset + y_adjust, anchor=tk.NE)
             elif h_mode == "left" and not enough_bottom:
-                popup.place(in_=anchor_widget, relx=0, rely=0, x=-x_offset, y=-y_offset, anchor=tk.SW)
+                popup.place(in_=anchor_widget, relx=0, rely=0, x=-x_offset + x_adjust, y=-y_offset + y_adjust, anchor=tk.SW)
             else:
-                popup.place(in_=anchor_widget, relx=1, rely=0, x=x_offset, y=-y_offset, anchor=tk.SE)
+                popup.place(in_=anchor_widget, relx=1, rely=0, x=x_offset + x_adjust, y=-y_offset + y_adjust, anchor=tk.SE)
         else:
             rx = root_left
             ry = root_top
             if h_mode == "left" and enough_bottom:
-                popup.place(in_=self.root, x=anchor_x - rx - x_offset, y=anchor_bottom - ry + y_offset, anchor=tk.NW)
+                popup.place(in_=self.root, x=anchor_x - rx - x_offset + x_adjust, y=anchor_bottom - ry + y_offset + y_adjust, anchor=tk.NW)
             elif h_mode == "right" and enough_bottom:
-                popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset, y=anchor_bottom - ry + y_offset, anchor=tk.NE)
+                popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset + x_adjust, y=anchor_bottom - ry + y_offset + y_adjust, anchor=tk.NE)
             elif h_mode == "left" and not enough_bottom:
-                popup.place(in_=self.root, x=anchor_x - rx - x_offset, y=anchor_y - ry - y_offset, anchor=tk.SW)
+                popup.place(in_=self.root, x=anchor_x - rx - x_offset + x_adjust, y=anchor_y - ry - y_offset + y_adjust, anchor=tk.SW)
             else:
-                popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset, y=anchor_y - ry - y_offset, anchor=tk.SE)
+                popup.place(in_=self.root, x=anchor_x + anchor_w - rx + x_offset + x_adjust, y=anchor_y - ry - y_offset + y_adjust, anchor=tk.SE)
         popup.lift()
 
     def open_change_profile_popup(self, anchor_widget):
@@ -7056,7 +7379,11 @@ bg_color=panel_bg, widths=[8, 10])
                 )
                 name_btn.config(command=lambda p=profile_name, nf=name_frame, nb=name_btn, w=profile_col_width, h=row_height: self.on_popup_profile_selected(p, nf, nb, w, h))
                 # Hovering shows the full profile name when the fixed-width button clips it.
-                Tooltip(name_btn, lambda nb=name_btn: nb.cget("text"))
+                Tooltip(
+                    name_btn,
+                    lambda nb=name_btn: nb.cget("text"),
+                    position_adjust=(0, 0) if is_active_profile else None,
+                )
 
                 combo_cell = tk.Frame(row, bg=background_color, width=combo_col_width, height=row_height)
                 combo_cell.grid(row=0, column=1, sticky=tk.EW, padx=(0, column_gap))
@@ -8101,25 +8428,177 @@ bg_color=panel_bg, widths=[8, 10])
         if hasattr(self, 'min_frame'):
             self.min_frame.config(bg=highlight_color if val else button_gray)
 
-    def update_wired_discovery_button(self):
-        if not hasattr(self, 'wired_discovery_btn') or not self.wired_discovery_btn:
+    def _schedule_wired_device_change_rescan(self, reason="device_arrival", candidate_path=None):
+        if not bool(getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True))):
             return
-        enabled = bool(getattr(CONFIG, 'wired_usb_enabled', True))
-        text = f"Wired Controller Discovery: {'On' if enabled else 'Off'}"
-        color = button_gray
-        self.wired_discovery_btn.config(text=text, bg=color)
-        if hasattr(self, 'wired_discovery_frame'):
-            self.wired_discovery_frame.config(bg=color)
+        pending = getattr(self, "_wired_device_change_after_id", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except Exception:
+                pass
+        self._wired_device_change_after_id = self.root.after(
+            500,
+            lambda r=reason, p=candidate_path: request_wired_rescan(r, candidate_path=p),
+        )
 
-    def toggle_wired_discovery(self):
-        enabled = not bool(getattr(CONFIG, 'wired_usb_enabled', True))
-        CONFIG.wired_usb_enabled = enabled
-        CONFIG.save_config()
-        if not enabled:
-            self.wired_pro2_detected = False
-            self._hidhide_installed_cached = False
-        self.update_wired_discovery_button()
-        self.update_driver_buttons_visibility()
+    def poll_wired_device_events(self):
+        if getattr(self, 'is_quitting', False):
+            return
+        latest = None
+        try:
+            q = getattr(self, "wired_device_event_queue", None)
+            if q is not None:
+                while True:
+                    try:
+                        latest = q.get_nowait()
+                    except queue.Empty:
+                        break
+        except Exception:
+            latest = None
+        if latest:
+            self._schedule_wired_device_change_rescan(
+                latest.get("reason", "device_arrival"),
+                latest.get("path"),
+            )
+        try:
+            self.root.after(250, self.poll_wired_device_events)
+        except Exception:
+            pass
+
+    def close_wired_pro_controller_settings_popup(self):
+        popup = getattr(self, "wired_pro_settings_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+        self.wired_pro_settings_popup = None
+        self.wired_pro_settings_popup_anchor = None
+        bind_id = getattr(self, "wired_pro_settings_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+            self.wired_pro_settings_popup_bind_id = None
+
+    def bind_wired_pro_controller_settings_popup_outside_click(self):
+        popup = getattr(self, "wired_pro_settings_popup", None)
+        if popup is None or not popup.winfo_exists():
+            return
+        bind_id = getattr(self, "wired_pro_settings_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+            self.wired_pro_settings_popup_bind_id = None
+
+        def close_if_outside(event):
+            current_popup = getattr(self, "wired_pro_settings_popup", None)
+            if current_popup is None or not current_popup.winfo_exists():
+                self.close_wired_pro_controller_settings_popup()
+                return
+            if self._event_in_widget(current_popup, event):
+                return
+            if self._event_in_widget(getattr(self, "wired_pro_settings_popup_anchor", None), event):
+                return
+            self.close_wired_pro_controller_settings_popup()
+
+        self.wired_pro_settings_popup_bind_id = self.root.bind("<ButtonPress>", close_if_outside, add="+")
+
+    def open_wired_pro_controller_settings_popup(self, anchor_widget):
+        if anchor_widget is getattr(self, "wired_pro_settings_btn", None) and hasattr(self, "wired_pro_settings_frame"):
+            anchor_widget = self.wired_pro_settings_frame
+        existing = getattr(self, "wired_pro_settings_popup", None)
+        if existing is not None and existing.winfo_exists() and getattr(self, "wired_pro_settings_popup_anchor", None) is anchor_widget:
+            self.close_wired_pro_controller_settings_popup()
+            return
+        self.close_wired_pro_controller_settings_popup()
+
+        spacing = int(8 * scaling_factor)
+        popup = tk.Frame(self.root, bg=background_color, bd=1, relief=tk.SOLID, padx=spacing, pady=spacing)
+        self.wired_pro_settings_popup = popup
+        self.wired_pro_settings_popup_anchor = anchor_widget
+
+        def read_hidhide_installed():
+            try:
+                import hidhide
+                return hidhide.is_available()
+            except Exception:
+                return False
+
+        def refresh_hidhide_button():
+            installed = read_hidhide_installed()
+            self._hidhide_installed_cached = installed
+            CONFIG.hidhide_installed = installed
+            CONFIG.save_config()
+            hidhide_btn.config(text="HidHide" if installed else "Install HidHide")
+
+        hidhide_frame = tk.Frame(popup, bg=button_gray)
+        hidhide_frame.pack(fill=tk.X)
+        hidhide_btn = tk.Button(
+            hidhide_frame,
+            text="HidHide" if read_hidhide_installed() else "Install HidHide",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 11, "bold")),
+            command=lambda: (self.on_wired_usb_driver_button(), refresh_hidhide_button()),
+        )
+        hidhide_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+        refresh_hidhide_button()
+
+        auto_scan_frame = tk.Frame(popup, bg=button_gray)
+        auto_scan_frame.pack(fill=tk.X, pady=(spacing, 0))
+
+        def auto_scan_enabled():
+            return bool(getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)))
+
+        def refresh_auto_scan_button():
+            auto_scan_btn.config(text=f"Auto Scan: {'On' if auto_scan_enabled() else 'Off'}")
+
+        def toggle_auto_scan():
+            val = not auto_scan_enabled()
+            CONFIG.wired_auto_scan_enabled = val
+            CONFIG.wired_usb_enabled = val
+            CONFIG.save_config()
+            set_wired_auto_scan_enabled(val)
+            refresh_auto_scan_button()
+
+        auto_scan_btn = tk.Button(
+            auto_scan_frame,
+            text="",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 11, "bold")),
+            command=toggle_auto_scan,
+        )
+        auto_scan_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+        refresh_auto_scan_button()
+
+        manual_frame = tk.Frame(popup, bg=button_gray)
+        manual_frame.pack(fill=tk.X, pady=(spacing, 0))
+
+        def run_manual_scan():
+            request_wired_rescan("manual_refresh", manual=True)
+
+        tk.Button(
+            manual_frame,
+            text="Manual Scan",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 11, "bold")),
+            command=run_manual_scan,
+        ).pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        popup.place(in_=self.root, x=-10000, y=-10000)
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(popup, anchor_widget, position_adjust=(2, -2))
+        self.root.after(100, self.bind_wired_pro_controller_settings_popup_outside_click)
 
     def on_hidhide_button(self):
         try:
@@ -8335,7 +8814,7 @@ bg_color=panel_bg, widths=[8, 10])
         try:
             import hidhide
             from usb_hid_controller import enumerate_pro_controller2
-            for entry in enumerate_pro_controller2():
+            for entry in enumerate_pro_controller2(reason="hidhide_action"):
                 instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
                 if instance_id:
                     hidhide.hide_device(instance_id)
@@ -8346,7 +8825,7 @@ bg_color=panel_bg, widths=[8, 10])
         try:
             import hidhide
             from usb_hid_controller import enumerate_pro_controller2
-            for entry in enumerate_pro_controller2():
+            for entry in enumerate_pro_controller2(reason="hidhide_action"):
                 instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
                 if instance_id:
                     hidhide.unhide_device(instance_id)
@@ -9338,6 +9817,16 @@ bg_color=panel_bg, widths=[8, 10])
             self.main_frame = tk.Frame(self.root, bg=background_color); self.main_frame.pack(pady=(10, 5), fill=tk.Y)
             self.players_info = None
         self.current_controllers = controllers_info
+        self.wired_pro2_detected = any(
+            controller is not None and (
+                controller.__class__.__name__ == "USBHidController"
+                or getattr(controller, "_hidhide_instance_id", None)
+            )
+            for vc in controllers_info or []
+            if vc is not None
+            for controller in getattr(vc, "controllers", []) or []
+        )
+        self.update_driver_buttons_visibility()
         
         if hasattr(self, 'djg_dominant_switch'):
             self.djg_dominant_switch.set_value(getattr(CONFIG, "djg_dominant_side", "Left"))
@@ -9418,6 +9907,11 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_quit(self):
         if getattr(self, 'is_cleaning_up', False): return
+        try:
+            if getattr(self, "wired_device_listener", None):
+                self.wired_device_listener.stop()
+        except Exception as e:
+            logger.debug("Failed to stop wired device listener: %s", e)
         
         # Restore window procedure
         if hasattr(self, 'old_wndproc') and self.old_wndproc:
@@ -9594,30 +10088,28 @@ bg_color=panel_bg, widths=[8, 10])
         auto-installed by the controller (MS OS descriptor), so it isn't managed here —
         we only keep an internal check as a safety-net warning. When a pad is present and
         HidHide is absent, prompt to install HidHide once per session."""
-        if not getattr(CONFIG, 'wired_usb_enabled', True):
-            self.wired_pro2_detected = False
-            self._hidhide_installed_cached = False
-            self._wired_pro2_refresh_running = False
-            self.update_driver_buttons_visibility()
-            return
         if getattr(self, '_wired_pro2_refresh_running', False) or getattr(self, 'is_quitting', False):
             return
         self._wired_pro2_refresh_running = True
 
         def worker():
-            detected = False
+            detected = any(
+                controller is not None and (
+                    controller.__class__.__name__ == "USBHidController"
+                    or getattr(controller, "_hidhide_instance_id", None)
+                )
+                for vc in getattr(self, "current_controllers", []) or []
+                if vc is not None
+                for controller in getattr(vc, "controllers", []) or []
+            )
             hh_installed = False
             winusb_bound = True
-            try:
-                from usb_hid_controller import enumerate_pro_controller2
-                detected = len(enumerate_pro_controller2()) > 0
-            except Exception as e:
-                logger.debug("Wired Pro2 detection failed: %s", e)
-            try:
-                import hidhide
-                hh_installed = hidhide.is_available()
-            except Exception:
-                hh_installed = False
+            if detected:
+                try:
+                    import hidhide
+                    hh_installed = hidhide.is_available()
+                except Exception:
+                    hh_installed = False
             if detected:
                 # Safety-net only: WinUSB should be auto-bound. If it isn't, activation
                 # (input) will fail, so we warn the user once.
@@ -9625,11 +10117,6 @@ bg_color=panel_bg, widths=[8, 10])
 
             def apply():
                 self._wired_pro2_refresh_running = False
-                if not getattr(CONFIG, 'wired_usb_enabled', True):
-                    self.wired_pro2_detected = False
-                    self._hidhide_installed_cached = False
-                    self.update_driver_buttons_visibility()
-                    return
                 self.wired_pro2_detected = detected
                 self._hidhide_installed_cached = hh_installed
                 self.update_driver_buttons_visibility()
@@ -9722,6 +10209,11 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.bind(CONTROLLER_UPDATED_EVENT, lambda e: self.update(self.message_queue.get()))
         
         self.power_listener.start()
+        try:
+            self.wired_device_listener.start()
+            self.root.after(250, self.poll_wired_device_events)
+        except Exception as e:
+            logger.debug("Failed to start wired device listener: %s", e)
         
         if CONFIG.start_minimized:
             self.hide_to_tray()

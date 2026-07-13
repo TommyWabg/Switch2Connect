@@ -805,6 +805,8 @@ class _UsbHidClient:
         self._last_recover = 0.0
         self._recover_attempts = 0
         self._io_pause = threading.Event()   # set while recovering; read loop stands down
+        self.on_disconnect_callback = None
+        self._disconnect_notified = False
 
     def open(self):
         if self.dev is not None:
@@ -1069,6 +1071,7 @@ class _UsbHidClient:
                 if self._io_pause.is_set():
                     continue
                 logger.info("USB HID read loop ended: %s", e)
+                self._notify_disconnect("read_error")
                 break
             if not data:
                 continue
@@ -1114,8 +1117,24 @@ class _UsbHidClient:
                     except Exception:
                         logger.exception("USB HID command-response callback failed")
 
+    def _notify_disconnect(self, reason):
+        if self._read_stop.is_set() or self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        self.is_connected = False
+        self._rumble_stop.set()
+        self._rumble_wake.set()
+        callback = self.on_disconnect_callback
+        if callback is None:
+            return
+        try:
+            callback(reason)
+        except Exception:
+            logger.debug("USB HID disconnect callback failed", exc_info=True)
+
     async def disconnect(self):
         self._read_stop.set()
+        self._disconnect_notified = True
         self._rumble_stop.set()
         self._rumble_wake.set()
         if self._rumble_thread and self._rumble_thread.is_alive():
@@ -1137,7 +1156,7 @@ class _UsbHidClient:
 _enum_log_state = {"last_seen": None}
 
 
-def enumerate_pro_controller2() -> list:
+def enumerate_pro_controller2(reason: str = "unspecified", candidate_path=None, allow_global_fallback: bool = False) -> list:
     """Return hidapi enumeration entries for wired Pro Controller 2 devices.
 
     Robust across hidapi builds: tries the filtered enumerate first, then falls back
@@ -1148,16 +1167,31 @@ def enumerate_pro_controller2() -> list:
     if hid is None:
         return []
 
+    t0 = time.perf_counter()
+    used_global_fallback = False
     entries = []
     try:
         entries = hid.enumerate(NINTENDO_VENDOR_ID, PRO_CONTROLLER2_PID) or []
     except Exception as e:
         logger.debug("hid.enumerate(vid,pid) failed: %s", e)
 
-    if not entries:
+    if candidate_path is not None:
+        candidate_text = candidate_path.decode("utf-8", errors="ignore") if isinstance(candidate_path, bytes) else str(candidate_path)
+        candidate_key = candidate_text.lower()
+
+        def _path_text(d):
+            path = d.get("path") or ""
+            return path.decode("utf-8", errors="ignore") if isinstance(path, bytes) else str(path)
+
+        matched_entries = [d for d in entries if _path_text(d).lower() == candidate_key]
+        if matched_entries:
+            entries = matched_entries
+
+    if not entries and allow_global_fallback:
         # Some hidapi builds ignore the VID/PID filter — enumerate all and filter.
         try:
             alldev = hid.enumerate() or []
+            used_global_fallback = True
         except Exception as e:
             logger.debug("hid.enumerate() failed: %s", e)
             alldev = []
@@ -1187,7 +1221,17 @@ def enumerate_pro_controller2() -> list:
             return 0
         return 1
 
-    return sorted(entries, key=_priority)
+    result = sorted(entries, key=_priority)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if elapsed_ms >= 100 or used_global_fallback:
+        logger.info(
+            "Wired USB scan: reason=%s duration=%.1fms found=%d global_fallback=%s",
+            reason,
+            elapsed_ms,
+            len(result),
+            used_global_fallback,
+        )
+    return result
 
 
 class USBHidController(Controller):
@@ -1241,6 +1285,9 @@ class USBHidController(Controller):
         self.side_buttons_pressed = False
         self.battery_voltage = 3.7
         self.full_parity = False   # set True once command-based init/calibration succeeds
+        self._loop = None
+        self._disconnect_notified = False
+        self.client.on_disconnect_callback = self._on_usb_hid_disconnected
 
     # --- Output reports are restricted for the wired pad ---
     # Command/feature/LED output reports can stop the default 0x05 input stream on
@@ -1273,10 +1320,30 @@ class USBHidController(Controller):
             return
         await Controller.trigger_connection_haptics(self)
 
+    def _on_usb_hid_disconnected(self, reason="read_error"):
+        if self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        self.interp_running = False
+        logger.info("Wired USB Pro Controller 2 hardware disconnect detected (%s, %s)", reason, self.device.address)
+        callback = self.disconnected_callback
+        if callback is None:
+            return
+        loop = getattr(self, "_loop", None)
+        if loop is None or not loop.is_running():
+            logger.debug("Wired USB disconnect callback dropped: discoverer loop unavailable")
+            return
+
+        async def _run_disconnect_callback():
+            await callback(self)
+
+        asyncio.run_coroutine_threadsafe(_run_disconnect_callback(), loop)
+
     async def initialize(self):
         """Initialize USB reports, then open hidapi and read the input stream.
         Startup commands go through the vendor bulk endpoint; arbitrary command HID
         output reports stay disabled after connect."""
+        self._loop = asyncio.get_running_loop()
         self.client.open()
         winusb_ok = await asyncio.to_thread(initialize_pro_controller2_usb_reports)
         if not winusb_ok:
@@ -1334,6 +1401,7 @@ class USBHidController(Controller):
             logger.debug("Wired USB re-init failed", exc_info=True)
 
     async def disconnect(self):
+        self._disconnect_notified = True
         self.interp_running = False
         task = getattr(self, "_reinit_task", None)
         if task is not None:

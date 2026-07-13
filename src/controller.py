@@ -3689,7 +3689,14 @@ class Controller:
                 pressed.add(token)
         return frozenset(pressed)
 
-    def _in_app_gyro_inputs_pressed(self, tokens, zr_pressed, zl_pressed):
+    def _in_app_gyro_ms_setting(self, key, default_ms):
+        try:
+            value = CONFIG.get_mapping_setting_scoped(key, default_ms, None)
+            return max(0.0, float(value)) / 1000.0
+        except Exception:
+            return max(0.0, float(default_ms)) / 1000.0
+
+    def _in_app_gyro_inputs_pressed(self, tokens, zr_pressed, zl_pressed, latch_seconds=None):
         # True if any token is pressed now OR within the release-latch window after release,
         # so brief gaps in the button state don't drop the effect. Shared by Trigger
         # Dampening and Trigger Deadzone.
@@ -3699,7 +3706,8 @@ class Controller:
         if latch is None:
             latch = {}
             self._in_app_gyro_input_latch = latch
-        latch_seconds = self.IN_APP_GYRO_INPUT_LATCH_SECONDS
+        if latch_seconds is None:
+            latch_seconds = self.IN_APP_GYRO_INPUT_LATCH_SECONDS
 
         for token in tokens:
             if token in raw_pressed:
@@ -3872,10 +3880,31 @@ class Controller:
                 dz_active = True
                 raw_pressed = self._in_app_gyro_raw_tokens_pressed(dz_inputs, zr_pressed, zl_pressed)
                 prev_pressed = getattr(self, "_dz_freeze_prev_pressed", None)
-                if prev_pressed is not None and raw_pressed != prev_pressed:
-                    self._gyro_freeze_until = time.perf_counter() + self.IN_APP_GYRO_DZ_FREEZE_SECONDS
+                now = time.perf_counter()
+                if prev_pressed is None:
+                    newly_pressed = bool(raw_pressed)
+                    newly_released = False
+                else:
+                    newly_pressed = bool(raw_pressed - prev_pressed)
+                    newly_released = bool(prev_pressed - raw_pressed)
+                if newly_pressed:
+                    freeze_seconds = self._in_app_gyro_ms_setting(
+                        f"{dz_trigger_key}_in_app_gyro_deadzone_pause_after_pressed_ms",
+                        100,
+                    )
+                    self._gyro_freeze_until = now + freeze_seconds
+                elif newly_released:
+                    freeze_seconds = self._in_app_gyro_ms_setting(
+                        f"{dz_trigger_key}_in_app_gyro_deadzone_pause_after_released_ms",
+                        100,
+                    )
+                    self._gyro_freeze_until = now + freeze_seconds
                 self._dz_freeze_prev_pressed = raw_pressed
-                if self._in_app_gyro_inputs_pressed(dz_inputs, zr_pressed, zl_pressed):
+                dz_latch_seconds = self._in_app_gyro_ms_setting(
+                    f"{dz_trigger_key}_in_app_gyro_deadzone_effect_after_released_ms",
+                    200,
+                )
+                if self._in_app_gyro_inputs_pressed(dz_inputs, zr_pressed, zl_pressed, dz_latch_seconds):
                     in_app_soft_dz = float(CONFIG.get_mapping_setting_scoped(f"{dz_trigger_key}_in_app_gyro_deadzone_amount", 15.0, None))
         if not dz_active:
             # Reset the edge baseline so re-entering (button reassigned / gyro re-triggered)
@@ -4016,7 +4045,11 @@ class Controller:
             
             if trigger_pressed and trigger_key:
                 damp_inputs = normalize_dampening_inputs(CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_mode", [], None))
-                if damp_inputs and self._in_app_gyro_inputs_pressed(damp_inputs, zr_pressed, zl_pressed):
+                damp_latch_seconds = self._in_app_gyro_ms_setting(
+                    f"{trigger_key}_in_app_gyro_dampening_effect_after_released_ms",
+                    200,
+                )
+                if damp_inputs and self._in_app_gyro_inputs_pressed(damp_inputs, zr_pressed, zl_pressed, damp_latch_seconds):
                     damp_amount = CONFIG.get_mapping_setting_scoped(f"{trigger_key}_in_app_gyro_dampening_amount", 90, None)
                     gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
             
