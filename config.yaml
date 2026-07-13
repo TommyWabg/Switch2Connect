@@ -2761,7 +2761,7 @@ stick_r_bias:
 - 0.0
 - 0.0
 ui_scale: 1.0
-usbip_sim_mode: Switch1
+usbip_sim_mode: PS5
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_ps5: 10
@@ -2772,7 +2772,8 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1261
-window_y: 69
+window_x: 1249
+window_y: 65
 winuhid_sim_mode: PS5
+wired_auto_scan_enabled: true
 wired_usb_enabled: true
