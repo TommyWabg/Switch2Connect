@@ -6,13 +6,13 @@ The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and
 
 1. Download the `.exe` from the **[Releases](https://github.com/TommyWabg/Switch2Connect/releases)** page.
 2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
-3. Once the installation completes, the setup window will close automatically and the main application will launch.
+3. Once the installation completes, the setup window will close automatically, and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
 5. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
 
 ## Feature Descriptions
 
-* **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommanded for 70Hz max bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for BLE protocol.
+* **Windows 10 Native Compatibility:** Resolved the `AttributeError: property is not available...` crash. Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommended for a 70Hz max Bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for the BLE protocol.
 * **Low Latency Bluetooth Mode:** The application now forces Windows Bluetooth LE into `ThroughputOptimized` mode upon connection. This drastically drops the connection interval, massively reducing native Bluetooth input delay across the board.
 * **ESP32-S3 N16R8 Low-Latency Connection:** Added native support for the ESP32-S3 N16R8 development board as a low-latency BLE bridge, which enables 133Hz polling rate. The application provides firmware installation, controller pairing via the SYNC button, and seamless reconnection for controllers previously bonded to the bridge.
 * **Wired Pro Controller Support:** Supports wired Switch 2 Pro Controller discovery. The **Wired Pro Controller** menu allows users to manage HidHide, toggle automatic discovery, and run a one-time manual scan when needed.
@@ -26,33 +26,35 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
 Cemuhook Gyro Sensitivity Adjustment: Added a Sensitivity slider (levels 1-5) to the "Gyro Passthrough" panel. The sensitivity specifically applies a linear multiplier only to the horizontal rotation (Yaw) axis sent via the Cemuhook UDP protocol.
   * **levels 1:** Virtual Switch 1 Joy-cons turn 360 degrees when the physical Switch 2 Joy-cons turn 360 degrees.
   * **levels 5:** Matches real Switch 1 Joycon sensitivity.
-* **On-the-Fly Layout Switching:** No more multiple executables! Instantly toggle between **Nintendo Layout** (matching physical labels) and **Xbox Layout** (standard PC positioning) directly from the UI.
-* **1000Hz Interpolation:** 1000Hz interpolation loop for ultra-smooth, jitter-free gyro motion rendering with both Switch 2 Right Joy-con and Pro Controller. **Gyro Mouse** and **Joy-con Mouse**now output smoother and lag-free movement at 1000Hz. Gyro data handed off to other external applications (such as third-party emulators) is transmitted at a consistent, high-frequency 1000Hz rate. This transmission is purely non-interpolated; rather than generating synthetic intermediate frames which could introduce latency, the app simply increases the packet delivery rate of real-time physical updates to ensure maximum accuracy and zero artificial delay.
+* **On-the-Fly Layout Switching:** Toggle between **Nintendo Layout** (matching physical labels) and **Xbox Layout** (standard PC positioning) directly from the UI.
+* **NSO GameCube Controller Layout Mapping:** The NSO GameCube Controller uses consistent ABXY layout mapping across Xbox, PlayStation, and Switch emulation modes. Xbox Layout maps buttons by physical position, while Switch Layout maps buttons by input function.
+* **1000Hz Interpolation:** 1000Hz interpolation loop for ultra-smooth, jitter-free gyro motion rendering with both Switch 2 Right Joy-con and Pro Controller. **Gyro Mouse** and **Joy-con Mouse**now output smoother and lag-free movement at 1000Hz. Gyro data handed off to other external applications (such as third-party emulators) is transmitted at a consistent, high-frequency 1000Hz rate. This transmission is purely non-interpolated; rather than generating synthetic intermediate frames, which could introduce latency, the app simply increases the packet delivery rate of real-time physical updates to ensure maximum accuracy and zero artificial delay.
 * **In-app Gyro Control (Mouse, R Joystick & Steering):** Utilize in-app gyro control for mouse aiming, or select R Joystick and Steering options. The Steering mode reads the controller's absolute tilt (accelerometer) and maps it directly to the Left Analog Stick's X-axis. Unlike the Mouse control mode, the R Joystick and Steering modes utilize a separate In-app Gyro mapping scope where all buttons default to their standard controller inputs to prevent unexpected mouse clicks during controller emulation.
-* **9-Axis Mouse Mode (Magnetometer Support):** 9-axis motion controled mouse by leveraging the controllers' magnetometer. This provides absolute orientation tracking and eliminates long-term yaw drift. 
-* **6-Axis Mouse Mode:** Play shooters or navigate through UI with high-polling rate gyro mouse control. RT and LT act as left and right mouse click when gyro mouse is activated. This mode self-levels horizontal and vertical input regardless of controller tilt.
+* **9-Axis Mouse Mode (Magnetometer Support):** A 9-axis motion controled mouse by leveraging the controllers' magnetometer. This provides absolute orientation tracking and eliminates long-term yaw drift. 
+* **6-Axis Mouse Mode:** Play shooters or navigate through UI with high-polling rate gyro mouse control. RT and LT act as left and right mouse clicks when the gyro mouse is activated. This mode self-levels horizontal and vertical input regardless of controller tilt.
 * **Gyro Racing Wheel Mode (Steering):** Reads the controller's absolute tilt (accelerometer) and maps it directly to the Left Analog Stick's X-axis.
 * **Stick Assist:** Allowing the right thumbstick to work alongside gyro aiming.
 * **In-App Gyro Trigger Deadzone:** Configurable within the In-App Gyro mapping pop-up window. Assign one or more buttons to apply a dedicated Trigger Deadzone while In-App Gyro is active. Users can customize the deadzone amount, gyro pause duration after button press and release, and how long the deadzone effect remains active after release. This helps reduce unintended gyro movement caused by button presses, releases, or controller vibration.
 * **In-App Gyro Trigger Dampening:** Configurable within the In-App Gyro mapping pop-up window. Assign one or more buttons to proportionally reduce gyro sensitivity by a customizable percentage. Users can also customize how long the dampening effect remains active after the assigned button is released, allowing smoother control during aiming, steering, or other gyro-based actions.
 * **In-app Gyro Lock:** A dedicated mapping option to pause gyro control while remaining in In-app Gyro mode, supporting both Hold and Tap activation logic.
-* **Gyro Data Passthrough:**
-  * **9-Axis Assist:** Integrated the 9-axis IMU fusion bias correction directly into the raw sensor reading pipeline. Using the magnetometer to continuously correct yaw drift for passthrough gyro data.
+* **Gyro Pass-through:**
+  * **9-Axis Assist:** Integrated the 9-axis IMU fusion bias correction directly into the raw sensor reading pipeline. Using the magnetometer to continuously correct yaw drift for pass-through gyro data.
   * **Horizon Lock:** Added a toggle switch to apply horizon lock to passthrough gyro data. When enabled, it applies roll compensation and maintains the horizontal level. It disables roll data passthrough in this mode, eliminating off-axis cursor drift, roll crosstalk, and gimbal lock.
   * **Adjustable Soft Deadzone Sliders:** Dedicated sliders for adjusting soft deadzone values for both In-App Gyro and Passthrough gyro data. Soft deadzone subtracts the active deadzone value from the input magnitude, ensuring output begins smoothly from 0.0 right at the threshold boundary and eliminating step-jump discontinuities.
-* **Gyro Calibration:** **Calibrate Gyro** button for calculate and permanently save sensor bias, eliminating gyro drift.
+* **Gyro Calibration:** **Calibrate Gyro** button to calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
 * **Dual Joy-con Gyro (DJG):** Introduced a gyro fusion system that combines motion data from both Left and Right Joy-cons when used as a merged pair for stutter-free aiming when ratcheting. This system designates a "Dominant" side for spatial orientation and uses the "Sub" side as an accelerator for larger movements. A magnitude threshold of 30 is applied to the sub side. It contributes to acceleration only when the dominant side exceeds this threshold. Sub side acceleration is strictly capped to a maximum of 2x the dominant movement, and its opposite directional movement will be ignored. When the dominant side's gyro is turned off, the sub side takes over control.
-  * Navigate to the Dual Joy-con Gyro (DJG) panel.
+  * Navigate to the Dual Joy-Con Gyro (DJG) panel.
   * Click the DJG toggle to ON to enable the fusion engine.
   * Set the Dominant Side to Left or Right. The dominant side acts as the primary reference for direction and gravity, while the sub side provides acceleration.
 * **DJG Trigger Mapping:** Added a dedicated "DJG" option to the Extra Button Mapping settings.
   * Assign the "DJG" action to any available extra button to serve as the hardware trigger for DJG features.
   * Pressing this mapped button during gameplay will execute the action defined by the current DJG Control Mode and DJG Activation settings.
 * **DJG Control Modes:** Three modes to dictate how the mapped DJG trigger button behaves during gameplay.
-  * Single Side Toggle: Toggle the gyro tracking of a single Joy-con on or off independently.
+  * Single Side Toggle: Toggle the gyro tracking of a single Joy-Con on or off independently.
   * Switch Dominant Side: Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced to be active upon switching.
-  * Switch Gyro Side: Turn off the current gyro and activate the opposite Joy-con's gyro exclusively. The Dominant Side setting syncs automatically.
+  * Switch Gyro Side: Turn off the current gyro and activate the opposite Joy-Con's gyro exclusively. The Dominant Side setting syncs automatically.
+  * Direct Merge: Combine motion input from both Joy-Cons directly without Dominant/Sub role switching.
 * **DJG Activation Types: Trigger behavior options to support different input styles.
   * Toggle: Switch the DJG state once per button press.
   * Hold: Switch the DJG state when the button is pressed, and revert to the original state when the button is released.
@@ -84,7 +86,7 @@ Rumble Delay Configuration: Implemented a customizable rumble delay setting in 
     * Strength 5 and Frequency 10 emulates the feel of a DualSense Edge controller.
     * Strength 10 and Frequency 10 emulates the rumble of an Xbox Elite Series 1 Controller.
   * Switch Mode: Mimics the native Switch HD Rumble (LRA) experience. It bypasses custom frequency scaling and masking, routing raw frequency data directly to the controller for a tighter, softer, and more detailed tactile feedback. Best suited for native Nintendo game emulations.
-* **Interactive Controller Identification:** Added a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-con belongs to which player in a multiplayer setup.
+* **Interactive Controller Identification:** Added a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-Con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Added rumble feedback (including a connection confirmation rumble) and mapped the Capture button to native Windows screenshots (`Win + PrtScn`).
 * **One-Click Disconnect:** Added a convenient 'X' button to the top right of each connected controller's UI block. You can now manually disconnect specific controllers directly from the interface without needing to power them off physically.
 * **Auto-Disconnect Options:** Added a 3-way Auto-Disconnect toggle (OFF, Inactive, Absolute).
@@ -94,7 +96,7 @@ Rumble Delay Configuration: Implemented a customizable rumble delay setting in 
 * **Run at Startup:** Added a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
 * **Hide to system tray:** Added the ability to minimize the application to the Windows system tray.
-* **Controller UI Navigation:** Implemented UI navigation using the left joystick or D-pad. The currently selected UI element is indicated by a white outline. The outline automatically hides upon detecting mouse clicks anywhere within the application or pressing B button on the controller.
+* **Controller UI Navigation:** Implemented UI navigation using the left joystick or D-pad. The currently selected UI element is indicated by a white outline. The outline automatically hides upon detecting mouse clicks anywhere within the application or pressing the B button on the controller.
   * UI Component Interaction: Added controller support for interacting with UI elements. Pressing the 'A' button clicks buttons or opens dropdown menus, while the 'B' button closes open dropdown menus without applying changes.
   * Slider and Time Input Adjustment: Enabled adjustment of sliders and auto-disconnect time input fields using the right joystick. Alternatively, holding the 'A' button while using the left joystick modifies the values without triggering spatial navigation.
 * **Window Position Persistence:** The application now saves and restores the window's position on the screen.
