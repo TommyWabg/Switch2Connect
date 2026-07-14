@@ -112,6 +112,42 @@ CONTROLER_NAMES = {
 
 _gc_debug_counter = 0
 
+_GCN_ABXY_LAYOUTS = {
+    # Values are internal Switch button names for physical GCN (A, B, X, Y).
+    ("xbox", "Xbox"): ("A", "X", "B", "Y"),
+    ("xbox", "Switch"): ("A", "B", "X", "Y"),
+    ("ps", "Xbox"): ("B", "Y", "A", "X"),
+    ("ps", "Switch"): ("B", "A", "Y", "X"),
+    ("switch", "Xbox"): ("B", "Y", "A", "X"),
+    ("switch", "Switch"): ("A", "B", "X", "Y"),
+}
+
+
+def _gcn_emu_group(simulation_mode):
+    if simulation_mode in ("Switch1", "Switch2"):
+        return "switch"
+    if simulation_mode in ("PS4", "PS5"):
+        return "ps"
+    return "xbox"
+
+
+def _gcn_abxy_bits(
+    raw_right_pressed,
+    raw_down_pressed,
+    raw_up_pressed,
+    raw_left_pressed,
+    simulation_mode,
+    abxy_mode,
+):
+    layout = "Switch" if abxy_mode == "Switch" else "Xbox"
+    targets = _GCN_ABXY_LAYOUTS[(_gcn_emu_group(simulation_mode), layout)]
+    pressed = (raw_right_pressed, raw_down_pressed, raw_up_pressed, raw_left_pressed)
+    buttons = 0
+    for is_pressed, target in zip(pressed, targets):
+        if is_pressed:
+            buttons |= SWITCH_BUTTONS[target]
+    return buttons
+
 
 def _hf_mask_at_strength5(hf_mapped, is_pro):
     """High-frequency dynamic mask at Strength=5 (PS5 Emu Mode / Xbox Rumble curve).
@@ -3191,25 +3227,19 @@ class Controller:
                 if raw_up_pressed:    inputData.buttons |= 0x02
                 if raw_left_pressed:  inputData.buttons |= 0x01
 
-            # NSO GameCube Controller: apply the requested GCN layout directly
-            # so Xbox/Switch layout mode is consistent across every emulation mode.
-            # raw_right=GCN A, raw_down=GCN B, raw_up=GCN X, raw_left=GCN Y.
-            # Desired Switch Layout: GCN A?ro B, GCN B?ro Y, GCN X?ro A, GCN Y?ro X
+            # NSO GameCube Controller: raw_right=A, raw_down=B, raw_up=X, raw_left=Y.
+            # Convert to the internal Switch button bits expected by each emu backend.
             if (getattr(self, 'controller_info', None) and
                     getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID):
                 inputData.buttons &= ~0x0F
-                if abxy_mode == "Xbox":
-                    # Letter-matched: GCN A->A, B->X, X->B, Y->Y.
-                    if raw_right_pressed: inputData.buttons |= 0x08
-                    if raw_down_pressed:  inputData.buttons |= 0x02
-                    if raw_up_pressed:    inputData.buttons |= 0x04
-                    if raw_left_pressed:  inputData.buttons |= 0x01
-                else:
-                    # Switch layout: positional match.
-                    if raw_right_pressed: inputData.buttons |= 0x08
-                    if raw_down_pressed:  inputData.buttons |= 0x04
-                    if raw_up_pressed:    inputData.buttons |= 0x02
-                    if raw_left_pressed:  inputData.buttons |= 0x01
+                inputData.buttons |= _gcn_abxy_bits(
+                    raw_right_pressed,
+                    raw_down_pressed,
+                    raw_up_pressed,
+                    raw_left_pressed,
+                    getattr(CONFIG, "simulation_mode", "PS5"),
+                    abxy_mode,
+                )
 
             inputData.buttons |= getattr(inputData, 'custom_buttons_mask', 0)
 
