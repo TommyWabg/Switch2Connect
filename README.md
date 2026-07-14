@@ -55,7 +55,7 @@ Cemuhook Gyro Sensitivity Adjustment: Added a Sensitivity slider (levels 1-5) t
   * Switch Dominant Side: Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced to be active upon switching.
   * Switch Gyro Side: Turn off the current gyro and activate the opposite Joy-Con's gyro exclusively. The Dominant Side setting syncs automatically.
   * Direct Merge: Combine motion input from both Joy-Cons directly without Dominant/Sub role switching.
-* **DJG Activation Types: Trigger behavior options to support different input styles.
+* **DJG Activation Types:** Trigger behavior options to support different input styles.
   * Toggle: Switch the DJG state once per button press.
   * Hold: Switch the DJG state when the button is pressed, and revert to the original state when the button is released.
 * **Full Controller Remappability:** All buttons (including extra buttons like GL, GR, SL_L, SL_R, SR_L, SR_R, NSO GCN L/R Analog Trigger Click, Home, Capture, and Chat) can be fully remapped to Switch inputs, PlayStation inputs, In-app controls, Windows controls, mouse clicks, or recorded custom input. Joysticks can also be remapped to L/R Joystick, WASD, mouse controls, or custom inputs. The mapping interface features a categorized pop-up window to streamline the selection process.
