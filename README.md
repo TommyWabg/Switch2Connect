@@ -148,5 +148,15 @@ If you are highly satisfied when gaming with this app, please consider leaving a
 
 Happy gaming, and thank you for your generous support!
 
-##
+## Credit
 **This project is developed based on and has been extensively modified from [Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers). I would like to thank the original author for her foundational work.**
+* **[Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers):** The core foundation of this project.
+* **[TheFrano/joycon2py](https://github.com/TheFrano/joycon2py), [german77/JoyconDriver](https://github.com/german77/JoyconDriver), [darthcloud/BlueRetro](https://github.com/darthcloud/BlueRetro/issues/1249):** The script and reverse-engineering information that the original switch2-controllers project was based on.
+* **[nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus), [lurebat/WinUHid](https://github.com/lurebat/WinUHid), [dorssel/usbipd-win](https://github.com/dorssel/usbipd-win):** The drivers for virtual controller emulations.
+* **[ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research):** Reverse-engineering for virtual Switch 2 Pro Controller emulation and real wired Switch 2 Pro Controller input translation.
+* **[dekuNukem/Nintendo_Switch_Reverse_Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering):** Reverse-engineering for Switch 1 Pro Controller and Joy-Cons emulation.
+* **[mart1nro/joycontrol](https://github.com/mart1nro/joycontrol):** Reference for Switch 1 Pro Controller and Joy-Cons emulation.
+* **[LeonChrome/XinHeLianSheng-Pro2-Bridge](https://github.com/LeonChrome/XinHeLianSheng-Pro2-Bridge):** Inspiration for the ESP32-S3 N16R8 implementation. Also a reference for DualSense audio haptics.
+* **[SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge):** Main reference for DualSense audio endpoint HID descriptor.
+* **[JibbSmart/JoyShockLibrary](https://github.com/JibbSmart/JoyShockLibrary):** Reference for Switch 1 Joy-Cons gyro direction.
+* **[RyanCopley/NSO-GameCube-Controller-Pairing-App](https://github.com/RyanCopley/NSO-GameCube-Controller-Pairing-App):** Reference for all NSO GameCube Controller related features. Also a reference for BLE throughput optimized mode.
