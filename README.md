@@ -120,9 +120,9 @@ Rumble Delay Configuration: Implemented a customizable rumble delay setting in 
 
 * **Operating System:** Windows 10 (22H2 or above) or Windows 11.
     * *Note:* **Windows 11 is highly recommended** for the best experience. It supports a maximum Bluetooth LE polling rate of **70Hz**, while Windows 10 is limited to **20Hz** due to the lack of OS driver support for the BLE protocol.
-* **Bluetooth Hardware:** Bluetooth 5.0 or above is required for stable connectivity and low-latency performance.
-* **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for virtual gamepad emulation (supporting Xbox, PS4, and PS5/DualSense emulation). For the Switch2 emulation mode, the open-source [usbip-win2 driver](https://github.com/czgdp1807/usbip-win2) is required and used.
-    * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid or USBIP) is missing and guide you through a one-click installation (requires administrator privileges).
+* **Bluetooth Hardware:** Bluetooth 5.0 or above is required for stable connectivity and low-latency performance. The optional ESP32-S3 N16R8 is highly recommended for reaching 133Hz, bringing the native Switch 2 console experience to PC.
+* **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for Xbox One, PS4, and PS5/DualSense controller emulation. [nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus) is required for Xbox360 and PS4 controller emulation. [usbip-win2 driver](https://github.com/czgdp1807/usbip-win2) is required for Switch 1 Joy-Cons/Pro Controller, Switch 2 Pro Controller, and PS5/DualSense (with audio haptics) controller emulation.
+    * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid, ViGEmBus, or USBIP) is missing and guide you through a one-click installation (requires administrator privileges) or open the download link for ViGEmBus.
 
 ### ESP32-S3 N16R8
 
