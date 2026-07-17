@@ -625,17 +625,22 @@ class VX360Gamepad:
         # val is 0-255. WinUHid XOne expects 10-bit RightTrigger (0-1023).
         self.report.RightTrigger = int(val * 1023 / 255)
 
+    @staticmethod
+    def _axis_float_to_ushort(val):
+        val = max(-1.0, min(1.0, float(val)))
+        return int((val + 1.0) * 32767.5)
+
     def left_joystick_float(self, x, y):
         # x, y are floats (-1.0 to 1.0)
         # WinUHid XOne expects USHORT (0 to 65535, 32768 is center)
-        self.report.LeftStickX = int((x + 1.0) * 32767.5)
-        self.report.LeftStickY = int((y + 1.0) * 32767.5)
+        self.report.LeftStickX = self._axis_float_to_ushort(x)
+        self.report.LeftStickY = self._axis_float_to_ushort(y)
 
     def right_joystick_float(self, x, y):
         # x, y are floats (-1.0 to 1.0)
         # WinUHid XOne expects USHORT (0 to 65535, 32768 is center)
-        self.report.RightStickX = int((x + 1.0) * 32767.5)
-        self.report.RightStickY = int((y + 1.0) * 32767.5)
+        self.report.RightStickX = self._axis_float_to_ushort(x)
+        self.report.RightStickY = self._axis_float_to_ushort(y)
 
     def set_buttons(self, buttons_mask):
         # Map XInput buttons flags to WINUHID_XONE_INPUT_REPORT bitfields

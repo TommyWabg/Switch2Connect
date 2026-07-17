@@ -479,6 +479,13 @@ class VirtualController:
             max(-1.0, min(1.0, stick[1])),
         )
 
+    def _clamp_stick_magnitude(self, stick):
+        x, y = stick
+        mag = (x * x + y * y) ** 0.5
+        if mag > 1.0:
+            return x / mag, y / mag
+        return self._clamp_stick_pair((x, y))
+
     def _is_djg_direct_merge(self):
         return bool(
             getattr(CONFIG, "djg_enabled", False) and
@@ -2006,7 +2013,7 @@ class VirtualController:
                     else:
                         rx = inputData.right_stick[0] + gyro_rs[0]
                         ry = inputData.right_stick[1] + gyro_rs[1]
-                        inputData.right_stick = (rx, ry)
+                        inputData.right_stick = self._clamp_stick_magnitude((rx, ry))
 
             if len(self.controllers) == 1 and self.mode != "Switch1":
                 custom_btns = getattr(inputData, 'custom_buttons_mask', 0)
@@ -2563,14 +2570,10 @@ class VirtualController:
     def _add_gyro_rstick_overlay(self, rx, ry, inputData):
         gx, gy = getattr(inputData, "gyro_rstick_overlay", (0.0, 0.0))
         if gx == 0.0 and gy == 0.0:
-            return rx, ry
+            return self._clamp_stick_pair((rx, ry))
         rx += gx
         ry += gy
-        mag = (rx * rx + ry * ry) ** 0.5
-        if mag > 1.0:
-            rx /= mag
-            ry /= mag
-        return rx, ry
+        return self._clamp_stick_magnitude((rx, ry))
 
     def update_as_ps4(self, inputData: ControllerInputData, buttons: int, controller: Controller):
 
@@ -3124,57 +3127,58 @@ class VirtualController:
                 ):
                     mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
                     self.last_xb_lx = mixed_left[0]
-                    self.last_xb_ly = -mixed_left[1]
+                    self.last_xb_ly = mixed_left[1]
                     self.last_xb_rx = mixed_right[0]
-                    self.last_xb_ry = -mixed_right[1]
+                    self.last_xb_ry = mixed_right[1]
                 elif custom_stick_route:
                     self.last_xb_lx = inputData.left_stick[0]
-                    self.last_xb_ly = -inputData.left_stick[1]
+                    self.last_xb_ly = inputData.left_stick[1]
                     self.last_xb_rx = inputData.right_stick[0]
-                    self.last_xb_ry = -inputData.right_stick[1]
+                    self.last_xb_ry = inputData.right_stick[1]
                 elif controller.is_joycon_right():
                     if self.hold_mode == "Vertical":
                         self.last_xb_rx = inputData.right_stick[0]
-                        self.last_xb_ry = -inputData.right_stick[1]
+                        self.last_xb_ry = inputData.right_stick[1]
                         self.last_xb_lx = 0.0; self.last_xb_ly = 0.0
                     else:
                         self.last_xb_lx = inputData.right_stick[0]
-                        self.last_xb_ly = -inputData.right_stick[1]
+                        self.last_xb_ly = inputData.right_stick[1]
                         self.last_xb_rx = 0.0
                         self.last_xb_ry = 0.0
                 else:
                     self.last_xb_lx = inputData.left_stick[0]
-                    self.last_xb_ly = -inputData.left_stick[1]
+                    self.last_xb_ly = inputData.left_stick[1]
                     self.last_xb_rx = inputData.right_stick[0]
-                    self.last_xb_ry = -inputData.right_stick[1]
+                    self.last_xb_ry = inputData.right_stick[1]
             else:
                 mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
                 self.last_xb_lx = mixed_left[0]
-                self.last_xb_ly = -mixed_left[1]
+                self.last_xb_ly = mixed_left[1]
                 self.last_xb_rx = mixed_right[0]
-                self.last_xb_ry = -mixed_right[1]
+                self.last_xb_ry = mixed_right[1]
 
-            rx_float, ry_float = self._add_gyro_rstick_overlay(self.last_xb_rx, -self.last_xb_ry, inputData)
+            rx_float, ry_float = self._add_gyro_rstick_overlay(self.last_xb_rx, self.last_xb_ry, inputData)
             self.last_xb_rx = rx_float
-            self.last_xb_ry = -ry_float
+            self.last_xb_ry = ry_float
 
             if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
                 self.last_xb_lx = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
+                self.last_xb_lx = max(-1.0, min(1.0, self.last_xb_lx))
 
             # Phase 3: Final Reporting
             if self.driver_type == "ViGEmBus":
                 self.vg_controller.report.wButtons = xb_btns
                 self.vg_controller.left_trigger(lt)
                 self.vg_controller.right_trigger(rt)
-                self.vg_controller.left_joystick_float(self.last_xb_lx, -self.last_xb_ly)
-                self.vg_controller.right_joystick_float(self.last_xb_rx, -self.last_xb_ry)
+                self.vg_controller.left_joystick_float(self.last_xb_lx, self.last_xb_ly)
+                self.vg_controller.right_joystick_float(self.last_xb_rx, self.last_xb_ry)
                 self.vg_controller.update()
             else:
                 self.vg_controller.set_buttons(xb_btns)
                 self.vg_controller.left_trigger(lt)
                 self.vg_controller.right_trigger(rt)
-                self.vg_controller.left_joystick_float(self.last_xb_lx, self.last_xb_ly)
-                self.vg_controller.right_joystick_float(self.last_xb_rx, self.last_xb_ry)
+                self.vg_controller.left_joystick_float(self.last_xb_lx, -self.last_xb_ly)
+                self.vg_controller.right_joystick_float(self.last_xb_rx, -self.last_xb_ry)
                 self.vg_controller.update()
 
     def is_single(self): 
