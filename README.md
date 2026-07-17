@@ -1,6 +1,20 @@
-# <img width="30" height="30" alt="icon" src="https://github.com/user-attachments/assets/a2b3be7e-851d-4c55-8803-3de00a85eaeb" /> Switch 2 Connect
-
-The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem. 
+# Switch 2 Connect
+### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
+<p align="center">
+ <img width="200" alt="icon" src="https://github.com/user-attachments/assets/a2b3be7e-851d-4c55-8803-3de00a85eaeb" />
+</p>
+<p align="center">
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?include_prereleases&style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases" alt="Contributors"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" /></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
+  <br>
+  <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
+</p>
+<p align="center">
+  <a href="https://ko-fi.com/tagayama">
+    <img width="200" src="https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_blue.png?_gl=1*11x4vbv*_gcl_au*MTAzOTY3NTA1Ni4xNzgyODE2Nzkx*_ga*MTQ5NTE2MDk5MC4xNzgyODE2Nzky*_ga_M13FZ7VQ2C*czE3ODQyNzMyMzQkbzQyJGcxJHQxNzg0Mjc0NDk4JGo2MCRsMCRoMA.." alt="ko-fi">
+  </a>
+</p>
 
 ## Quick Start
 
@@ -110,6 +124,24 @@ Rumble Delay Configuration: Implemented a customizable rumble delay setting in 
 * **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for virtual gamepad emulation (supporting Xbox, PS4, and PS5/DualSense emulation). For the Switch2 emulation mode, the open-source [usbip-win2 driver](https://github.com/czgdp1807/usbip-win2) is required and used.
     * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid or USBIP) is missing and guide you through a one-click installation (requires administrator privileges).
 
+### ESP32-S3 N16R8
+
+<img width="447" height="235" alt="ESP32-S3 N16R8 Guide" src="https://github.com/user-attachments/assets/6bb295fb-bc2c-4cb4-b859-ead65429ee64" />
+
+* **ESP32-S3 N16R8 Firmware Installation Guide:**
+
+1.  Hold the boot button on the ESP32-S3 N16R8 board.
+2.  Plug in the ESP32-S3 N16R8 board's OTG  port via USB-C to the PC while holding the boot button.
+3.  In the app, click the **[ESP32-S3 N16R8 Driver]** button.
+4.  Click click **[Install]** and wait until finish installing.
+5.  Unplug and plug the ESP32-S3 N16R8 board.
+6.  Reconnect any controllers previously paired via the system BLE by pressing SYNC.
+
+* **ESP32-S3 N16R8 Buying Guide:**
+1.  Search for development boards strictly labeled as **ESP32-S3 N16R8**. This ensures the board contains 16MB Flash and 8MB PSRAM, which is necessary for handling complex tasks and controller connections. Avoid any boards labeled as "N8R2", "N8R8", or standard "ESP32".
+2.  Select the **ESP32-S3-WROOM-1** version if you want a built-in PCB antenna. This is the recommended, plug-and-play choice for standard plastic enclosures. Only choose the ESP32-S3-WROOM-1U version if you are using a metal case or require an external antenna to extend the Bluetooth/Wi-Fi range.
+3.  Verify that the board features an **OTG USB port** (often a dual USB-C design). The OTG port is strictly required for data transfer and firmware installation.
+
 ## Important Setting for Steam Users:
 Because this app emulates both Xbox One and PS4/PS5 controllers, Steam Input might try to "help" by applying its own layout overrides, which can double-swap your buttons and mess up your in-game controls! 
 **To ensure your layout stays consistent:**
@@ -140,11 +172,11 @@ Built with a user-experience-first mindset, this project has reached a mature an
 
 If you are highly satisfied when gaming with this app, please consider leaving a tip. Any financial "thank you" is incredibly appreciated!
 
-<div align="left">
+<p align="left">
   <a href="https://ko-fi.com/tagayama">
-    <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi">
+    <img width="200" src="https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_blue.png?_gl=1*11x4vbv*_gcl_au*MTAzOTY3NTA1Ni4xNzgyODE2Nzkx*_ga*MTQ5NTE2MDk5MC4xNzgyODE2Nzky*_ga_M13FZ7VQ2C*czE3ODQyNzMyMzQkbzQyJGcxJHQxNzg0Mjc0NDk4JGo2MCRsMCRoMA.." alt="ko-fi">
   </a>
-</div>
+</p>
 
 Happy gaming, and thank you for your generous support!
 
