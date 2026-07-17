@@ -116,6 +116,14 @@ Rumble Delay Configuration: Implemented a customizable rumble delay setting in 
 * **Window Position Persistence:** The application saves and restores the window's position on the screen.
 * **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
 
+## Known Limitations
+
+* **Amiibo Support:** Amiibo support is not implemented.
+* **Switch 2 Pro Controller Audio:** Wireless audio transmission for the Switch 2 Pro Controller headphone jack and microphone is not supported.
+* **NSO GameCube Controller Gyro:** Gyro data from the NSO GameCube Controller cannot be decoded correctly.
+* **NSO GameCube Controller Rumble Brake:** The Rumble Motor Brake command is not known, so PWM-based rumble strength control cannot be implemented correctly. Only basic rumble motor on/off control is currently implemented.
+* **Switch 2 Joy-Con Charging Grip Back Buttons:** Back buttons on the Switch 2 Joy-Con Charging Grip are not supported.
+
 ## System Requirements
 
 * **Operating System:** Windows 10 (22H2 or above) or Windows 11.
