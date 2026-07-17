@@ -12,7 +12,7 @@
 </p>
 <p align="center">
   <a href="https://ko-fi.com/tagayama">
-    <img width="200" src="https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_blue.png?_gl=1*11x4vbv*_gcl_au*MTAzOTY3NTA1Ni4xNzgyODE2Nzkx*_ga*MTQ5NTE2MDk5MC4xNzgyODE2Nzky*_ga_M13FZ7VQ2C*czE3ODQyNzMyMzQkbzQyJGcxJHQxNzg0Mjc0NDk4JGo2MCRsMCRoMA.." alt="ko-fi">
+    <img width="200" src="https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_beige.png?_gl=1*1ndc5yc*_gcl_au*MTAzOTY3NTA1Ni4xNzgyODE2Nzkx*_ga*MTQ5NTE2MDk5MC4xNzgyODE2Nzky*_ga_M13FZ7VQ2C*czE3ODQzMDg3NDckbzQ0JGcxJHQxNzg0MzA5NTQxJGo1OSRsMCRoMA.." alt="ko-fi">
   </a>
 </p>
 
@@ -182,7 +182,7 @@ If you are highly satisfied when gaming with this app, please consider leaving a
 
 <p align="left">
   <a href="https://ko-fi.com/tagayama">
-    <img width="200" src="https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_blue.png?_gl=1*11x4vbv*_gcl_au*MTAzOTY3NTA1Ni4xNzgyODE2Nzkx*_ga*MTQ5NTE2MDk5MC4xNzgyODE2Nzky*_ga_M13FZ7VQ2C*czE3ODQyNzMyMzQkbzQyJGcxJHQxNzg0Mjc0NDk4JGo2MCRsMCRoMA.." alt="ko-fi">
+    <img width="200" src="https://storage.ko-fi.com/cdn/brandasset/v2/support_me_on_kofi_beige.png?_gl=1*1ndc5yc*_gcl_au*MTAzOTY3NTA1Ni4xNzgyODE2Nzkx*_ga*MTQ5NTE2MDk5MC4xNzgyODE2Nzky*_ga_M13FZ7VQ2C*czE3ODQzMDg3NDckbzQ0JGcxJHQxNzg0MzA5NTQxJGo1OSRsMCRoMA.." alt="ko-fi">
   </a>
 </p>
 
