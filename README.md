@@ -4,7 +4,7 @@
  <a href="https://github.com/TommyWabg/Switch2Connect/releases/download/v1.0/Switch2Connect_v1.0.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
 <p align="center">
-  <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?include_prereleases&style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/releases/download/v1.0/Switch2Connect_v1.0.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
   <br>
