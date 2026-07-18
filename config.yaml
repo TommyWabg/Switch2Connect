@@ -183,7 +183,7 @@ merged_gyro_side:
   E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
   enabled: true
-  ir_activate_threshold: 1
+  ir_activate_threshold: 2
   sensitivity: 4.0
 open_when_startup: false
 profile_defaults:
@@ -199,6 +199,9 @@ profile_defaults:
   gyro_mode: World
   gyro_passthrough_mode: Default
   gyro_sensitivity: 4.0
+  impulse_trigger_dynamic_frequency: true
+  impulse_trigger_enabled: true
+  impulse_trigger_frequency: 10
   in_app_gyro_soft_deadzone: 0.0
   r_joystick_gyro_sensitivity: 5.0
   stabilized_gyro: true
@@ -223,6 +226,9 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    impulse_trigger_dynamic_frequency: true
+    impulse_trigger_enabled: true
+    impulse_trigger_frequency: 10
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -441,6 +447,15 @@ profiles:
       gc_r_click_mapping: Default
       gc_trigger_mode: Hair Trigger
       gl_mapping: PS_L_Touch
+      gr_in_app_gyro_dampening_amount_mapping: 90
+      gr_in_app_gyro_dampening_effect_after_released_ms_mapping: 200
+      gr_in_app_gyro_dampening_mode_mapping: 'Off'
+      gr_in_app_gyro_deadzone_amount_mapping: 15.0
+      gr_in_app_gyro_deadzone_effect_after_released_ms_mapping: 200
+      gr_in_app_gyro_deadzone_mode_mapping: []
+      gr_in_app_gyro_deadzone_pause_after_pressed_ms_mapping: 100
+      gr_in_app_gyro_deadzone_pause_after_released_ms_mapping: 100
+      gr_in_app_gyro_simul_mapping: None
       gr_mapping: PS_R_Touch
       home_mapping: Default
       in_app_gyro_mode_mappings:
@@ -858,6 +873,9 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    impulse_trigger_dynamic_frequency: true
+    impulse_trigger_enabled: true
+    impulse_trigger_frequency: 10
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -1494,6 +1512,9 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    impulse_trigger_dynamic_frequency: true
+    impulse_trigger_enabled: true
+    impulse_trigger_frequency: 10
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -2126,6 +2147,9 @@ profiles:
     gyro_mode: World
     gyro_passthrough_mode: Default
     gyro_sensitivity: 4.0
+    impulse_trigger_dynamic_frequency: true
+    impulse_trigger_enabled: true
+    impulse_trigger_frequency: 10
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -2772,8 +2796,8 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1249
-window_y: 65
+window_x: 1234
+window_y: 69
 winuhid_sim_mode: PS5
 wired_auto_scan_enabled: true
 wired_usb_enabled: true
