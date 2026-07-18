@@ -60,6 +60,48 @@ from dualsense_haptic import DualSenseHapticProcessor
 logger = logging.getLogger(__name__)
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
+# Xbox One impulse-trigger calibration.  The frame carries the linear base
+# amplitude; controller.py applies the shared Xbox HF dynamic mask exactly once
+# at the physical-output stage, where the target controller type is known.
+IMPULSE_RAW_MAX = 100
+IMPULSE_HF_AMP_MAX = 1023
+IMPULSE_HF_FREQ_LOW = 300
+IMPULSE_HF_FREQ_HIGH = 481
+IMPULSE_RAW_LOW = 30
+IMPULSE_RAW_HIGH = 100
+
+def _round_half_up_ratio(numerator, denominator):
+    return (numerator + denominator // 2) // denominator
+
+def _impulse_fixed_hf_frequency(setting):
+    """Maps the 1..10 fixed-frequency setting into the 300..481 HF range."""
+    setting = max(1, min(10, int(setting)))
+    return _round_half_up_ratio(
+        IMPULSE_HF_FREQ_LOW * 9
+        + (setting - 1) * (IMPULSE_HF_FREQ_HIGH - IMPULSE_HF_FREQ_LOW),
+        9)
+
+
+def _map_xbox_impulse_trigger(raw, dynamic_frequency=True, fixed_frequency=10):
+    """Maps a WinUHid impulse percentage to a linear, pre-mask HF frame."""
+    raw = max(0, min(IMPULSE_RAW_MAX, int(raw)))
+    if raw == 0:
+        return _zero_vibration()
+
+    hf_amp = _round_half_up_ratio(IMPULSE_HF_AMP_MAX * raw, IMPULSE_RAW_HIGH)
+    if dynamic_frequency:
+        freq_numerator = (
+            IMPULSE_HF_FREQ_LOW * (IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
+            + (raw - IMPULSE_RAW_LOW)
+              * (IMPULSE_HF_FREQ_HIGH - IMPULSE_HF_FREQ_LOW)
+        )
+        hf_freq = _round_half_up_ratio(
+            freq_numerator, IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
+    else:
+        hf_freq = _impulse_fixed_hf_frequency(fixed_frequency)
+    hf_freq = max(1, min(511, hf_freq))
+    return VibrationData(lf_amp=0, hf_amp=hf_amp, hf_freq=hf_freq)
+
 def _copy_vibration(v) -> VibrationData:
     return VibrationData(
         lf_freq=v.lf_freq, lf_amp=v.lf_amp, lf_en_tone=getattr(v, 'lf_en_tone', False),
@@ -268,6 +310,17 @@ class VirtualController:
         
         # Thread-safe target vibration state, change event, and task reference
         self.vibration_lock = threading.Lock()
+        # Xbox impulse triggers are a latest-state overlay, never part of the
+        # ordinary mono rumble buffers.
+        self.xbox_impulse_raw_l = 0
+        self.xbox_impulse_raw_r = 0
+        self.xbox_impulse_sequence = 0
+        self.xbox_impulse_stop_sequence = 0
+        self.xbox_impulse_sequence_l = 0
+        self.xbox_impulse_sequence_r = 0
+        self.xbox_impulse_stop_sequence_l = 0
+        self.xbox_impulse_stop_sequence_r = 0
+        self._xbox_feedback_generation = 0
         self.target_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
         self.target_vibration_r = VibrationData(lf_amp=0, hf_amp=0)
         self.latest_vibration_l = VibrationData(lf_amp=0, hf_amp=0)
@@ -1219,7 +1272,13 @@ class VirtualController:
                 self.driver_type = "WinUHid"
 
             if self.vg_controller is not None and self.mode != "Switch1":
-                self.vg_controller.register_notification(callback_function=self.vibration_callback)
+                if (self.mode == "Xbox One"
+                        and self.driver_type == "WinUHid"
+                        and hasattr(self.vg_controller, 'register_force_feedback_notification')):
+                    self.vg_controller.register_force_feedback_notification(
+                        self.xbox_force_feedback_callback)
+                else:
+                    self.vg_controller.register_notification(callback_function=self.vibration_callback)
             time.sleep(0.5)
 
         self.previous_buttons_left = 0x00000000
@@ -1241,6 +1300,9 @@ class VirtualController:
 
     def set_mode(self, new_mode):
         if self.mode != new_mode:
+            # A mode change must not leave a previously active Xbox trigger
+            # motor latched in the physical-controller output path.
+            self.clear_xbox_impulse_triggers()
             self.reset_inputs()
             with self.state_lock:
                 self.mode = new_mode
@@ -1314,6 +1376,102 @@ class VirtualController:
             self.vibration_dirty_l = True
             self.vibration_dirty_r = True
             self.traditional_rumble_seq = getattr(self, 'traditional_rumble_seq', 0) + 1
+
+    def xbox_force_feedback_callback(self, large_motor, small_motor, left_trigger, right_trigger):
+        """Receives one atomic Xbox One four-motor state from WinUHid."""
+        # A delayed callback must never apply after a newer four-motor packet
+        # (or after a clear/mode change) has superseded it.
+        with self.vibration_lock:
+            self._xbox_feedback_generation += 1
+            generation = self._xbox_feedback_generation
+        delay = getattr(CONFIG, "rumble_delay_ms", 0)
+        if delay > 0:
+            threading.Timer(
+                delay / 1000.0,
+                self._xbox_force_feedback_callback_internal,
+                args=(large_motor, small_motor, left_trigger, right_trigger, generation),
+            ).start()
+        else:
+            self._xbox_force_feedback_callback_internal(
+                large_motor, small_motor, left_trigger, right_trigger, generation)
+
+    def _xbox_force_feedback_callback_internal(self, large_motor, small_motor, left_trigger, right_trigger, generation):
+        with self.vibration_lock:
+            if generation != self._xbox_feedback_generation:
+                return
+        # Reuse the ordinary path verbatim so Xbox main-motor rumble remains
+        # mono. Impulse state is stored separately below.
+        self._vibration_callback_internal(None, None, large_motor, small_motor, 0, None)
+        if getattr(CONFIG, 'impulse_trigger_enabled', True):
+            left_trigger = max(0, min(IMPULSE_RAW_MAX, int(left_trigger)))
+            right_trigger = max(0, min(IMPULSE_RAW_MAX, int(right_trigger)))
+        else:
+            # Keep ordinary main-motor rumble above intact, while ensuring a
+            # disabled feature cannot revive a stale LT/RT output state.
+            left_trigger = 0
+            right_trigger = 0
+        with self.vibration_lock:
+            previous_l = self.xbox_impulse_raw_l
+            previous_r = self.xbox_impulse_raw_r
+            if previous_l == left_trigger and previous_r == right_trigger:
+                return
+            self.xbox_impulse_raw_l = left_trigger
+            self.xbox_impulse_raw_r = right_trigger
+            self.xbox_impulse_sequence += 1
+            if previous_l != left_trigger:
+                self.xbox_impulse_sequence_l += 1
+            if previous_r != right_trigger:
+                self.xbox_impulse_sequence_r += 1
+            if previous_l > 0 and left_trigger == 0:
+                self.xbox_impulse_stop_sequence += 1
+                self.xbox_impulse_stop_sequence_l += 1
+            if previous_r > 0 and right_trigger == 0:
+                self.xbox_impulse_stop_sequence += 1
+                self.xbox_impulse_stop_sequence_r += 1
+
+    def get_xbox_impulse_state(self):
+        with self.vibration_lock:
+            return {
+                'left_active': self.xbox_impulse_raw_l > 0,
+                'right_active': self.xbox_impulse_raw_r > 0,
+                'sequence': self.xbox_impulse_sequence,
+                'stop_sequence': self.xbox_impulse_stop_sequence,
+                'sequence_l': self.xbox_impulse_sequence_l,
+                'sequence_r': self.xbox_impulse_sequence_r,
+                'stop_sequence_l': self.xbox_impulse_stop_sequence_l,
+                'stop_sequence_r': self.xbox_impulse_stop_sequence_r,
+            }
+
+    def get_current_xbox_impulse_frames(self, is_left=True):
+        with self.vibration_lock:
+            raw = self.xbox_impulse_raw_l if is_left else self.xbox_impulse_raw_r
+        if not getattr(CONFIG, 'impulse_trigger_enabled', True):
+            raw = 0
+        frame = _map_xbox_impulse_trigger(
+            raw,
+            dynamic_frequency=getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True),
+            fixed_frequency=getattr(CONFIG, 'impulse_trigger_frequency', 10))
+        return _copy_vibration(frame), _copy_vibration(frame), _copy_vibration(frame), raw == 0
+
+    def clear_xbox_impulse_triggers(self):
+        with self.vibration_lock:
+            # Invalidate a pending delayed four-motor packet before it can
+            # re-enable an impulse side after this explicit clear.
+            self._xbox_feedback_generation += 1
+            if self.xbox_impulse_raw_l == 0 and self.xbox_impulse_raw_r == 0:
+                return
+            left_was_active = self.xbox_impulse_raw_l > 0
+            right_was_active = self.xbox_impulse_raw_r > 0
+            self.xbox_impulse_raw_l = 0
+            self.xbox_impulse_raw_r = 0
+            self.xbox_impulse_sequence += 1
+            self.xbox_impulse_stop_sequence += 1
+            if left_was_active:
+                self.xbox_impulse_sequence_l += 1
+                self.xbox_impulse_stop_sequence_l += 1
+            if right_was_active:
+                self.xbox_impulse_sequence_r += 1
+                self.xbox_impulse_stop_sequence_r += 1
 
     @staticmethod
     def _audio_haptic_hold_candidate(vibration):

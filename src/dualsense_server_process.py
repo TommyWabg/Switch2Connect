@@ -57,7 +57,7 @@ def main(argv=None):
     try:
         log_dir = os.path.join(
             os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-            "Switch2Controllers",
+            "Switch 2 Connect",
         )
         os.makedirs(log_dir, exist_ok=True)
         log_handlers.append(

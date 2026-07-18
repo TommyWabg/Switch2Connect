@@ -21,6 +21,7 @@ import ctypes
 import os
 import sys
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -591,7 +592,20 @@ class VX360Gamepad:
     """Wraps WinUHid Xbox One controller to behave like VX360Gamepad from vgamepad."""
     def __init__(self):
         self.notification_callback = None
+        self.force_feedback_notification_callback = None
         self.report = WINUHID_XONE_INPUT_REPORT()
+        # Phase 1 diagnostic state.  Keep this in the Python wrapper so the
+        # existing two-motor notification contract remains byte-for-byte
+        # unchanged while we capture the Xbox One impulse-trigger values.
+        self._impulse_log_previous = (0, 0, 0, 0)
+        self._impulse_log_started_at = None
+        self._impulse_log_last_at = None
+        self._impulse_log_samples = 0
+        self._impulse_log_sequence = 0
+        self._impulse_log_peak_lt = 0
+        self._impulse_log_peak_rt = 0
+        self._impulse_log_peak_main_l = 0
+        self._impulse_log_peak_main_r = 0
         if _winuhid_devs is not None:
             _winuhid_devs.WinUHidXOneInitializeInputReport(ctypes.byref(self.report))
             self._c_rumble_cb = XONE_RUMBLE_CALLBACK(self._rumble_handler)
@@ -603,7 +617,80 @@ class VX360Gamepad:
             logger.error("WinUHidDevs DLL not loaded")
 
     def _rumble_handler(self, context, left_motor, right_motor, left_trigger, right_trigger):
-        if self.notification_callback:
+        # WinUHid XOne supplies all four motors as percentages (0-100).  Log
+        # the raw values before the legacy main-motor conversion below so the
+        # gpadtester Low/High calibration can be based on the actual Xbox
+        # impulse-trigger magnitudes.
+        main_l = int(left_motor)
+        main_r = int(right_motor)
+        impulse_l = int(left_trigger)
+        impulse_r = int(right_trigger)
+        current = (main_l, main_r, impulse_l, impulse_r)
+        impulse_active = impulse_l > 0 or impulse_r > 0
+        was_impulse_active = (
+            self._impulse_log_previous[2] > 0
+            or self._impulse_log_previous[3] > 0
+        )
+        now = time.perf_counter()
+
+        if impulse_active:
+            if not was_impulse_active:
+                self._impulse_log_started_at = now
+                self._impulse_log_last_at = None
+                self._impulse_log_samples = 0
+                self._impulse_log_peak_lt = 0
+                self._impulse_log_peak_rt = 0
+                self._impulse_log_peak_main_l = 0
+                self._impulse_log_peak_main_r = 0
+
+            self._impulse_log_samples += 1
+            self._impulse_log_peak_lt = max(self._impulse_log_peak_lt, impulse_l)
+            self._impulse_log_peak_rt = max(self._impulse_log_peak_rt, impulse_r)
+            self._impulse_log_peak_main_l = max(self._impulse_log_peak_main_l, main_l)
+            self._impulse_log_peak_main_r = max(self._impulse_log_peak_main_r, main_r)
+
+        # Emit only edge/change records. This keeps the native rumble callback
+        # lightweight while retaining every value needed to identify Low/High.
+        if impulse_active or was_impulse_active:
+            if not was_impulse_active:
+                event = "START"
+            elif not impulse_active:
+                event = "STOP"
+            elif current != self._impulse_log_previous:
+                event = "UPDATE"
+            else:
+                event = None
+
+            if event is not None:
+                self._impulse_log_sequence += 1
+                dt_ms = 0.0 if self._impulse_log_last_at is None else (now - self._impulse_log_last_at) * 1000.0
+                logger.info(
+                    "XONE-IMPULSE seq=%d dt=%.1fms main[L=%d R=%d] impulse[LT=%d RT=%d] event=%s",
+                    self._impulse_log_sequence, dt_ms, main_l, main_r,
+                    impulse_l, impulse_r, event,
+                )
+                self._impulse_log_last_at = now
+
+            if was_impulse_active and not impulse_active:
+                duration_ms = 0.0 if self._impulse_log_started_at is None else (now - self._impulse_log_started_at) * 1000.0
+                logger.info(
+                    "XONE-IMPULSE-SUMMARY duration=%.1fms samples=%d peak[LT=%d RT=%d] main_peak[L=%d R=%d]",
+                    duration_ms, self._impulse_log_samples,
+                    self._impulse_log_peak_lt, self._impulse_log_peak_rt,
+                    self._impulse_log_peak_main_l, self._impulse_log_peak_main_r,
+                )
+                self._impulse_log_started_at = None
+
+        self._impulse_log_previous = current
+
+        # Xbox-capable callers can consume all four motors atomically.  Keep
+        # the legacy two-motor callback as a fallback for existing users.
+        if self.force_feedback_notification_callback:
+            large_motor = int(left_motor * 2.55)
+            small_motor = int(right_motor * 2.55)
+            self.force_feedback_notification_callback(
+                large_motor, small_motor, impulse_l, impulse_r)
+        elif self.notification_callback:
             # WinUHid provides motor values as percentages (0-100).
             # vgamepad expects 0-255.
             # Convert percentage to 0-255.
@@ -616,6 +703,17 @@ class VX360Gamepad:
 
     def unregister_notification(self):
         self.notification_callback = None
+
+    def register_force_feedback_notification(self, callback_function):
+        """Registers an Xbox One-only, atomic four-motor callback.
+
+        Main motors retain the legacy 0-255 representation; impulse motors
+        intentionally retain the native WinUHid 0-100 percentage values.
+        """
+        self.force_feedback_notification_callback = callback_function
+
+    def unregister_force_feedback_notification(self):
+        self.force_feedback_notification_callback = None
 
     def left_trigger(self, val):
         # val is 0-255. WinUHid XOne expects 10-bit LeftTrigger (0-1023).
@@ -678,6 +776,7 @@ class VX360Gamepad:
             self.device = None
         self._c_rumble_cb = None
         self.notification_callback = None
+        self.force_feedback_notification_callback = None
 
     def __del__(self):
         self.close()

@@ -456,12 +456,21 @@ class Config:
             use_appdata = True
 
         if use_appdata:
-            appdata_dir = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'Switch2Controllers')
+            appdata_root = os.environ.get('APPDATA', os.path.expanduser('~'))
+            appdata_dir = os.path.join(appdata_root, 'Switch 2 Connect')
+            legacy_config = os.path.join(appdata_root, 'Switch2Controllers', 'config.yaml')
             os.makedirs(appdata_dir, exist_ok=True)
             self.config_file_path = os.path.join(appdata_dir, 'config.yaml')
             
             if not os.path.exists(self.config_file_path):
-                if os.path.exists(local_config):
+                if os.path.exists(legacy_config):
+                    try:
+                        import shutil
+                        shutil.copy(legacy_config, self.config_file_path)
+                        logger.info("Migrated configuration from the legacy Switch2Controllers AppData folder.")
+                    except Exception as e:
+                        logger.error(f"Failed to migrate legacy AppData config: {e}")
+                elif os.path.exists(local_config):
                     try:
                         import shutil
                         shutil.copy(local_config, self.config_file_path)
@@ -750,6 +759,9 @@ class Config:
             "djg_activation": config.get("djg_activation", "Hold"),
             "audio_haptics_enabled": config.get("audio_haptics_enabled", True),
             "adaptive_triggers_enabled": config.get("adaptive_triggers_enabled", True),
+            "impulse_trigger_enabled": config.get("impulse_trigger_enabled", True),
+            "impulse_trigger_dynamic_frequency": config.get("impulse_trigger_dynamic_frequency", True),
+            "impulse_trigger_frequency": max(1, min(10, int(config.get("impulse_trigger_frequency", 10)))),
         }
 
     def get_default_profile_settings(self):
@@ -775,6 +787,9 @@ class Config:
             "djg_activation": "Hold",
             "audio_haptics_enabled": True,
             "adaptive_triggers_enabled": True,
+            "impulse_trigger_enabled": True,
+            "impulse_trigger_dynamic_frequency": True,
+            "impulse_trigger_frequency": 10,
         }
 
     @property
@@ -993,6 +1008,38 @@ class Config:
     @adaptive_triggers_enabled.setter
     def adaptive_triggers_enabled(self, value):
         self._set_profile_setting("adaptive_triggers_enabled", bool(value))
+
+    @property
+    def impulse_trigger_enabled(self):
+        return bool(self._get_profile_setting("impulse_trigger_enabled"))
+
+    @impulse_trigger_enabled.setter
+    def impulse_trigger_enabled(self, value):
+        self._set_profile_setting("impulse_trigger_enabled", bool(value))
+
+    @property
+    def impulse_trigger_dynamic_frequency(self):
+        return bool(self._get_profile_setting("impulse_trigger_dynamic_frequency"))
+
+    @impulse_trigger_dynamic_frequency.setter
+    def impulse_trigger_dynamic_frequency(self, value):
+        self._set_profile_setting("impulse_trigger_dynamic_frequency", bool(value))
+
+    @property
+    def impulse_trigger_frequency(self):
+        try:
+            value = int(self._get_profile_setting("impulse_trigger_frequency"))
+        except (TypeError, ValueError):
+            value = 10
+        return max(1, min(10, value))
+
+    @impulse_trigger_frequency.setter
+    def impulse_trigger_frequency(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 10
+        self._set_profile_setting("impulse_trigger_frequency", max(1, min(10, value)))
 
     @property
     def djg_activation(self):

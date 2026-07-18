@@ -56,12 +56,12 @@ import win32gui
 import win32con
 from ctypes import wintypes
 
-print("Switch2Connect  Copyright (C) 2026  TommyWabg")
+print("Switch 2 Connect  Copyright (C) 2026  TommyWabg")
 print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.")
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v0.12.10"
+APP_VERSION = "v1.0.0"
 
 def _set_current_thread_priority(level):
     try:
@@ -7512,6 +7512,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.rumble_mode_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         self.audio_haptics_button = tk.Button(row_vibration, text="Audio Haptics Settings", command=lambda: self.open_audio_haptics_settings(self.audio_haptics_button), font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, activebackground=highlight_color, padx=int(10 * scaling_factor))
         self.audio_haptics_button.pack(side=tk.LEFT, padx=(int(10 * scaling_factor), 0))
+        self.impulse_trigger_button = tk.Button(row_vibration, text="Impulse Trigger Settings", command=lambda: self.open_impulse_trigger_settings(self.impulse_trigger_button), font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg=text_color, relief=tk.FLAT, bd=0, activebackground=highlight_color, padx=int(10 * scaling_factor))
         self.update_dynamic_rumble_mode_options()
 
         self.strength_label = tk.Label(row_vibration, text="Strength:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")))
@@ -7819,18 +7820,81 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.adaptive_triggers_enabled = val
             CONFIG.save_config()
 
-        row1 = tk.Frame(content_frame, bg=background_color)
-        row1.pack(fill=tk.X, pady=(0, int(15 * scaling_factor)))
-        tk.Label(row1, text="Audio Haptics:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, width=15, anchor="w").pack(side=tk.LEFT)
-        ToggleSwitch(row1, ["On", "Off"], [True, False], getattr(CONFIG, "audio_haptics_enabled", True), update_audio_haptics, background_color).pack(side=tk.RIGHT)
+        # Use a shared, natural-width grid column instead of Label.width.
+        # Label.width is character-cell based and created asymmetric visual
+        # padding with proportional bold fonts.
+        audio_label = tk.Label(content_frame, text="Audio Haptics:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        audio_label.grid(row=0, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(0, int(15 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, "audio_haptics_enabled", True), update_audio_haptics, background_color).grid(row=0, column=1, sticky=tk.W, pady=(0, int(15 * scaling_factor)))
 
-        row2 = tk.Frame(content_frame, bg=background_color)
-        row2.pack(fill=tk.X)
-        tk.Label(row2, text="Adaptive Triggers:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, width=15, anchor="w").pack(side=tk.LEFT)
-        ToggleSwitch(row2, ["On", "Off"], [True, False], getattr(CONFIG, "adaptive_triggers_enabled", True), update_adaptive_triggers, background_color).pack(side=tk.RIGHT)
+        adaptive_label = tk.Label(content_frame, text="Adaptive Triggers:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        adaptive_label.grid(row=1, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, "adaptive_triggers_enabled", True), update_adaptive_triggers, background_color).grid(row=1, column=1, sticky=tk.W)
 
         popup.update_idletasks()
         self._place_popup_within_root_bounds(popup, anchor_widget)
+        self.root.after(100, self.bind_joystick_custom_popup_outside_click)
+
+    def open_impulse_trigger_settings(self, anchor_widget):
+        if self._toggle_joystick_popup(anchor_widget):
+            return
+        popup = self._create_joystick_option_popup(anchor_widget, defer_place=True)
+
+        content_frame = tk.Frame(popup, bg=background_color)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor))
+
+        def clear_active_xbox_impulses():
+            for vc in VIRTUAL_CONTROLLERS:
+                if (vc is not None and getattr(vc, 'mode', '') == "Xbox One"
+                        and getattr(vc, 'driver_type', '') == "WinUHid"):
+                    try:
+                        vc.clear_xbox_impulse_triggers()
+                    except Exception:
+                        pass
+
+        def update_impulse_enabled(value):
+            CONFIG.impulse_trigger_enabled = value
+            CONFIG.save_config()
+            if not value:
+                clear_active_xbox_impulses()
+
+        def update_dynamic_frequency(value):
+            CONFIG.impulse_trigger_dynamic_frequency = value
+            CONFIG.save_config()
+            refresh_frequency_visibility()
+
+        def update_fixed_frequency(value):
+            CONFIG.impulse_trigger_frequency = int(float(value))
+            CONFIG.save_config()
+
+        def refresh_frequency_visibility():
+            if getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True):
+                frequency_label.grid_remove()
+                frequency_scale.grid_remove()
+            else:
+                frequency_label.grid()
+                frequency_scale.grid()
+            popup.update_idletasks()
+            self._place_popup_within_root_bounds(popup, anchor_widget)
+
+        # A shared two-column grid gives a natural-width title column: its
+        # longest label starts at the real popup padding, while all titles
+        # still share a right edge and all controls share a left edge.
+        impulse_label = tk.Label(content_frame, text="Impulse Trigger:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        impulse_label.grid(row=0, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(0, int(15 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, 'impulse_trigger_enabled', True), update_impulse_enabled, background_color).grid(row=0, column=1, sticky=tk.W, pady=(0, int(15 * scaling_factor)))
+
+        dynamic_label = tk.Label(content_frame, text="Dynamic Frequency:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        dynamic_label.grid(row=1, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)))
+        ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True), update_dynamic_frequency, background_color).grid(row=1, column=1, sticky=tk.W)
+
+        frequency_label = tk.Label(content_frame, text="Frequency:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        frequency_label.grid(row=2, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(int(15 * scaling_factor), 0))
+        frequency_scale = tk.Scale(content_frame, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=update_fixed_frequency)
+        frequency_scale.set(getattr(CONFIG, 'impulse_trigger_frequency', 10))
+        frequency_scale.grid(row=2, column=1, sticky=tk.W, pady=(int(15 * scaling_factor), 0))
+
+        refresh_frequency_visibility()
         self.root.after(100, self.bind_joystick_custom_popup_outside_click)
 
     def _prerender_settings_tabs(self):
@@ -8385,23 +8449,57 @@ bg_color=panel_bg, widths=[8, 10])
             
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
-        
         current_rumble = getattr(CONFIG, "rumble_mode", "Xbox")
-        if current_rumble == "Switch":
-            current_rumble = "PS5" # Automatically migrate name in memory
-            CONFIG.rumble_mode = "PS5"
+        is_usbip_ps5 = driver_type == "USBIP" and sim_mode == "PS5"
+        allowed_values = ["Xbox", "PS5"] if is_usbip_ps5 else ["Xbox", "Switch"]
+
+        # Rumble values are persisted per Emu Mode category.  "PS5" is only a
+        # valid alias for USBIP PS5 audio/HD rumble; converting it globally used
+        # to corrupt the Xbox category when returning to Xbox One.  Recover old
+        # corrupted Xbox/WinUHid values by mapping PS5 back to Switch instead.
+        normalized_rumble = current_rumble
+        if is_usbip_ps5 and current_rumble == "Switch":
+            normalized_rumble = "PS5"
+        elif not is_usbip_ps5 and current_rumble == "PS5":
+            normalized_rumble = "Switch"
+        elif current_rumble not in allowed_values:
+            logger.warning(
+                "Unsupported rumble mode %r for driver=%s emu_mode=%s; using %s",
+                current_rumble, driver_type, sim_mode, allowed_values[0],
+            )
+            normalized_rumble = allowed_values[0]
+
+        if normalized_rumble != current_rumble:
+            logger.info(
+                "Normalized rumble mode %s -> %s for driver=%s emu_mode=%s",
+                current_rumble, normalized_rumble, driver_type, sim_mode,
+            )
+            CONFIG.rumble_mode = normalized_rumble
             CONFIG.save_config()
+        current_rumble = normalized_rumble
+
+        # These buttons occupy the same Rumble Mode position and are mutually
+        # exclusive by the active emulation transport.
+        if hasattr(self, 'audio_haptics_button'):
+            self.audio_haptics_button.pack_forget()
+        if hasattr(self, 'impulse_trigger_button'):
+            self.impulse_trigger_button.pack_forget()
             
-        if driver_type == "USBIP" and sim_mode == "PS5":
+        if is_usbip_ps5:
             self.rumble_mode_switch.update_options(["Xbox", "PS5 / HD Rumble"], ["Xbox", "PS5"], current_rumble, widths=[8, 16])
             self.audio_haptics_button.pack(side=tk.LEFT, after=self.rumble_mode_switch, padx=(int(10 * scaling_factor), 0))
-        else:
-            if current_rumble == "PS5":
-                current_rumble = "Switch"
-                CONFIG.rumble_mode = "Switch"
-                CONFIG.save_config()
+        elif driver_type == "WinUHid" and sim_mode == "Xbox One":
             self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
-            self.audio_haptics_button.pack_forget()
+            self.impulse_trigger_button.pack(side=tk.LEFT, after=self.rumble_mode_switch, padx=(int(10 * scaling_factor), 0))
+        else:
+            self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
+
+        if hasattr(self, 'vibration_frequency_label') and hasattr(self, 'vibration_frequency_scale'):
+            self.update_rumble_mode_ui(current_rumble)
+        if hasattr(self, 'vibration_strength_scale'):
+            self.vibration_strength_scale.set(CONFIG.vibration_strength)
+        if hasattr(self, 'vibration_frequency_scale'):
+            self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
 
     def update_rumble_mode_ui(self, mode):
         if mode in ["Switch", "PS5"]:
@@ -9902,7 +10000,7 @@ bg_color=panel_bg, widths=[8, 10])
             img = Image.new('RGB', (64, 64), color=(0, 195, 227)) # Cyan fallback
         
         menu = (item('Show', self.show_window, default=True), item('Exit', lambda: self.root.after(0, self.on_quit)))
-        self.tray_icon = pystray.Icon("Switch2Controllers", img, "Switch2 Controllers", menu, action=self.show_window)
+        self.tray_icon = pystray.Icon("Switch2Connect", img, "Switch 2 Connect", menu, action=self.show_window)
         self.tray_icon.run_detached()
 
     def on_quit(self):
@@ -10253,7 +10351,7 @@ if __name__ == "__main__":
                 import traceback
                 _log_dir = os.path.join(
                     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                    "Switch2Controllers",
+                    "Switch 2 Connect",
                 )
                 os.makedirs(_log_dir, exist_ok=True)
                 with open(os.path.join(_log_dir, "dualsense_server.log"), "a", encoding="utf-8") as _f:

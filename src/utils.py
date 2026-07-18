@@ -161,7 +161,8 @@ def quaternion_from_vectors(v_from, v_to):
 
 def set_startup(enabled: bool):
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    app_name = "Switch2Controllers"
+    app_name = "Switch 2 Connect"
+    legacy_app_name = "Switch2Controllers"
     
     if hasattr(sys, 'frozen'):
         # Executable path
@@ -174,11 +175,16 @@ def set_startup(enabled: bool):
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
         if enabled:
             winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, app_path)
-        else:
             try:
-                winreg.DeleteValue(key, app_name)
+                winreg.DeleteValue(key, legacy_app_name)
             except FileNotFoundError:
                 pass
+        else:
+            for value_name in (app_name, legacy_app_name):
+                try:
+                    winreg.DeleteValue(key, value_name)
+                except FileNotFoundError:
+                    pass
         winreg.CloseKey(key)
         return True
     except Exception as e:

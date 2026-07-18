@@ -552,6 +552,47 @@ def _compute_vibration_config(
     return lf_multiplier, hf_multiplier, freq_factor_lf, freq_factor_hf, direct_gain
 
 
+XBOX_HF_MASK_MIN_FREQUENCY = 0x0e1  # 225: Xbox low-frequency reference.
+XBOX_HF_MASK_MAX_FREQUENCY = 369    # Xbox Frequency=10 HF ceiling.
+
+
+def _xbox_hf_mask_position(hf_frequency: int) -> float:
+    """Project an HF frequency into the existing Xbox 1..10 mask domain."""
+    frequency = min(511, max(1, int(hf_frequency)))
+    span = max(1, XBOX_HF_MASK_MAX_FREQUENCY - XBOX_HF_MASK_MIN_FREQUENCY)
+    position = 1.0 + ((frequency - XBOX_HF_MASK_MIN_FREQUENCY) / span) * 9.0
+    return min(10.0, max(1.0, position))
+
+
+def _apply_xbox_impulse_hf_mask(v, is_pro: bool):
+    """Apply the Xbox HF Strength=5 mask to one Impulse Trigger frame.
+
+    The Frequency=10 mask value is the normalization reference, so raw=100
+    remains at the physical 10-bit ceiling (1023) while lower raw values retain
+    the same frequency-dependent strength relationship as Xbox Rumble Mode.
+    """
+    base_amp = min(1023, max(0, int(getattr(v, 'hf_amp', 0))))
+    if base_amp == 0:
+        return VibrationData(lf_amp=0, hf_amp=0)
+
+    hf_frequency = min(511, max(1, int(getattr(v, 'hf_freq', 0))))
+    mask = _hf_mask_at_strength5(_xbox_hf_mask_position(hf_frequency), is_pro)
+    high_reference = _hf_mask_at_strength5(10.0, is_pro)
+    if high_reference <= 0:
+        masked_amp = 0
+    else:
+        masked_amp = int((base_amp * mask / high_reference) + 0.5)
+
+    return VibrationData(
+        lf_freq=getattr(v, 'lf_freq', 0x0e1),
+        lf_en_tone=getattr(v, 'lf_en_tone', False),
+        lf_amp=0,
+        hf_freq=hf_frequency,
+        hf_en_tone=getattr(v, 'hf_en_tone', False),
+        hf_amp=min(1023, max(0, masked_amp)),
+    )
+
+
 
 def normalize_calibration_key(key):
     if not key:
@@ -1748,6 +1789,30 @@ class Controller:
         finally:
             self._rumble_task_running = False
 
+    async def _xbox_impulse_rumble_send_worker(
+        self, v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
+        i1_l, i2_l, i3_l, i1_r, i2_r, i3_r
+    ):
+        """Sends ordinary mono rumble plus final, side-specific Xbox impulse HF."""
+        self._rumble_task_running = True
+        try:
+            if self.is_pro_controller():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l, False,
+                    v1_r, v2_r, v3_r,
+                    impulse_overlay=(i1_l, i2_l, i3_l),
+                    impulse_overlay_r=(i1_r, i2_r, i3_r))
+            elif self.is_joycon_left():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l,
+                    impulse_overlay=(i1_l, i2_l, i3_l))
+            else:
+                await self.set_vibration(
+                    v1_r, v2_r, v3_r,
+                    impulse_overlay=(i1_r, i2_r, i3_r))
+        finally:
+            self._rumble_task_running = False
+
     def _poke_rumble_scheduler(self):
         try:
             self._rumble_scheduler_event.set()
@@ -1787,11 +1852,19 @@ class Controller:
         if getattr(vc, 'rumble_force_clear', False):
             self.rumble_stopped = False
             self._zero_count = 0
+            if hasattr(vc, 'clear_xbox_impulse_triggers'):
+                vc.clear_xbox_impulse_triggers()
             vc.rumble_force_clear = False
 
         use_dualsense_stereo = (
             getattr(vc, 'mode', None) == "PS5" and
             getattr(vc, 'driver_type', None) == "USBIP"
+        )
+        use_xbox_impulse = (
+            getattr(vc, 'mode', None) == "Xbox One" and
+            getattr(vc, 'driver_type', None) == "WinUHid" and
+            hasattr(vc, 'get_xbox_impulse_state') and
+            hasattr(vc, 'get_current_xbox_impulse_frames')
         )
 
         def dispatch_rumble_task(coro):
@@ -1802,6 +1875,92 @@ class Controller:
             return False
 
         if not use_dualsense_stereo:
+            # Preserve the existing ordinary-rumble fast path exactly unless
+            # an Xbox Impulse Trigger side is active or has changed.  Ordinary
+            # Xbox rumble remains the same mono signal on both physical sides.
+            if use_xbox_impulse:
+                impulse_state = vc.get_xbox_impulse_state()
+                if self.is_pro_controller():
+                    impulse_changed = (
+                        impulse_state['sequence_l'] != getattr(
+                            self, '_last_xbox_impulse_sequence_sent_l', impulse_state['sequence_l']) or
+                        impulse_state['sequence_r'] != getattr(
+                            self, '_last_xbox_impulse_sequence_sent_r', impulse_state['sequence_r']))
+                    impulse_stop_changed = (
+                        impulse_state['stop_sequence_l'] != getattr(
+                            self, '_last_xbox_impulse_stop_sequence_sent_l', impulse_state['stop_sequence_l']) or
+                        impulse_state['stop_sequence_r'] != getattr(
+                            self, '_last_xbox_impulse_stop_sequence_sent_r', impulse_state['stop_sequence_r']))
+                    impulse_active = (
+                        impulse_state['left_active'] or impulse_state['right_active'])
+                elif self.is_joycon_left():
+                    impulse_changed = impulse_state['sequence_l'] != getattr(
+                        self, '_last_xbox_impulse_sequence_sent_l', impulse_state['sequence_l'])
+                    impulse_stop_changed = impulse_state['stop_sequence_l'] != getattr(
+                        self, '_last_xbox_impulse_stop_sequence_sent_l', impulse_state['stop_sequence_l'])
+                    impulse_active = impulse_state['left_active']
+                else:
+                    impulse_changed = impulse_state['sequence_r'] != getattr(
+                        self, '_last_xbox_impulse_sequence_sent_r', impulse_state['sequence_r'])
+                    impulse_stop_changed = impulse_state['stop_sequence_r'] != getattr(
+                        self, '_last_xbox_impulse_stop_sequence_sent_r', impulse_state['stop_sequence_r'])
+                    impulse_active = impulse_state['right_active']
+
+                if impulse_active or impulse_changed or impulse_stop_changed:
+                    if self.is_pro_controller():
+                        v1_l, v2_l, v3_l, base_zero_l = vc.get_current_vibration_frames(is_left=True)
+                        v1_r, v2_r, v3_r, base_zero_r = vc.get_current_vibration_frames(is_left=False)
+                    elif self.is_joycon_left():
+                        v1_l, v2_l, v3_l, base_zero_l = vc.get_current_vibration_frames(is_left=True)
+                        v1_r = v2_r = v3_r = VibrationData()
+                        base_zero_r = True
+                    else:
+                        v1_r, v2_r, v3_r, base_zero_r = vc.get_current_vibration_frames(is_left=False)
+                        v1_l = v2_l = v3_l = VibrationData()
+                        base_zero_l = True
+
+                    i1_l, i2_l, i3_l, impulse_zero_l = vc.get_current_xbox_impulse_frames(is_left=True)
+                    i1_r, i2_r, i3_r, impulse_zero_r = vc.get_current_xbox_impulse_frames(is_left=False)
+                    is_zero = (
+                        (base_zero_l and impulse_zero_l and base_zero_r and impulse_zero_r)
+                        if self.is_pro_controller() else
+                        (base_zero_l and impulse_zero_l if self.is_joycon_left()
+                         else base_zero_r and impulse_zero_r)
+                    )
+
+                    if not getattr(self, '_rumble_task_running', False):
+                        if is_zero:
+                            # A changed zero state is a required flush even if
+                            # ordinary rumble had already settled at zero.
+                            if (impulse_changed or impulse_stop_changed or
+                                    not getattr(self, 'rumble_stopped', False)):
+                                self._zero_count = getattr(self, '_zero_count', 0) + 1
+                                sent = dispatch_rumble_task(
+                                    self._xbox_impulse_rumble_send_worker(
+                                        v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
+                                        i1_l, i2_l, i3_l, i1_r, i2_r, i3_r))
+                                if sent:
+                                    self._last_xbox_impulse_sequence_sent_l = impulse_state['sequence_l']
+                                    self._last_xbox_impulse_sequence_sent_r = impulse_state['sequence_r']
+                                    self._last_xbox_impulse_stop_sequence_sent_l = impulse_state['stop_sequence_l']
+                                    self._last_xbox_impulse_stop_sequence_sent_r = impulse_state['stop_sequence_r']
+                                if self._zero_count >= 3:
+                                    self.rumble_stopped = True
+                        else:
+                            self.rumble_stopped = False
+                            self._zero_count = 0
+                            if self._bridge_rumble_due():
+                                sent = dispatch_rumble_task(
+                                    self._xbox_impulse_rumble_send_worker(
+                                        v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
+                                        i1_l, i2_l, i3_l, i1_r, i2_r, i3_r))
+                                if sent:
+                                    self._last_xbox_impulse_sequence_sent_l = impulse_state['sequence_l']
+                                    self._last_xbox_impulse_sequence_sent_r = impulse_state['sequence_r']
+                                    self._last_xbox_impulse_stop_sequence_sent_l = impulse_state['stop_sequence_l']
+                                    self._last_xbox_impulse_stop_sequence_sent_r = impulse_state['stop_sequence_r']
+                    return
+
             v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
 
             if not getattr(self, '_rumble_task_running', False):
@@ -1935,7 +2094,7 @@ class Controller:
             )
             t.start()
 
-    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None):
+    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None, impulse_overlay = None, impulse_overlay_r = None):
         if _PERF_DIAGNOSTICS:
             try:
                 _now_r = time.perf_counter()
@@ -2145,7 +2304,7 @@ class Controller:
         def scaled_audio_frame(v):
             return convert_y700_audio_haptic_frame(scale_and_clamp(v, True))
 
-        def merge_scaled_frame(base, trigger=None, audio=None):
+        def merge_scaled_frame(base, trigger=None, audio=None, impulse=None):
             scaled_base = scale_and_clamp(base, force_direct_amplitude=False)
             scaled_trigger = scale_and_clamp(trigger, force_direct_amplitude=False) if trigger is not None else None
             scaled_audio = scaled_audio_frame(audio) if audio is not None else None
@@ -2153,22 +2312,33 @@ class Controller:
                 final_vib = _vib_merge_ble_source_aware(scaled_base, scaled_trigger, scaled_audio)
             else:
                 final_vib = merge_ble_vibrations(scaled_base)
-                
-                
+            # Impulse bypasses ordinary strength/frequency scaling. Dynamic
+            # Frequency uses the Xbox HF mask once; fixed Frequency deliberately
+            # keeps its linear HIGH_LOW_RATIO amplitude and skips that mask.
+            if impulse is not None and int(getattr(impulse, 'hf_amp', 0)) > 0:
+                if getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True):
+                    output_impulse = _apply_xbox_impulse_hf_mask(impulse, is_pro)
+                else:
+                    output_impulse = impulse
+                final_vib.hf_amp = min(1023, final_vib.hf_amp + output_impulse.hf_amp)
+                final_vib.hf_freq = output_impulse.hf_freq
             return final_vib
 
         v1 = merge_scaled_frame(
             vibration,
             trigger_overlay[0] if trigger_overlay is not None else None,
-            audio_overlay[0] if audio_overlay is not None else None)
+            audio_overlay[0] if audio_overlay is not None else None,
+            impulse_overlay[0] if impulse_overlay is not None else None)
         v2 = merge_scaled_frame(
             vibration2,
             trigger_overlay[1] if trigger_overlay is not None else None,
-            audio_overlay[1] if audio_overlay is not None else None)
+            audio_overlay[1] if audio_overlay is not None else None,
+            impulse_overlay[1] if impulse_overlay is not None else None)
         v3 = merge_scaled_frame(
             vibration3,
             trigger_overlay[2] if trigger_overlay is not None else None,
-            audio_overlay[2] if audio_overlay is not None else None)
+            audio_overlay[2] if audio_overlay is not None else None,
+            impulse_overlay[2] if impulse_overlay is not None else None)
 
         encode_frame = lambda v: v.get_bytes()
         motor_vibrations = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + encode_frame(v1) + encode_frame(v2) + encode_frame(v3)
@@ -2188,15 +2358,18 @@ class Controller:
                     v1_r = merge_scaled_frame(
                         vibration_r1,
                         trigger_overlay_r[0] if trigger_overlay_r is not None else None,
-                        audio_overlay_r[0] if audio_overlay_r is not None else None)
+                        audio_overlay_r[0] if audio_overlay_r is not None else None,
+                        impulse_overlay_r[0] if impulse_overlay_r is not None else None)
                     v2_r = merge_scaled_frame(
                         vibration_r2,
                         trigger_overlay_r[1] if trigger_overlay_r is not None else None,
-                        audio_overlay_r[1] if audio_overlay_r is not None else None)
+                        audio_overlay_r[1] if audio_overlay_r is not None else None,
+                        impulse_overlay_r[1] if impulse_overlay_r is not None else None)
                     v3_r = merge_scaled_frame(
                         vibration_r3,
                         trigger_overlay_r[2] if trigger_overlay_r is not None else None,
-                        audio_overlay_r[2] if audio_overlay_r is not None else None)
+                        audio_overlay_r[2] if audio_overlay_r is not None else None,
+                        impulse_overlay_r[2] if impulse_overlay_r is not None else None)
                     motor_vibrations_r = (0x50 + (self.vibration_packet_id & 0x0F)).to_bytes(1, 'little') + encode_frame(v1_r) + encode_frame(v2_r) + encode_frame(v3_r)
                     # Match y700/Switch2 raw02 layout: left motor block first,
                     # then right motor block.  Reversing these makes DualSense
