@@ -149,21 +149,6 @@ def _gcn_abxy_bits(
     return buttons
 
 
-def _hf_mask_at_strength5(hf_mapped, is_pro):
-    """High-frequency dynamic mask at Strength=5 (PS5 Emu Mode / Xbox Rumble curve).
-
-    hf_mapped is the 1..10 normalized high-frequency position.  Used by both the Xbox
-    rumble path and the Audio-Haptics direct path so the two never diverge.
-    """
-    if is_pro:
-        if hf_mapped <= 5.0:
-            return 0.25 - 0.0375 * (hf_mapped - 1.0)
-        return 0.1 + 0.028 * (hf_mapped - 5.0)
-    if hf_mapped <= 5.0:
-        return 0.19 - 0.02375 * (hf_mapped - 1.0)
-    return 0.095 + 0.00164 * (hf_mapped - 5.0)
-
-
 def _vib_map_y700_to_ble(value: int, direct_gain: float) -> int:
     """Map a y700 raw02 physical amplitude (0..29000) to a BLE 10-bit amplitude (0..1023).
 
@@ -554,30 +539,62 @@ def _compute_vibration_config(
 
 XBOX_HF_MASK_MIN_FREQUENCY = 0x0e1  # 225: Xbox low-frequency reference.
 XBOX_HF_MASK_MAX_FREQUENCY = 369    # Xbox Frequency=10 HF ceiling.
+IMPULSE_HF_MASK_MAX_FREQUENCY = 481 # Tuned Xbox Impulse Trigger High frequency.
 
 
 def _xbox_hf_mask_position(hf_frequency: int) -> float:
-    """Project an HF frequency into the existing Xbox 1..10 mask domain."""
+    """Project an HF frequency into the existing 225..369 Xbox mask domain."""
     frequency = min(511, max(1, int(hf_frequency)))
     span = max(1, XBOX_HF_MASK_MAX_FREQUENCY - XBOX_HF_MASK_MIN_FREQUENCY)
     position = 1.0 + ((frequency - XBOX_HF_MASK_MIN_FREQUENCY) / span) * 9.0
     return min(10.0, max(1.0, position))
 
 
-def _apply_xbox_impulse_hf_mask(v, is_pro: bool):
-    """Apply the Xbox HF Strength=5 mask to one Impulse Trigger frame.
+def _xbox_hf_mask_at_frequency(hf_frequency: int, is_pro: bool) -> float:
+    """Return the unchanged Xbox Rumble HF mask at an actual 225..369 frequency."""
+    return _hf_mask_at_strength5(_xbox_hf_mask_position(hf_frequency), is_pro)
 
-    The Frequency=10 mask value is the normalization reference, so raw=100
-    remains at the physical 10-bit ceiling (1023) while lower raw values retain
-    the same frequency-dependent strength relationship as Xbox Rumble Mode.
+
+def _extended_impulse_hf_mask_at_frequency(hf_frequency: int, is_pro: bool) -> float:
+    """Extend the physical Xbox HF mask from 369 through Impulse High at 481.
+
+    Frequencies through 369 use the existing Xbox Rumble curve unchanged.  The
+    370..481 segment continues that curve's final physical-frequency slope;
+    this preserves continuity at 369 without remapping the 225..369 domain.
+    """
+    frequency = min(IMPULSE_HF_MASK_MAX_FREQUENCY, max(1, int(hf_frequency)))
+    if frequency <= XBOX_HF_MASK_MAX_FREQUENCY:
+        return _xbox_hf_mask_at_frequency(frequency, is_pro)
+
+    tail_start_position = 5.0
+    tail_start_frequency = (
+        XBOX_HF_MASK_MIN_FREQUENCY
+        + (XBOX_HF_MASK_MAX_FREQUENCY - XBOX_HF_MASK_MIN_FREQUENCY)
+        * (tail_start_position - 1.0) / 9.0
+    )
+    tail_start_mask = _hf_mask_at_strength5(tail_start_position, is_pro)
+    tail_end_mask = _hf_mask_at_strength5(10.0, is_pro)
+    tail_slope = (tail_end_mask - tail_start_mask) / max(
+        1.0, XBOX_HF_MASK_MAX_FREQUENCY - tail_start_frequency)
+    return tail_end_mask + tail_slope * (frequency - XBOX_HF_MASK_MAX_FREQUENCY)
+
+
+def _apply_xbox_impulse_hf_mask(v, is_pro: bool):
+    """Apply Xbox HF physical-frequency strength ratios to an Impulse frame.
+
+    The complete 225..481 physical-frequency curve is normalized against the
+    tuned Impulse High reference at 481.  Raw=100 therefore remains at the
+    physical 10-bit ceiling (1023); the mask supplies only the relative
+    strength ratio for each lower frequency.
     """
     base_amp = min(1023, max(0, int(getattr(v, 'hf_amp', 0))))
     if base_amp == 0:
         return VibrationData(lf_amp=0, hf_amp=0)
 
     hf_frequency = min(511, max(1, int(getattr(v, 'hf_freq', 0))))
-    mask = _hf_mask_at_strength5(_xbox_hf_mask_position(hf_frequency), is_pro)
-    high_reference = _hf_mask_at_strength5(10.0, is_pro)
+    mask = _extended_impulse_hf_mask_at_frequency(hf_frequency, is_pro)
+    high_reference = _extended_impulse_hf_mask_at_frequency(
+        IMPULSE_HF_MASK_MAX_FREQUENCY, is_pro)
     if high_reference <= 0:
         masked_amp = 0
     else:
