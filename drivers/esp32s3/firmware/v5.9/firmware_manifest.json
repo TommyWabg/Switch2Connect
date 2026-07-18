@@ -1,11 +1,12 @@
 ﻿{
     "packageVersion":  "1.0.0",
-    "firmwareVersion":  "0.12.4",
+    "firmwareVersion":  "1.0.0",
     "target":  "esp32s3",
     "flashMode":  "dio",
     "flashFreq":  "80m",
     "flashSize":  "16MB",
     "defaultProfile":  "tinyusb_direct",
+    "releaseNotes":  "tinyusb_direct v1.0.0 (2026-07-19): Rebuilt the production ESP32-S3 Bluedroid bridge with APP_FIRMWARE_VERSION 1.0.0; synchronized installer assets and firmware_bin.",
     "profiles":  [
                      {
                          "id":  "basic_ble_transport_0_10_5",
@@ -32,13 +33,13 @@
                      {
                          "id":  "tinyusb_direct",
                          "label":  "ESP32-S3 Bluedroid Bridge (production)",
-                         "version":  "0.12.4",
+                         "version":  "1.0.0",
                          "app":  "esp32s3_bluedroid_bridge.bin",
                          "assets":  [
                                         {
                                             "offset":  "0x0",
                                             "path":  "v1.0_bluedroid/bootloader.bin",
-                                            "sha256":  "73523d9b9379bf9c76d3d3b1aba645093d5b3b241dedaa612d0d425bccbd505f"
+                                            "sha256":  "1de9a30a472a8bcf3aeced54cadb3a2c5d8d9ae6a5b8c541a6e9dc31850e77e0"
                                         },
                                         {
                                             "offset":  "0x8000",
@@ -48,7 +49,7 @@
                                         {
                                             "offset":  "0x10000",
                                             "path":  "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
-                                            "sha256":  "859f32988a2ebee793626b732b7a00ad661742eee4fa18e36bd98dcfe1627bb7"
+                                            "sha256":  "3c78d42b26de6630a04f41c75f94617f7352cee20f98e1fca871db94915a2d66"
                                         }
                                     ]
                      }
