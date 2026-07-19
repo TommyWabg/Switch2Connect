@@ -130,7 +130,7 @@ cemuhook_mac_to_pad:
 cemuhook_pad_overwrite_idx: 0
 change_profile_mode: Auto
 controller_calibration_aliases: {}
-driver_installed: true
+driver_installed: false
 driver_type: WinUHid
 gc_l_click_mapping: Default
 gc_r_click_mapping: Default
@@ -202,6 +202,7 @@ profile_defaults:
   impulse_trigger_dynamic_frequency: true
   impulse_trigger_enabled: true
   impulse_trigger_frequency: 10
+  impulse_trigger_strength: 5
   in_app_gyro_soft_deadzone: 0.0
   r_joystick_gyro_sensitivity: 5.0
   stabilized_gyro: true
@@ -229,6 +230,7 @@ profiles:
     impulse_trigger_dynamic_frequency: true
     impulse_trigger_enabled: true
     impulse_trigger_frequency: 10
+    impulse_trigger_strength: 5
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -876,6 +878,7 @@ profiles:
     impulse_trigger_dynamic_frequency: true
     impulse_trigger_enabled: true
     impulse_trigger_frequency: 10
+    impulse_trigger_strength: 5
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -1515,6 +1518,7 @@ profiles:
     impulse_trigger_dynamic_frequency: true
     impulse_trigger_enabled: true
     impulse_trigger_frequency: 10
+    impulse_trigger_strength: 5
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -2150,6 +2154,7 @@ profiles:
     impulse_trigger_dynamic_frequency: true
     impulse_trigger_enabled: true
     impulse_trigger_frequency: 10
+    impulse_trigger_strength: 5
     in_app_gyro_soft_deadzone: 0.0
     mode_shift_enabled:
       Mouse: true
@@ -2796,8 +2801,8 @@ vigembus_sim_mode: Xbox360
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1234
-window_y: 69
+window_x: 1247
+window_y: 70
 winuhid_sim_mode: PS5
 wired_auto_scan_enabled: true
 wired_usb_enabled: true
