@@ -540,6 +540,10 @@ def _compute_vibration_config(
 XBOX_HF_MASK_MIN_FREQUENCY = 0x0e1  # 225: Xbox low-frequency reference.
 XBOX_HF_MASK_MAX_FREQUENCY = 369    # Xbox Frequency=10 HF ceiling.
 IMPULSE_HF_MASK_MAX_FREQUENCY = 481 # Tuned Xbox Impulse Trigger High frequency.
+IMPULSE_HF_MASK_MIN_FREQUENCY = 300 # Tuned Xbox Impulse Trigger Low frequency.
+IMPULSE_RAW_MIN = 1
+IMPULSE_RAW_MAX = 100
+IMPULSE_HF_AMP_MAX = 1023
 
 
 def _xbox_hf_mask_position(hf_frequency: int) -> float:
@@ -608,6 +612,69 @@ def _apply_xbox_impulse_hf_mask(v, is_pro: bool):
         hf_en_tone=getattr(v, 'hf_en_tone', False),
         hf_amp=min(1023, max(0, masked_amp)),
     )
+
+
+def _round_half_up_ratio(numerator: int, denominator: int) -> int:
+    return (numerator + denominator // 2) // denominator
+
+
+def _impulse_dynamic_hf_frequency(raw: int) -> int:
+    """Match the raw=1..100 -> 300..481 dynamic-frequency mapping."""
+    raw = min(IMPULSE_RAW_MAX, max(IMPULSE_RAW_MIN, int(raw)))
+    return _round_half_up_ratio(
+        IMPULSE_HF_MASK_MIN_FREQUENCY * (IMPULSE_RAW_MAX - IMPULSE_RAW_MIN)
+        + (raw - IMPULSE_RAW_MIN)
+          * (IMPULSE_HF_MASK_MAX_FREQUENCY - IMPULSE_HF_MASK_MIN_FREQUENCY),
+        IMPULSE_RAW_MAX - IMPULSE_RAW_MIN)
+
+
+def _impulse_strength_gain(raw: int, strength: int) -> float:
+    """Linearly reduce the Strength slider gain from raw=1 to raw=100."""
+    raw = min(IMPULSE_RAW_MAX, max(IMPULSE_RAW_MIN, int(raw)))
+    strength = min(10, max(1, int(strength)))
+    return 1.0 + (strength - 1.0) * (
+        (IMPULSE_RAW_MAX - raw) / (IMPULSE_RAW_MAX - IMPULSE_RAW_MIN))
+
+
+def _impulse_base_hf_amplitude(raw: int, dynamic_frequency: bool, is_pro: bool) -> int:
+    """Return the pre-Strength physical HF amplitude for an Impulse raw value."""
+    raw = min(IMPULSE_RAW_MAX, max(IMPULSE_RAW_MIN, int(raw)))
+    base_amp = _round_half_up_ratio(IMPULSE_HF_AMP_MAX * raw, IMPULSE_RAW_MAX)
+    if not dynamic_frequency:
+        return base_amp
+
+    hf_frequency = _impulse_dynamic_hf_frequency(raw)
+    mask = _extended_impulse_hf_mask_at_frequency(hf_frequency, is_pro)
+    high_reference = _extended_impulse_hf_mask_at_frequency(
+        IMPULSE_HF_MASK_MAX_FREQUENCY, is_pro)
+    if high_reference <= 0:
+        return 0
+    return min(IMPULSE_HF_AMP_MAX, max(
+        0, int((base_amp * mask / high_reference) + 0.5)))
+
+
+def _apply_xbox_impulse_strength(raw: int, dynamic_frequency: bool, is_pro: bool,
+                                 strength: int) -> int:
+    """Apply Strength and preserve one distinct 10-bit output level per raw value.
+
+    The nominal slider gain is linear (raw=1 uses Strength x, raw=100 uses
+    1x).  The increasing headroom ceiling prevents intermediate raw values
+    from saturating at 1023 and losing their original signal distinction.
+    """
+    raw = min(IMPULSE_RAW_MAX, max(0, int(raw)))
+    if raw == 0:
+        return 0
+
+    previous = 0
+    for sample_raw in range(IMPULSE_RAW_MIN, raw + 1):
+        base_amp = _impulse_base_hf_amplitude(
+            sample_raw, dynamic_frequency, is_pro)
+        target_amp = int((base_amp * _impulse_strength_gain(
+            sample_raw, strength)) + 0.5)
+        headroom_max = IMPULSE_HF_AMP_MAX - (IMPULSE_RAW_MAX - sample_raw)
+        output_amp = min(headroom_max, max(target_amp, previous + 1))
+        previous = output_amp
+    return previous
 
 
 
@@ -1011,6 +1078,8 @@ class VibrationData:
     hf_freq: int = 0x1e1
     hf_en_tone : int = False
     hf_amp: int = 0x000
+    # Populated only for Xbox Impulse Trigger overlays; excluded from HID bytes.
+    impulse_raw: int = 0
 
     def get_bytes(self):
         value = 0x0000000000
@@ -2330,13 +2399,17 @@ class Controller:
             else:
                 final_vib = merge_ble_vibrations(scaled_base)
             # Impulse bypasses ordinary strength/frequency scaling. Dynamic
-            # Frequency uses the Xbox HF mask once; fixed Frequency deliberately
-            # keeps its linear HIGH_LOW_RATIO amplitude and skips that mask.
+            # Frequency uses the Xbox HF mask once; fixed Frequency skips that
+            # mask. Both paths then apply the Impulse Trigger Strength curve.
             if impulse is not None and int(getattr(impulse, 'hf_amp', 0)) > 0:
-                if getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True):
+                dynamic_frequency = getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True)
+                if dynamic_frequency:
                     output_impulse = _apply_xbox_impulse_hf_mask(impulse, is_pro)
                 else:
                     output_impulse = impulse
+                output_impulse.hf_amp = _apply_xbox_impulse_strength(
+                    getattr(impulse, 'impulse_raw', 0), dynamic_frequency, is_pro,
+                    getattr(CONFIG, 'impulse_trigger_strength', 5))
                 final_vib.hf_amp = min(1023, final_vib.hf_amp + output_impulse.hf_amp)
                 final_vib.hf_freq = output_impulse.hf_freq
             return final_vib

@@ -67,7 +67,7 @@ IMPULSE_RAW_MAX = 100
 IMPULSE_HF_AMP_MAX = 1023
 IMPULSE_HF_FREQ_LOW = 300
 IMPULSE_HF_FREQ_HIGH = 481
-IMPULSE_RAW_LOW = 30
+IMPULSE_RAW_LOW = 1
 IMPULSE_RAW_HIGH = 100
 
 def _round_half_up_ratio(numerator, denominator):
@@ -100,12 +100,14 @@ def _map_xbox_impulse_trigger(raw, dynamic_frequency=True, fixed_frequency=10):
     else:
         hf_freq = _impulse_fixed_hf_frequency(fixed_frequency)
     hf_freq = max(1, min(511, hf_freq))
-    return VibrationData(lf_amp=0, hf_amp=hf_amp, hf_freq=hf_freq)
+    return VibrationData(
+        lf_amp=0, hf_amp=hf_amp, hf_freq=hf_freq, impulse_raw=raw)
 
 def _copy_vibration(v) -> VibrationData:
     return VibrationData(
         lf_freq=v.lf_freq, lf_amp=v.lf_amp, lf_en_tone=getattr(v, 'lf_en_tone', False),
-        hf_freq=v.hf_freq, hf_amp=v.hf_amp, hf_en_tone=getattr(v, 'hf_en_tone', False)
+        hf_freq=v.hf_freq, hf_amp=v.hf_amp, hf_en_tone=getattr(v, 'hf_en_tone', False),
+        impulse_raw=getattr(v, 'impulse_raw', 0)
     )
 
 def _zero_vibration(lf_freq=0x0e1, hf_freq=0x1e1) -> VibrationData:

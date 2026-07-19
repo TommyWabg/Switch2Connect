@@ -740,6 +740,10 @@ class Config:
         in_app_deadzone = config.get("in_app_gyro_soft_deadzone", 0.0)
         if isinstance(in_app_deadzone, bool):
             in_app_deadzone = 0.0
+        try:
+            impulse_trigger_strength = int(config.get("impulse_trigger_strength", 5))
+        except (TypeError, ValueError):
+            impulse_trigger_strength = 5
         return {
             "gyro_mode": config.get("gyro_mode", "World"),
             "gyro_control_mode": config.get("gyro_control_mode", "Mouse"),
@@ -762,6 +766,7 @@ class Config:
             "impulse_trigger_enabled": config.get("impulse_trigger_enabled", True),
             "impulse_trigger_dynamic_frequency": config.get("impulse_trigger_dynamic_frequency", True),
             "impulse_trigger_frequency": max(1, min(10, int(config.get("impulse_trigger_frequency", 10)))),
+            "impulse_trigger_strength": max(1, min(10, impulse_trigger_strength)),
         }
 
     def get_default_profile_settings(self):
@@ -790,6 +795,7 @@ class Config:
             "impulse_trigger_enabled": True,
             "impulse_trigger_dynamic_frequency": True,
             "impulse_trigger_frequency": 10,
+            "impulse_trigger_strength": 5,
         }
 
     @property
@@ -1040,6 +1046,22 @@ class Config:
         except (TypeError, ValueError):
             value = 10
         self._set_profile_setting("impulse_trigger_frequency", max(1, min(10, value)))
+
+    @property
+    def impulse_trigger_strength(self):
+        try:
+            value = int(self._get_profile_setting("impulse_trigger_strength"))
+        except (TypeError, ValueError):
+            value = 5
+        return max(1, min(10, value))
+
+    @impulse_trigger_strength.setter
+    def impulse_trigger_strength(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 5
+        self._set_profile_setting("impulse_trigger_strength", max(1, min(10, value)))
 
     @property
     def djg_activation(self):

@@ -7867,6 +7867,10 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.impulse_trigger_frequency = int(float(value))
             CONFIG.save_config()
 
+        def update_impulse_strength(value):
+            CONFIG.impulse_trigger_strength = int(float(value))
+            CONFIG.save_config()
+
         def refresh_frequency_visibility():
             if getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True):
                 frequency_label.grid_remove()
@@ -7888,11 +7892,17 @@ bg_color=panel_bg, widths=[8, 10])
         dynamic_label.grid(row=1, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)))
         ToggleSwitch(content_frame, ["On", "Off"], [True, False], getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True), update_dynamic_frequency, background_color).grid(row=1, column=1, sticky=tk.W)
 
+        strength_label = tk.Label(content_frame, text="Strength:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
+        strength_label.grid(row=2, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(int(15 * scaling_factor), 0))
+        strength_scale = tk.Scale(content_frame, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=update_impulse_strength)
+        strength_scale.set(getattr(CONFIG, 'impulse_trigger_strength', 5))
+        strength_scale.grid(row=2, column=1, sticky=tk.W, pady=(int(15 * scaling_factor), 0))
+
         frequency_label = tk.Label(content_frame, text="Frequency:", font=scale_font(("Arial", 11, "bold")), bg=background_color, fg=text_color, anchor="e")
-        frequency_label.grid(row=2, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(int(15 * scaling_factor), 0))
+        frequency_label.grid(row=3, column=0, sticky=tk.E, padx=(0, int(5 * scaling_factor)), pady=(int(15 * scaling_factor), 0))
         frequency_scale = tk.Scale(content_frame, from_=1, to=10, resolution=1, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=background_color, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=update_fixed_frequency)
         frequency_scale.set(getattr(CONFIG, 'impulse_trigger_frequency', 10))
-        frequency_scale.grid(row=2, column=1, sticky=tk.W, pady=(int(15 * scaling_factor), 0))
+        frequency_scale.grid(row=3, column=1, sticky=tk.W, pady=(int(15 * scaling_factor), 0))
 
         refresh_frequency_visibility()
         self.root.after(100, self.bind_joystick_custom_popup_outside_click)
