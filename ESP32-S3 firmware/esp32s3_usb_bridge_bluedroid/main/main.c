@@ -55,9 +55,9 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "1.0.0"
+#define APP_FIRMWARE_VERSION      "1.2"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
-#define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_1"
+#define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_3"
 #define CDC_LINE_STATE_DTR        0x01
 #define NINTENDO_COMPANY_ID       0x0553
 #define MAX_CH                    8     // one GATTC app per channel
@@ -244,27 +244,90 @@ static in_report_t s_in_shadow[MAX_CH];
 static volatile bool s_in_dirty[MAX_CH];
 static portMUX_TYPE s_in_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- Jitter Buffer (FIFO) for Audio Haptics ---
-#define RUMBLE_QUEUE_SIZE 5
+// --- Latest-only, congestion-aware Audio Haptic playout ---
 typedef struct {
-    int ch;
     uint8_t data[64];
     size_t len;
-} rumble_pkt_t;
+    uint32_t generation;
+    bool dirty;
+    bool active;
+    bool congested;
+} rumble_shadow_t;
 
-static QueueHandle_t s_rumble_queue;
+static rumble_shadow_t s_rumble_shadow[MAX_CH];
+static portMUX_TYPE s_rumble_mux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t s_rumble_task_h;
+static int s_rumble_rr;
+
+static void rumble_shadow_deactivate(int ch) {
+    if (ch < 0 || ch >= MAX_CH) return;
+    portENTER_CRITICAL(&s_rumble_mux);
+    s_rumble_shadow[ch].active = false;
+    s_rumble_shadow[ch].dirty = false;
+    s_rumble_shadow[ch].congested = false;
+    s_rumble_shadow[ch].len = 0;
+    s_rumble_shadow[ch].generation++;
+    portEXIT_CRITICAL(&s_rumble_mux);
+}
+
+static bool rumble_take_latest(int *out_ch, uint8_t *data, size_t *len,
+                               uint32_t *generation) {
+    bool found = false;
+    portENTER_CRITICAL(&s_rumble_mux);
+    for (int n = 0; n < MAX_CH; n++) {
+        int ch = (s_rumble_rr + n) % MAX_CH;
+        rumble_shadow_t *slot = &s_rumble_shadow[ch];
+        if (!slot->active || !slot->dirty || slot->congested || slot->len == 0) continue;
+        *out_ch = ch;
+        *len = slot->len;
+        *generation = slot->generation;
+        memcpy(data, slot->data, slot->len);
+        s_rumble_rr = (ch + 1) % MAX_CH;
+        found = true;
+        break;
+    }
+    portEXIT_CRITICAL(&s_rumble_mux);
+    return found;
+}
 
 static void rumble_playout_task(void *arg) {
-    rumble_pkt_t pkt;
+    (void)arg;
+    TickType_t last_attempt = 0;
     while (1) {
-        if (xQueueReceive(s_rumble_queue, &pkt, portMAX_DELAY)) {
-            if (s_ch[pkt.ch].used && s_ch[pkt.ch].rumble_handle) {
-                esp_ble_gattc_write_char(s_ch[pkt.ch].gattc_if, s_ch[pkt.ch].conn_id, s_ch[pkt.ch].rumble_handle, pkt.len, pkt.data,
-                                         ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        while (1) {
+            int ch = -1;
+            uint8_t data[64];
+            size_t len = 0;
+            uint32_t generation = 0;
+            if (!rumble_take_latest(&ch, data, &len, &generation)) break;
+
+            TickType_t now = xTaskGetTickCount();
+            TickType_t minimum_gap = pdMS_TO_TICKS(15);
+            TickType_t elapsed = now - last_attempt;
+            if (last_attempt != 0 && elapsed < minimum_gap)
+                vTaskDelay(minimum_gap - elapsed);
+
+            esp_err_t result = ESP_ERR_INVALID_STATE;
+            if (s_ch[ch].used && s_ch[ch].rumble_handle) {
+                result = esp_ble_gattc_write_char(
+                    s_ch[ch].gattc_if, s_ch[ch].conn_id, s_ch[ch].rumble_handle,
+                    len, data, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
             }
-            // Strict 15ms minimum gap between packets as requested
-            vTaskDelay(pdMS_TO_TICKS(15));
+            last_attempt = xTaskGetTickCount();
+
+            portENTER_CRITICAL(&s_rumble_mux);
+            rumble_shadow_t *slot = &s_rumble_shadow[ch];
+            if (result == ESP_OK && slot->active && slot->generation == generation)
+                slot->dirty = false;
+            else if (slot->active)
+                slot->dirty = true;
+            portEXIT_CRITICAL(&s_rumble_mux);
+
+            // A failed queue attempt is retried at the same bounded cadence.  A
+            // congestion event marks the channel unavailable until Bluedroid's
+            // uncongested callback wakes this task again.
+            if (result != ESP_OK) vTaskDelay(minimum_gap);
         }
     }
 }
@@ -299,7 +362,7 @@ static void send_status_response(void) {
     char b[256];
     snprintf(b, sizeof(b),
         "{\"cmd\":\"status\",\"version\":\"%s\",\"profile\":\"%s\",\"build\":\"%s\","
-        "\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1}}\n",
+        "\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1,\"shadow_latest\":1,\"direct_rumble\":1}}\n",
         APP_FIRMWARE_VERSION, EXPECTED_FIRMWARE_PROFILE, EXPECTED_FIRMWARE_BUILD,
         (unsigned)ch_active_mask(), s_own_mac);
     send_json(b);
@@ -614,6 +677,7 @@ static void do_wr(char *args) {  // wr <ch> <c|r> <hex>
     if (len == 0) return;
     uint16_t handle = (k_s[0] == 'c') ? s_ch[ch].cmd_handle : s_ch[ch].rumble_handle;
     if (handle == 0) return;
+    if (k_s[0] == 'r') rumble_shadow_deactivate(ch);
     esp_ble_gattc_write_char(s_ch[ch].gattc_if, s_ch[ch].conn_id, handle, len, buf,
                              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
 }
@@ -625,18 +689,34 @@ static void do_rs(char *args) {  // rs <ch> <hex>
     int ch = atoi(ch_s);
     if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || s_ch[ch].rumble_handle == 0) return;
     
-    rumble_pkt_t pkt;
-    pkt.ch = ch;
-    pkt.len = parse_hex(h_s, pkt.data, sizeof(pkt.data));
-    if (pkt.len == 0) return;
-    
-    if (s_rumble_queue) {
-        if (xQueueSend(s_rumble_queue, &pkt, 0) != pdTRUE) {
-            rumble_pkt_t dummy;
-            xQueueReceive(s_rumble_queue, &dummy, 0); // Drop oldest
-            xQueueSend(s_rumble_queue, &pkt, 0);      // Push newest
-        }
-    }
+    uint8_t data[64];
+    size_t len = parse_hex(h_s, data, sizeof(data));
+    if (len == 0) return;
+
+    portENTER_CRITICAL(&s_rumble_mux);
+    rumble_shadow_t *slot = &s_rumble_shadow[ch];
+    memcpy(slot->data, data, len);
+    slot->len = len;
+    slot->generation++;
+    slot->active = true;
+    slot->dirty = true;
+    portEXIT_CRITICAL(&s_rumble_mux);
+    if (s_rumble_task_h) xTaskNotifyGive(s_rumble_task_h);
+}
+static void do_rd(char *args) {  // rd <ch> <hex> (immediate, non-Audio path)
+    char *save = NULL;
+    char *ch_s = strtok_r(args, " ", &save);
+    char *h_s  = strtok_r(NULL, " ", &save);
+    if (!ch_s || !h_s) return;
+    int ch = atoi(ch_s);
+    if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || s_ch[ch].rumble_handle == 0) return;
+    uint8_t buf[64];
+    size_t len = parse_hex(h_s, buf, sizeof(buf));
+    if (len == 0) return;
+    rumble_shadow_deactivate(ch);
+    esp_ble_gattc_write_char(s_ch[ch].gattc_if, s_ch[ch].conn_id,
+                             s_ch[ch].rumble_handle, len, buf,
+                             ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
 }
 static void wr_one(int ch, char kind, const uint8_t *buf, size_t len) {
     if (ch < 0 || ch >= MAX_CH || !s_ch[ch].used || len == 0) return;
@@ -680,6 +760,7 @@ static void handle_command(char *cmd) {
     else if (strncmp(cmd, "disc ", 5) == 0)     { do_disc(cmd + 5); }
     else if (strncmp(cmd, "wrpair ", 7) == 0)   { do_wrpair(cmd + 7); }
     else if (strncmp(cmd, "wr ", 3) == 0)       { do_wr(cmd + 3); }
+    else if (strncmp(cmd, "rd ", 3) == 0)       { do_rd(cmd + 3); }
     else if (strncmp(cmd, "rs ", 3) == 0)       { do_rs(cmd + 3); }
 }
 
@@ -897,6 +978,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         esp_ble_gattc_close(gattc_if, param->disconnect.conn_id);
 
         if (dch >= 0) {
+            rumble_shadow_deactivate(dch);
             if (!s_ch[dch].ready) {
                 char b[100];
                 snprintf(b, sizeof(b),
@@ -1073,6 +1155,25 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         }
         break;
 
+    case ESP_GATTC_CONGEST_EVT:
+        portENTER_CRITICAL(&s_rumble_mux);
+        s_rumble_shadow[ch].congested = param->congest.congested;
+        portEXIT_CRITICAL(&s_rumble_mux);
+        if (!param->congest.congested && s_rumble_task_h)
+            xTaskNotifyGive(s_rumble_task_h);
+        break;
+
+    case ESP_GATTC_WRITE_CHAR_EVT:
+        if (param->write.handle == s_ch[ch].rumble_handle &&
+                param->write.status != ESP_GATT_OK) {
+            portENTER_CRITICAL(&s_rumble_mux);
+            if (s_rumble_shadow[ch].active)
+                s_rumble_shadow[ch].dirty = true;
+            portEXIT_CRITICAL(&s_rumble_mux);
+            if (s_rumble_task_h) xTaskNotifyGive(s_rumble_task_h);
+        }
+        break;
+
     // ESP_GATTC_DISCONNECT_EVT is handled above (routed by remote_bda, not gattc_if).
 
     default: break;
@@ -1202,7 +1303,6 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_ble_gatt_set_local_mtu(247));
     esp_ble_gap_set_scan_params(&s_scan_params);
 
-    s_rumble_queue = xQueueCreate(RUMBLE_QUEUE_SIZE, sizeof(rumble_pkt_t));
     xTaskCreatePinnedToCore(rumble_playout_task, "rumble_task", 4096, NULL, 5, &s_rumble_task_h, 0);
 
     ESP_LOGI(TAG, "Bluedroid up, MAC=%s, %d GATTC apps. Waiting for host.", s_own_mac, MAX_CH);
