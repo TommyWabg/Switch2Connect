@@ -1,12 +1,12 @@
 ﻿{
-    "packageVersion":  "1.0.0",
-    "firmwareVersion":  "1.0.0",
+    "packageVersion":  "1.2",
+    "firmwareVersion":  "1.2",
     "target":  "esp32s3",
     "flashMode":  "dio",
     "flashFreq":  "80m",
     "flashSize":  "16MB",
     "defaultProfile":  "tinyusb_direct",
-    "releaseNotes":  "tinyusb_direct v1.0.0 (2026-07-19): Rebuilt the production ESP32-S3 Bluedroid bridge with APP_FIRMWARE_VERSION 1.0.0; synchronized installer assets and firmware_bin.",
+    "releaseNotes":  "tinyusb_direct v1.2 (2026-07-22): Bluedroid production bridge with per-channel latest-only, congestion-aware Audio Haptic playout, shadow_latest capability, and Host latest-only ESP32 input dispatch. Audio-safe rs ownership and non-Audio rd routing remain unchanged.",
     "profiles":  [
                      {
                          "id":  "basic_ble_transport_0_10_5",
@@ -33,23 +33,23 @@
                      {
                          "id":  "tinyusb_direct",
                          "label":  "ESP32-S3 Bluedroid Bridge (production)",
-                         "version":  "1.0.0",
+                         "version":  "1.2",
                          "app":  "esp32s3_bluedroid_bridge.bin",
                          "assets":  [
                                         {
                                             "offset":  "0x0",
-                                            "path":  "v1.0_bluedroid/bootloader.bin",
-                                            "sha256":  "1de9a30a472a8bcf3aeced54cadb3a2c5d8d9ae6a5b8c541a6e9dc31850e77e0"
+                                            "path":  "v1.2_bluedroid/bootloader.bin",
+                                            "sha256":  "a182332bf3da19810d8532dc119306cebfd4b76c03debdcfda6f975373face60"
                                         },
                                         {
                                             "offset":  "0x8000",
-                                            "path":  "v1.0_bluedroid/partition-table.bin",
+                                            "path":  "v1.2_bluedroid/partition-table.bin",
                                             "sha256":  "7f00b6c042a89b15b0cac534f82ed988caf29278ff5700b0c511eb1b5bb7c820"
                                         },
                                         {
                                             "offset":  "0x10000",
-                                            "path":  "v1.0_bluedroid/esp32s3_bluedroid_bridge.bin",
-                                            "sha256":  "3c78d42b26de6630a04f41c75f94617f7352cee20f98e1fca871db94915a2d66"
+                                            "path":  "v1.2_bluedroid/esp32s3_bluedroid_bridge.bin",
+                                            "sha256":  "4bab6eaf21f5fa20b410a2d0baf374db4b38d61be87bb0c017581c141cf95fc9"
                                         }
                                     ]
                      }
