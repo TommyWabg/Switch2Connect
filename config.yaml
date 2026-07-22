@@ -130,6 +130,62 @@ cemuhook_mac_to_pad:
 cemuhook_pad_overwrite_idx: 0
 change_profile_mode: Auto
 controller_calibration_aliases: {}
+controller_fast_cache: true
+controller_fast_cache_entries:
+  E0:EF:BF:81:06:9F:
+    controller_info_hex: 010048454b313030303030363635383600007e056920010601232323a0a0a0e6e6e6323232ffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    product_id: 8297
+    schema: 1
+    stick_primary:
+      center:
+      - 1944
+      - 2093
+      max:
+      - 1601
+      - 1596
+      min:
+      - 1603
+      - 1525
+    stick_secondary:
+      center:
+      - 2101
+      - 2081
+      max:
+      - 1581
+      - 1619
+      min:
+      - 1518
+      - 1557
+  E0:EF:BF:EF:CC:BD:
+    controller_info_hex: 010048434b313130303233353433333600007e056620010802323232aaaaaaff8c5f323232ffffffffffffffffffffff
+    product_id: 8294
+    schema: 1
+    stick_primary:
+      center:
+      - 2041
+      - 2031
+      max:
+      - 1186
+      - 1174
+      min:
+      - 1189
+      - 1225
+    stick_secondary: null
+  E0:EF:BF:F0:0E:17:
+    controller_info_hex: 010048424b313130303531373836353600007e056720010802323232aaaaaa9be1e6323232ffffffffffffffffffffff
+    product_id: 8295
+    schema: 1
+    stick_primary:
+      center:
+      - 2053
+      - 2141
+      max:
+      - 1167
+      - 1235
+      min:
+      - 1191
+      - 1176
+    stick_secondary: null
 driver_installed: false
 driver_type: WinUHid
 gc_l_click_mapping: Default
@@ -161,7 +217,7 @@ hidhide_hide_enabled: true
 hidhide_installed: true
 home_mapping: Default
 in_app_gyro_soft_deadzone: 0.0
-joycon_hold_mode: &id003 {}
+joycon_hold_mode: &id011 {}
 joystick_calibration_data: {}
 mag_calibration_data:
   E0:EF:BF:81:06:9F: &id002
@@ -182,7 +238,7 @@ mag_calibration_data:
 merged_gyro_side:
   E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
-  enabled: true
+  enabled: false
   ir_activate_threshold: 2
   sensitivity: 4.0
 open_when_startup: false
@@ -297,6 +353,36 @@ profiles:
         zl_mapping: Default
         zr_mapping: Default
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: false
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: false
+          right: 3
+        pro_controller:
+          left: 3
+          linked: false
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -397,6 +483,36 @@ profiles:
         zl_mapping: Default
         zr_mapping: Default
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: false
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: false
+          right: 3
+        pro_controller:
+          left: 3
+          linked: false
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -508,6 +624,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -618,6 +788,36 @@ profiles:
         zl_mapping: Default
         zr_mapping: Default
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: false
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: false
+          right: 3
+        pro_controller:
+          left: 3
+          linked: false
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -717,6 +917,36 @@ profiles:
         zl_mapping: Default
         zr_mapping: Default
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: false
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: false
+          right: 3
+        pro_controller:
+          left: 3
+          linked: false
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -818,6 +1048,36 @@ profiles:
         zl_mapping: Default
         zr_mapping: Default
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: false
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: false
+          right: 3
+        pro_controller:
+          left: 3
+          linked: false
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -910,6 +1170,47 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: &id003 []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: &id004 []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: *id003
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: *id004
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -946,6 +1247,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: &id005 []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: &id006 []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: *id005
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: *id006
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -1011,6 +1366,47 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: &id007 []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: &id008 []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: *id007
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: *id008
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -1047,6 +1443,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: &id009 []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: &id010 []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: *id009
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: *id010
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -1113,6 +1563,47 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -1148,7 +1639,61 @@ profiles:
         y_mapping: Default
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
-      joycon_hold_mode: *id003
+      joycon_hold_mode: *id011
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -1220,6 +1765,47 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: &id012 []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: &id013 []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: *id012
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: *id013
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -1256,6 +1842,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: &id014 []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: &id015 []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: *id014
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: *id015
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -1320,6 +1960,47 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: &id016 []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: &id017 []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: *id016
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: *id017
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -1356,6 +2037,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: &id018 []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: &id019 []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: *id018
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: *id019
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -1422,6 +2157,47 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: &id020 []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: &id021 []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: *id020
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: *id021
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -1458,6 +2234,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: &id022 []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: &id023 []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: *id022
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: *id023
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -1506,7 +2336,7 @@ profiles:
     cemuhook_sensitivity: 1
     change_profile_list: true
     djg_activation: Hold
-    djg_dominant_side: Left
+    djg_dominant_side: Right
     djg_enabled: false
     djg_mode: Switch Dominant Side
     driver_type: USBIP
@@ -1541,13 +2371,14 @@ profiles:
       in_app_gyro_mode_mappings:
         a_mapping: Default
         b_mapping: Default
-        c_mapping: Calibration
+        c_mapping: Default
         capt_mapping: Default
         down_mapping: Default
-        gc_l_click_mapping: Default
-        gc_r_click_mapping: Default
-        gl_mapping: PS_L_Touch
-        gr_mapping: PS_R_Touch
+        gc_l_click_mapping: Custom[Hold]:MB_3
+        gc_r_click_mapping: Custom[Hold]:MB_1
+        gc_trigger_mode: Hair Trigger
+        gl_mapping: Default
+        gr_mapping: Default
         home_mapping: Default
         l_joystick_custom:
           down: Default
@@ -1568,7 +2399,7 @@ profiles:
           left: Default
           right: Default
           up: Default
-        r_joystick_mapping: Default
+        r_joystick_mapping: Mouse
         r_joystick_mouse_sensitivity: 5.0
         r_joystick_scroll_activation: Hold
         r_joystick_scroll_mode: Up/Down
@@ -1576,22 +2407,52 @@ profiles:
         r_stk_mapping: Default
         right_mapping: Default
         sll_mapping: Default
-        slr_mapping: PS_R_Touch
-        srl_mapping: PS_L_Touch
-        srr_mapping: Change Profile
+        slr_mapping: Default
+        srl_mapping: Default
+        srr_mapping: Default
         up_mapping: Default
         x_mapping: Default
         y_mapping: Default
-        zl_mapping: Default
-        zr_mapping: Default
+        zl_mapping: Custom[Hold]:MB_3
+        zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
         right: Default
         up: Default
       l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 20.0
+      l_joystick_mouse_sensitivity: 5.0
       l_joystick_scroll_activation: Hold
       l_joystick_scroll_mode: Up/Down
       l_mapping: Default
@@ -1605,7 +2466,7 @@ profiles:
         right: Default
         up: Default
       r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 20.0
+      r_joystick_mouse_sensitivity: 5.0
       r_joystick_scroll_activation: Hold
       r_joystick_scroll_mode: Up/Down
       r_mapping: Default
@@ -1686,13 +2547,67 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
         right: Default
         up: Default
       l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 20.0
+      l_joystick_mouse_sensitivity: 5.0
       l_joystick_scroll_activation: Hold
       l_joystick_scroll_mode: Up/Down
       l_mapping: Default
@@ -1706,7 +2621,7 @@ profiles:
         right: Default
         up: Default
       r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 20.0
+      r_joystick_mouse_sensitivity: 5.0
       r_joystick_scroll_activation: Hold
       r_joystick_scroll_mode: Up/Down
       r_mapping: Default
@@ -1788,13 +2703,43 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
         right: Default
         up: Default
       l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 20.0
+      l_joystick_mouse_sensitivity: 5.0
       l_joystick_scroll_activation: Hold
       l_joystick_scroll_mode: Up/Down
       l_mapping: Default
@@ -1808,7 +2753,7 @@ profiles:
         right: Default
         up: Default
       r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 20.0
+      r_joystick_mouse_sensitivity: 5.0
       r_joystick_scroll_activation: Hold
       r_joystick_scroll_mode: Up/Down
       r_mapping: Default
@@ -1850,11 +2795,12 @@ profiles:
       in_app_gyro_mode_mappings:
         a_mapping: Default
         b_mapping: Default
-        c_mapping: Calibration
+        c_mapping: Default
         capt_mapping: Default
         down_mapping: Default
-        gc_l_click_mapping: Default
-        gc_r_click_mapping: Default
+        gc_l_click_mapping: Custom[Hold]:MB_3
+        gc_r_click_mapping: Custom[Hold]:MB_1
+        gc_trigger_mode: Hair Trigger
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
@@ -1877,7 +2823,7 @@ profiles:
           left: Default
           right: Default
           up: Default
-        r_joystick_mapping: Default
+        r_joystick_mapping: Mouse
         r_joystick_mouse_sensitivity: 5.0
         r_joystick_scroll_activation: Hold
         r_joystick_scroll_mode: Up/Down
@@ -1887,20 +2833,50 @@ profiles:
         sll_mapping: Default
         slr_mapping: Default
         srl_mapping: Default
-        srr_mapping: Change Profile
+        srr_mapping: Default
         up_mapping: Default
         x_mapping: Default
         y_mapping: Default
-        zl_mapping: Default
-        zr_mapping: Default
+        zl_mapping: Custom[Hold]:MB_3
+        zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
         right: Default
         up: Default
       l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 20.0
+      l_joystick_mouse_sensitivity: 5.0
       l_joystick_scroll_activation: Hold
       l_joystick_scroll_mode: Up/Down
       l_mapping: Default
@@ -1914,7 +2890,7 @@ profiles:
         right: Default
         up: Default
       r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 20.0
+      r_joystick_mouse_sensitivity: 5.0
       r_joystick_scroll_activation: Hold
       r_joystick_scroll_mode: Up/Down
       r_mapping: Default
@@ -1952,8 +2928,9 @@ profiles:
         c_mapping: Default
         capt_mapping: Default
         down_mapping: Default
-        gc_l_click_mapping: Default
-        gc_r_click_mapping: Default
+        gc_l_click_mapping: Custom[Hold]:MB_3
+        gc_r_click_mapping: Custom[Hold]:MB_1
+        gc_trigger_mode: Hair Trigger
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
@@ -1976,7 +2953,7 @@ profiles:
           left: Default
           right: Default
           up: Default
-        r_joystick_mapping: Default
+        r_joystick_mapping: Mouse
         r_joystick_mouse_sensitivity: 5.0
         r_joystick_scroll_activation: Hold
         r_joystick_scroll_mode: Up/Down
@@ -1984,22 +2961,52 @@ profiles:
         r_stk_mapping: Default
         right_mapping: Default
         sll_mapping: Default
-        slr_mapping: GR
-        srl_mapping: GL
-        srr_mapping: Change Profile
+        slr_mapping: Default
+        srl_mapping: Default
+        srr_mapping: Default
         up_mapping: Default
         x_mapping: Default
         y_mapping: Default
-        zl_mapping: Default
-        zr_mapping: Default
+        zl_mapping: Custom[Hold]:MB_3
+        zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
         right: Default
         up: Default
       l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 20.0
+      l_joystick_mouse_sensitivity: 5.0
       l_joystick_scroll_activation: Hold
       l_joystick_scroll_mode: Up/Down
       l_mapping: Default
@@ -2013,7 +3020,7 @@ profiles:
         right: Default
         up: Default
       r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 20.0
+      r_joystick_mouse_sensitivity: 5.0
       r_joystick_scroll_activation: Hold
       r_joystick_scroll_mode: Up/Down
       r_mapping: Default
@@ -2050,11 +3057,12 @@ profiles:
       in_app_gyro_mode_mappings:
         a_mapping: Default
         b_mapping: Default
-        c_mapping: Calibration
+        c_mapping: Default
         capt_mapping: Default
         down_mapping: Default
-        gc_l_click_mapping: Default
-        gc_r_click_mapping: Default
+        gc_l_click_mapping: Custom[Hold]:MB_3
+        gc_r_click_mapping: Custom[Hold]:MB_1
+        gc_trigger_mode: Hair Trigger
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
@@ -2077,7 +3085,7 @@ profiles:
           left: Default
           right: Default
           up: Default
-        r_joystick_mapping: Default
+        r_joystick_mapping: Mouse
         r_joystick_mouse_sensitivity: 5.0
         r_joystick_scroll_activation: Hold
         r_joystick_scroll_mode: Up/Down
@@ -2087,20 +3095,50 @@ profiles:
         sll_mapping: Default
         slr_mapping: Default
         srl_mapping: Default
-        srr_mapping: Change Profile
+        srr_mapping: Default
         up_mapping: Default
         x_mapping: Default
         y_mapping: Default
-        zl_mapping: Default
-        zr_mapping: Default
+        zl_mapping: Custom[Hold]:MB_3
+        zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
         right: Default
         up: Default
       l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 20.0
+      l_joystick_mouse_sensitivity: 5.0
       l_joystick_scroll_activation: Hold
       l_joystick_scroll_mode: Up/Down
       l_mapping: Default
@@ -2114,7 +3152,7 @@ profiles:
         right: Default
         up: Default
       r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 20.0
+      r_joystick_mouse_sensitivity: 5.0
       r_joystick_scroll_activation: Hold
       r_joystick_scroll_mode: Up/Down
       r_mapping: Default
@@ -2142,7 +3180,7 @@ profiles:
     cemuhook_sensitivity: 1
     change_profile_list: true
     djg_activation: Hold
-    djg_dominant_side: Left
+    djg_dominant_side: Right
     djg_enabled: false
     djg_mode: Switch Dominant Side
     driver_type: USBIP
@@ -2222,6 +3260,36 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -2323,6 +3391,36 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -2425,6 +3523,36 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -2532,6 +3660,60 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -2632,6 +3814,36 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -2734,6 +3946,36 @@ profiles:
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
       joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: L
+            middle_click: None
+            right_click: ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 2
+          function: Default
+          ir_mouse:
+            left_click: R
+            middle_click: None
+            right_click: ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
       l_joystick_custom:
         down: Default
         left: Default
@@ -2775,6 +4017,7 @@ profiles:
       zl_mapping: Default
       zr_mapping: Default
 r_joystick_gyro_sensitivity: 5.0
+ready_driven_controller_init: true
 rumble_delay_ms: 0
 rumble_mode: Xbox
 simulation_mode: PS5
@@ -2789,6 +4032,7 @@ stick_mouse_sensitivity: 5.0
 stick_r_bias:
 - 0.0
 - 0.0
+sw2_zero_command_pacing: true
 ui_scale: 1.0
 usbip_sim_mode: PS5
 vibration_frequency: 10
@@ -2798,11 +4042,14 @@ vibration_strength_switch: 5
 vibration_strength_xbox: 5
 vigembus_installed: true
 vigembus_sim_mode: Xbox360
+virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1247
-window_y: 70
+window_x: 1215
+window_y: 64
+winrt_cached_services: true
+winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5
 wired_auto_scan_enabled: true
 wired_usb_enabled: true
