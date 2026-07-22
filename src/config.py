@@ -1030,7 +1030,7 @@ class Config:
             value = int(value)
         except (TypeError, ValueError, OverflowError):
             return JOYSTICK_DEADZONE_DEFAULT_PERCENT
-        return max(0, min(99, value))
+        return max(0, min(100, value))
 
     def _normalize_joystick_deadzone_settings(self, category):
         """Repair old/partial settings in place and preserve the link invariant."""

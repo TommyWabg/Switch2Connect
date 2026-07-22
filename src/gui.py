@@ -8818,10 +8818,15 @@ bg_color=panel_bg, widths=[8, 10])
         content.pack(fill=tk.BOTH, expand=True, padx=int(5 * scaling_factor), pady=int(5 * scaling_factor))
         syncing = {"value": False, "dirty": False}
         rows = {}
-        # Cache image sizes because the Entry's requested height is the source of
-        # truth for alignment and can change with UI scaling.
+        # Keep the link icon at the exact former Entry-based size. Sliders are taller
+        # than the old controls and must not enlarge this button.
         icon_images_by_height = {}
         popup.joystick_deadzone_icon_images = icon_images_by_height
+
+        icon_size_reference = tk.Entry(
+            content, width=3, font=scale_font(("Arial", 11, "bold")), bd=0)
+        previous_entry_height = icon_size_reference.winfo_reqheight()
+        icon_size_reference.destroy()
 
         def get_icon_images(entry_height):
             icon_height = max(1, int(round(entry_height * 0.8)))
@@ -8833,41 +8838,31 @@ bg_color=panel_bg, widths=[8, 10])
                     icon_images_by_height[icon_height][icon_name] = ImageTk.PhotoImage(image)
             return icon_images_by_height[icon_height]
 
-        def valid_percent(text):
-            return text == "" or (text.isdigit() and int(text) <= 99)
-        vcmd = (self.root.register(valid_percent), "%P")
-
         def commit_row(family, side=None):
             row = rows[family]
             selected = ("left", "right") if side is None else (side,)
             changed = False
             for current_side in selected:
-                text = row[current_side].get().strip()
-                if text == "":
-                    continue
                 CONFIG.set_joystick_deadzone_percent(
-                    family, current_side, int(text), profile_name, category)
+                    family, current_side, row[current_side].get(), profile_name, category)
                 changed = True
             values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
             syncing["value"] = True
-            row["left"].set(str(values["left"]))
-            row["right"].set(str(values["right"]))
+            row["left"].set(values["left"])
+            row["right"].set(values["right"])
             syncing["value"] = False
             syncing["dirty"] = syncing["dirty"] or changed
             return changed
 
-        def sync_from_edit(family, side, *_):
+        def sync_from_slider(family, side, value):
             if syncing["value"]:
                 return
-            text = rows[family][side].get()
-            if not text or not text.isdigit() or int(text) > 99:
-                return
-            CONFIG.set_joystick_deadzone_percent(family, side, int(text), profile_name, category)
+            CONFIG.set_joystick_deadzone_percent(family, side, int(float(value)), profile_name, category)
             values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
             if values["linked"]:
                 other = "right" if side == "left" else "left"
                 syncing["value"] = True
-                rows[family][other].set(str(values[other]))
+                rows[family][other].set(values[other])
                 syncing["value"] = False
             syncing["dirty"] = True
 
@@ -8875,8 +8870,8 @@ bg_color=panel_bg, widths=[8, 10])
             values = CONFIG.get_joystick_deadzone_settings(profile_name, category)[family]
             values = CONFIG.set_joystick_deadzone_linked(family, not values["linked"], profile_name, category)
             syncing["value"] = True
-            rows[family]["left"].set(str(values["left"]))
-            rows[family]["right"].set(str(values["right"]))
+            rows[family]["left"].set(values["left"])
+            rows[family]["right"].set(values["right"])
             syncing["value"] = False
             rows[family]["refresh_link"]()
             syncing["dirty"] = True
@@ -8900,36 +8895,41 @@ bg_color=panel_bg, widths=[8, 10])
                          padx=(0, int(8 * scaling_factor)), pady=row_pady)
             tk.Label(content, text="L Joystick:", bg=background_color, fg=text_color,
                      font=scale_font(("Arial", 11, "bold")), anchor=tk.E).grid(row=grid_row, column=1, sticky=tk.E)
-            left_var, right_var = tk.StringVar(value=str(values["left"])), tk.StringVar(value=str(values["right"]))
-            left = tk.Entry(content, textvariable=left_var, width=3, justify=tk.CENTER, validate="key", validatecommand=vcmd,
-                            bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, font=scale_font(("Arial", 11, "bold")))
+            left_var, right_var = tk.IntVar(value=values["left"]), tk.IntVar(value=values["right"])
+            rows[family] = {"left": left_var, "right": right_var}
+            slider_options = {
+                "from_": 0, "to": 100, "resolution": 1, "orient": tk.HORIZONTAL,
+                "length": int(120 * scaling_factor), "bg": background_color,
+                "fg": text_color, "troughcolor": button_gray,
+                "activebackground": highlight_color, "highlightthickness": 0,
+                "bd": 0, "sliderrelief": tk.FLAT,
+                "sliderlength": int(15 * scaling_factor), "width": int(15 * scaling_factor),
+                "font": scale_font(("Arial", 10, "bold")),
+            }
+            left = tk.Scale(
+                content, variable=left_var,
+                command=lambda value, f=family: sync_from_slider(f, "left", value),
+                **slider_options)
             left.grid(row=grid_row, column=2, sticky=tk.W, padx=(int(4 * scaling_factor), 0))
-            tk.Label(content, text="%", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=grid_row, column=3, sticky=tk.W)
-            icon_images = get_icon_images(left.winfo_reqheight())
+            icon_images = get_icon_images(previous_entry_height)
             link_button = tk.Button(content, image=icon_images["unlink"], bg=background_color,
                                     activebackground=background_color, relief=tk.FLAT, bd=0,
                                     highlightthickness=0, cursor="hand2", padx=0, pady=0)
             # grid's default placement is centered; sticky only accepts n/e/s/w.
-            link_button.grid(row=grid_row, column=4, padx=int(8 * scaling_factor))
+            link_button.grid(row=grid_row, column=3, padx=int(8 * scaling_factor))
             tk.Label(content, text="R Joystick:", bg=background_color, fg=text_color,
-                     font=scale_font(("Arial", 11, "bold")), anchor=tk.E).grid(row=grid_row, column=5, sticky=tk.E)
-            right = tk.Entry(content, textvariable=right_var, width=3, justify=tk.CENTER, validate="key", validatecommand=vcmd,
-                             bg=button_gray, fg=text_color, insertbackground=text_color, bd=0, font=scale_font(("Arial", 11, "bold")))
-            right.grid(row=grid_row, column=6, sticky=tk.W, padx=(int(4 * scaling_factor), 0))
-            tk.Label(content, text="%", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=grid_row, column=7, sticky=tk.W)
-            rows[family] = {"left": left_var, "right": right_var}
+                     font=scale_font(("Arial", 11, "bold")), anchor=tk.E).grid(row=grid_row, column=4, sticky=tk.E)
+            right = tk.Scale(
+                content, variable=right_var,
+                command=lambda value, f=family: sync_from_slider(f, "right", value),
+                **slider_options)
+            right.grid(row=grid_row, column=5, sticky=tk.W, padx=(int(4 * scaling_factor), 0))
             def refresh_link(f=family, button=link_button):
                 linked = CONFIG.get_joystick_deadzone_settings(profile_name, category)[f]["linked"]
                 button.config(image=icon_images["link" if linked else "unlink"])
             rows[family]["refresh_link"] = refresh_link
             refresh_link()
             link_button.config(command=lambda f=family: toggle_link(f))
-            left_var.trace_add("write", lambda *_args, f=family: sync_from_edit(f, "left"))
-            right_var.trace_add("write", lambda *_args, f=family: sync_from_edit(f, "right"))
-            left.bind("<FocusOut>", lambda _e, f=family: commit_row(f, "left"))
-            right.bind("<FocusOut>", lambda _e, f=family: commit_row(f, "right"))
-            left.bind("<Return>", lambda _e, f=family: (commit_row(f, "left"), "break")[1])
-            right.bind("<Return>", lambda _e, f=family: (commit_row(f, "right"), "break")[1])
             # Every cell in this row must reserve the same vertical padding.
             # Otherwise only the controller label is shifted by the row gap.
             for widget in content.grid_slaves(row=grid_row):
