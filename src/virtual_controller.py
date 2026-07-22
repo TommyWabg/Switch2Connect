@@ -56,9 +56,9 @@ from audio_endpoint_guard import DualSenseAudioEndpointGuard
 from utils import USBIPAllocator
 from dualsense_structs import DualSenseInputReport01
 from dualsense_haptic import DualSenseHapticProcessor
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
 logger = logging.getLogger(__name__)
-_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
 # Xbox One impulse-trigger calibration.  The frame carries the linear base
 # amplitude; controller.py applies the shared Xbox HF dynamic mask exactly once
@@ -69,9 +69,66 @@ IMPULSE_HF_FREQ_LOW = 300
 IMPULSE_HF_FREQ_HIGH = 481
 IMPULSE_RAW_LOW = 1
 IMPULSE_RAW_HIGH = 100
+IMPULSE_RELEASE_SECONDS = 0.090
+
+
+def _impulse_release_scale(elapsed_seconds):
+    elapsed = max(0.0, float(elapsed_seconds))
+    return max(0.0, 1.0 - elapsed / IMPULSE_RELEASE_SECONDS)
+
+
+def _next_impulse_release_state(current_raw, release_started, new_raw, now,
+                                force_clear=False):
+    """Return raw, start time, changed and stopped for one independent side."""
+    current_raw = max(0, min(IMPULSE_RAW_MAX, int(current_raw)))
+    release_started = max(0.0, float(release_started))
+    new_raw = max(0, min(IMPULSE_RAW_MAX, int(new_raw)))
+    if force_clear:
+        changed = current_raw > 0 or release_started > 0.0
+        return 0, 0.0, changed, current_raw > 0
+    if new_raw > 0:
+        if current_raw == new_raw and release_started <= 0.0:
+            return current_raw, 0.0, False, False
+        return new_raw, 0.0, True, False
+    if current_raw > 0 and release_started <= 0.0:
+        return current_raw, float(now), True, True
+    return current_raw, release_started, False, False
+
+
+def _resolve_impulse_release(current_raw, release_started, now):
+    """Return raw, scale, active and expired for one side at a point in time."""
+    current_raw = max(0, min(IMPULSE_RAW_MAX, int(current_raw)))
+    release_started = max(0.0, float(release_started))
+    if current_raw <= 0:
+        return 0, 0.0, False, False
+    if release_started <= 0.0:
+        return current_raw, 1.0, True, False
+    elapsed = max(0.0, float(now) - release_started)
+    if elapsed >= IMPULSE_RELEASE_SECONDS:
+        return 0, 0.0, False, True
+    return current_raw, _impulse_release_scale(elapsed), True, False
+
+
+def _impulse_release_frequency_raw(source_raw, release_scale):
+    """Map the instantaneous release strength back into the dynamic raw domain."""
+    source_raw = max(0, min(IMPULSE_RAW_MAX, int(source_raw)))
+    scale = min(1.0, max(0.0, float(release_scale)))
+    if source_raw == 0 or scale <= 0.0:
+        return 0
+    return max(IMPULSE_RAW_LOW, min(
+        IMPULSE_RAW_MAX, int((source_raw * scale) + 0.5)))
 
 def _round_half_up_ratio(numerator, denominator):
     return (numerator + denominator // 2) // denominator
+
+
+def _impulse_dynamic_hf_frequency(raw):
+    raw = max(IMPULSE_RAW_LOW, min(IMPULSE_RAW_HIGH, int(raw)))
+    return _round_half_up_ratio(
+        IMPULSE_HF_FREQ_LOW * (IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
+        + (raw - IMPULSE_RAW_LOW)
+          * (IMPULSE_HF_FREQ_HIGH - IMPULSE_HF_FREQ_LOW),
+        IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
 
 def _impulse_fixed_hf_frequency(setting):
     """Maps the 1..10 fixed-frequency setting into the 300..481 HF range."""
@@ -82,7 +139,8 @@ def _impulse_fixed_hf_frequency(setting):
         9)
 
 
-def _map_xbox_impulse_trigger(raw, dynamic_frequency=True, fixed_frequency=10):
+def _map_xbox_impulse_trigger(raw, dynamic_frequency=True, fixed_frequency=10,
+                              frequency_raw=None):
     """Maps a WinUHid impulse percentage to a linear, pre-mask HF frame."""
     raw = max(0, min(IMPULSE_RAW_MAX, int(raw)))
     if raw == 0:
@@ -90,13 +148,9 @@ def _map_xbox_impulse_trigger(raw, dynamic_frequency=True, fixed_frequency=10):
 
     hf_amp = _round_half_up_ratio(IMPULSE_HF_AMP_MAX * raw, IMPULSE_RAW_HIGH)
     if dynamic_frequency:
-        freq_numerator = (
-            IMPULSE_HF_FREQ_LOW * (IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
-            + (raw - IMPULSE_RAW_LOW)
-              * (IMPULSE_HF_FREQ_HIGH - IMPULSE_HF_FREQ_LOW)
-        )
-        hf_freq = _round_half_up_ratio(
-            freq_numerator, IMPULSE_RAW_HIGH - IMPULSE_RAW_LOW)
+        frequency_raw = raw if frequency_raw is None else max(
+            IMPULSE_RAW_LOW, min(IMPULSE_RAW_MAX, int(frequency_raw)))
+        hf_freq = _impulse_dynamic_hf_frequency(frequency_raw)
     else:
         hf_freq = _impulse_fixed_hf_frequency(fixed_frequency)
     hf_freq = max(1, min(511, hf_freq))
@@ -107,7 +161,8 @@ def _copy_vibration(v) -> VibrationData:
     return VibrationData(
         lf_freq=v.lf_freq, lf_amp=v.lf_amp, lf_en_tone=getattr(v, 'lf_en_tone', False),
         hf_freq=v.hf_freq, hf_amp=v.hf_amp, hf_en_tone=getattr(v, 'hf_en_tone', False),
-        impulse_raw=getattr(v, 'impulse_raw', 0)
+        impulse_raw=getattr(v, 'impulse_raw', 0),
+        impulse_scale=getattr(v, 'impulse_scale', 1.0)
     )
 
 def _zero_vibration(lf_freq=0x0e1, hf_freq=0x1e1) -> VibrationData:
@@ -127,6 +182,23 @@ def _fuse_djg_axis(dom_adj, sub_adj, scale):
             sub_scaled = dom_adj
         return dom_adj + sub_scaled
     return dom_adj
+
+
+def _merge_djg_direct_motion(left_g, right_g, left_a, right_a,
+                             left_active, right_active):
+    zero = (0.0, 0.0, 0.0)
+    if left_active and right_active:
+        merged_g = tuple(left_g[i] + right_g[i] for i in range(3))
+        if left_a != zero and right_a != zero:
+            merged_a = tuple((left_a[i] + right_a[i]) * 0.5 for i in range(3))
+        else:
+            merged_a = left_a if left_a != zero else right_a
+        return merged_g, merged_a
+    if left_active:
+        return tuple(left_g), tuple(left_a)
+    if right_active:
+        return tuple(right_g), tuple(right_a)
+    return zero, zero
 
 
 MAC_TO_USBIP = {}
@@ -316,6 +388,8 @@ class VirtualController:
         # ordinary mono rumble buffers.
         self.xbox_impulse_raw_l = 0
         self.xbox_impulse_raw_r = 0
+        self.xbox_impulse_release_started_l = 0.0
+        self.xbox_impulse_release_started_r = 0.0
         self.xbox_impulse_sequence = 0
         self.xbox_impulse_stop_sequence = 0
         self.xbox_impulse_sequence_l = 0
@@ -541,10 +615,11 @@ class VirtualController:
             return x / mag, y / mag
         return self._clamp_stick_pair((x, y))
 
-    def _is_djg_direct_merge(self):
+    def _is_djg_none_merge(self):
         return bool(
             getattr(CONFIG, "djg_enabled", False) and
-            getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Direct Merge"
+            getattr(CONFIG, "djg_mode", "Single Side Toggle") == "Single Side Toggle" and
+            getattr(CONFIG, "djg_dominant_side", "Right") == "None"
         )
 
     def _direct_merged_motion(self, inputData):
@@ -552,20 +627,10 @@ class VirtualController:
         right_g = self.djg_direct_cached_gyro.get("Right", (0.0, 0.0, 0.0))
         left_a = self.djg_direct_cached_accel.get("Left", (0.0, 0.0, 0.0))
         right_a = self.djg_direct_cached_accel.get("Right", (0.0, 0.0, 0.0))
-        merged_g = (
-            left_g[0] + right_g[0],
-            left_g[1] + right_g[1],
-            left_g[2] + right_g[2],
-        )
-        if left_a != (0.0, 0.0, 0.0) and right_a != (0.0, 0.0, 0.0):
-            merged_a = (
-                (left_a[0] + right_a[0]) * 0.5,
-                (left_a[1] + right_a[1]) * 0.5,
-                (left_a[2] + right_a[2]) * 0.5,
-            )
-        else:
-            merged_a = left_a if left_a != (0.0, 0.0, 0.0) else (right_a if right_a != (0.0, 0.0, 0.0) else inputData.accelerometer)
-        return merged_g, merged_a
+        return _merge_djg_direct_motion(
+            left_g, right_g, left_a, right_a,
+            bool(getattr(self, 'djg_left_active', True)),
+            bool(getattr(self, 'djg_right_active', True)))
 
     def _controller_mapping_scope(self, controller):
         active = (
@@ -622,12 +687,6 @@ class VirtualController:
         return self._clamp_stick_pair(sum_left), self._clamp_stick_pair(sum_right)
 
     def handle_djg_trigger(self, controller, pressed=True):
-        if self._is_djg_direct_merge():
-            import utils
-            if hasattr(utils, 'force_ui_update_callback') and utils.force_ui_update_callback:
-                utils.force_ui_update_callback()
-            return
-
         activation = getattr(CONFIG, "djg_activation", "Toggle")
         if activation == "Toggle" and not pressed:
             return
@@ -639,13 +698,13 @@ class VirtualController:
             else:
                 self.djg_right_active = not self.djg_right_active
         elif mode == "Switch Dominant Side":
-            current = getattr(CONFIG, "djg_dominant_side", "Left")
+            current = getattr(CONFIG, "djg_dominant_side", "Right")
             CONFIG.djg_dominant_side = "Right" if current == "Left" else "Left"
             CONFIG.save_config()
             self.djg_left_active = True
             self.djg_right_active = True
         elif mode == "Switch Gyro Side":
-            current = getattr(CONFIG, "djg_dominant_side", "Left")
+            current = getattr(CONFIG, "djg_dominant_side", "Right")
             new_side = "Right" if current == "Left" else "Left"
             self.active_gyro_side = new_side
             CONFIG.djg_dominant_side = new_side
@@ -680,15 +739,14 @@ class VirtualController:
             else:
                 controller._shared_dampening_btn_states = dict(getattr(controller, "_profile_combo_btn_states", {}) or {})
 
-            direct_merge = is_merged and self._is_djg_direct_merge()
+            direct_merge = is_merged and self._is_djg_none_merge()
             if direct_merge:
                 for c in controllers:
-                    c.gyro_active = True
                     c._skip_gyro_mouse = False
                 return
 
             if len(self.controllers) == 2 and getattr(CONFIG, "djg_enabled", False):
-                djg_dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                djg_dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
                 djg_sub_side = "Right" if djg_dom_side == "Left" else "Left"
                 
                 side = "Left" if controller.is_joycon_left() else "Right"
@@ -864,11 +922,32 @@ class VirtualController:
         with self.state_lock:
             if self.vg_controller is None and self.running:
                 self._setup_vg_controller()
+            ready = self._submit_virtual_ready_probe()
+        if not ready:
+            raise RuntimeError("virtual device did not accept neutral readiness probe")
+
+    def _submit_virtual_ready_probe(self):
+        """Submit the already-neutral report and use its native result as readiness.
+
+        WinUHid's create call only allocates the object.  A successful input submit
+        is the first point at which the virtual device is usable by Windows.
+        """
+        if self.vg_controller is None or not hasattr(self.vg_controller, "update"):
+            return False
+        try:
+            result = self.vg_controller.update()
+            # Legacy ViGEm/USBIP helpers return None on success; the WinUHid
+            # adapters return a bool from the native ReportInput call.
+            return result is not False
+        except Exception:
+            logger.exception("Virtual device neutral readiness probe failed")
+            return False
 
     def _setup_vg_controller(self):
         with VIRTUAL_DEVICE_CREATION_LOCK:
             import time
-            time.sleep(0.5)
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
         server_port = self.server_port
         # Detach first while server socket is still active
         self._suppress_usbip_reconnect = True
@@ -886,7 +965,8 @@ class VirtualController:
             
             # Force cleanup of the old target
             gc.collect()
-            time.sleep(0.5)
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
 
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         self._suppress_usbip_reconnect = False
@@ -921,7 +1001,8 @@ class VirtualController:
             
             # Force GC to release sockets/files
             gc.collect()
-            time.sleep(0.5)
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
             
             if self.mode == "Switch2":
                 usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
@@ -1129,6 +1210,7 @@ class VirtualController:
                             on_audio_data_callback=self._usbip_audio_callback,
                             on_disconnect_callback=self._on_ps5_usbip_disconnected,
                             on_haptic_callback=self._proxy_haptic_callback,
+                            on_audio_activity_callback=self._proxy_audio_activity_callback,
                             enable_audio=enable_audio,
                         )
                         self.usbip_server = DualSenseServerProxy(**server_kwargs)
@@ -1281,7 +1363,8 @@ class VirtualController:
                         self.xbox_force_feedback_callback)
                 else:
                     self.vg_controller.register_notification(callback_function=self.vibration_callback)
-            time.sleep(0.5)
+            if not getattr(CONFIG, "virtual_driver_ready_probe", True):
+                time.sleep(0.5)
 
         self.previous_buttons_left = 0x00000000
         self.previous_buttons_right = 0x00000000
@@ -1404,7 +1487,8 @@ class VirtualController:
         # Reuse the ordinary path verbatim so Xbox main-motor rumble remains
         # mono. Impulse state is stored separately below.
         self._vibration_callback_internal(None, None, large_motor, small_motor, 0, None)
-        if getattr(CONFIG, 'impulse_trigger_enabled', True):
+        impulse_enabled = getattr(CONFIG, 'impulse_trigger_enabled', True)
+        if impulse_enabled:
             left_trigger = max(0, min(IMPULSE_RAW_MAX, int(left_trigger)))
             right_trigger = max(0, min(IMPULSE_RAW_MAX, int(right_trigger)))
         else:
@@ -1413,29 +1497,62 @@ class VirtualController:
             left_trigger = 0
             right_trigger = 0
         with self.vibration_lock:
-            previous_l = self.xbox_impulse_raw_l
-            previous_r = self.xbox_impulse_raw_r
-            if previous_l == left_trigger and previous_r == right_trigger:
+            now = time.perf_counter()
+
+            def update_side(side, new_raw, force_clear=False):
+                raw_name = f'xbox_impulse_raw_{side}'
+                release_name = f'xbox_impulse_release_started_{side}'
+                raw, started, changed, stopped = _next_impulse_release_state(
+                    getattr(self, raw_name, 0), getattr(self, release_name, 0.0),
+                    new_raw, now, force_clear)
+                setattr(self, raw_name, raw)
+                setattr(self, release_name, started)
+                return changed, stopped
+
+            changed_l, stopped_l = update_side('l', left_trigger, not impulse_enabled)
+            changed_r, stopped_r = update_side('r', right_trigger, not impulse_enabled)
+            if not (changed_l or changed_r):
                 return
-            self.xbox_impulse_raw_l = left_trigger
-            self.xbox_impulse_raw_r = right_trigger
             self.xbox_impulse_sequence += 1
-            if previous_l != left_trigger:
+            if changed_l:
                 self.xbox_impulse_sequence_l += 1
-            if previous_r != right_trigger:
+            if changed_r:
                 self.xbox_impulse_sequence_r += 1
-            if previous_l > 0 and left_trigger == 0:
+            if stopped_l:
                 self.xbox_impulse_stop_sequence += 1
                 self.xbox_impulse_stop_sequence_l += 1
-            if previous_r > 0 and right_trigger == 0:
+            if stopped_r:
                 self.xbox_impulse_stop_sequence += 1
                 self.xbox_impulse_stop_sequence_r += 1
 
+    def _get_xbox_impulse_output_locked(self, side, now):
+        """Return (raw, release_scale, active), completing release if due."""
+        raw_name = f'xbox_impulse_raw_{side}'
+        release_name = f'xbox_impulse_release_started_{side}'
+        raw = int(getattr(self, raw_name, 0))
+        release_started = float(getattr(self, release_name, 0.0))
+        raw, scale, active, expired = _resolve_impulse_release(
+            raw, release_started, now)
+        if not expired:
+            return raw, scale, active
+
+        setattr(self, raw_name, raw)
+        setattr(self, release_name, 0.0)
+        self.xbox_impulse_sequence += 1
+        if side == 'l':
+            self.xbox_impulse_sequence_l += 1
+        else:
+            self.xbox_impulse_sequence_r += 1
+        return raw, scale, active
+
     def get_xbox_impulse_state(self):
         with self.vibration_lock:
+            now = time.perf_counter()
+            _, _, left_active = self._get_xbox_impulse_output_locked('l', now)
+            _, _, right_active = self._get_xbox_impulse_output_locked('r', now)
             return {
-                'left_active': self.xbox_impulse_raw_l > 0,
-                'right_active': self.xbox_impulse_raw_r > 0,
+                'left_active': left_active,
+                'right_active': right_active,
                 'sequence': self.xbox_impulse_sequence,
                 'stop_sequence': self.xbox_impulse_stop_sequence,
                 'sequence_l': self.xbox_impulse_sequence_l,
@@ -1446,26 +1563,36 @@ class VirtualController:
 
     def get_current_xbox_impulse_frames(self, is_left=True):
         with self.vibration_lock:
-            raw = self.xbox_impulse_raw_l if is_left else self.xbox_impulse_raw_r
+            raw, release_scale, active = self._get_xbox_impulse_output_locked(
+                'l' if is_left else 'r', time.perf_counter())
         if not getattr(CONFIG, 'impulse_trigger_enabled', True):
             raw = 0
+            release_scale = 0.0
+            active = False
+        frequency_raw = _impulse_release_frequency_raw(raw, release_scale)
         frame = _map_xbox_impulse_trigger(
             raw,
             dynamic_frequency=getattr(CONFIG, 'impulse_trigger_dynamic_frequency', True),
-            fixed_frequency=getattr(CONFIG, 'impulse_trigger_frequency', 10))
-        return _copy_vibration(frame), _copy_vibration(frame), _copy_vibration(frame), raw == 0
+            fixed_frequency=getattr(CONFIG, 'impulse_trigger_frequency', 10),
+            frequency_raw=frequency_raw)
+        frame.impulse_scale = release_scale
+        return _copy_vibration(frame), _copy_vibration(frame), _copy_vibration(frame), not active
 
     def clear_xbox_impulse_triggers(self):
         with self.vibration_lock:
             # Invalidate a pending delayed four-motor packet before it can
             # re-enable an impulse side after this explicit clear.
             self._xbox_feedback_generation += 1
-            if self.xbox_impulse_raw_l == 0 and self.xbox_impulse_raw_r == 0:
+            if (self.xbox_impulse_raw_l == 0 and self.xbox_impulse_raw_r == 0 and
+                    self.xbox_impulse_release_started_l <= 0.0 and
+                    self.xbox_impulse_release_started_r <= 0.0):
                 return
             left_was_active = self.xbox_impulse_raw_l > 0
             right_was_active = self.xbox_impulse_raw_r > 0
             self.xbox_impulse_raw_l = 0
             self.xbox_impulse_raw_r = 0
+            self.xbox_impulse_release_started_l = 0.0
+            self.xbox_impulse_release_started_r = 0.0
             self.xbox_impulse_sequence += 1
             self.xbox_impulse_stop_sequence += 1
             if left_was_active:
@@ -1813,19 +1940,19 @@ class VirtualController:
             is_zero = (v1.lf_amp == 0 and v1.hf_amp == 0 and v2.lf_amp == 0 and v2.hf_amp == 0 and v3.lf_amp == 0 and v3.hf_amp == 0)
             return v1, v2, v3, is_zero
 
-    async def init_added_controller(self, controller: Controller):
+    async def init_added_controller(self, controller: Controller, update_leds=True):
         controller.virtual_controller = self
         self.loop = asyncio.get_running_loop()
         if self.vibration_changed_event is None:
             self.vibration_changed_event = asyncio.Event()
-        await self.update_leds()
+        if update_leds:
+            await self.update_leds()
 
         if self.mode == "Switch1":
             self.hold_mode = "Vertical"
             from usbip_server import USBIPJoyConLServer, USBIPJoyConRServer, USBIPProControllerServer
             import os
             import subprocess
-            import time
             from utils import USBIPAllocator
             
             mac_address = controller.device.address
@@ -1944,9 +2071,9 @@ class VirtualController:
         controller.gyro_steering_origin_accel = None
         
         def input_report_callback(inputData: ControllerInputData, controller: Controller):
-            perf_start = time.perf_counter() if _PERF_DIAGNOSTICS else 0.0
             if self.vg_controller is None:
-                return
+                return False
+            submitted = False
             controllers = getattr(self, "_controllers_tuple", None)
             if controllers is None or len(controllers) != len(self.controllers):
                 self._refresh_controller_cache()
@@ -1962,9 +2089,7 @@ class VirtualController:
             if len(controllers) == 2 or controller.is_pro_controller():
                 if getattr(CONFIG, "djg_enabled", False):
                     mode = getattr(CONFIG, "djg_mode", "Single Side Toggle")
-                    if mode == "Direct Merge":
-                        controller.gyro_active = controller.is_joycon_left() or controller.is_joycon_right() or controller.is_pro_controller()
-                    elif mode == "Switch Gyro Side":
+                    if mode == "Switch Gyro Side":
                         controller.gyro_active = (controller.is_joycon_left() and self.active_gyro_side == "Left") or (controller.is_joycon_right() and self.active_gyro_side == "Right") or controller.is_pro_controller()
                     else:
                         controller.gyro_active = (controller.is_joycon_left() and getattr(self, 'djg_left_active', True)) or (controller.is_joycon_right() and getattr(self, 'djg_right_active', True))
@@ -1984,7 +2109,7 @@ class VirtualController:
             if is_merged:
                 left_c, right_c = getattr(self, "_merged_pair", (None, None))
                 other_c = right_c if controller is left_c else left_c
-                direct_merge = self._is_djg_direct_merge()
+                direct_merge = self._is_djg_none_merge()
                 # The In-App Gyro activation trigger is shared across both Joy-Cons in every
                 # merged mode: a trigger button on either side activates gyro regardless of
                 # which Joy-Con's IMU is currently feeding the output. Previously DJG modes
@@ -2028,20 +2153,28 @@ class VirtualController:
                             break
                     if commit_c is not None:
                         pending_key = commit_c._pending_in_app_gyro_trigger_key
+                        pending_side = getattr(commit_c, "_pending_in_app_gyro_trigger_side", None)
                         commit_time = time.perf_counter()
                         commit_c._last_in_app_gyro_trigger_key = pending_key
                         commit_c._last_in_app_gyro_trigger_time = commit_time
                         commit_c._own_last_in_app_gyro_trigger_key = pending_key
                         commit_c._own_last_in_app_gyro_trigger_time = commit_time
+                        # Carry the triggering side so Deadzone/Dampening (applied by the
+                        # dominant gyro side) can read the IR-triggering side's per-side tuning.
+                        commit_c._last_in_app_gyro_trigger_side = pending_side
+                        commit_c._own_last_in_app_gyro_trigger_side = pending_side
                 self._prev_shared_in_app_gyro_active = shared_in_app_gyro
 
-                # Pick the shared source key from whichever side most recently activated.
+                # Pick the shared source key (and its triggering side) from whichever side
+                # most recently activated.
                 left_time = getattr(left_c, '_own_last_in_app_gyro_trigger_time', 0.0)
                 right_time = getattr(right_c, '_own_last_in_app_gyro_trigger_time', 0.0)
                 if left_time >= right_time:
                     shared_last_in_app_gyro_trigger_key = getattr(left_c, '_own_last_in_app_gyro_trigger_key', None)
+                    shared_last_in_app_gyro_trigger_side = getattr(left_c, '_own_last_in_app_gyro_trigger_side', None)
                 else:
                     shared_last_in_app_gyro_trigger_key = getattr(right_c, '_own_last_in_app_gyro_trigger_key', None)
+                    shared_last_in_app_gyro_trigger_side = getattr(right_c, '_own_last_in_app_gyro_trigger_side', None)
 
                 shared_gyro = shared_in_app_gyro
 
@@ -2114,6 +2247,7 @@ class VirtualController:
                     c._shared_in_app_gyro_toggle = shared_in_app_gyro_toggle
                     c._shared_in_app_gyro_hold_pressed = shared_in_app_gyro_hold_pressed
                     c._shared_last_in_app_gyro_trigger_key = shared_last_in_app_gyro_trigger_key
+                    c._shared_last_in_app_gyro_trigger_side = shared_last_in_app_gyro_trigger_side
                     c._shared_zr_pressed = shared_zr
                     c._shared_zl_pressed = shared_zl
                     c._shared_mode_shift_toggle = shared_mode_shift_toggle
@@ -2141,7 +2275,7 @@ class VirtualController:
                 controller._shared_mode_shift_active = getattr(controller, '_own_mode_shift_active', False)
                 
             current_buttons = inputData.buttons 
-            if is_merged and self._is_djg_direct_merge():
+            if is_merged and self._is_djg_none_merge():
                 side = "Left" if controller.is_joycon_left() else ("Right" if controller.is_joycon_right() else None)
                 if side:
                     self.djg_direct_cached_gyro[side] = inputData.gyroscope
@@ -2315,10 +2449,15 @@ class VirtualController:
                     send_cemuhook = True
                 else:
                     send_cemuhook = False
-                    if self._is_djg_direct_merge():
-                        send_cemuhook = controller.is_joycon_right()
+                    if self._is_djg_none_merge():
+                        left_on = bool(getattr(self, 'djg_left_active', True))
+                        right_on = bool(getattr(self, 'djg_right_active', True))
+                        send_cemuhook = (
+                            (right_on and controller.is_joycon_right()) or
+                            (left_on and not right_on and controller.is_joycon_left())
+                        )
                     elif getattr(CONFIG, "djg_enabled", False):
-                        dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                        dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
                         if controller.is_joycon_left() and dom_side == "Left":
                             send_cemuhook = True
                         elif controller.is_joycon_right() and dom_side == "Right":
@@ -2356,7 +2495,7 @@ class VirtualController:
                         # 1. 統一為標準的 V mode 物理軸向
                         # 根據實測，Joy-Con 2 (左/右) 與 Pro Controller 的原始 IMU 座標系完全一致
                         # 皆需要反轉三軸的重力向量 (X, Y, Z)，才能在 Yuzu 等模擬器中得到正確的旋轉方向與重力向量
-                        if self._is_djg_direct_merge():
+                        if self._is_djg_none_merge():
                             source_gyro, source_accel = self._direct_merged_motion(inputData)
                         else:
                             source_gyro, source_accel = inputData.gyroscope, inputData.accelerometer
@@ -2391,69 +2530,28 @@ class VirtualController:
                 inputData.accelerometer = (0.0, 0.0, 0.0)
 
             if self.mode == "PS4":
-                self.update_as_ps4(inputData, buttons, controller)
+                submitted = self.update_as_ps4(inputData, buttons, controller)
             elif self.mode == "PS5":
-                self.update_as_ps5(inputData, buttons, controller)
+                submitted = self.update_as_ps5(inputData, buttons, controller)
             elif self.mode == "Switch2":
-                self.update_as_switch2_pro(inputData, buttons, controller)
+                submitted = self.update_as_switch2_pro(inputData, buttons, controller)
             elif self.mode == "Switch1":
                 if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
-                    self.update_as_switch1_pro(inputData, buttons, controller)
+                    submitted = self.update_as_switch1_pro(inputData, buttons, controller)
                 elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
-                    self.update_as_switch1_joycon_l(inputData, buttons, controller)
+                    submitted = self.update_as_switch1_joycon_l(inputData, buttons, controller)
                 elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
-                    self.update_as_switch1_joycon_r(inputData, buttons, controller)
+                    submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
             else:
-                self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
+                submitted = self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
             
             # Record raw buttons for shared click logic in next report
             controller._last_raw_buttons = current_buttons
-            if _PERF_DIAGNOSTICS and perf_start:
-                elapsed_us = (time.perf_counter() - perf_start) * 1000000.0
-                samples = getattr(self, "_input_pipeline_samples", None)
-                if samples is None:
-                    samples = []
-                    self._input_pipeline_samples = samples
-                    self._input_pipeline_log_t = time.perf_counter()
-                samples.append(elapsed_us)
-                now_perf = time.perf_counter()
-                if now_perf - getattr(self, "_input_pipeline_log_t", 0.0) >= 1.0:
-                    ordered = sorted(samples)
-                    count = len(ordered)
-                    if count:
-                        p50 = ordered[min(count - 1, count // 2)]
-                        p95 = ordered[min(count - 1, int(count * 0.95))]
-                        logger.info(
-                            "Input pipeline perf: mode=%s merged=%d samples=%d p50=%.0fus p95=%.0fus max=%.0fus",
-                            self.mode,
-                            1 if is_merged else 0,
-                            count,
-                            p50,
-                            p95,
-                            ordered[-1],
-                        )
-                    samples.clear()
-                    self._input_pipeline_log_t = now_perf
+            return bool(submitted)
 
         def wrapped_callback(inputData: ControllerInputData, controller: Controller):
             with self.state_lock:
-                input_report_callback(inputData, controller)
-            # TEMP diagnostic: confirms the base handler's forward reaches the virtual
-            # controller output, and whether vg_controller is ready. Compare its rate with
-            # the base handler's INPUT-RATE to see if the forward is being skipped.
-            try:
-                _now = time.perf_counter()
-                controller._vc_cb_count = getattr(controller, '_vc_cb_count', 0) + 1
-                if _now - getattr(controller, '_vc_cb_t0', 0.0) >= 1.0:
-                    logger.info("VC-CB-RATE addr=%s mode=%s vg=%s usbip=%s rate=%d/s",
-                                controller.device.address, self.mode,
-                                self.vg_controller is not None,
-                                getattr(self, 'usbip_server', None) is not None,
-                                controller._vc_cb_count)
-                    controller._vc_cb_count = 0
-                    controller._vc_cb_t0 = _now
-            except Exception:
-                pass
+                return input_report_callback(inputData, controller)
 
         controller.set_input_report_callback(wrapped_callback)
         controller.gyro_fusion_callback = self.gyro_fusion_callback
@@ -2713,6 +2811,8 @@ class VirtualController:
                 state = self._build_switch1_report(inputData, buttons, controller, device_type="L")
                 if getattr(controller, '_sw1_should_emit', True):
                     self.usbip_server_l.update_state(state)
+                return True
+        return False
 
     def update_as_switch1_joycon_r(self, inputData: ControllerInputData, buttons: int, controller):
         if self.driver_type == "USBIP":
@@ -2720,12 +2820,16 @@ class VirtualController:
                 state = self._build_switch1_report(inputData, buttons, controller, device_type="R")
                 if getattr(controller, '_sw1_should_emit', True):
                     self.usbip_server_r.update_state(state)
+                return True
+        return False
 
     def update_as_switch1_pro(self, inputData: ControllerInputData, buttons: int, controller):
         if self.driver_type == "USBIP":
             if hasattr(self, 'usbip_server_pro') and self.usbip_server_pro:
                 state = self._build_switch1_report(inputData, buttons, controller, device_type="Pro")
                 self.usbip_server_pro.update_state(state)
+                return True
+        return False
 
     def _add_gyro_rstick_overlay(self, rx, ry, inputData):
         gx, gy = getattr(inputData, "gyro_rstick_overlay", (0.0, 0.0))
@@ -2739,10 +2843,11 @@ class VirtualController:
 
         with self.state_lock:
             if self.vg_controller is None:
-                return
+                return False
             self._update_as_ps4_locked(inputData, buttons, controller)
             if getattr(self, 'driver_type', '') != "ViGEmBus":
-                self.vg_controller.update()
+                return self.vg_controller.update() is not False
+            return True
 
     def _update_as_ps4_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         driver_type = self.driver_type
@@ -2887,7 +2992,7 @@ class VirtualController:
                 self.last_rx = float_to_byte(mixed_right[0])
                 self.last_ry = float_to_byte(-mixed_right[1])
 
-                if self._is_djg_direct_merge():
+                if self._is_djg_none_merge():
                     merged_g, merged_a = self._direct_merged_motion(inputData)
                     self.last_gx = merged_g[0]
                     self.last_gy = merged_g[2]
@@ -2898,7 +3003,7 @@ class VirtualController:
                 else:
                     is_passthrough_source = False
                     if getattr(CONFIG, "djg_enabled", False):
-                        dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                        dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
                         if controller.is_joycon_left() and dom_side == "Left":
                             is_passthrough_source = True
                         elif controller.is_joycon_right() and dom_side == "Right":
@@ -3122,7 +3227,7 @@ class VirtualController:
             self.last_rx = float_to_byte(mixed_right[0])
             self.last_ry = float_to_byte(-mixed_right[1])
 
-            if self._is_djg_direct_merge():
+            if self._is_djg_none_merge():
                 merged_g, merged_a = self._direct_merged_motion(inputData)
                 self.last_gx = merged_g[0]
                 self.last_gy = merged_g[2]
@@ -3133,7 +3238,7 @@ class VirtualController:
             else:
                 is_passthrough_source = False
                 if getattr(CONFIG, "djg_enabled", False):
-                    dom_side = getattr(CONFIG, "djg_dominant_side", "Left")
+                    dom_side = getattr(CONFIG, "djg_dominant_side", "Right")
                     if controller.is_joycon_left() and dom_side == "Left":
                         is_passthrough_source = True
                     elif controller.is_joycon_right() and dom_side == "Right":
@@ -3229,7 +3334,7 @@ class VirtualController:
     def update_as_xbox(self, inputData: ControllerInputData, buttons: int, controller: Controller, buttonsConfig: ButtonConfig):
         with self.state_lock:
             if self.vg_controller is None:
-                return
+                return False
             # Phase 1: Button Mapping (Respects GUI layout setting)
             xb_btns = 0
             
@@ -3340,6 +3445,7 @@ class VirtualController:
                 self.vg_controller.left_joystick_float(self.last_xb_lx, -self.last_xb_ly)
                 self.vg_controller.right_joystick_float(self.last_xb_rx, -self.last_xb_ry)
                 self.vg_controller.update()
+            return True
 
     def is_single(self): 
         return len(self.controllers) == 1
@@ -3418,7 +3524,7 @@ class VirtualController:
                         self.vg_controller.update()
         
         logger.info(f"Player {self.player_number}: Update loop thread finished.")
-                
+
     def reset_inputs(self):
         """Reset all virtual inputs to neutral/released state."""
         with self.state_lock:
@@ -3953,33 +4059,8 @@ class VirtualController:
                     # motor value clears ordinary rumble.  The traditional_rumble_active
                     # guard keeps routine motor=0 reports (no rumble held) from log-spamming
                     # and needlessly churning the vibration buffers.
-                    logger.info(
-                        "Traditional rumble STOP honored: exact=%d flag_masked=%d fingerprint=%d audio_recent=%d deferred=%d (flag0=0x%02x flag2=0x%02x)",
-                        int(signature_match), int(flag_masked_match), int(source_fingerprint_stop),
-                        int(audio_recent), int(getattr(self, '_trad_rumble_pending_stop_at', None) is not None),
-                        valid_flag0, valid_flag2,
-                    )
                     with self.vibration_lock:
                         self._clear_traditional_rumble_locked()
-
-                # Arbitration diagnostics: log immediately on a mode change, then a 3s
-                # heartbeat, so you can confirm which source each game selects.
-                if mode_changed or (_PERF_DIAGNOSTICS and _arb_now - getattr(self, '_arb_log_ts', 0) > 3.0):
-                    self._arb_log_ts = _arb_now
-                    logger.info(
-                        "Rumble source diag: mode=%s concurrent=%d ordinary_active=%d audio_recent=%d audio_stream_recent=%d zero_keepalive=%d explicit_stop=%d sig_match=%d sig_match_masked=%d fingerprint=%d pending=%d lastMotorR=%d lastMotorL=%d (flag0=0x%02x flag2=0x%02x v1=%d v2=%d haptics_select=%d) motorR=%d motorL=%d%s",
-                        self.rumble_host_mode, int(USBIP_PS5_CONCURRENT_RUMBLE_TEST),
-                        int(getattr(self, 'traditional_rumble_active', False)),
-                        int(audio_recent), int(audio_stream_recent), int(zero_keepalive_for_audio),
-                        int(explicit_stop), int(signature_match), int(flag_masked_match), int(source_fingerprint_stop),
-                        int(getattr(self, '_trad_rumble_pending_stop_at', None) is not None),
-                        getattr(self, 'traditional_rumble_last_motor_r', 0),
-                        getattr(self, 'traditional_rumble_last_motor_l', 0),
-                        valid_flag0, valid_flag2,
-                        int(compat_v1), int(compat_v2), int(haptics_select),
-                        out_data[3], out_data[4],
-                        " [MODE CHANGE]" if mode_changed else "",
-                    )
 
                 # Only feed the ordinary motors in compatibility mode;
                 # otherwise the HD audio-haptic path owns the rumble.
@@ -4135,23 +4216,14 @@ class VirtualController:
         self.last_usbip_audio_packet_time = time.perf_counter()
         self._haptic_callback(left_intensity, right_intensity, mode, spectral=spectral)
 
+    def _proxy_audio_activity_callback(self, active):
+        """Track PCM transport activity independently of non-zero haptic output."""
+        self.last_usbip_audio_packet_time = time.perf_counter() if active else 0.0
+
     def _haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
         # Passive locking arbitration: AudioPcm path switches BACK to audio_haptics
         # only when a genuine SPECTRAL haptic signal arrives from Ch3/Ch4.
         # SILENCE callbacks never change the mode (avoid releasing the lock on quiet frames).
-
-        # Concurrent-rumble test: do not let the HID motor-rumble source lock out
-        # the audio-haptic source.  Both sources are merged later at BLE-frame scale.
-        # Arbitration diagnostics: confirm HD audio-haptics are actually driving the
-        # controller (throttled, only while producing output). Covers games that stream
-        # audio-haptics without ever sending output report 0x02.
-        if _PERF_DIAGNOSTICS and (left_intensity > 0 or right_intensity > 0):
-            _hd_now = time.time()
-            if _hd_now - getattr(self, '_hd_log_ts', 0) > 3.0:
-                self._hd_log_ts = _hd_now
-                logger.info(
-                    "Rumble arbiter: HD audio-haptics driving controller (mode=%s L=%d R=%d)",
-                    mode, left_intensity, right_intensity)
 
         if spectral is not None:
             now = time.perf_counter()
@@ -4661,7 +4733,7 @@ class VirtualController:
             self.last_s2_rx = mixed_right[0]
             self.last_s2_ry = mixed_right[1]
                 
-            if self._is_djg_direct_merge():
+            if self._is_djg_none_merge():
                 merged_g, merged_a = self._direct_merged_motion(inputData)
                 self.last_s2_gx = merged_g[0]
                 self.last_s2_gy = merged_g[2]
@@ -4725,6 +4797,8 @@ class VirtualController:
         
         if hasattr(self, 'usbip_server') and self.usbip_server:
             self.usbip_server.update_state(state)
+            return True
+        return False
 
 
 

@@ -117,7 +117,7 @@ async def auto_disconnect_checker(quit_event):
         except Exception as e:
             logger.error(f"Error in auto_disconnect_checker: {e}")
 
-async def run_discovery(update_controllers_threadsafe, quit_event):
+async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
     global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, DISCONNECT_CALLBACK, _CURRENTLY_DISCOVERING
     global GLOBAL_LOCK, CONNECTION_LOCK
     
@@ -206,7 +206,7 @@ async def auto_disconnect_checker(quit_event):
         except Exception as e:
             logger.error(f"Error in auto_disconnect_checker: {e}")
 
-async def run_discovery(update_controllers_threadsafe, quit_event):
+async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
     global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, DISCONNECT_CALLBACK, _CURRENTLY_DISCOVERING
     global GLOBAL_LOCK, CONNECTION_LOCK, _SYSTEM_BT_AVAILABLE
 
@@ -260,7 +260,33 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                 MAX_ESP32S3_CHANNELS,
                 MAX_ESP32S3_GROUPS,
             )
-            bridge = detect_bridge()
+
+            def publish_bridge_scan_state(active: bool):
+                """Publish bridge runtime readiness without probing the COM port again."""
+                active = bool(active)
+                if _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE == active:
+                    return
+                _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE = active
+                callback = UPDATE_CALLBACK
+                if callback is not None:
+                    try:
+                        callback(list(VIRTUAL_CONTROLLERS))
+                    except Exception:
+                        logger.debug("Failed to publish ESP32-S3 bridge state change", exc_info=True)
+
+            bootstrap_status = (startup_bridge_context or {}).get("status")
+            bootstrap_age = time.monotonic() - float((startup_bridge_context or {}).get("observed_mono", 0.0))
+            use_bootstrap_bridge = bool(
+                bootstrap_status
+                and bootstrap_age <= 3.0
+                and getattr(bootstrap_status, "serial_port", None)
+                and getattr(bootstrap_status, "firmware_current", False)
+                and getattr(bootstrap_status, "bridge_ready", False)
+            )
+            if use_bootstrap_bridge:
+                bridge = bootstrap_status
+            else:
+                bridge = detect_bridge()
         except Exception as e:
             bridge = None
             logger.debug(f"ESP32-S3 bridge detection failed: {e}")
@@ -304,11 +330,12 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                 shared_client = None
                 worker_task = None
                 try:
-                    try:
-                        current_bridge = detect_bridge()
-                    except Exception as e:
-                        current_bridge = None
-                        logger.debug("ESP32-S3 bridge redetection failed before route start: %s", e)
+                    current_bridge = None
+                    if not use_bootstrap_bridge:
+                        try:
+                            current_bridge = detect_bridge()
+                        except Exception as e:
+                            logger.debug("ESP32-S3 bridge redetection failed before route start: %s", e)
 
                     # The bridge was already positively identified before
                     # entering this route. During OTG reconnects, a second
@@ -336,13 +363,13 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                         open_success = False
                         for _ in range(5):
                             try:
-                                shared_client.open()
+                                shared_client.open(fast=use_bootstrap_bridge)
                                 open_success = True
                                 break
                             except PermissionError:
                                 time.sleep(0.5)
                         if not open_success:
-                            shared_client.open() # Try one last time to throw the exception if still failing
+                            shared_client.open(fast=use_bootstrap_bridge) # Try one last time to throw the exception if still failing
                     except OSError as e:
                         logger.warning(
                             "%s USB CDC transport could not be opened: %s. Falling back to system bluetooth.",
@@ -366,7 +393,7 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                         if ch is not None and shared_client is not None:
                             try:
                                 await asyncio.to_thread(
-                                    shared_client.send_manager_command, f"disc {ch}", timeout=0.5
+                                    shared_client.send_fire_and_forget, f"disc {ch}"
                                 )
                             except Exception:
                                 logger.debug("Failed to send disc for channel %s", ch, exc_info=True)
@@ -374,7 +401,7 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                             # detected again. disc alone does not restart the scan.
                             try:
                                 await asyncio.to_thread(
-                                    shared_client.send_manager_command, "scan on", timeout=0.5
+                                    shared_client.send_fire_and_forget, "scan on"
                                 )
                             except Exception:
                                 pass
@@ -474,13 +501,13 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     # Block controller connections until "scan on" is sent and the
                     # bridge is fully armed. Cleared at session start so the GUI shows
                     # "Initializing" instead of "Ready" during the setup window.
-                    _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE = False
+                    publish_bridge_scan_state(False)
 
                     def bridge_event_callback(event):
                         try:
                             cmd = event.get("cmd")
 
-                            if cmd == "connected":
+                            if cmd in ("connected", "gatt_ready"):
                                 # Drop stale connections that arrive before the bridge is
                                 # fully armed (before "scan on"). The firmware may auto-
                                 # reconnect lingering links from the previous session
@@ -494,9 +521,7 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                     )
                                     if channel >= 0:
                                         try:
-                                            shared_client.send_manager_command(
-                                                f"disc {channel}", timeout=0.3
-                                            )
+                                            shared_client.send_fire_and_forget(f"disc {channel}")
                                         except Exception:
                                             pass
                                     return
@@ -512,7 +537,6 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                 if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
                                     async def handle_connected(ch=channel, m=mac):
                                         if ch not in controllers_by_channel:
-                                            bridge_init_macs.add(m)
                                             bridge_init_since.setdefault(m, time.time())
                                             try:
                                                 ctrl = await add_esp32_channel(ch, m)
@@ -522,7 +546,12 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                             finally:
                                                 bridge_init_macs.discard(m)
                                                 bridge_init_since.pop(m, None)
-                                    asyncio.run_coroutine_threadsafe(handle_connected(), DISCOVERER_LOOP)
+                                    if channel not in controllers_by_channel and mac not in bridge_init_macs:
+                                        # Reserve before scheduling: firmware v2 emits
+                                        # gatt_ready followed by legacy connected for
+                                        # compatibility, and both may arrive in one read.
+                                        bridge_init_macs.add(mac)
+                                        asyncio.run_coroutine_threadsafe(handle_connected(), DISCOVERER_LOOP)
                                 return
 
                             if cmd == "connect_fail":
@@ -545,7 +574,7 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                         bridge_connecting_macs.discard(m)
                                         cmd_str = f"conn {t} {m}"
                                         await asyncio.to_thread(
-                                            shared_client.send_manager_command, cmd_str, timeout=0.3
+                                            shared_client.send_fire_and_forget, cmd_str
                                         )
                                         bridge_connecting_macs.add(m)
                                     asyncio.run_coroutine_threadsafe(_retry(), DISCOVERER_LOOP)
@@ -616,8 +645,8 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                     if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
                                         async def _conn_directed(m=mac, t=addr_type):
                                             await asyncio.to_thread(
-                                                shared_client.send_manager_command,
-                                                f"conn {t} {m}", timeout=0.3
+                                                shared_client.send_fire_and_forget,
+                                                f"conn {t} {m}"
                                             )
                                         asyncio.run_coroutine_threadsafe(_conn_directed(), DISCOVERER_LOOP)
                                     return
@@ -676,7 +705,7 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                         async def cleanup_ghost():
                                             for ch, ctrl in list(controllers_by_channel.items()):
                                                 if getattr(ctrl.controller_info, 'mac_address', '').upper() == mac:
-                                                    await asyncio.to_thread(shared_client.send_manager_command, f"disc {ch}", timeout=0.5)
+                                                    await asyncio.to_thread(shared_client.send_fire_and_forget, f"disc {ch}")
                                                     break
                                             await asyncio.sleep(2.0)
                                             bridge_connecting_macs.discard(mac)
@@ -718,8 +747,8 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                 if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
                                     async def _conn_undirected(m=mac, t=addr_type):
                                         await asyncio.to_thread(
-                                            shared_client.send_manager_command,
-                                            f"conn {t} {m}", timeout=0.3
+                                            shared_client.send_fire_and_forget,
+                                            f"conn {t} {m}"
                                         )
                                     asyncio.run_coroutine_threadsafe(_conn_undirected(), DISCOVERER_LOOP)
 
@@ -733,30 +762,44 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     # stale links left over from a previous unclean shutdown / crash so
                     # the firmware channels start empty and controllers re-advertise and
                     # reconnect cleanly; "scan on" starts reporting advertisements.
-                    await asyncio.to_thread(shared_client.send_manager_command, "auto off", timeout=0.5)
-                    await asyncio.to_thread(shared_client.send_manager_command, "ble disconnect", timeout=0.8)
+                    await asyncio.to_thread(shared_client.send_fire_and_forget, "auto off")
+                    await asyncio.to_thread(shared_client.send_fire_and_forget, "ble disconnect")
 
                     # Read the bridge's own BLE MAC so we can pair controllers to it
                     # (Switch 2 SET_MAC handshake) and recognise reconnect ads aimed at us.
                     try:
                         from utils import convert_mac_string_to_value
-                        status_reply = await asyncio.to_thread(
-                            shared_client.send_manager_command, "status lite", timeout=1.0
-                        )
-                        if status_reply:
-                            s = json.loads(status_reply)
-                            m = (s.get("mac") or "").strip().upper()
-                            if m and m != "00:00:00:00:00:00":
-                                esp32_mac_str = m
-                                esp32_mac_value = convert_mac_string_to_value(m)
-                                logger.info("ESP32-S3 bridge BLE MAC: %s", esp32_mac_str)
+                        bootstrap_status_text = getattr(
+                            (startup_bridge_context or {}).get("status"), "status_text", ""
+                        ) if use_bootstrap_bridge else ""
+                        bootstrap_mac = ""
+                        if bootstrap_status_text:
+                            try:
+                                bootstrap_mac = (json.loads(bootstrap_status_text).get("mac") or "").strip().upper()
+                            except Exception:
+                                bootstrap_mac = ""
+                        if bootstrap_mac and bootstrap_mac != "00:00:00:00:00:00":
+                            esp32_mac_str = bootstrap_mac
+                            esp32_mac_value = convert_mac_string_to_value(bootstrap_mac)
+                            logger.info("ESP32-S3 bridge BLE MAC: %s (bootstrap)", esp32_mac_str)
+                        else:
+                            status_reply = await asyncio.to_thread(
+                                shared_client.send_manager_command, "status lite", timeout=1.0
+                            )
+                            if status_reply:
+                                s = json.loads(status_reply)
+                                m = (s.get("mac") or "").strip().upper()
+                                if m and m != "00:00:00:00:00:00":
+                                    esp32_mac_str = m
+                                    esp32_mac_value = convert_mac_string_to_value(m)
+                                    logger.info("ESP32-S3 bridge BLE MAC: %s", esp32_mac_str)
                     except Exception:
                         logger.debug("Could not read ESP32-S3 bridge BLE MAC", exc_info=True)
                     if esp32_mac_value is None:
                         logger.warning("ESP32-S3 bridge MAC unknown; controllers paired to another host won't reconnect until firmware reports its MAC.")
 
-                    await asyncio.to_thread(shared_client.send_manager_command, "scan on", timeout=0.5)
-                    _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE = True
+                    await asyncio.to_thread(shared_client.send_fire_and_forget, "scan on")
+                    publish_bridge_scan_state(True)
                     logger.info("ESP32-S3 Bridge is scanning. Monitoring up to %d physical channels / %d controller groups.",
                                 MAX_ESP32S3_CHANNELS,
                                 MAX_ESP32S3_GROUPS)
@@ -995,8 +1038,8 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                             # so a connect that never completed cannot leave the bridge
                             # unable to find any controller until it is replugged.
                             try:
-                                await asyncio.to_thread(shared_client.send_manager_command, "cancel", timeout=0.5)
-                                await asyncio.to_thread(shared_client.send_manager_command, "scan on", timeout=0.5)
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "cancel")
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "scan on")
                             except Exception:
                                 pass
 
@@ -1056,14 +1099,14 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                                 # resume scanning on the resulting disconnect events because
                                 # scan_mode is now off. On the next app start the discoverer
                                 # re-arms the bridge with "auto off" + "scan on".
-                                await asyncio.to_thread(shared_client.send_manager_command, "scan off", timeout=0.5)
-                                await asyncio.to_thread(shared_client.send_manager_command, "auto off", timeout=0.5)
-                                await asyncio.to_thread(shared_client.send_manager_command, "ble disconnect", timeout=0.8)
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "scan off")
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "auto off")
+                                await asyncio.to_thread(shared_client.send_fire_and_forget, "ble disconnect")
                         except Exception:
                             pass
                         await shared_client.disconnect()
 
-                    _usb_serial_bridge_mod.BRIDGE_SCAN_ACTIVE = False
+                    publish_bridge_scan_state(False)
 
                     if quit_event.is_set():
                         return
@@ -1173,13 +1216,14 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
 
         _connecting_macs: set[str] = set()
 
-        async def add_controller(device: BLEDevice, paired: bool):
+        async def add_controller(device: BLEDevice, paired: bool, advertised_product_id=None):
             nonlocal pending_connections_count
             controller = None
             try:
                 # 1. Serialize BLE connection & pairing phase to prevent WinRT concurrency crashes
                 async with CONNECTION_LOCK:
-                    controller = Controller(device)
+                    controller = Controller(device, advertised_product_id=advertised_product_id,
+                                            paired_connection=paired)
                     await controller.connect_ble()
                     logger.info(f"Controller connected via system bluetooth: {device.address}")
                     controller.disconnected_callback = disconnected_controller
@@ -1209,25 +1253,44 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                     else:
                         virtual_controller.add_controller(controller)
                 
-                    await virtual_controller.init_added_controller(controller)
-                
+                    # LED writes are non-critical and used to run twice here
+                    # (init_added_controller + update_all_player_leds), delaying
+                    # virtual-device readiness by over 100 ms on WinRT.
+                    await virtual_controller.init_added_controller(controller, update_leds=False)
+
+                    # The first accepted WinRT input report arrives after the UI
+                    # has usually been created.  Queue a UI refresh when that
+                    # report supplies the first valid battery state, without
+                    # making the connection path wait for it.
+                    def refresh_battery_ui(changed_controller, _state):
+                        if (changed_controller is not controller
+                                or changed_controller not in virtual_controller.controllers):
+                            return
+                        callback = UPDATE_CALLBACK
+                        if callback is not None:
+                            callback(list(VIRTUAL_CONTROLLERS))
+                    controller.set_battery_state_callback(refresh_battery_ui)
+                 
                     reorder_controllers()
                 
                     if UPDATE_CALLBACK is not None:
                         UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
                 
-                    await update_all_player_leds()
-
                     logger.info(VIRTUAL_CONTROLLERS)
                 
                     pending_connections_count = max(0, pending_connections_count - 1)
                     logger.info(f"Controller {device.address} connected. Remaining pending connections: {pending_connections_count}")
-                    if pending_connections_count == 0:
-                        await start_all_pending_virtual_usb()
-                        for vc in VIRTUAL_CONTROLLERS:
-                            if vc is not None:
-                                for c in getattr(vc, "controllers", []):
-                                    asyncio.create_task(trigger_connection_haptics(c))
+                # A controller must become usable as soon as its own input path is
+                # initialized.  Do not make it wait for another pending BLE attempt
+                # (which may still be in WinRT's 20-second connect timeout).
+                await asyncio.to_thread(virtual_controller.setup_virtual_device)
+                async def _refresh_leds_after_virtual_ready():
+                    try:
+                        await update_all_player_leds()
+                    except Exception as e:
+                        logger.debug(f"Deferred player LED refresh failed: {e}")
+                asyncio.create_task(_refresh_leds_after_virtual_ready())
+                asyncio.create_task(trigger_connection_haptics(controller))
             except Exception:
                 logger.exception(f"Unable to initialize device {device.address}")
                 if device.address in connected_mac_addresses:
@@ -1236,8 +1299,6 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                 async with GLOBAL_LOCK:
                     pending_connections_count = max(0, pending_connections_count - 1)
                     logger.info(f"Connection failed for {device.address}. Remaining pending connections: {pending_connections_count}")
-                    if pending_connections_count == 0:
-                        await start_all_pending_virtual_usb()
                 if controller is not None:
                     try:
                         await controller.disconnect()
@@ -1264,13 +1325,13 @@ async def run_discovery(update_controllers_threadsafe, quit_event):
                         _connecting_macs.add(device.address)
                         async with GLOBAL_LOCK:
                             pending_connections_count += 1
-                        asyncio.create_task(add_controller(device, False))
+                        asyncio.create_task(add_controller(device, False, product_id))
                     elif reconnect_mac == host_mac_value:
                         logger.info(f"Found already paired device {CONTROLER_NAMES[product_id]} {device.address}")
                         _connecting_macs.add(device.address)
                         async with GLOBAL_LOCK:
                             pending_connections_count += 1
-                        asyncio.create_task(add_controller(device, True))
+                        asyncio.create_task(add_controller(device, True, product_id))
 
         while not quit_event.is_set():
             try:
@@ -1522,8 +1583,8 @@ async def run_usb_hid_discovery(quit_event):
         hidden_instances.clear()
 
 
-def start_discoverer(update_controllers_threadsafe, quit_event):
-    asyncio.run(run_discovery(update_controllers_threadsafe, quit_event))
+def start_discoverer(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
+    asyncio.run(run_discovery(update_controllers_threadsafe, quit_event, startup_bridge_context))
 
 def reorder_controllers():
     global VIRTUAL_CONTROLLERS

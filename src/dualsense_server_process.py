@@ -33,6 +33,7 @@ MSG_STOP = 0x02
 MSG_OUTPUT_REPORT = 0x83
 MSG_HAPTIC_FRAME = 0x82
 MSG_STATUS = 0x84
+MSG_AUDIO_ACTIVITY = 0x85
 
 
 def _send_datagram(sock, addr, msg_type, payload=b""):
@@ -57,7 +58,7 @@ def main(argv=None):
     try:
         log_dir = os.path.join(
             os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-            "Switch 2 Connect",
+            "Switch2Controllers",
         )
         os.makedirs(log_dir, exist_ok=True)
         log_handlers.append(
@@ -108,12 +109,21 @@ def main(argv=None):
         if data:
             _send_datagram(ctrl_sock, parent_addr, MSG_OUTPUT_REPORT, bytes(data))
 
+    last_audio_activity_sent = 0.0
+
     def on_audio_data(data):
+        nonlocal last_audio_activity_sent
         if data is None:
+            _send_datagram(ctrl_sock, parent_addr, MSG_AUDIO_ACTIVITY, b"\x00")
+            last_audio_activity_sent = 0.0
             haptic_processor.reset()
             on_haptic_frame(0, 0, "SILENCE", {})
             return
         if data:
+            now = time.perf_counter()
+            if now - last_audio_activity_sent >= 0.1:
+                _send_datagram(ctrl_sock, parent_addr, MSG_AUDIO_ACTIVITY, b"\x01")
+                last_audio_activity_sent = now
             haptic_processor.process_audio_packet(bytes(data))
 
     def on_disconnect():

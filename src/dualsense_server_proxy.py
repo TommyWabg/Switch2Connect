@@ -33,6 +33,7 @@ MSG_STOP = 0x02
 MSG_HAPTIC_FRAME = 0x82
 MSG_OUTPUT_REPORT = 0x83
 MSG_STATUS = 0x84
+MSG_AUDIO_ACTIVITY = 0x85
 
 
 class DualSenseServerProxy:
@@ -46,6 +47,7 @@ class DualSenseServerProxy:
         on_audio_data_callback=None,
         on_disconnect_callback=None,
         on_haptic_callback=None,
+        on_audio_activity_callback=None,
         enable_audio=True,
     ):
         self.host = host
@@ -57,6 +59,7 @@ class DualSenseServerProxy:
         self.on_audio_data_callback = on_audio_data_callback
         self.on_disconnect_callback = on_disconnect_callback
         self.on_haptic_callback = on_haptic_callback
+        self.on_audio_activity_callback = on_audio_activity_callback
         self._proc = None
         self._running = False
         self._rx_thread = None
@@ -202,6 +205,9 @@ class DualSenseServerProxy:
                 elif msg_type == MSG_STATUS and payload == b"disconnect":
                     if self.on_disconnect_callback:
                         self.on_disconnect_callback()
+                elif msg_type == MSG_AUDIO_ACTIVITY:
+                    if self.on_audio_activity_callback:
+                        self.on_audio_activity_callback(bool(payload and payload[0]))
             except Exception:
                 logger.debug("DualSense proxy callback failed", exc_info=True)
 

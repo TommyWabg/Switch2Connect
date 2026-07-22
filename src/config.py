@@ -18,6 +18,7 @@
 # Electronic Mail: tommyw9318@gmail.com
 
 from dataclasses import dataclass
+import copy
 import os
 import yaml
 import logging
@@ -25,6 +26,22 @@ import sys
 import threading
 
 logger = logging.getLogger(__name__)
+
+DJG_MODES = ("Switch Dominant Side", "Switch Gyro Side", "Single Side Toggle")
+DJG_DOMINANT_SIDES = ("Left", "Right", "None")
+
+
+def normalize_djg_settings(mode, dominant_side):
+    """Normalize current DJG settings and migrate the removed Direct Merge mode."""
+    if mode == "Direct Merge":
+        return "Single Side Toggle", "None"
+    if mode not in DJG_MODES:
+        mode = "Switch Dominant Side"
+    if dominant_side not in DJG_DOMINANT_SIDES:
+        dominant_side = "Right"
+    if mode != "Single Side Toggle" and dominant_side == "None":
+        dominant_side = "Right"
+    return mode, dominant_side
 
 # Use the libyaml C loader/dumper when available. It is ~6x faster than the pure
 # Python implementation and releases the GIL during (de)serialization, which keeps
@@ -194,6 +211,57 @@ def back_button_label(token):
 
 JOYSTICK_OPTIONS = ["Default", "R Joystick", "L Joystick", "WASD", "KB Arrow Keys", "Mouse", "Scroll Wheel", "Custom"]
 
+# Physical-stick deadzones are stored at the Profile × Emu Mode category root,
+# deliberately outside the Mode Shift mapping stores.  Both mapping layers then
+# use the same physical-stick threshold.
+JOYSTICK_DEADZONE_DEFAULT_PERCENT = 3
+JOYSTICK_DEADZONE_FAMILIES = ("pro_controller", "joycon", "nso_gamecube_controller")
+
+IR_SENSOR_SIDES = ("left", "right")
+IR_SENSOR_IN_APP_GYRO_DEFAULTS = {
+    "simul": "None",
+    "deadzone_mode": [],
+    "deadzone_amount": 15.0,
+    "deadzone_pause_after_pressed_ms": 100,
+    "deadzone_pause_after_released_ms": 100,
+    "deadzone_effect_after_released_ms": 200,
+    "dampening_mode": [],
+    "dampening_amount": 90,
+    "dampening_effect_after_released_ms": 200,
+}
+IR_SENSOR_DEFAULTS = {
+    "left": {"function": "Default", "activate_threshold": 1,
+             "ir_mouse": {"sensitivity": 4.0, "left_click": ["L"], "right_click": ["ZL"], "middle_click": []},
+             "in_app_gyro": IR_SENSOR_IN_APP_GYRO_DEFAULTS.copy()},
+    "right": {"function": "Default", "activate_threshold": 1,
+              "ir_mouse": {"sensitivity": 4.0, "left_click": ["R"], "right_click": ["ZR"], "middle_click": []},
+              "in_app_gyro": IR_SENSOR_IN_APP_GYRO_DEFAULTS.copy()},
+}
+
+def build_joycon_ir_sensor_defaults():
+    import copy
+    return copy.deepcopy(IR_SENSOR_DEFAULTS)
+
+def normalize_ir_mouse_switch_inputs(value):
+    """Canonical ordered multi-select value used by the IR Mouse click bindings."""
+    if isinstance(value, str):
+        raw = [] if value in ("", "None", "Default") else [value]
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = []
+    valid = set(SWITCH_INPUT_DAMPENING_OPTIONS)
+    selected = {str(token) for token in raw if str(token) in valid}
+    return [token for token in SWITCH_INPUT_DAMPENING_OPTIONS if token in selected]
+
+def build_joystick_deadzone_defaults():
+    return {
+        family: {"left": JOYSTICK_DEADZONE_DEFAULT_PERCENT,
+                 "right": JOYSTICK_DEADZONE_DEFAULT_PERCENT,
+                 "linked": True}
+        for family in JOYSTICK_DEADZONE_FAMILIES
+    }
+
 # In-app Gyro Lock: a Back Button Option that pauses gyro control while staying in
 # In-app Gyro mode. Stored in the Custom recorder form as "Custom[Hold|Tap]:GYRO_LOCK".
 GYRO_LOCK_TOKEN = "GYRO_LOCK"
@@ -276,6 +344,7 @@ def build_in_app_gyro_mapping_defaults(stick_mouse_sensitivity=20.0):
     })
     for custom_key, custom_defaults in JOYSTICK_CUSTOM_DEFAULTS.items():
         defaults[custom_key] = custom_defaults.copy()
+    defaults["joycon_ir_sensor"] = build_joycon_ir_sensor_defaults()
     return defaults
 
 # Separate In-app Gyro Mode Mapping store used when Gyro Control == "R Joystick".
@@ -303,6 +372,7 @@ def build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default="Hair Trigger")
     })
     for custom_key, custom_defaults in JOYSTICK_CUSTOM_DEFAULTS.items():
         defaults[custom_key] = custom_defaults.copy()
+    defaults["joycon_ir_sensor"] = build_joycon_ir_sensor_defaults()
     return defaults
 
 # Separate Mode Shift Mapping store used when Gyro Control == "Steering". Mirrors the
@@ -570,6 +640,8 @@ class Config:
             for cat in categories:
                 if cat not in prof_data:
                     prof_data[cat] = {}
+                if not isinstance(prof_data[cat], dict):
+                    prof_data[cat] = {}
                 if "joycon_hold_mode" not in prof_data[cat]:
                     prof_data[cat]["joycon_hold_mode"] = old_hold_mode.copy()
                 for key, def_val in self.get_default_category_dict(cat).items():
@@ -594,12 +666,33 @@ class Config:
                             val = config.get("capt_mapping", default_capt)
                             if val in ("None", "CAPT", "Default", "Capture"):
                                 val = "Capture" if cat in ("switch1", "switch2") else "PrtSc"
+                        elif key == "joycon_ir_sensor":
+                            # One-time compatibility migration from the former global
+                            # Joy-con Mouse settings into the new per-side schema.
+                            val = build_joycon_ir_sensor_defaults()
+                            legacy_mouse = config.get("mouse", {}) if isinstance(config.get("mouse", {}), dict) else {}
+                            if legacy_mouse:
+                                enabled = bool(legacy_mouse.get("enabled", False))
+                                threshold = legacy_mouse.get("ir_activate_threshold", 1)
+                                # NOTE: the legacy global `mouse.sensitivity` is a different
+                                # (sub-1) scale than IR-mouse sensitivity (1-10), so it is NOT
+                                # migrated here -- doing so seeded an unreachable 0.01 the slider
+                                # clamped to 1. Keep the IR-mouse default (4.0).
+                                legacy_buttons = legacy_mouse.get("buttons", {}) if isinstance(legacy_mouse.get("buttons", {}), dict) else {}
+                                for side, legacy_key in (("left", "left_joycon"), ("right", "right_joycon")):
+                                    val[side]["function"] = "Default" if enabled else "None"
+                                    val[side]["activate_threshold"] = threshold
+                                    raw = legacy_buttons.get(legacy_key, {}) if isinstance(legacy_buttons.get(legacy_key, {}), dict) else {}
+                                    for old_key, new_key in (("left_button", "left_click"), ("right_button", "right_click"), ("middle_button", "middle_click")):
+                                        if raw.get(old_key) in SWITCH_BUTTONS:
+                                            val[side]["ir_mouse"][new_key] = raw[old_key]
                         else:
                             val = config.get(key, def_val)
                         
                         if key == "rumble_mode" and val == "PC":
                             val = "Xbox"
                         prof_data[cat][key] = val
+                self._normalize_joystick_deadzone_settings(prof_data[cat])
                 self.ensure_mapping_scope(cat, MAPPING_SCOPE_IN_APP_GYRO)
         
         self.gyro_smoothing = 0.0 
@@ -639,6 +732,16 @@ class Config:
         self.driver_type = config.get("driver_type", "WinUHid")
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
+        # Connection-speed changes are independently reversible.  These defaults
+        # enable the ready-driven path while keeping the former waits/pacing as a
+        # per-flag fallback for model or adapter regressions.
+        self.ready_driven_controller_init = config.get("ready_driven_controller_init", True)
+        self.virtual_driver_ready_probe = config.get("virtual_driver_ready_probe", True)
+        self.sw2_zero_command_pacing = config.get("sw2_zero_command_pacing", True)
+        self.controller_fast_cache = config.get("controller_fast_cache", True)
+        self.controller_fast_cache_entries = config.get("controller_fast_cache_entries", {}) or {}
+        self.winrt_cached_services = config.get("winrt_cached_services", True)
+        self.winrt_skip_pro2_unsupported_init_0101 = config.get("winrt_skip_pro2_unsupported_init_0101", True)
         
         self.simulation_mode = config.get("simulation_mode", "PS5")
         if self.simulation_mode == "Switch 2 Pro":
@@ -694,6 +797,7 @@ class Config:
         self.auto_disconnect_days = int(config.get("auto_disconnect_days", 0))
         self.auto_disconnect_hours = int(config.get("auto_disconnect_hours", 0))
         self.auto_disconnect_minutes = int(config.get("auto_disconnect_minutes", 0))
+        self._normalize_djg_profiles()
         self._normalize_mode_shift_enabled_profiles()
 
         # abxy_mode, rumble_mode, vibration_strength, vibration_frequency are now properties managed per Emu Mode category
@@ -730,6 +834,25 @@ class Config:
             prof["mode_shift_enabled"] = normalized
             prof[MODE_SHIFT_ENABLED_MIGRATION_KEY] = True
 
+    def _normalize_djg_profiles(self):
+        if not isinstance(getattr(self, "profiles", None), dict):
+            return
+        for prof in self.profiles.values():
+            if not isinstance(prof, dict):
+                continue
+            mode, side = normalize_djg_settings(
+                prof.get("djg_mode", "Switch Dominant Side"),
+                prof.get("djg_dominant_side", "Right"))
+            prof["djg_mode"] = mode
+            prof["djg_dominant_side"] = side
+        defaults = getattr(self, "profile_setting_defaults", None)
+        if isinstance(defaults, dict):
+            mode, side = normalize_djg_settings(
+                defaults.get("djg_mode", "Switch Dominant Side"),
+                defaults.get("djg_dominant_side", "Right"))
+            defaults["djg_mode"] = mode
+            defaults["djg_dominant_side"] = side
+
     def _build_profile_setting_defaults(self, config):
         saved_defaults = config.get("profile_defaults", {})
         if isinstance(saved_defaults, dict) and saved_defaults:
@@ -744,6 +867,9 @@ class Config:
             impulse_trigger_strength = int(config.get("impulse_trigger_strength", 5))
         except (TypeError, ValueError):
             impulse_trigger_strength = 5
+        djg_mode, djg_side = normalize_djg_settings(
+            config.get("djg_mode", "Switch Dominant Side"),
+            config.get("djg_dominant_side", "Right"))
         return {
             "gyro_mode": config.get("gyro_mode", "World"),
             "gyro_control_mode": config.get("gyro_control_mode", "Mouse"),
@@ -758,8 +884,8 @@ class Config:
             "cemuhook_sensitivity": int(config.get("cemuhook_sensitivity", 1)),
             "steam_roll_compensation": bool(config.get("steam_roll_compensation", False)),
             "djg_enabled": bool(config.get("djg_enabled", False)),
-            "djg_dominant_side": config.get("djg_dominant_side", "Right"),
-            "djg_mode": config.get("djg_mode", "Switch Dominant Side"),
+            "djg_dominant_side": djg_side,
+            "djg_mode": djg_mode,
             "djg_activation": config.get("djg_activation", "Hold"),
             "audio_haptics_enabled": config.get("audio_haptics_enabled", True),
             "adaptive_triggers_enabled": config.get("adaptive_triggers_enabled", True),
@@ -892,7 +1018,267 @@ class Config:
                     continue
                 if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS:
                     cat_data[MAPPING_SCOPE_IN_APP_GYRO].setdefault(key, val.copy() if isinstance(val, dict) else val)
+            cat_data["joystick_deadzone_settings"] = build_joystick_deadzone_defaults()
+            cat_data["joycon_ir_sensor"] = build_joycon_ir_sensor_defaults()
         return defaults.get(cat, defaults["xbox"]).copy()
+
+    @staticmethod
+    def _normalize_joystick_deadzone_percent(value):
+        if isinstance(value, bool):
+            return JOYSTICK_DEADZONE_DEFAULT_PERCENT
+        try:
+            value = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return JOYSTICK_DEADZONE_DEFAULT_PERCENT
+        return max(0, min(99, value))
+
+    def _normalize_joystick_deadzone_settings(self, category):
+        """Repair old/partial settings in place and preserve the link invariant."""
+        stored = category.get("joystick_deadzone_settings")
+        if not isinstance(stored, dict):
+            stored = {}
+            category["joystick_deadzone_settings"] = stored
+        for family in JOYSTICK_DEADZONE_FAMILIES:
+            values = stored.get(family)
+            if not isinstance(values, dict):
+                values = {}
+                stored[family] = values
+            left = self._normalize_joystick_deadzone_percent(values.get("left"))
+            right = self._normalize_joystick_deadzone_percent(values.get("right"))
+            # Missing/invalid link state follows the current reset default.  An
+            # explicitly stored False remains an intentional Unlink choice.
+            linked = values.get("linked", True)
+            linked = linked if isinstance(linked, bool) else True
+            values.update(left=left, right=left if linked else right, linked=linked)
+        return stored
+
+    def get_joystick_deadzone_settings(self, profile_name=None, category=None):
+        profile_name = profile_name or self.active_profile
+        category = category or self.get_current_category()
+        profile = self.profiles.setdefault(profile_name, {})
+        category_data = profile.setdefault(category, self.get_default_category_dict(category))
+        if not isinstance(category_data, dict):
+            category_data = self.get_default_category_dict(category)
+            profile[category] = category_data
+        return self._normalize_joystick_deadzone_settings(category_data)
+
+    def get_joystick_deadzone_percent(self, family, side, profile_name=None, category=None):
+        family = family if family in JOYSTICK_DEADZONE_FAMILIES else "pro_controller"
+        side = "left" if side == "left" else "right"
+        return self.get_joystick_deadzone_settings(profile_name, category)[family][side]
+
+    def set_joystick_deadzone_percent(self, family, side, value, profile_name=None, category=None):
+        family = family if family in JOYSTICK_DEADZONE_FAMILIES else "pro_controller"
+        side = "left" if side == "left" else "right"
+        values = self.get_joystick_deadzone_settings(profile_name, category)[family]
+        value = self._normalize_joystick_deadzone_percent(value)
+        values[side] = value
+        if values["linked"]:
+            values["right" if side == "left" else "left"] = value
+        self._bump_settings_generation()
+        return values.copy()
+
+    def set_joystick_deadzone_linked(self, family, linked, profile_name=None, category=None):
+        family = family if family in JOYSTICK_DEADZONE_FAMILIES else "pro_controller"
+        values = self.get_joystick_deadzone_settings(profile_name, category)[family]
+        values["linked"] = bool(linked)
+        if values["linked"]:
+            values["right"] = values["left"]
+        self._bump_settings_generation()
+        return values.copy()
+
+    def _normalize_joycon_ir_sensor_values(self, side, values, category_data=None):
+        side = "left" if side == "left" else "right"
+        # Read-only reference to the module-level defaults. Do NOT mutate `defaults`
+        # or assign any of its nested objects into `values` without deepcopy -- this
+        # function runs on every IR getter call (per input report), so the previous
+        # unconditional copy.deepcopy of the whole tree was a per-frame hot spot.
+        defaults = IR_SENSOR_DEFAULTS[side]
+        if not isinstance(values, dict):
+            values = copy.deepcopy(defaults)
+        values.setdefault("function", defaults["function"])
+        if not isinstance(values["function"], str): values["function"] = defaults["function"]
+        # The IR sensor is emitted through the normal mapping-action pipeline.  Keep
+        # its special actions in precisely the same canonical form as Controller
+        # Mapping so that selecting an item by its display label cannot produce a
+        # visually-selected but inert action after loading an older config.
+        ir_function_aliases = {
+            "Gyro": f"Custom[Hold]:{IN_APP_GYRO_TOKEN}",
+            "In-app Gyro": f"Custom[Hold]:{IN_APP_GYRO_TOKEN}",
+            "Mode Shift": f"Custom[Hold]:{MODE_SHIFT_TOKEN}",
+            "Gyro Lock": f"Custom[Hold]:{GYRO_LOCK_TOKEN}",
+        }
+        values["function"] = ir_function_aliases.get(values["function"], values["function"])
+        try: values["activate_threshold"] = max(1, min(3, int(values.get("activate_threshold", defaults["activate_threshold"]))))
+        except (TypeError, ValueError): values["activate_threshold"] = defaults["activate_threshold"]
+        if not isinstance(values.get("ir_mouse"), dict): values["ir_mouse"] = copy.deepcopy(defaults["ir_mouse"])
+        for key, default in defaults["ir_mouse"].items(): values["ir_mouse"].setdefault(key, default)
+        # Heal ir_mouse sensitivity into the slider's supported range [1, 10]. Legacy configs
+        # migrated the old global mouse sensitivity (a sub-1 scale, e.g. 0.01) into this field,
+        # which the from_=1 slider clamps to a display of 1 and cannot restore. Sub-1 / invalid
+        # values self-heal to the IR-mouse default (4.0) on load.
+        try:
+            _sens = float(values["ir_mouse"].get("sensitivity", defaults["ir_mouse"]["sensitivity"]))
+        except (TypeError, ValueError):
+            _sens = float(defaults["ir_mouse"]["sensitivity"])
+        if _sens < 1.0:
+            _sens = float(defaults["ir_mouse"]["sensitivity"])
+        elif _sens > 10.0:
+            _sens = 10.0
+        values["ir_mouse"]["sensitivity"] = _sens
+        for click_key in ("left_click", "right_click", "middle_click"):
+            values["ir_mouse"][click_key] = normalize_ir_mouse_switch_inputs(values["ir_mouse"].get(click_key))
+        if not isinstance(values.get("in_app_gyro"), dict):
+            migrated = copy.deepcopy(defaults["in_app_gyro"])
+            legacy_keys = {
+                "simul": "joycon_ir_sensor_in_app_gyro_simul",
+                "deadzone_mode": "joycon_ir_sensor_in_app_gyro_deadzone_mode",
+                "deadzone_amount": "joycon_ir_sensor_in_app_gyro_deadzone_amount",
+                "deadzone_pause_after_pressed_ms": "joycon_ir_sensor_in_app_gyro_deadzone_pause_after_pressed_ms",
+                "deadzone_pause_after_released_ms": "joycon_ir_sensor_in_app_gyro_deadzone_pause_after_released_ms",
+                "deadzone_effect_after_released_ms": "joycon_ir_sensor_in_app_gyro_deadzone_effect_after_released_ms",
+                "dampening_mode": "joycon_ir_sensor_in_app_gyro_dampening_mode",
+                "dampening_amount": "joycon_ir_sensor_in_app_gyro_dampening_amount",
+                "dampening_effect_after_released_ms": "joycon_ir_sensor_in_app_gyro_dampening_effect_after_released_ms",
+            }
+            for new_key, old_key in legacy_keys.items():
+                if old_key in category_data:
+                    migrated[new_key] = copy.deepcopy(category_data[old_key])
+            values["in_app_gyro"] = migrated
+        for key, default in defaults["in_app_gyro"].items():
+            values["in_app_gyro"].setdefault(key, copy.deepcopy(default))
+        for key in ("deadzone_mode", "dampening_mode"):
+            values["in_app_gyro"][key] = normalize_dampening_inputs(values["in_app_gyro"].get(key))
+        values["in_app_gyro"]["simul"] = values["in_app_gyro"].get("simul", "None")
+        return values
+
+    def get_joycon_ir_sensor_settings(self, side, profile_name=None, category=None):
+        import copy
+        side = "left" if side == "left" else "right"
+        profile_name = profile_name or self.active_profile
+        category = category or self.get_current_category()
+        category_data = self.profiles.setdefault(profile_name, {}).setdefault(category, self.get_default_category_dict(category))
+        stored = category_data.get("joycon_ir_sensor")
+        if not isinstance(stored, dict):
+            stored = build_joycon_ir_sensor_defaults()
+            category_data["joycon_ir_sensor"] = stored
+        values = stored.get(side)
+        if not isinstance(values, dict):
+            values = copy.deepcopy(IR_SENSOR_DEFAULTS[side])
+            stored[side] = values
+        return self._normalize_joycon_ir_sensor_values(side, values, category_data)
+
+    def get_joycon_ir_sensor_settings_scoped(self, side, profile_name=None, category=None, scope=None):
+        import copy
+        scope = self._resolve_in_app_gyro_scope(scope)
+        if not scope:
+            return self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        side = "left" if side == "left" else "right"
+        profile_name = profile_name or self.active_profile
+        category = category or self.get_current_category()
+        profile = self.profiles.setdefault(profile_name, {})
+        category_data = profile.setdefault(category, self.get_default_category_dict(category))
+        scoped = category_data.get(scope)
+        if not isinstance(scoped, dict):
+            if scope == MAPPING_SCOPE_IN_APP_GYRO_RSTICK:
+                gc_trigger_default = self.get_default_category_dict(category).get("gc_trigger_mode", "Hair Trigger")
+                scoped = build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default)
+            elif scope == MAPPING_SCOPE_IN_APP_GYRO_STEERING:
+                gc_trigger_default = self.get_default_category_dict(category).get("gc_trigger_mode", "Hair Trigger")
+                scoped = build_in_app_gyro_steering_mapping_defaults(gc_trigger_default)
+            else:
+                scoped = build_in_app_gyro_mapping_defaults(self.get_default_profile_settings().get("stick_mouse_sensitivity", 20.0))
+            category_data[scope] = scoped
+        stored = scoped.get("joycon_ir_sensor")
+        if not isinstance(stored, dict):
+            base = category_data.get("joycon_ir_sensor")
+            stored = copy.deepcopy(base) if isinstance(base, dict) else build_joycon_ir_sensor_defaults()
+            scoped["joycon_ir_sensor"] = stored
+        values = stored.get(side)
+        if not isinstance(values, dict):
+            base_values = category_data.get("joycon_ir_sensor", {}).get(side)
+            values = copy.deepcopy(base_values) if isinstance(base_values, dict) else copy.deepcopy(IR_SENSOR_DEFAULTS[side])
+            stored[side] = values
+        return self._normalize_joycon_ir_sensor_values(side, values, category_data)
+
+    def set_joycon_ir_sensor_setting(self, side, key, value, profile_name=None, category=None):
+        values = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        values[key] = value
+        self._bump_settings_generation()
+
+    def set_joycon_ir_sensor_setting_scoped(self, side, key, value, profile_name=None, category=None, scope=None):
+        resolved_scope = self._resolve_in_app_gyro_scope(scope)
+        values = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, scope)
+        old_value = values.get("function") if key == "function" else None
+        values[key] = value
+        # The Joy-con Function is cross-synced between Controller Mapping and the Mode
+        # Shift (In-app Gyro) layer the same way the L/R Joystick Custom mapping is.
+        if key == "function":
+            self._sync_in_app_gyro_ir_function(side, old_value, value, resolved_scope, profile_name, category)
+        self._bump_settings_generation()
+
+    def set_joycon_ir_mouse_setting(self, side, key, value, profile_name=None, category=None):
+        """Update one nested IR-mouse value without exposing mutable config internals."""
+        values = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        if key not in IR_SENSOR_DEFAULTS["left"]["ir_mouse"]:
+            return
+        if key in ("left_click", "right_click", "middle_click"):
+            value = normalize_ir_mouse_switch_inputs(value)
+        values["ir_mouse"][key] = value
+        self._bump_settings_generation()
+
+    def set_joycon_ir_mouse_setting_scoped(self, side, key, value, profile_name=None, category=None, scope=None):
+        values = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, scope)
+        if key not in IR_SENSOR_DEFAULTS["left"]["ir_mouse"]:
+            return
+        if key in ("left_click", "right_click", "middle_click"):
+            value = normalize_ir_mouse_switch_inputs(value)
+        values["ir_mouse"][key] = value
+        self._bump_settings_generation()
+
+    def get_joycon_ir_in_app_gyro_setting(self, side, key, default=None, profile_name=None, category=None):
+        values = self.get_joycon_ir_sensor_settings(side, profile_name, category).get("in_app_gyro", {})
+        if default is None:
+            default = IR_SENSOR_IN_APP_GYRO_DEFAULTS.get(key)
+        return values.get(key, default)
+
+    def get_joycon_ir_in_app_gyro_setting_scoped(self, side, key, default=None, profile_name=None, category=None, scope=None):
+        values = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, scope).get("in_app_gyro", {})
+        if default is None:
+            default = IR_SENSOR_IN_APP_GYRO_DEFAULTS.get(key)
+        return values.get(key, default)
+
+    def set_joycon_ir_in_app_gyro_setting(self, side, key, value, profile_name=None, category=None):
+        values = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        if key not in IR_SENSOR_IN_APP_GYRO_DEFAULTS:
+            return
+        if key in ("deadzone_mode", "dampening_mode"):
+            value = normalize_dampening_inputs(value)
+        values["in_app_gyro"][key] = value
+        self._bump_settings_generation()
+
+    def set_joycon_ir_in_app_gyro_setting_scoped(self, side, key, value, profile_name=None, category=None, scope=None):
+        values = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, scope)
+        if key not in IR_SENSOR_IN_APP_GYRO_DEFAULTS:
+            return
+        if key in ("deadzone_mode", "dampening_mode"):
+            value = normalize_dampening_inputs(value)
+        values["in_app_gyro"][key] = value
+        # Keep the tuning block identical across layers, like L/R Joystick Custom.
+        self._sync_in_app_gyro_ir_tuning(side, self._resolve_in_app_gyro_scope(scope), profile_name, category)
+        self._bump_settings_generation()
+
+    def reset_joycon_ir_in_app_gyro_settings(self, side, profile_name=None, category=None):
+        values = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        values["in_app_gyro"] = copy.deepcopy(IR_SENSOR_IN_APP_GYRO_DEFAULTS)
+        self._bump_settings_generation()
+
+    def reset_joycon_ir_in_app_gyro_settings_scoped(self, side, profile_name=None, category=None, scope=None):
+        values = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, scope)
+        values["in_app_gyro"] = copy.deepcopy(IR_SENSOR_IN_APP_GYRO_DEFAULTS)
+        # Mirror the reset to the other layer so both stay identical.
+        self._sync_in_app_gyro_ir_tuning(side, self._resolve_in_app_gyro_scope(scope), profile_name, category)
+        self._bump_settings_generation()
 
     def get_default_profile_dict(self):
         categories = ["xbox", "ps4", "ps5_winuhid", "ps5_usbip", "switch1", "switch2"]
@@ -975,7 +1361,7 @@ class Config:
 
     @property
     def djg_dominant_side(self):
-        return self.profiles.get(self.active_profile, {}).get("djg_dominant_side", "Left")
+        return self.profiles.get(self.active_profile, {}).get("djg_dominant_side", "Right")
 
     @djg_dominant_side.setter
     def djg_dominant_side(self, value):
@@ -1241,22 +1627,49 @@ class Config:
 
     @property
     def djg_dominant_side(self):
-        return self._get_profile_setting("djg_dominant_side")
+        mode, side = normalize_djg_settings(
+            self._get_profile_setting("djg_mode"),
+            self._get_profile_setting("djg_dominant_side"))
+        return side
 
     @djg_dominant_side.setter
     def djg_dominant_side(self, value):
-        self._set_profile_setting("djg_dominant_side", value)
+        _, side = normalize_djg_settings(self.djg_mode, value)
+        self._set_profile_setting("djg_dominant_side", side)
 
     @property
     def djg_mode(self):
-        return self._get_profile_setting("djg_mode")
+        mode, _ = normalize_djg_settings(
+            self._get_profile_setting("djg_mode"),
+            self._get_profile_setting("djg_dominant_side"))
+        return mode
 
     @djg_mode.setter
     def djg_mode(self, value):
-        self._set_profile_setting("djg_mode", value)
+        mode, side = normalize_djg_settings(value, self.djg_dominant_side)
+        self._set_profile_setting("djg_mode", mode)
+        self._set_profile_setting("djg_dominant_side", side)
 
+
+    def suppress_saves(self, on):
+        """While on, save_config() only records a pending flag (no disk write). Turning it
+        off flushes a single save if any were requested. Used to coalesce rapid gamepad
+        numeric edits into one write instead of saving on every step."""
+        if on:
+            self._save_suppressed = True
+        else:
+            self._save_suppressed = False
+            if getattr(self, "_save_pending", False):
+                self._save_pending = False
+                self.save_config()
 
     def save_config(self):
+        # Coalesce rapid saves (e.g. gamepad hold-to-adjust): while suppressed, just mark
+        # pending and let suppress_saves(False) flush a single write.
+        if getattr(self, "_save_suppressed", False):
+            self._save_pending = True
+            return
+        self._save_pending = False
         # Snapshot config values in the calling thread
         data = {
             'driver_installed': self.driver_installed,
@@ -1265,6 +1678,13 @@ class Config:
             'hidhide_installed': self.hidhide_installed,
             'hidhide_hide_enabled': self.hidhide_hide_enabled,
             'driver_type': self.driver_type,
+            'ready_driven_controller_init': self.ready_driven_controller_init,
+            'virtual_driver_ready_probe': self.virtual_driver_ready_probe,
+            'sw2_zero_command_pacing': self.sw2_zero_command_pacing,
+            'controller_fast_cache': self.controller_fast_cache,
+            'controller_fast_cache_entries': self.controller_fast_cache_entries,
+            'winrt_cached_services': self.winrt_cached_services,
+            'winrt_skip_pro2_unsupported_init_0101': self.winrt_skip_pro2_unsupported_init_0101,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
             'usbip_sim_mode': self.usbip_sim_mode,
@@ -1598,7 +2018,7 @@ class Config:
                 defaults = build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity)
             for key, def_val in defaults.items():
                 if key not in scoped:
-                    scoped[key] = def_val.copy() if isinstance(def_val, dict) else def_val
+                    scoped[key] = copy.deepcopy(def_val) if isinstance(def_val, dict) else def_val
             # On creation, reconcile the activation buttons with Controller Mapping for
             # the active scope: Mode Shift always, In-app Gyro only while Mode Shift is On.
             if scope == self.active_in_app_gyro_scope():
@@ -1623,12 +2043,12 @@ class Config:
         for key, def_val in JOYSTICK_CUSTOM_DEFAULTS.items():
             if key not in scoped:
                 base_val = self.button_remaps[cat].get(key, def_val)
-                scoped[key] = base_val.copy() if isinstance(base_val, dict) else def_val.copy()
+                scoped[key] = copy.deepcopy(base_val) if isinstance(base_val, dict) else copy.deepcopy(def_val)
         for key, val in list(self.button_remaps[cat].items()):
             if key == scope:
                 continue
             if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS:
-                scoped.setdefault(key, val.copy() if isinstance(val, dict) else val)
+                scoped.setdefault(key, copy.deepcopy(val) if isinstance(val, dict) else val)
         return scoped
 
     def get_mapping_scope_dict(self, scope):
@@ -1820,6 +2240,84 @@ class Config:
             elif not has_custom and target.get(f"{key}_mapping", "Default") == "Custom":
                 target[f"{key}_mapping"] = "Default"
 
+    def _sync_in_app_gyro_ir_function(self, side, old_val, new_val, source_scope, profile_name=None, category=None):
+        """Mirror the Joy-con IR Sensor 'function' (and its in_app_gyro tuning block)
+        between Controller Mapping and the active In-app Gyro scope. Same rules as
+        _sync_in_app_gyro_mapping_key: a Mode Shift function is ALWAYS cross-synced
+        regardless of the Mode Shift On/Off toggle; an In-app Gyro function is
+        cross-synced only while Mode Shift is On. This is the IR-Sensor analog of the
+        L/R Joystick Custom sync (_sync_in_app_gyro_joystick_custom)."""
+        side = "left" if side == "left" else "right"
+        active_scope = self.active_in_app_gyro_scope()
+        if source_scope in (MAPPING_SCOPE_IN_APP_GYRO, MAPPING_SCOPE_IN_APP_GYRO_RSTICK, MAPPING_SCOPE_IN_APP_GYRO_STEERING):
+            # Edited the active In-app Gyro store -> mirror into Controller Mapping.
+            if source_scope != active_scope:
+                return
+            source = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, active_scope)
+            target = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        else:
+            # Edited Controller Mapping -> mirror into the active In-app Gyro store.
+            if active_scope is None:
+                return
+            source = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+            target = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, active_scope)
+
+        def mirror_in_app_gyro(value):
+            target["function"] = value
+            # Also mirror the in_app_gyro tuning sub-block so both layers share an
+            # identical gyro feel (deadzone/dampening/etc.).
+            target["in_app_gyro"] = copy.deepcopy(source.get("in_app_gyro", {}))
+
+        # Mode Shift function: ALWAYS cross-synced.
+        if self._is_mode_shift_value(new_val):
+            target["function"] = new_val
+            return
+        if self._is_mode_shift_value(old_val) and self._is_mode_shift_value(target.get("function")):
+            target["function"] = "Default"
+            return
+
+        # Leaving In-app Gyro: ALWAYS clear the mirrored copy in the partner layer,
+        # regardless of the Mode Shift On/Off toggle. A stale In-app Gyro that cannot be
+        # turned off (especially in the always-active base/Controller Mapping layer, which
+        # the runtime honours without a per-active-scope gate) is worse than a missed sync
+        # -- it keeps triggering gyro until disconnect and survives restart. The clear only
+        # fires when the partner actually holds an In-app Gyro value, so a layer that was
+        # set independently (Mode Shift Off, never mirrored) is left untouched.
+        if self._is_in_app_gyro_value(old_val) and not self._is_in_app_gyro_value(new_val):
+            if self._is_in_app_gyro_value(target.get("function")):
+                target["function"] = "Default"
+            return
+
+        # Entering / keeping In-app Gyro: propagate only while Mode Shift is On (Off keeps
+        # the two layers independent).
+        if not self.mode_shift_enabled:
+            return
+        if self._is_in_app_gyro_value(new_val):
+            mirror_in_app_gyro(new_val)
+
+    def _sync_in_app_gyro_ir_tuning(self, side, source_scope, profile_name=None, category=None):
+        """Keep the Joy-con IR Sensor In-App Gyro tuning block (simul/deadzone/
+        dampening) identical across Controller Mapping and the active In-app Gyro
+        scope. Matches the always-shared behaviour of the L/R Joystick Custom In-App
+        Gyro settings (which live in a single shared base slot), so -- unlike the
+        function sync -- this mirrors UNCONDITIONALLY, regardless of the Mode Shift
+        On/Off toggle. Runs only on popup-close / reset, never on the input hot path."""
+        side = "left" if side == "left" else "right"
+        active_scope = self.active_in_app_gyro_scope()
+        if active_scope is None:
+            return
+        if source_scope in (MAPPING_SCOPE_IN_APP_GYRO, MAPPING_SCOPE_IN_APP_GYRO_RSTICK, MAPPING_SCOPE_IN_APP_GYRO_STEERING):
+            # Edited the active In-app Gyro store -> mirror into Controller Mapping.
+            if source_scope != active_scope:
+                return
+            source = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, active_scope)
+            target = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+        else:
+            # Edited Controller Mapping -> mirror into the active In-app Gyro store.
+            source = self.get_joycon_ir_sensor_settings(side, profile_name, category)
+            target = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, active_scope)
+        target["in_app_gyro"] = copy.deepcopy(source.get("in_app_gyro", {}))
+
     def sync_active_in_app_gyro_activation(self):
         """Union-sync the 'In-app Gyro' activation buttons between Controller Mapping
         and the active In-app Gyro scope (any button that is In-app Gyro in either
@@ -1914,6 +2412,28 @@ class Config:
                     self.button_remaps[cat][key] = val_copy
                 if changed_scoped:
                     scoped[key] = scoped_copy
+        # The nested joycon_ir_sensor 'function' is not caught by the *_mapping/
+        # *_custom loop above, so reconcile it explicitly here (same rules): Mode
+        # Shift always union-syncs; In-app Gyro only while Mode Shift is On, also
+        # mirroring the in_app_gyro tuning block.
+        for ir_side in ("left", "right"):
+            base_ir = self.get_joycon_ir_sensor_settings(ir_side)
+            scoped_ir = self.get_joycon_ir_sensor_settings_scoped(ir_side, scope=active_scope)
+            base_fn = base_ir.get("function", "Default")
+            scoped_fn = scoped_ir.get("function", "Default")
+            base_ms = self._is_mode_shift_value(base_fn)
+            scoped_ms = self._is_mode_shift_value(scoped_fn)
+            if base_ms or scoped_ms:
+                ms_val = base_fn if base_ms else scoped_fn
+                base_ir["function"] = ms_val
+                scoped_ir["function"] = ms_val
+            elif mode_shift_on and (self._is_in_app_gyro_value(base_fn) or self._is_in_app_gyro_value(scoped_fn)):
+                if self._is_in_app_gyro_value(base_fn):
+                    scoped_ir["function"] = base_fn
+                    scoped_ir["in_app_gyro"] = copy.deepcopy(base_ir.get("in_app_gyro", {}))
+                else:
+                    base_ir["function"] = scoped_fn
+                    base_ir["in_app_gyro"] = copy.deepcopy(scoped_ir.get("in_app_gyro", {}))
         self._bump_settings_generation()
 
     def reset_in_app_gyro_mode_mapping(self):
@@ -1930,7 +2450,7 @@ class Config:
         else:
             defaults = build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity)
         self.button_remaps[cat][scope] = {
-            key: val.copy() if isinstance(val, dict) else val
+            key: copy.deepcopy(val) if isinstance(val, dict) else val
             for key, val in defaults.items()
         }
         self._bump_settings_generation()
@@ -1944,8 +2464,8 @@ class Config:
         for key, val in self.button_remaps[cat].items():
             if key in (MAPPING_SCOPE_IN_APP_GYRO, MAPPING_SCOPE_IN_APP_GYRO_RSTICK, MAPPING_SCOPE_IN_APP_GYRO_STEERING, "joycon_hold_mode"):
                 continue
-            if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS or key == "gc_trigger_mode":
-                copied[key] = val.copy() if isinstance(val, dict) else val
+            if key.endswith("_mapping") or key in SHARED_BUTTON_MAPPING_DEFAULTS or key in JOYSTICK_CUSTOM_DEFAULTS or key in ("gc_trigger_mode", "joycon_ir_sensor"):
+                copied[key] = copy.deepcopy(val) if isinstance(val, dict) else val
         if scope == MAPPING_SCOPE_IN_APP_GYRO_RSTICK:
             gc_trigger_default = self.get_default_category_dict(cat).get("gc_trigger_mode", "Hair Trigger")
             defaults = build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default)
@@ -1955,7 +2475,7 @@ class Config:
         else:
             defaults = build_in_app_gyro_mapping_defaults(self.stick_mouse_sensitivity)
         for key, val in defaults.items():
-            copied.setdefault(key, val.copy() if isinstance(val, dict) else val)
+            copied.setdefault(key, copy.deepcopy(val) if isinstance(val, dict) else val)
         self.button_remaps[cat][scope] = copied
         self._bump_settings_generation()
 

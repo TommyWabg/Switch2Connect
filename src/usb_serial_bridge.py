@@ -18,6 +18,7 @@
 # Electronic Mail: tommyw9318@gmail.com
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import win32com.client
 import serial
 
 from config import get_driver_path, CONFIG
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 from controller import (
     Controller,
     ControllerInfo,
@@ -58,6 +60,7 @@ ACTIVE_CLIENTS = []
 BRIDGE_SCAN_ACTIVE = False
 
 CDC_WAKE_DELAY_SECONDS = 0.1
+CDC_WRITE_TIMEOUT_SECONDS = 0.003
 
 def _set_current_thread_priority(level):
     try:
@@ -72,9 +75,9 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "1.0.0"
+APP_FIRMWARE_VERSION = "1.2"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
-EXPECTED_FIRMWARE_BUILD = "cdc_bridge_1"
+EXPECTED_FIRMWARE_BUILD = "cdc_bridge_3"
 MAX_ESP32S3_CHANNELS = 8
 MAX_ESP32S3_GROUPS = 4
 NINTENDO_REPORT_SIZE = 64
@@ -140,23 +143,93 @@ class ESP32S3SerialClient:
         self._read_stop = threading.Event()
         self.event_callback = None
         self._notify_callbacks = {}
+        self._notify_lock = threading.RLock()
+        # The serial reader only frames and publishes. Controller input work is
+        # isolated on a latest-only consumer so a slow mapping/gyro/USBIP callback
+        # can never stop CDC draining. Command/ACK/event callbacks keep FIFO order
+        # on a separate low-volume dispatcher.
+        self._input_condition = threading.Condition()
+        self._input_slots = {}
+        self._input_consumer_stop = False
+        self._input_consumer_threads = {}
+        # Compatibility alias for diagnostics/tests that tracked the original
+        # shared consumer. It points at channel 0's worker.
+        self._input_consumer_thread = None
+        self._input_sequence = 0
+        self._input_rr_cursor = None
+        self._input_diag_t0 = time.perf_counter()
+        self._input_diag = {}
+        self._control_dispatch_queue = queue.Queue(maxsize=256)
+        self._control_dispatch_stop = False
+        self._control_dispatch_thread = None
+        self._control_dispatch_drop = 0
+        self._cdc_diag_t0 = time.perf_counter()
+        self._cdc_diag_bytes = 0
+        self._cdc_diag_reads = 0
+        self._cdc_diag_input = 0
+        self._cdc_diag_command = 0
+        self._cdc_diag_text = 0
+        self._cdc_diag_resync = 0
+        self._cdc_diag_backlog_max = 0
+        self._cdc_diag_gap_us = 0.0
+        self._cdc_diag_gap_count = 0
+        self._cdc_diag_gap_max_us = 0.0
+        self._cdc_last_drain_end = time.perf_counter()
         self._gatt_lock = threading.RLock()
         self._gatt_chars = {}
         self._gatt_done_channels = set()
         self._write_lock = threading.Lock()
+        # Shadow rumble publication must never block an Audio Haptic cadence
+        # thread on USB CDC.  Keep one latest payload per channel and let a
+        # persistent bridge-level worker perform the serial writes.
+        self._rumble_tx_condition = threading.Condition()
+        self._rumble_tx_slots = {}
+        self._rumble_tx_stop = False
+        self._rumble_tx_thread = None
         self._write_count = 0
         self._response_queue = queue.Queue()
         self._closed_by_error = False
+        self.firmware_features = {}
         ACTIVE_CLIENTS.append(self)
 
-    def open(self):
+    @property
+    def supports_direct_rumble(self) -> bool:
+        return bool(self.firmware_features.get("direct_rumble"))
+
+    @property
+    def supports_latest_rumble_shadow(self) -> bool:
+        return bool(self.firmware_features.get("shadow_latest"))
+
+    def _update_firmware_features(self, text) -> None:
+        try:
+            data = json.loads(text)
+            if data.get("cmd") == "status" and isinstance(data.get("features"), dict):
+                self.firmware_features = dict(data["features"])
+        except Exception:
+            pass
+
+    def open(self, fast=False):
         if self.is_connected:
             return
         if self._closed_by_error:
             raise OSError(f"ESP32-S3 port {self.port} was closed after a hardware disconnect; reconnect required")
         try:
-            self.handle = serial.Serial(self.port, baudrate=2000000, timeout=0.1)
-            _wake_serial_port(self.handle)
+            self.handle = serial.Serial(
+                self.port, baudrate=2000000, timeout=0.1,
+                write_timeout=CDC_WRITE_TIMEOUT_SECONDS)
+            if fast:
+                # The startup probe verified this bridge moments ago. Avoid a
+                # second fixed CDC wake delay; the first manager command remains
+                # the transport validation point.
+                self.handle.dtr = True
+                self.handle.rts = True
+                try:
+                    self.handle.reset_input_buffer()
+                    self.handle.reset_output_buffer()
+                except Exception:
+                    pass
+            else:
+                _wake_serial_port(self.handle)
             self.is_connected = True
         except Exception as e:
             raise OSError(f"Unable to open ESP32-S3 serial port {self.port}: {e}")
@@ -179,6 +252,9 @@ class ESP32S3SerialClient:
                 pass
             self.handle = None
         self.is_connected = False
+        with self._input_condition:
+            self._input_slots.clear()
+            self._input_rr_cursor = None
 
         attempt = 0
         while not self._read_stop.is_set():
@@ -193,7 +269,9 @@ class ESP32S3SerialClient:
                 with self._write_lock:
                     if self.is_connected:
                         return True
-                    new_handle = serial.Serial(self.port, baudrate=2000000, timeout=0.1)
+                    new_handle = serial.Serial(
+                        self.port, baudrate=2000000, timeout=0.1,
+                        write_timeout=CDC_WRITE_TIMEOUT_SECONDS)
                     _wake_serial_port(new_handle)
                     self.handle = new_handle
                     self.is_connected = True
@@ -210,6 +288,29 @@ class ESP32S3SerialClient:
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
 
+    def _ensure_input_consumer(self, channel):
+        channel = int(channel)
+        with self._input_condition:
+            self._input_consumer_stop = False
+            thread = self._input_consumer_threads.get(channel)
+            if thread and thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._input_consumer_loop, args=(channel,), daemon=True,
+                name=f"ESP32InputConsumer-{self.port}-ch{channel}")
+            self._input_consumer_threads[channel] = thread
+            if channel == 0:
+                self._input_consumer_thread = thread
+            thread.start()
+
+    def _ensure_control_dispatch_worker(self):
+        if not self._control_dispatch_thread or not self._control_dispatch_thread.is_alive():
+            self._control_dispatch_stop = False
+            self._control_dispatch_thread = threading.Thread(
+                target=self._control_dispatch_loop, daemon=True,
+                name=f"ESP32ControlDispatch-{self.port}")
+            self._control_dispatch_thread.start()
+
     def _drain_response_queue(self):
         while True:
             try:
@@ -222,6 +323,19 @@ class ESP32S3SerialClient:
 
     def close_sync(self):
         self._read_stop.set()
+        with self._input_condition:
+            self._input_consumer_stop = True
+            self._input_slots.clear()
+            self._input_condition.notify_all()
+        self._control_dispatch_stop = True
+        try:
+            self._control_dispatch_queue.put_nowait(("stop",))
+        except queue.Full:
+            pass
+        with self._rumble_tx_condition:
+            self._rumble_tx_stop = True
+            self._rumble_tx_slots.clear()
+            self._rumble_tx_condition.notify_all()
         self.is_connected = False
         if self.handle:
             try:
@@ -232,9 +346,72 @@ class ESP32S3SerialClient:
                 
         if self._read_thread and self._read_thread.is_alive():
             self._read_thread.join(timeout=0.5)
+        for thread in tuple(self._input_consumer_threads.values()):
+            if thread.is_alive():
+                thread.join(timeout=0.5)
+        self._input_consumer_threads.clear()
+        self._input_consumer_thread = None
+        if self._control_dispatch_thread and self._control_dispatch_thread.is_alive():
+            self._control_dispatch_thread.join(timeout=0.5)
+        if self._rumble_tx_thread and self._rumble_tx_thread.is_alive():
+            self._rumble_tx_thread.join(timeout=0.5)
+        while True:
+            try:
+                self._control_dispatch_queue.get_nowait()
+            except queue.Empty:
+                break
             
         if self in ACTIVE_CLIENTS:
             ACTIVE_CLIENTS.remove(self)
+
+    def _ensure_rumble_tx_worker(self):
+        with self._rumble_tx_condition:
+            if self._rumble_tx_thread and self._rumble_tx_thread.is_alive():
+                return
+            self._rumble_tx_stop = False
+            self._rumble_tx_thread = threading.Thread(
+                target=self._rumble_tx_loop,
+                daemon=True,
+                name=f"ESP32RumbleTx-{self.port}",
+            )
+            self._rumble_tx_thread.start()
+
+    def _rumble_tx_loop(self):
+        """Write only the newest shadow payloads outside Audio/input workers."""
+        while True:
+            with self._rumble_tx_condition:
+                while not self._rumble_tx_stop and not self._rumble_tx_slots:
+                    self._rumble_tx_condition.wait()
+                if self._rumble_tx_stop:
+                    return
+                slots = self._rumble_tx_slots
+                self._rumble_tx_slots = {}
+
+            # Preserve publication order between channels within this snapshot.
+            # A newer value arriving during a write remains in the next snapshot
+            # and supersedes any intermediate frame for that channel.
+            for channel, data in slots.items():
+                self._write_rumble_shadow(channel, data)
+
+    def _write_rumble_shadow(self, channel: int, data) -> bool:
+        hexd = bytes(data).hex()
+        cmd = f"rs {int(channel)} {hexd}\n"
+        with self._write_lock:
+            try:
+                self.open()
+                self._ensure_read_thread()
+                self.handle.write(cmd.encode("ascii"))
+                return True
+            except Exception as e:
+                logger.debug("Failed to write ESP32-S3 rs payload: %s", e)
+                return False
+
+
+
+
+
+
+
 
     async def stop_notify(self, _uuid):
         self._read_stop.set()
@@ -297,18 +474,23 @@ class ESP32S3SerialClient:
     async def start_channel_notify(self, channel, uuid, callback):
         self.open()
         channel = int(channel)
-        if channel not in self._notify_callbacks:
-            self._notify_callbacks[channel] = {}
         key = self._norm_uuid(uuid)
-        callbacks = self._notify_callbacks[channel].setdefault(key, [])
-        if callback not in callbacks:
-            callbacks.append(callback)
+        with self._notify_lock:
+            if channel not in self._notify_callbacks:
+                self._notify_callbacks[channel] = {}
+            callbacks = self._notify_callbacks[channel].setdefault(key, [])
+            if callback not in callbacks:
+                callbacks.append(callback)
         self._ensure_read_thread()
         
     async def stop_channel_notify(self, channel, uuid):
         channel = int(channel)
-        if channel in self._notify_callbacks:
-            self._notify_callbacks[channel].pop(self._norm_uuid(uuid), None)
+        key = self._norm_uuid(uuid)
+        with self._notify_lock:
+            if channel in self._notify_callbacks:
+                self._notify_callbacks[channel].pop(key, None)
+        with self._input_condition:
+            self._input_slots.pop((channel, key), None)
 
     async def write_gatt_char(self, _uuid, data, response=False):
         await self.write_channel_gatt_char(0, _uuid, data, response=response)
@@ -346,7 +528,9 @@ class ESP32S3SerialClient:
                     return ""
 
             try:
-                return self._response_queue.get(timeout=timeout)
+                response = self._response_queue.get(timeout=timeout)
+                self._update_firmware_features(response)
+                return response
             except queue.Empty:
                 return ""
 
@@ -406,6 +590,15 @@ class ESP32S3SerialClient:
                 logger.debug("Failed to write ESP32-S3 command line %r: %s", command, e)
                 return False
 
+    def send_fire_and_forget(self, command: str) -> bool:
+        """Write a manager command that has no response contract.
+
+        This intentionally does not wait for the manager response queue.  Lifecycle
+        completion is reported through bridge events, while status remains the only
+        request/response manager operation.
+        """
+        return self.send_command_line(command)
+
     def send_ble_write(self, channel: int, uuid: str, data, mirror_channel=None):
         uuid_text = str(uuid).lower()
         if uuid_text == COMMAND_WRITE_UUID.lower():
@@ -464,7 +657,7 @@ class ESP32S3SerialClient:
                 return False
 
     def send_rumble_shadow(self, channel: int, data) -> bool:
-        """Push the latest rumble payload for one channel into the firmware shadow.
+        """Publish the latest rumble payload without waiting for USB CDC.
 
         Format: 'rs <ch> <hex>'.  The firmware stores this as the channel's latest
         rumble and a dedicated firmware task re-sends it to BLE at a steady,
@@ -473,8 +666,24 @@ class ESP32S3SerialClient:
         sustain, so rumble smoothness no longer depends on host/OS scheduling jitter.
         Requires firmware with the 'shadow' feature (v0.11.3+).
         """
+        self._ensure_rumble_tx_worker()
+        with self._rumble_tx_condition:
+            self._rumble_tx_slots[int(channel)] = bytes(data)
+            self._rumble_tx_condition.notify()
+        return True
+
+    def send_rumble_direct(self, channel: int, data) -> bool:
+        """Write one rumble payload straight to the controller's BLE rumble char.
+
+        Format: 'rd <ch> <hex>'.  Unlike 'rs' (which queues into the firmware's shared
+        15ms audio-haptics FIFO), 'rd' writes immediately -- the 0.12.2 behaviour -- so
+        ordinary rumble stays smooth.  The host uses this for ESP32-S3 merged Joy-Con
+        rumble whenever no audio-haptic stream is present.
+        """
+        if not self.supports_direct_rumble:
+            return False
         hexd = bytes(data).hex()
-        cmd = f"rs {int(channel)} {hexd}\n"
+        cmd = f"rd {int(channel)} {hexd}\n"
         with self._write_lock:
             self.open()
             self._ensure_read_thread()
@@ -482,7 +691,7 @@ class ESP32S3SerialClient:
                 self.handle.write(cmd.encode("ascii"))
                 return True
             except Exception as e:
-                logger.debug("Failed to write ESP32-S3 rs payload: %s", e)
+                logger.debug("Failed to write ESP32-S3 rd payload: %s", e)
                 return False
 
     def get_or_create_rumble_dispatcher(self):
@@ -502,6 +711,153 @@ class ESP32S3SerialClient:
         if disp is not None:
             disp.stop()
             self._rumble_dispatcher = None
+
+    def _enqueue_control_dispatch(self, item):
+        self._ensure_control_dispatch_worker()
+        try:
+            self._control_dispatch_queue.put_nowait(item)
+            return True
+        except queue.Full:
+            self._control_dispatch_drop += 1
+            return False
+
+    def _control_dispatch_loop(self):
+        while not self._control_dispatch_stop:
+            try:
+                item = self._control_dispatch_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not item or item[0] == "stop":
+                continue
+            kind = item[0]
+            try:
+                if kind == "notify":
+                    _, callbacks, payload, channel, uuid_text = item
+                    for callback in callbacks:
+                        try:
+                            callback(None, bytearray(payload))
+                        except Exception:
+                            logger.exception(
+                                "ESP32-S3 control callback failed channel=%d uuid=%s",
+                                channel, uuid_text)
+                elif kind == "event":
+                    _, callback, event = item
+                    callback(event)
+            except Exception:
+                logger.exception("ESP32-S3 control dispatcher failed")
+
+    def _publish_input(self, channel, source_uuid, payload, callbacks):
+        self._ensure_input_consumer(channel)
+        key = (int(channel), self._norm_uuid(source_uuid or INPUT_REPORT_UUID))
+        now = time.perf_counter()
+        with self._input_condition:
+            self._input_sequence += 1
+            if _PERF_DIAGNOSTICS:
+                diag = self._input_diag.setdefault(int(channel), {
+                    "publish": 0, "overwrite": 0, "dispatch": 0, "error": 0,
+                    "age_us": 0.0, "max_age_us": 0.0,
+                    "callback_us": 0.0, "max_callback_us": 0.0,
+                })
+                diag["publish"] += 1
+                if key in self._input_slots:
+                    diag["overwrite"] += 1
+            self._input_slots[key] = (
+                now, self._input_sequence, tuple(callbacks), bytes(payload))
+            # Consumers are channel-affine; wake all so the matching channel is
+            # never left asleep behind an unrelated consumer.
+            self._input_condition.notify_all()
+
+    def _take_next_input_locked(self, channel):
+        keys = [key for key in self._input_slots if key[0] == channel]
+        if not keys:
+            return None
+        keys.sort()
+        key = keys[0]
+        if self._input_rr_cursor is not None:
+            for candidate in keys:
+                if candidate > self._input_rr_cursor:
+                    key = candidate
+                    break
+        self._input_rr_cursor = key
+        return key, self._input_slots.pop(key)
+
+    def _input_consumer_loop(self, channel):
+        # Keep input above normal but below USB audio workers (priority 2).
+        _set_current_thread_priority(1)
+        while True:
+            with self._input_condition:
+                while (not self._input_consumer_stop and
+                       not any(key[0] == channel for key in self._input_slots)):
+                    self._input_condition.wait(timeout=0.5)
+                if self._input_consumer_stop:
+                    return
+                selected = self._take_next_input_locked(channel)
+            if selected is None:
+                continue
+            (channel, uuid_text), (published, _sequence, callbacks, payload) = selected
+            callback_started = time.perf_counter() if _PERF_DIAGNOSTICS else 0.0
+            callback_errors = 0
+            for callback in callbacks:
+                try:
+                    callback(None, bytearray(payload))
+                except Exception:
+                    callback_errors += 1
+                    logger.exception(
+                        "ESP32-S3 input callback failed channel=%d uuid=%s",
+                        channel, uuid_text)
+            if _PERF_DIAGNOSTICS:
+                callback_finished = time.perf_counter()
+                with self._input_condition:
+                    diag = self._input_diag.setdefault(channel, {
+                        "publish": 0, "overwrite": 0, "dispatch": 0, "error": 0,
+                        "age_us": 0.0, "max_age_us": 0.0,
+                        "callback_us": 0.0, "max_callback_us": 0.0,
+                    })
+                    age_us = (callback_started - published) * 1_000_000.0
+                    callback_us = (callback_finished - callback_started) * 1_000_000.0
+                    diag["dispatch"] += 1
+                    diag["error"] += callback_errors
+                    diag["age_us"] += age_us
+                    diag["max_age_us"] = max(diag["max_age_us"], age_us)
+                    diag["callback_us"] += callback_us
+                    diag["max_callback_us"] = max(diag["max_callback_us"], callback_us)
+                    snapshots = self._maybe_log_input_diagnostics_locked()
+                self._emit_input_diagnostics(snapshots)
+            # Bound bursts and give priority-2 audio workers an immediate chance
+            # to run when both Joy-Con channels are continuously active.
+            time.sleep(0)
+
+    def _maybe_log_input_diagnostics_locked(self):
+        if not _PERF_DIAGNOSTICS:
+            return None
+        now = time.perf_counter()
+        if now - self._input_diag_t0 < 1.0:
+            return None
+        snapshots = []
+        for channel, diag in sorted(self._input_diag.items()):
+            dispatch = max(1, diag["dispatch"])
+            snapshots.append((
+                channel, diag["publish"], diag["overwrite"], diag["dispatch"],
+                diag["age_us"] / dispatch, diag["max_age_us"],
+                diag["callback_us"] / dispatch, diag["max_callback_us"],
+                diag["error"],
+            ))
+        self._input_diag.clear()
+        self._input_diag_t0 = now
+        return snapshots
+
+    def _emit_input_diagnostics(self, snapshots):
+        if not snapshots:
+            return
+        for snapshot in snapshots:
+            (channel, publish, overwrite, dispatch, avg_age_us, max_age_us,
+             avg_callback_us, max_callback_us, errors) = snapshot
+            logger.info(
+                "ESP32-INPUT ch=%d publish=%d overwrite=%d dispatch=%d "
+                "age_avg=%.0fus age_max=%.0fus callback_avg=%.0fus "
+                "callback_max=%.0fus errors=%d",
+                channel, publish, overwrite, dispatch, avg_age_us, max_age_us,
+                avg_callback_us, max_callback_us, errors)
 
     def _queue_text_response(self, data):
         if not data:
@@ -527,11 +883,13 @@ class ESP32S3SerialClient:
                     logger.debug("Failed to parse ESP32-S3 GATT metadata: %s", text, exc_info=True)
                 return
             if ('"cmd":"scan_result"' in text or '"cmd":"connected"' in text
+                    or '"cmd":"link_up"' in text or '"cmd":"gatt_ready"' in text
                     or '"cmd":"connect_fail"' in text or '"cmd":"connect_busy"' in text
                     or '"cmd":"disconnected"' in text):
                 if self.event_callback:
                     try:
-                        self.event_callback(json.loads(text))
+                        self._enqueue_control_dispatch(
+                            ("event", self.event_callback, json.loads(text)))
                     except Exception:
                         pass
                 # These are event-only; never go into the command response queue
@@ -540,15 +898,22 @@ class ESP32S3SerialClient:
                 # Firmware debug messages must not pollute the status response queue:
                 # send_manager_command("status lite") would return the debug JSON, parse
                 # ble_channels=0, and falsely trigger a multi-controller disconnect.
-                logger.debug("ESP32-S3 firmware debug: %s", text)
-                
-                
                 try:
                     debug_data = json.loads(text)
-                    print(f"[BLE Callback] {debug_data.get('msg')}")
+                    message = str(debug_data.get('msg') or '')
+                    if message.startswith('QOS '):
+                        logger.debug("ESP32-S3 firmware status: %s", message)
+                    else:
+                        logger.debug("ESP32-S3 firmware debug: %s", message)
                 except Exception:
-                    print(f"[BLE Callback] {text}")
-                
+                    logger.debug("ESP32-S3 firmware debug parse failed: %s", text)
+                return
+            if '"cmd":"qos"' in text:
+                try:
+                    qos = json.loads(text)
+                    logger.debug("ESP32-S3 firmware status: %s", qos)
+                except Exception:
+                    logger.debug("ESP32-S3 firmware QoS parse failed: %s", text)
                 return
             self._response_queue.put(text)
 
@@ -576,7 +941,11 @@ class ESP32S3SerialClient:
             else:
                 report_payload = data[1:]
 
-            channel_callbacks = self._notify_callbacks.get(channel, {})
+            with self._notify_lock:
+                channel_callbacks = {
+                    uuid: tuple(callbacks)
+                    for uuid, callbacks in self._notify_callbacks.get(channel, {}).items()
+                }
             for uuid, callbacks in list(channel_callbacks.items()):
                 uuid_text = str(uuid).lower()
                 if source_uuid is not None and uuid_text != source_uuid:
@@ -585,37 +954,55 @@ class ESP32S3SerialClient:
                     continue
                 if not is_command and source_uuid is None and not uuid_text.startswith(INPUT_UUID_PREFIX):
                     continue
-                for cb in list(callbacks):
-                    try:
-                        cb(None, bytearray(report_payload))
-                    except Exception:
-                        logger.exception("ESP32-S3 Serial callback failed channel=%d uuid=%s", channel, uuid_text)
+                if is_command:
+                    # ACK/command notifications are ordered and must never be
+                    # coalesced.  Keep them off the CDC reader nonetheless.
+                    self._enqueue_control_dispatch(
+                        ("notify", callbacks, bytes(report_payload), channel, uuid_text))
+                else:
+                    # Ordinary input is state, not an event stream.  Publish only
+                    # the latest state so CDC/UDP stalls cannot replay stale input.
+                    self._publish_input(
+                        channel, source_uuid or uuid_text, report_payload, callbacks)
             return
 
         if data[0] == NINTENDO_INPUT_REPORT_ID:
             data = data[1:]
         
-        channel_0_callbacks = self._notify_callbacks.get(0, {})
-        for callbacks in list(channel_0_callbacks.values()):
-            for cb in list(callbacks):
-                try:
-                    cb(None, bytearray(data))
-                except Exception:
-                    logger.exception("ESP32-S3 Serial input callback failed")
+        with self._notify_lock:
+            callbacks = tuple(
+                callback
+                for uuid, registered in self._notify_callbacks.get(0, {}).items()
+                if str(uuid).lower().startswith(INPUT_UUID_PREFIX)
+                for callback in registered
+            )
+        if callbacks:
+            self._publish_input(0, INPUT_REPORT_UUID, data, callbacks)
 
     def _read_loop(self):
         _set_current_thread_priority(2)
         buf = bytearray()
         while not self._read_stop.is_set() and self.is_connected and self.handle:
             try:
-                if self.handle.in_waiting:
-                    chunk = self.handle.read(self.handle.in_waiting or 1024)
+                waiting = self.handle.in_waiting
+                if waiting:
+                    now = time.perf_counter()
+                    gap_us = (now - self._cdc_last_drain_end) * 1_000_000.0
+                    self._cdc_diag_gap_us += gap_us
+                    self._cdc_diag_gap_count += 1
+                    self._cdc_diag_gap_max_us = max(self._cdc_diag_gap_max_us, gap_us)
+                    self._cdc_diag_backlog_max = max(self._cdc_diag_backlog_max, waiting)
+                    chunk = self.handle.read(waiting or 1024)
                     if chunk:
                         buf.extend(chunk)
                 else:
                     chunk = self.handle.read(1)
                     if chunk:
                         buf.extend(chunk)
+                if chunk:
+                    self._cdc_diag_bytes += len(chunk)
+                    self._cdc_diag_reads += 1
+                self._cdc_last_drain_end = time.perf_counter()
             except serial.SerialException as e:
                 logger.warning("ESP32-S3 Serial read loop error on %s: %s — retrying until recovered", self.port, e)
                 if self._try_reopen():
@@ -648,10 +1035,12 @@ class ESP32S3SerialClient:
                 if nl_idx != -1 and (hdr_idx == -1 or nl_idx < hdr_idx):
                     line = bytes(buf[:nl_idx + 1])
                     buf = buf[nl_idx + 1:]
+                    self._cdc_diag_text += 1
                     self._queue_text_response(line)
                     continue
 
                 if hdr_idx > 0:
+                    self._cdc_diag_resync += hdr_idx
                     buf = buf[hdr_idx:]
                     continue
 
@@ -684,6 +1073,9 @@ class ESP32S3SerialClient:
                     continue
 
                 break
+
+    def _maybe_log_cdc_diagnostics(self):
+        return
 
 class MockCharacteristic:
     def __init__(self, uuid, properties, handle=1):
@@ -732,6 +1124,9 @@ class ESP32S3ChannelClient:
 
     def send_manager_command(self, command: str, timeout=2.0):
         return self.shared_client.send_manager_command(command, timeout=timeout)
+
+    def send_fire_and_forget(self, command: str) -> bool:
+        return self.shared_client.send_fire_and_forget(command)
 
     def send_command_line(self, command: str) -> bool:
         return self.shared_client.send_command_line(command)
@@ -787,6 +1182,22 @@ def scan_serial_ports():
         else:
             ports_by_name[port] = PortInfo(port, name, manufacturer, device_id, likely, otg)
 
+    # pyserial provides the COM path and hardware ID for normal CDC/CH343 boards.
+    # Prefer it at startup: WMI's full PnP traversal is comparatively expensive.
+    try:
+        from serial.tools import list_ports
+        for item in list_ports.comports():
+            port = str(getattr(item, "device", "") or getattr(item, "name", "") or "")
+            name = str(getattr(item, "description", "") or port)
+            manufacturer = str(getattr(item, "manufacturer", "") or "")
+            device_id = str(getattr(item, "hwid", "") or "")
+            add_port(port, name, manufacturer, device_id)
+    except Exception as e:
+        logger.debug(f"ESP32-S3 pyserial port scan failed: {e}")
+    likely_count = sum(p.likely_ch343 for p in ports_by_name.values())
+    if likely_count:
+        return sorted(ports_by_name.values(), key=lambda p: int(re.sub(r"\D", "", p.port) or "9999"))
+
     try:
         wmi = win32com.client.GetObject("winmgmts://./root/cimv2")
         for item in wmi.ExecQuery("SELECT Name,Manufacturer,DeviceID FROM Win32_PnPEntity"):
@@ -829,9 +1240,9 @@ def shutdown_all_bridges():
     """
     for client in list(ACTIVE_CLIENTS):
         try:
-            client.send_manager_command("scan off", timeout=0.5)
-            client.send_manager_command("auto off", timeout=0.5)
-            client.send_manager_command("ble disconnect", timeout=0.8)
+            client.send_fire_and_forget("scan off")
+            client.send_fire_and_forget("auto off")
+            client.send_fire_and_forget("ble disconnect")
         except Exception:
             pass
 
@@ -849,27 +1260,25 @@ def send_serial_command(port: str, command="status lite", timeout=1.2):
 
     handle = None
     try:
-        handle = serial.Serial(port, baudrate=2000000, timeout=0.1)
+        handle = serial.Serial(
+            port, baudrate=2000000, timeout=0.1,
+            write_timeout=CDC_WRITE_TIMEOUT_SECONDS)
         payload = (command.strip() + "\n").encode("utf-8")
+        deadline = time.monotonic() + max(0.05, float(timeout))
 
+        # A healthy, already-running CDC bridge replies immediately.  The legacy
+        # path always slept 500 ms after every temporary COM open, and startup
+        # performed that probe repeatedly.  Try once right away, retaining the
+        # wake/retry path below for a board that is still enumerating.
         handle.dtr = True
         handle.rts = True
-        time.sleep(STARTUP_STATUS_WAKE_DELAY_SECONDS)
         try:
             handle.reset_output_buffer()
         except Exception:
             pass
 
-        for attempt in range(STATUS_PROBE_ATTEMPTS):
-            try:
-                handle.reset_input_buffer()
-            except Exception:
-                pass
-
-            handle.write(payload)
-            chunks = []
-            deadline = time.time() + STARTUP_STATUS_READ_WINDOW_SECONDS
-            while time.time() < deadline:
+        def read_until(read_deadline, chunks):
+            while time.monotonic() < read_deadline:
                 if handle.in_waiting:
                     text = handle.read(handle.in_waiting).decode("utf-8", errors="replace")
                     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
@@ -877,10 +1286,42 @@ def send_serial_command(port: str, command="status lite", timeout=1.2):
                     combined = "".join(chunks)
                     if '"version"' in combined and '"cmd"' in combined:
                         return combined
-                time.sleep(0.02)
+                time.sleep(0.01)
+            return ""
 
-            if attempt < STATUS_PROBE_ATTEMPTS - 1:
-                time.sleep(STATUS_PROBE_RETRY_DELAY_SECONDS)
+        chunks = []
+        handle.write(payload)
+        immediate_reply = read_until(
+            min(deadline, time.monotonic() + min(0.12, max(0.0, float(timeout)))),
+            chunks,
+        )
+        if immediate_reply:
+            return immediate_reply
+
+        # Preserve the firmware boot/CDC settle allowance only after the fast
+        # probe missed.  A single monotonic deadline now bounds all retries.
+        wake_remaining = STARTUP_STATUS_WAKE_DELAY_SECONDS - 0.12
+        if wake_remaining > 0 and time.monotonic() < deadline:
+            time.sleep(min(wake_remaining, max(0.0, deadline - time.monotonic())))
+
+        for attempt in range(STATUS_PROBE_ATTEMPTS):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                handle.reset_input_buffer()
+            except Exception:
+                pass
+
+            handle.write(payload)
+            reply = read_until(
+                min(deadline, time.monotonic() + STARTUP_STATUS_READ_WINDOW_SECONDS),
+                chunks,
+            )
+            if reply:
+                return reply
+
+            if attempt < STATUS_PROBE_ATTEMPTS - 1 and time.monotonic() < deadline:
+                time.sleep(min(STATUS_PROBE_RETRY_DELAY_SECONDS, max(0.0, deadline - time.monotonic())))
         return "".join(chunks)
     except Exception as e:
         logger.debug(f"ESP32-S3 serial command failed on {port}: {e}")
@@ -973,7 +1414,6 @@ def detect_bridge():
     bridge_ready = bool(serial_port and firmware_current)
     usb_present = bool(serial_port)
     firmware_update_required = bool(serial_port and firmware_installed and not firmware_current)
-
     return BridgeStatus(
         serial_port,
         firmware_installed,
@@ -1071,13 +1511,13 @@ class ESP32S3Controller(Controller):
             try:
                 if self._owns_client:
                     # Standalone single-controller client owns the whole bridge.
-                    self.client.send_manager_command("auto off", timeout=0.5)
-                    self.client.send_manager_command("ble disconnect", timeout=0.8)
+                    self.client.send_fire_and_forget("auto off")
+                    self.client.send_fire_and_forget("ble disconnect")
                 else:
                     # Shared bridge client: drop only THIS controller's BLE channel so
                     # the firmware actually disconnects the physical controller instead
                     # of keeping it connected (the channel is then free to be re-detected).
-                    self.shared_client.send_manager_command(f"disc {self.channel}", timeout=0.5)
+                    self.shared_client.send_fire_and_forget(f"disc {self.channel}")
             except Exception:
                 logger.debug("ESP32-S3 BLE disconnect command failed", exc_info=True)
             if self._owns_client:
@@ -1186,17 +1626,64 @@ def _run_esptool_attempts(attempts, progress=None):
             time.sleep(0.5)
     raise last_error
 
-def _write_flash_args(manifest, firmware_root, profile, port, baud, no_stub, before="default_reset"):
+def _validate_firmware_assets(manifest, firmware_root, profile):
+    """Return verified flash assets and fail before esptool can modify a device."""
+    root = os.path.realpath(firmware_root)
+    assets = profile.get("assets", [])
+    if not isinstance(assets, list) or not assets:
+        raise RuntimeError(f"Firmware profile has no assets: {profile.get('id', '<unknown>')}")
+
+    expected_offsets = {0x0, 0x8000, 0x10000}
+    offsets = set()
+    verified = []
+    for asset in assets:
+        relative_path = asset.get("path")
+        expected_hash = str(asset.get("sha256", "")).lower()
+        try:
+            offset = int(str(asset.get("offset", "")), 0)
+        except ValueError as e:
+            raise RuntimeError(f"Invalid firmware asset offset: {asset.get('offset')}") from e
+        if not relative_path or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise RuntimeError(f"Invalid firmware asset metadata at offset 0x{offset:X}")
+        path = os.path.realpath(os.path.join(root, relative_path.replace("/", os.sep)))
+        try:
+            if os.path.commonpath([root, path]) != root:
+                raise RuntimeError(f"Firmware asset is outside the firmware directory: {relative_path}")
+        except ValueError as e:
+            raise RuntimeError(f"Invalid firmware asset path: {relative_path}") from e
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        digest = hashlib.sha256()
+        with open(path, "rb") as binary:
+            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual_hash = digest.hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"Firmware asset checksum mismatch: {relative_path} "
+                f"(expected {expected_hash}, got {actual_hash})"
+            )
+        if offset in offsets:
+            raise RuntimeError(f"Duplicate firmware asset offset: 0x{offset:X}")
+        offsets.add(offset)
+        verified.append({"offset": asset["offset"], "path": path})
+
+    if profile.get("id") == EXPECTED_FIRMWARE_PROFILE and offsets != expected_offsets:
+        raise RuntimeError("Production firmware profile must contain 0x0, 0x8000, and 0x10000 assets")
+    return verified
+
+
+def _write_flash_args(manifest, firmware_root, profile, port, baud, no_stub,
+                      before="default_reset", verified_assets=None):
     args = _common_esptool_args(port, baud, no_stub, "write_flash", before=before)
     args += ["--flash_mode", manifest.get("flashMode", "dio")]
     args += ["--flash_freq", manifest.get("flashFreq", "80m")]
     args += ["--flash_size", manifest.get("flashSize", "16MB")]
-    for asset in profile.get("assets", []):
-        path = os.path.join(firmware_root, asset["path"].replace("/", os.sep))
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
+    for asset in verified_assets if verified_assets is not None else _validate_firmware_assets(manifest, firmware_root, profile):
+        path = asset["path"]
         args += [asset["offset"], path]
     return args
+
 
 def release_port(port: str):
     logger.info(f"Releasing COM port {port} before flashing...")
@@ -1256,17 +1743,21 @@ def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFI
     profile = next((p for p in manifest.get("profiles", []) if p.get("id") == profile_id), None)
     if profile is None:
         raise RuntimeError(f"Firmware profile not found: {profile_id}")
+    verified_assets = _validate_firmware_assets(manifest, firmware_root, profile)
 
     if progress:
         progress({"percent": 25, "message": f"Flashing {profile.get('label', profile_id)}"})
         progress(f"{ESP32S3_LABEL}: flashing {profile.get('label', profile_id)}")
     try:
         _run_esptool_attempts([
-            ("write flash using automatic reset", _write_flash_args(manifest, firmware_root, profile, port, baud, no_stub)),
-            ("write flash using 115200 baud recovery", _write_flash_args(manifest, firmware_root, profile, port, 115200, False)),
-            ("write flash using manual bootloader mode", _write_flash_args(manifest, firmware_root, profile, port, 115200, False, before="no_reset")),
+            ("write flash using automatic reset", _write_flash_args(manifest, firmware_root, profile, port, baud, no_stub, verified_assets=verified_assets)),
+            ("write flash using 115200 baud recovery", _write_flash_args(manifest, firmware_root, profile, port, 115200, False, verified_assets=verified_assets)),
+            ("write flash using manual bootloader mode", _write_flash_args(manifest, firmware_root, profile, port, 115200, False, before="no_reset", verified_assets=verified_assets)),
         ], progress=progress)
     except Exception as e:
         raise RuntimeError(_serial_recovery_hint(port, str(e))) from e
     if progress:
+        # Deliberately match the 1.1 completion boundary: a successful esptool write
+        # is installation success. CDC identity is checked after the user re-plugs,
+        # when Windows has finished re-enumerating the device.
         progress({"percent": 100, "message": "Firmware flashing completed"})

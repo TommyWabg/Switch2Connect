@@ -22,8 +22,12 @@ import os
 import sys
 import logging
 import time
+_PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
 logger = logging.getLogger(__name__)
+
+# Built-in diagnostics remain rate-limited below. Never emit one log per native
+# WinUHid callback: doing so would hold the GIL and stall other controllers.
 
 # Load the DLLs
 try:
@@ -500,7 +504,8 @@ class VDS4Gamepad:
 
     def update(self):
         if self.device and _winuhid_devs:
-            _winuhid_devs.WinUHidPS4ReportInput(self.device, ctypes.byref(self.report))
+            return bool(_winuhid_devs.WinUHidPS4ReportInput(self.device, ctypes.byref(self.report)))
+        return False
 
     def close(self):
         if hasattr(self, 'device') and self.device and _winuhid_devs:
@@ -571,7 +576,8 @@ class VDS5Gamepad:
 
     def update(self):
         if self.device and _winuhid_devs:
-            _winuhid_devs.WinUHidPS5ReportInput(self.device, ctypes.byref(self.report))
+            return bool(_winuhid_devs.WinUHidPS5ReportInput(self.device, ctypes.byref(self.report)))
+        return False
 
     def close(self):
         if hasattr(self, 'device') and self.device and _winuhid_devs:
@@ -617,14 +623,33 @@ class VX360Gamepad:
             logger.error("WinUHidDevs DLL not loaded")
 
     def _rumble_handler(self, context, left_motor, right_motor, left_trigger, right_trigger):
-        # WinUHid XOne supplies all four motors as percentages (0-100).  Log
-        # the raw values before the legacy main-motor conversion below so the
-        # gpadtester Low/High calibration can be based on the actual Xbox
-        # impulse-trigger magnitudes.
-        main_l = int(left_motor)
-        main_r = int(right_motor)
+        # Native WinUHid callback -- runs on the driver's callback thread and holds the
+        # GIL.  Keep it to functional work only; the impulse calibration logging lives in
+        # the rate-limited _log_impulse_diagnostics(); logging every rumble update here
+        # would stall input for every connected controller.
+        # WinUHid XOne supplies all four motors as percentages (0-100).
         impulse_l = int(left_trigger)
         impulse_r = int(right_trigger)
+
+        if _PERF_DIAGNOSTICS:
+            self._log_impulse_diagnostics(int(left_motor), int(right_motor), impulse_l, impulse_r)
+
+        # Xbox-capable callers can consume all four motors atomically.  Keep
+        # the legacy two-motor callback as a fallback for existing users.
+        if self.force_feedback_notification_callback:
+            # WinUHid provides motor values as percentages (0-100); vgamepad expects 0-255.
+            self.force_feedback_notification_callback(
+                int(left_motor * 2.55), int(right_motor * 2.55), impulse_l, impulse_r)
+        elif self.notification_callback:
+            self.notification_callback(
+                None, None, int(left_motor * 2.55), int(right_motor * 2.55), 0, None)
+
+    def _log_impulse_diagnostics(self, main_l, main_r, impulse_l, impulse_r):
+        """Rate-limited Xbox impulse-trigger calibration logging.
+
+        Records the raw four-motor values so the gpadtester Low/High calibration can be
+        based on the actual Xbox impulse-trigger magnitudes.
+        """
         current = (main_l, main_r, impulse_l, impulse_r)
         impulse_active = impulse_l > 0 or impulse_r > 0
         was_impulse_active = (
@@ -682,21 +707,6 @@ class VX360Gamepad:
                 self._impulse_log_started_at = None
 
         self._impulse_log_previous = current
-
-        # Xbox-capable callers can consume all four motors atomically.  Keep
-        # the legacy two-motor callback as a fallback for existing users.
-        if self.force_feedback_notification_callback:
-            large_motor = int(left_motor * 2.55)
-            small_motor = int(right_motor * 2.55)
-            self.force_feedback_notification_callback(
-                large_motor, small_motor, impulse_l, impulse_r)
-        elif self.notification_callback:
-            # WinUHid provides motor values as percentages (0-100).
-            # vgamepad expects 0-255.
-            # Convert percentage to 0-255.
-            large_motor = int(left_motor * 2.55)
-            small_motor = int(right_motor * 2.55)
-            self.notification_callback(None, None, large_motor, small_motor, 0, None)
 
     def register_notification(self, callback_function):
         self.notification_callback = callback_function
@@ -768,7 +778,8 @@ class VX360Gamepad:
 
     def update(self):
         if self.device and _winuhid_devs:
-            _winuhid_devs.WinUHidXOneReportInput(self.device, ctypes.byref(self.report))
+            return bool(_winuhid_devs.WinUHidXOneReportInput(self.device, ctypes.byref(self.report)))
+        return False
 
     def close(self):
         if hasattr(self, 'device') and self.device and _winuhid_devs:
