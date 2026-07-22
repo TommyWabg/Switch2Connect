@@ -1239,30 +1239,44 @@ class VirtualController:
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
                             )
-                            def _log_attach_output(proc, player_num, host, port, bus):
-                                try:
-                                    out, err = proc.communicate(timeout=10)
-                                    rc = proc.returncode
-                                    if out: logger.info(f"Player {player_num} usbip attach stdout: {out.decode(errors='replace').strip()}")
-                                    if err: logger.warning(f"Player {player_num} usbip attach stderr: {err.decode(errors='replace').strip()}")
-                                    if rc != 0:
-                                        logger.error(f"Player {player_num} usbip attach failed (rc={rc}) on {host}:{port} bus={bus}")
-                                    else:
-                                        logger.info(f"Player {player_num} usbip attach OK on {host}:{port} bus={bus}")
-                                        for delay in (0.5, 1.0, 1.5):
-                                            time.sleep(delay)
-                                            guard = getattr(self, 'dualsense_audio_guard', None)
-                                            if guard is None:
-                                                break
-                                            guard.restore_now()
-                                except Exception as ex:
-                                    logger.warning(f"Player {player_num} usbip attach log error: {ex}")
+                            def _log_attach_output(proc, player_num, host, port, bus, attach_cmd):
+                                for attempt in range(2):
+                                    try:
+                                        out, err = proc.communicate(timeout=10)
+                                        rc = proc.returncode
+                                        if out: logger.info(f"Player {player_num} usbip attach stdout: {out.decode(errors='replace').strip()}")
+                                        if err: logger.warning(f"Player {player_num} usbip attach stderr: {err.decode(errors='replace').strip()}")
+                                        if rc == 0:
+                                            logger.info(f"Player {player_num} usbip attach OK on {host}:{port} bus={bus}")
+                                            for delay in (0.5, 1.0, 1.5):
+                                                time.sleep(delay)
+                                                guard = getattr(self, 'dualsense_audio_guard', None)
+                                                if guard is None:
+                                                    break
+                                                guard.restore_now()
+                                            return
+                                        logger.error(
+                                            f"Player {player_num} usbip attach failed "
+                                            f"(attempt {attempt + 1}, rc={rc}) on {host}:{port} bus={bus}"
+                                        )
+                                        if attempt == 0:
+                                            time.sleep(0.5)
+                                            proc = subprocess.Popen(
+                                                attach_cmd,
+                                                stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE,
+                                                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                                            )
+                                    except Exception as ex:
+                                        logger.warning(f"Player {player_num} usbip attach attempt {attempt + 1} error: {ex}")
+                                        break
+                                self._stop_dualsense_audio_guard()
                             threading.Thread(
                                 target=_log_attach_output,
-                                args=(_attach_proc, self.player_number, self.host_ip, self.server_port, self.bus_id),
+                                args=(_attach_proc, self.player_number, self.host_ip, self.server_port, self.bus_id, _attach_cmd),
                                 daemon=True
                             ).start()
-                            logger.info(f"Attached virtual DualSense for Player {self.player_number} via USBIP on {self.host_ip}:{self.server_port} bus={self.bus_id}")
+                            logger.info(f"Waiting for virtual DualSense attach for Player {self.player_number} on {self.host_ip}:{self.server_port} bus={self.bus_id}")
                         except Exception as e:
                             self._stop_dualsense_audio_guard()
                             logger.error(f"Failed to attach PS5 USBIP device: {e}")

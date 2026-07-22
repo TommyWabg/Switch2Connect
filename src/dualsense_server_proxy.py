@@ -34,6 +34,7 @@ MSG_HAPTIC_FRAME = 0x82
 MSG_OUTPUT_REPORT = 0x83
 MSG_STATUS = 0x84
 MSG_AUDIO_ACTIVITY = 0x85
+DUALSENSE_STARTUP_TIMEOUT = 10.0
 
 
 class DualSenseServerProxy:
@@ -62,6 +63,8 @@ class DualSenseServerProxy:
         self.on_audio_activity_callback = on_audio_activity_callback
         self._proc = None
         self._running = False
+        self._ready_event = threading.Event()
+        self._last_heartbeat = 0.0
         self._rx_thread = None
         self._watch_thread = None
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -99,24 +102,36 @@ class DualSenseServerProxy:
         if self._running:
             return
         self._running = True
+        self._ready_event.clear()
         creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-        self._proc = subprocess.Popen(
-            self._child_command(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
-        self._rx_thread = threading.Thread(target=self._rx_loop, name="DualSenseProxyRx", daemon=True)
-        self._watch_thread = threading.Thread(target=self._watch_loop, name="DualSenseProxyWatch", daemon=True)
-        self._rx_thread.start()
-        self._watch_thread.start()
-        time.sleep(0.15)
-        if self._proc.poll() is not None:
-            rc = self._proc.returncode
-            self._running = False
-            raise RuntimeError(f"DualSense USBIP child exited during startup rc={rc}")
+        try:
+            self._proc = subprocess.Popen(
+                self._child_command(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            self._rx_thread = threading.Thread(target=self._rx_loop, name="DualSenseProxyRx", daemon=True)
+            self._watch_thread = threading.Thread(target=self._watch_loop, name="DualSenseProxyWatch", daemon=True)
+            self._rx_thread.start()
+            self._watch_thread.start()
+
+            deadline = time.monotonic() + DUALSENSE_STARTUP_TIMEOUT
+            while not self._ready_event.wait(timeout=0.05):
+                if self._proc.poll() is not None:
+                    rc = self._proc.returncode
+                    raise RuntimeError(f"DualSense USBIP child exited during startup rc={rc}")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"DualSense USBIP child did not become ready within "
+                        f"{DUALSENSE_STARTUP_TIMEOUT:.1f}s"
+                    )
+        except Exception:
+            self.stop()
+            raise
+
         logger.info(
-            "DualSense USBIP server running out-of-process pid=%s ctrl=%d port=%d bus=%s",
+            "DualSense USBIP server ready out-of-process pid=%s ctrl=%d port=%d bus=%s",
             getattr(self._proc, "pid", None),
             self._child_port,
             self.port,
@@ -136,8 +151,10 @@ class DualSenseServerProxy:
             except Exception:
                 try:
                     proc.terminate()
+                    proc.wait(timeout=1.0)
                 except Exception:
                     pass
+        self._proc = None
         try:
             self._sock.close()
         except Exception:
@@ -202,8 +219,13 @@ class DualSenseServerProxy:
                                 "right_hf_amp": right_hf_amp,
                             },
                         )
-                elif msg_type == MSG_STATUS and payload == b"disconnect":
-                    if self.on_disconnect_callback:
+                elif msg_type == MSG_STATUS:
+                    if payload == b"started":
+                        self._last_heartbeat = time.monotonic()
+                        self._ready_event.set()
+                    elif payload == b"heartbeat":
+                        self._last_heartbeat = time.monotonic()
+                    elif payload == b"disconnect" and self.on_disconnect_callback:
                         self.on_disconnect_callback()
                 elif msg_type == MSG_AUDIO_ACTIVITY:
                     if self.on_audio_activity_callback:

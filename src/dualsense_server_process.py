@@ -54,11 +54,13 @@ def main(argv=None):
     parser.add_argument("--disable-audio", action="store_true")
     args = parser.parse_args(argv)
 
-    log_handlers = [logging.StreamHandler()]
+    log_handlers = []
+    if sys.stderr is not None:
+        log_handlers.append(logging.StreamHandler())
     try:
         log_dir = os.path.join(
             os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-            "Switch2Controllers",
+            "Switch 2 Connect",
         )
         os.makedirs(log_dir, exist_ok=True)
         log_handlers.append(
@@ -73,6 +75,7 @@ def main(argv=None):
         format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s",
         datefmt="%H:%M:%S",
         handlers=log_handlers,
+        force=True,
     )
     logger.info("DualSense server child starting (frozen=%s, pid=%s)", getattr(sys, "frozen", False), os.getpid())
     from usbip_dualsense_server import USBIPDualSenseServer
@@ -143,6 +146,10 @@ def main(argv=None):
     try:
         server.start()
         _send_datagram(ctrl_sock, parent_addr, MSG_STATUS, b"started")
+        logger.info(
+            "DualSense server child ready ctrl=%d parent=%d usbip=%s:%d bus=%s",
+            args.ctrl_port, args.parent_port, args.host, args.port, args.bus_id,
+        )
         last_heartbeat = time.perf_counter()
         while not stop_event.is_set():
             try:
