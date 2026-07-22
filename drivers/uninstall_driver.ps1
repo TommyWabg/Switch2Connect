@@ -57,12 +57,14 @@ Get-ChildItem -Path $RootDir -Filter "config.yaml" -Recurse | ForEach-Object {
     $content = $content -replace "driver_installed:\s*true", "driver_installed: false"
     $content | Set-Content $_.FullName
 }
-$AppDataConfig = Join-Path $env:APPDATA "Switch2Controllers\config.yaml"
-if (Test-Path $AppDataConfig) {
-    Write-Host "Resetting driver_installed flag in user AppData config..." -ForegroundColor Yellow
-    $content = Get-Content $AppDataConfig
-    $content = $content -replace "driver_installed:\s*true", "driver_installed: false"
-    $content | Set-Content $AppDataConfig
+@("Switch 2 Connect\config.yaml", "Switch2Controllers\config.yaml") | ForEach-Object {
+    $AppDataConfig = Join-Path $env:APPDATA $_
+    if (Test-Path $AppDataConfig) {
+        Write-Host "Resetting driver_installed flag in user AppData config..." -ForegroundColor Yellow
+        $content = Get-Content $AppDataConfig
+        $content = $content -replace "driver_installed:\s*true", "driver_installed: false"
+        $content | Set-Content $AppDataConfig
+    }
 }
 
 Write-Host "Uninstallation complete!" -ForegroundColor Green
