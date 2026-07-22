@@ -1,11 +1,11 @@
 # Switch 2 Connect
 ### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
- <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.1.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
+ <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.2.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
 <p align="center">
   <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
-  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.1.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.2.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
   <br>
   <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
@@ -18,7 +18,7 @@
 
 ## Quick Start
 
-1. Download the latest version of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.1.exe)**.
+1. Download the latest version of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.2.exe)**.
 2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
 3. Once the installation completes, the setup window will close automatically, and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
@@ -36,12 +36,10 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
 * **Tabs Organized Settings Interface:** The settings interface is organized into distinct "Controller Mapping", "Mode Shift Mapping", and "Gyro Settings" tabs for easy navigation.
 * **DualSense Audio Haptic Feedback Support:** Featuring the  USBIP-based PS5 emu mode, which can establish a 4-channel audio playback device to receive DualSense audio haptic feedback from supported games. This architecture unifies PS5 Audio Haptics, Traditional PS5 Rumble, and Xbox Rumble. Translated DualSense Adaptive Trigger signals to generate independent HD Rumble pulses, which specifically trigger upon physical trigger press (ZL/ZR) or when a payload change occurs while the physical trigger is actively held.
 * **Xbox One Impulse Trigger Support:** In WinUHid Xbox One emulation mode, Xbox Impulse Trigger force-feedback values from LT and RT are translated into Switch 2 high-frequency HD Rumble output. Standard gamepad rumble is emitted as the same mono signal on both physical sides, while Impulse Trigger feedback is routed as independent left and right high-frequency overlays for trigger-specific effects.
-  * **Impulse Trigger Settings:** The **Impulse Trigger Settings** button appears beside **Rumble Mode** in WinUHid Xbox One emulation mode. The floating settings window provides independent controls for enabling impulse feedback, selecting dynamic or fixed frequency behavior, and choosing a fixed frequency level when dynamic frequency is disabled.
-    * **Impulse Trigger On/Off:** Enables or disables LT/RT impulse feedback without changing standard gamepad rumble.
-    * **Dynamic Frequency On/Off:** Uses the incoming impulse strength to determine both frequency and amplitude to better match the real Xbox One controller's impulse trigger behavior.
-    * **Strength Slider:** The Strength slider is available in both dynamic and fixed frequency modes. Levels `1-10` set the raw-strength-`1` target gain from `1x` to `10x`; the gain decreases linearly to `1x` at raw strength `100`. The output curve reserves physical headroom for higher raw values so individual input strengths remain distinct.
-    * **Frequency Slider:** When Dynamic Frequency is disabled, the `Frequency` slider maps levels `1-10` linearly across frequency values `300-481`. The highest strength uses the controller's physical output limit, and lower strengths scale linearly from that limit.
-    * **Physical Strength Ratio:** Dynamic Frequency uses the Xbox Rumble high-frequency physical-strength ratio across the full impulse frequency range to compensate for the physical strength difference between each frequency, so lower frequencies preserve their tuned relative strength while raw strength `100` reaches the physical high-frequency ceiling.
+  * **Impulse Trigger Settings:** The **Impulse Trigger Settings** button appears beside **Rumble Mode** in WinUHid Xbox One emulation mode. The floating settings window provides controls for enabling impulse feedback, selecting dynamic or fixed frequency behavior, adjusting impulse strength, and choosing a fixed frequency level.
+  * **Dynamic Frequency:** When enabled, incoming impulse strength determines both output frequency and amplitude. During the release envelope, frequency continues to follow the current decaying output strength.
+  * **Fixed Frequency:** When Dynamic Frequency is disabled, the **Frequency** slider selects the impulse output frequency independently from incoming impulse strength.
+  * **Release Envelope:** When an Impulse Trigger stop command is received, the current output decays linearly to zero over 90 ms. A new command on the same side immediately replaces the pending release.
 * **Native Motion Support (PS4/PS5 Mode):** Switching to PS4 or PS5 mode enables native motion sensor reporting via the DS4 or DualSense protocol. This provides enhanced compatibility for Steam Input and games that support native DualShock 4 or DualSense gyro features.
 * **Cemuhook UDP Server Support:** Featuring the Cemuhook UDP server (127.0.0.1:26760) to transmit direct motion control data to Switch 1 emulators. To use this feature, select "Cemuhook" on the "Mode" toggle switch within the "Gyro Passthrough" settings panel.
 * **Cemuhook Gyro Sensitivity Adjustment:** Featuring a Sensitivity slider (levels 1-5) to the "Gyro Passthrough" panel. The sensitivity specifically applies a linear multiplier only to the horizontal rotation (Yaw) axis sent via the Cemuhook UDP protocol.
@@ -72,14 +70,15 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
   * Assign the "DJG" action to any available extra button to serve as the hardware trigger for DJG features.
   * Pressing this mapped button during gameplay will execute the action defined by the current DJG Control Mode and DJG Activation settings.
 * **DJG Control Modes:** Three modes to dictate how the mapped DJG trigger button behaves during gameplay.
-  * Single Side Toggle: Toggle the gyro tracking of a single Joy-Con on or off independently.
-  * Switch Dominant Side: Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced to be active upon switching.
-  * Switch Gyro Side: Turn off the current gyro and activate the opposite Joy-Con's gyro exclusively. The Dominant Side setting syncs automatically.
-  * Direct Merge: Combine motion input from both Joy-Cons directly without Dominant/Sub role switching.
+  * **Switch Dominant Side:** Swap the Dominant and Sub roles between the Left and Right Joy-cons. Both sides are forced to be active upon switching.
+  * **Switch Gyro Side:** Turn off the current gyro and activate the opposite Joy-Con's gyro exclusively. The Dominant Side setting syncs automatically.
+  * **Single Side Toggle:** Toggles the gyro tracking state of one Joy-Con independently. A DJG trigger mapped on the Left Joy-Con controls the L Gyro, while a trigger mapped on the Right Joy-Con controls the R Gyro. Select **Dominant Side: Left** or **Right** to choose the primary side. Select **Dominant Side: None** to combine enabled motion input from both Joy-Cons directly while allowing DJG controls to manage each side.
 * **DJG Activation Types:** Trigger behavior options to support different input styles.
   * Toggle: Switch the DJG state once per button press.
   * Hold: Switch the DJG state when the button is pressed, and revert to the original state when the button is released.
+* **Per-Controller Joystick Deadzones:** Configure left and right joystick deadzones independently for Pro Controller, Joy-Con, and NSO GameCube Controller. Each controller family stores its own deadzone values, with an option to link or separate the left and right joystick settings.
 * **Full Controller Remappability:** All buttons (including extra buttons like GL, GR, SL_L, SL_R, SR_L, SR_R, NSO GCN L/R Analog Trigger Click, Home, Capture, and Chat) can be fully remapped to Switch inputs, PlayStation inputs, In-app controls, Windows controls, mouse clicks, or recorded custom input. Joysticks can also be remapped to L/R Joystick, WASD, mouse controls, or custom inputs. The mapping interface features a categorized pop-up window to streamline the selection process.
+* **Joy-Con IR Sensor Mapping:** Each Left and Right Joy-Con IR Sensor can be configured as an independent physical input. Per-side settings include Function mapping, Activation Threshold, and IR Mouse sensitivity.
 * **Advanced Custom Input Remapping:** Featuring a powerful  "Custom" mapping feature. Users can record and assign any complex combination of keyboard keys, mouse clicks, or controller buttons to a single input. This flexible system supports both "Tap" (fires the recorded sequence momentarily) and "Hold" (sustains the sequence for as long as the button is pressed) modes.
   * Click the dropdown menu and select the "Custom" option.
   * Press and hold your desired combination of keyboard keys, mouse clicks, and/or controller buttons simultaneously.
@@ -88,13 +87,12 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
   * Click the X button to remove custom input and fall back to the default.
 * **Mode Shift Mapping System:** Applies an alternative button mapping layer utilizing the In-app Gyro mapping store. The Mode Shift layer is activated via a dedicated mapping option supporting both Hold (active while held) and Tap (toggle) logic. Tap and Hold share a unified state machine, where a Hold action temporarily inverts a Tap-entered Mode Shift. Additionally, entering In-app Gyro mode can automatically apply the Mode Shift layer based on per-profile Gyro Control settings.
 * **Categorized Button Mapping Profiles:** Segregated custom button mapping and rumble configurations into three independent target categories: Xbox, PS4, PS5, and Switch 2. Remap profiles are saved and loaded automatically based on the active emulation mode.
-Custom Mapping Profile System: A comprehensive profile management system allows users to create, rename, delete, and switch between multiple configurations. Each profile persistently stores button mappings, emulation mode, and driver settings. Profiles can be managed via a dedicated pop-up window that also configures the "Change Profile List" and "Profile Switching Combo" inputs. Features three seamless profile switching methods:
+* **Custom Mapping Profile System:** A comprehensive profile management system allows users to create, rename, delete, and switch between multiple configurations. Each profile persistently stores button mappings, emulation mode, and driver settings. Profiles can be managed via a dedicated pop-up window that also configures the "Change Profile List" and "Profile Switching Combo" inputs. Features three seamless profile switching methods:
   * Profile Switching Combo: Users can record a custom Profile Switching Combo Trigger and assign specific Combo inputs for dedicated profiles. Pressing the Trigger input and a profile's Combo input simultaneously instantly switches to that dedicated profile. Both inputs function as standard mappings when not combined.
   * Auto Change Profile: Automatically switches to the selected checked profile in the Change Profile List after 2 seconds of trigger inactivity.
   * Manual Change Profile: Opens a selection notification. Navigate through the checked profiles using the L/R joysticks or Dpad Up/Down, and use the current Xbox/Switch layout A to confirm or B to cancel.
     * Auto/Manual Mode Setting: Toggle between Auto and Manual modes via the pop-up window by clicking the "Change Profile" button.
 * **Assign Profile To Application:** Featuring profile auto-switching based on active foreground application. Bind one or more executable files (.exe) to a profile; when any of those applications become the focused window, the profile automatically activates.
-* **Joy-con Mouse Toggle:** A  dedicated switch in the GUI to enable or disable the Joy-con mouse mode. This prevents accidental cursor movement during gameplay.
 * **Dynamic Split & Merge System:** The  **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Featuring V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
 * **Per-Joy-Con V/H Mode Persistence:** The application records and remembers whether each single Joy-Con is held vertically or horizontally. Layout preferences (Vertical or Horizontal) are dynamically mapped to each controller's Bluetooth MAC address and saved in `config.yaml`.
@@ -114,12 +112,16 @@ Rumble Delay Configuration: Featuring a customizable rumble delay setting in mi
   * Inactive: tracks physical button and stick inputs to automatically disconnect idle controllers while keeping active players connected.
   * Absolute: tracks the overall time each controller is connected to the app and disconnects the ones that reach the time limit.
 * **Dedicated UI Driver Controls:** Featuring an **Install/Uninstall WinUHid Driver** button to the left of the "Run At Startup" button.
+* **ESP32-S3 Bridge Firmware Management:** The ESP32-S3 N16R8 connection path includes bundled firmware installation and repair, BOOT-mode status detection, and bridge initialization handling after the device is unplugged or reconnected.
 * **Run at Startup:** Featuring a toggle to automatically launch the application with Windows.
 * **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
 * **Hide to system tray:** Featuring the ability to minimize the application to the Windows system tray.
-* **Controller UI Navigation:** Featuring UI navigation using the left joystick or D-pad. The currently selected UI element is indicated by a white outline. The outline automatically hides upon detecting mouse clicks anywhere within the application or pressing the B button on the controller.
-  * UI Component Interaction: Featuring controller support for interacting with UI elements. Pressing the 'A' button clicks buttons or opens dropdown menus, while the 'B' button closes open dropdown menus without applying changes.
-  * Slider and Time Input Adjustment: Enabled adjustment of sliders and auto-disconnect time input fields using the right joystick. Alternatively, holding the 'A' button while using the left joystick modifies the values without triggering spatial navigation.
+* **Controller UI Navigation:** Use the left joystick or D-pad to navigate the application interface. The selected UI element is indicated by a white outline, and the outline hides after mouse interaction or when Navigation mode is exited with the B button.
+  * **Active Window Focus:** When a floating window or pop-up dialog is open, navigation remains within that active top-level interface.
+  * **Return Selection:** Pressing B closes the active floating window and returns selection to the control that opened it. Re-entering Navigation mode restores the last selected control.
+  * **UI Component Interaction:** Press A to activate buttons or open dropdown menus. Press B to close an open floating window or exit Navigation mode.
+  * **Text Input Adjustment:** Text input fields support value adjustment with the right joystick or by holding A while using the left joystick. Continuous adjustment accelerates while the input is held.
+  * **Slider and Time Input Adjustment:** Sliders can be adjusted with the right joystick or A plus the left joystick.
 * **Window Position Persistence:** The application saves and restores the window's position on the screen.
 * **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
 
