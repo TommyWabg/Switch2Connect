@@ -54,13 +54,23 @@ from PIL import Image, ImageTk
 import win32gui
 import win32con
 from ctypes import wintypes
+from driver_install_helper import (
+    VIGEMBUS_ABSENT,
+    VIGEMBUS_HEALTHY,
+    VIGEMBUS_PARTIAL,
+    WINUHID_ABSENT,
+    WINUHID_HEALTHY,
+    WINUHID_PARTIAL,
+    get_winuhid_status,
+    get_vigembus_status,
+)
 
 print("Switch 2 Connect  Copyright (C) 2026  TommyWabg")
 print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.")
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.3"
 
 def _set_current_thread_priority(level):
     try:
@@ -89,6 +99,17 @@ class SHELLEXECUTEINFOW(ctypes.Structure):
         ("hProcess", wintypes.HANDLE),
     ]
 
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
 # Explicitly set types for Win32 API to ensure compatibility
 ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
 ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
@@ -98,6 +119,20 @@ ctypes.windll.kernel32.WaitForSingleObject.restype = wintypes.DWORD
 
 ctypes.windll.kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 ctypes.windll.kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+ctypes.windll.user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+ctypes.windll.user32.GetWindowPlacement.restype = wintypes.BOOL
+ctypes.windll.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+ctypes.windll.user32.GetAncestor.restype = wintypes.HWND
+ctypes.windll.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
+ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
+ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
+ctypes.windll.user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_int, wintypes.UINT,
+]
+ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
 
 ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
@@ -145,131 +180,78 @@ def get_exe_display_name(path):
     return os.path.splitext(os.path.basename(path))[0] or "Choose App"
 
 def check_driver_registry():
-    import winreg
-    for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
-        try:
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver",
-                0,
-                sam
-            )
-            winreg.CloseKey(key)
-            return True
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-    return False
+    return get_winuhid_status().registry_exists
 
 def check_driver_pnputil():
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["pnputil", "/enum-devices", "/deviceid", "Root\\WinUHid"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0 and "root\\winuhid" in result.stdout.lower():
-            return True
-    except Exception as e:
-        logger.error(f"Error checking driver installation via pnputil: {e}")
-    return False
+    return bool(get_winuhid_status().present_instances)
 
 def is_driver_installed():
-    return check_driver_registry() or check_driver_pnputil()
+    return get_winuhid_status().installed
+
+
+def verify_winuhid_runtime(attempts=10, delay_seconds=0.5):
+    """Create, submit one neutral report to, and destroy a temporary WinUHid pad."""
+    import winuhid_client
+    for attempt in range(max(1, attempts)):
+        pad = None
+        try:
+            pad = winuhid_client.VX360Gamepad()
+            if getattr(pad, "device", None) and pad.update() is not False:
+                return True
+        except Exception as exc:
+            logger.debug("WinUHid runtime smoke test attempt %d failed: %s", attempt + 1, exc)
+        finally:
+            if pad is not None:
+                try:
+                    pad.close()
+                except Exception:
+                    pass
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    logger.error("WinUHid runtime smoke test failed after %d attempts", attempts)
+    return False
 
 def check_vigembus_registry():
-    import winreg
-    for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
-        try:
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SYSTEM\CurrentControlSet\Services\ViGEmBus",
-                0,
-                sam
-            )
-            winreg.CloseKey(key)
-            return True
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-            
-    # Also check uninstall keys
-    paths = [
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-    ]
-    for path in paths:
-        for sam in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
-            try:
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, sam)
-                info = winreg.QueryInfoKey(key)
-                for i in range(info[0]):
-                    try:
-                        subkey_name = winreg.EnumKey(key, i)
-                        if subkey_name == "{966606F3-2745-49E9-BF15-5C3EAA4E9077}":
-                            winreg.CloseKey(key)
-                            return True
-                        subkey = winreg.OpenKey(key, subkey_name)
-                        try:
-                            val, _ = winreg.QueryValueEx(subkey, "DisplayName")
-                            if "vigem" in str(val).lower() or "virtual gamepad emulation" in str(val).lower():
-                                winreg.CloseKey(subkey)
-                                winreg.CloseKey(key)
-                                return True
-                        except:
-                            pass
-                        winreg.CloseKey(subkey)
-                    except:
-                        pass
-                winreg.CloseKey(key)
-            except:
-                pass
-    return False
+    status = get_vigembus_status()
+    return status.service_exists or bool(status.msi_entries)
 
 def check_vigembus_pnputil():
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["pnputil", "/enum-devices", "/deviceid", "Root\\ViGEmBus"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0 and "root\\vigembus" in result.stdout.lower():
-            return True
-            
-        result = subprocess.run(
-            ["pnputil", "/enum-devices", "/deviceid", "Nefarius\\ViGEmBus\\Gen1"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0 and "vigembus" in result.stdout.lower():
-            return True
-    except Exception as e:
-        logger.error(f"Error checking ViGEmBus installation via pnputil enum-devices: {e}")
-
-    try:
-        result = subprocess.run(
-            ["pnputil", "/enum-drivers"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        if result.returncode == 0:
-            if "vigembus" in result.stdout.lower() or "nefarius" in result.stdout.lower():
-                return True
-    except Exception as e:
-        logger.error(f"Error checking ViGEmBus installation via pnputil enum-drivers: {e}")
-        
-    return False
+    status = get_vigembus_status()
+    return bool(status.bound_instances and status.driver_packages)
 
 def is_vigembus_installed():
-    return check_vigembus_registry() or check_vigembus_pnputil()
+    return get_vigembus_status().installed
+
+
+def verify_vigembus_runtime(attempts=10, delay_seconds=0.5):
+    for attempt in range(max(1, attempts)):
+        bus = None
+        try:
+            from virtual_controller import get_vigem
+            vigem = get_vigem()
+            bus = vigem.win.virtual_gamepad.VBus()
+            return True
+        except Exception as exc:
+            logger.debug("ViGEmBus runtime smoke test attempt %d failed: %s", attempt + 1, exc)
+        finally:
+            if bus is not None:
+                try:
+                    del bus
+                except Exception:
+                    pass
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return False
+
+
+def verify_vigembus_ready(attempts=12, delay_seconds=0.5):
+    """Wait for both PnP/service health and an actual client connection."""
+    for attempt in range(max(1, attempts)):
+        if get_vigembus_status().installed and verify_vigembus_runtime(attempts=1):
+            return True
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return False
 
 def is_pro2_winusb_bound():
     """True when the Pro Controller 2 vendor interface (MI_01) is bound to WinUSB.
@@ -2104,14 +2086,159 @@ class ControllerWindow:
         utils.force_ui_update_callback = self.force_refresh_player_slots
 
     def center_window_on_root(self, window, width, height):
-        self.root.update_idletasks()
-        rx = self.root.winfo_x()
-        ry = self.root.winfo_y()
-        rw = self.root.winfo_width()
-        rh = self.root.winfo_height()
-        x = rx + (rw - width) // 2
-        y = ry + (rh - height) // 2
-        window.geometry(f"{width}x{height}+{x}+{y}")
+        """Center a child window over the main window in screen coordinates.
+
+        Tk's ``winfo_x/y`` can be relative to the window-manager frame and a new
+        Toplevel may be repositioned again when it is first mapped.  Driver
+        install/uninstall dialogs are especially likely to hit that race because
+        they are created immediately before an elevated process is launched.
+        Use root screen coordinates, then repeat the placement after mapping.
+        """
+        width = max(1, int(width))
+        height = max(1, int(height))
+        anchor = {"x": None, "y": None}
+        pixel_anchor = {"x": None, "y": None}
+
+        def top_level_hwnd(widget):
+            try:
+                hwnd = widget.winfo_id()
+                root_hwnd = ctypes.windll.user32.GetAncestor(hwnd, 2)  # GA_ROOT
+                return root_hwnd or hwnd
+            except (tk.TclError, AttributeError, OSError):
+                return None
+
+        def capture_physical_root_center():
+            """Return the main-window center in Win32 physical screen pixels."""
+            hwnd = top_level_hwnd(self.root)
+            rect = wintypes.RECT()
+            try:
+                valid = (
+                    hwnd and
+                    not ctypes.windll.user32.IsIconic(hwnd) and
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)) and
+                    rect.right > rect.left and rect.bottom > rect.top and
+                    rect.left > -10000 and rect.top > -10000
+                )
+                if valid:
+                    center = ((rect.left + rect.right) // 2,
+                              (rect.top + rect.bottom) // 2)
+                    self._last_main_window_center_px = center
+                    return center
+            except (AttributeError, OSError):
+                pass
+            return getattr(self, "_last_main_window_center_px", None)
+
+        def place():
+            try:
+                if not window.winfo_exists() or not self.root.winfo_exists():
+                    return
+                self.root.update_idletasks()
+                window.update_idletasks()
+
+                if pixel_anchor["x"] is None:
+                    physical_center = capture_physical_root_center()
+                    if physical_center:
+                        pixel_anchor["x"], pixel_anchor["y"] = physical_center
+
+                # Capture the main-window centre once, before an elevation request
+                # can temporarily minimize/deactivate it. During the UAC transition
+                # Windows may report coordinates around -32000; recalculating from
+                # those values moved the progress window to the desktop's top-left.
+                if anchor["x"] is None:
+                    rx = self.root.winfo_rootx()
+                    ry = self.root.winfo_rooty()
+                    rw = max(1, self.root.winfo_width())
+                    rh = max(1, self.root.winfo_height())
+                    try:
+                        root_state = self.root.state()
+                    except tk.TclError:
+                        root_state = "withdrawn"
+
+                    # Preserve the last known centre across the complete driver
+                    # operation. Result dialogs are created only after the UAC
+                    # process exits, when the root can still be iconic and report
+                    # an unusable position. A per-dialog cache is not sufficient.
+                    root_position_valid = (
+                        root_state not in ("iconic", "withdrawn") and
+                        rx > -10000 and ry > -10000 and rw > 1 and rh > 1
+                    )
+                    if root_position_valid:
+                        anchor["x"] = rx + rw // 2
+                        anchor["y"] = ry + rh // 2
+                        self._last_main_window_center = (anchor["x"], anchor["y"])
+                    else:
+                        cached_center = getattr(self, "_last_main_window_center", None)
+                        if cached_center:
+                            anchor["x"], anchor["y"] = cached_center
+                        else:
+                            # Last-resort recovery for a first dialog opened while
+                            # the root is already minimized: use the normal (restored)
+                            # rectangle retained by the Windows window manager.
+                            hwnd = self.get_root_hwnd()
+                            placement = WINDOWPLACEMENT()
+                            placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+                            if hwnd and ctypes.windll.user32.GetWindowPlacement(
+                                    hwnd, ctypes.byref(placement)):
+                                rect = placement.rcNormalPosition
+                                anchor["x"] = (rect.left + rect.right) // 2
+                                anchor["y"] = (rect.top + rect.bottom) // 2
+                                self._last_main_window_center = (anchor["x"], anchor["y"])
+                            else:
+                                anchor["x"] = rx + rw // 2
+                                anchor["y"] = ry + rh // 2
+                x = anchor["x"] - width // 2
+                y = anchor["y"] - height // 2
+
+                # Keep the complete dialog visible on the same virtual desktop as
+                # the main window while preserving its center whenever possible.
+                try:
+                    # Tk can report only the primary monitor as its vroot on
+                    # Windows. System metrics cover the complete multi-monitor
+                    # desktop, including monitors with negative coordinates.
+                    virtual_x = ctypes.windll.user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+                    virtual_y = ctypes.windll.user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+                    virtual_w = ctypes.windll.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+                    virtual_h = ctypes.windll.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+                except (AttributeError, OSError):
+                    virtual_x = self.root.winfo_vrootx()
+                    virtual_y = self.root.winfo_vrooty()
+                    virtual_w = self.root.winfo_vrootwidth()
+                    virtual_h = self.root.winfo_vrootheight()
+                if virtual_w > 1 and virtual_h > 1:
+                    x = min(max(x, virtual_x), virtual_x + virtual_w - width)
+                    y = min(max(y, virtual_y), virtual_y + virtual_h - height)
+
+                window.geometry(f"{width}x{height}+{x}+{y}")
+                window.lift(self.root)
+
+                # Tk geometry coordinates can be logical pixels while Win32 window
+                # rectangles use physical pixels. On mixed-DPI desktops that sent
+                # dialogs to (0, 0). Apply the final position in one coordinate
+                # system using the actual decorated dialog size.
+                dialog_hwnd = top_level_hwnd(window)
+                dialog_rect = wintypes.RECT()
+                if (pixel_anchor["x"] is not None and dialog_hwnd and
+                        ctypes.windll.user32.GetWindowRect(
+                            dialog_hwnd, ctypes.byref(dialog_rect))):
+                    outer_w = max(1, dialog_rect.right - dialog_rect.left)
+                    outer_h = max(1, dialog_rect.bottom - dialog_rect.top)
+                    physical_x = pixel_anchor["x"] - outer_w // 2
+                    physical_y = pixel_anchor["y"] - outer_h // 2
+                    ctypes.windll.user32.SetWindowPos(
+                        dialog_hwnd, 0, physical_x, physical_y, 0, 0,
+                        0x0001 | 0x0004 | 0x0010,  # NOSIZE | NOZORDER | NOACTIVATE
+                    )
+            except (tk.TclError, RuntimeError, OSError, ValueError, ctypes.ArgumentError):
+                pass
+
+        place()
+        # The window manager may add borders or apply DPI scaling at first map.
+        # Re-center on the next idle cycle and once more after that settles.
+        try:
+            window.after_idle(place)
+            window.after(50, place)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def start_joystick_calibration_from_callback(self, virtual_controller):
         if threading.current_thread() != threading.main_thread():
@@ -2712,13 +2839,20 @@ class ControllerWindow:
             else:
                 self._esp32s3_firmware_busy = False
                 error_str = str(done["error"])
+                try:
+                    from usb_serial_bridge import flash_log, get_flash_log_path
+                    flash_log(f"flash failed: {error_str}")
+                    _log_path = get_flash_log_path()
+                except Exception:
+                    _log_path = ""
                 if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
                     messagebox.showerror(ESP32S3_LABEL, (
                         "Could not enter flashing mode.\n\n"
                         "To enter Boot mode manually:\n"
                         "  1. Hold the BOOT button\n"
                         "  2. Tap RESET once, then release BOOT\n"
-                        "  3. Click Repair to retry"
+                        "  3. Click Repair to retry\n\n"
+                        f"Details logged to:\n{_log_path}"
                     ))
                 else:
                     messagebox.showerror(ESP32S3_LABEL, f"ESP32-S3 N16R8 firmware operation failed:\n{done['error']}")
@@ -3211,13 +3345,20 @@ class ControllerWindow:
             else:
                 self._esp32s3_firmware_busy = False
                 error_str = str(done["error"])
+                try:
+                    from usb_serial_bridge import flash_log, get_flash_log_path
+                    flash_log(f"flash failed: {error_str}")
+                    _log_path = get_flash_log_path()
+                except Exception:
+                    _log_path = ""
                 if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
                     on_done(False, (
                         "Could not enter flashing mode.\n\n"
                         "To enter Boot mode manually:\n"
                         "  1. Hold the BOOT button\n"
                         "  2. Tap RESET once, then release BOOT\n"
-                        "  3. Click Repair to retry"
+                        "  3. Click Repair to retry\n\n"
+                        f"Details logged to:\n{_log_path}"
                     ))
                 else:
                     on_done(False, f"ESP32-S3 N16R8 firmware operation failed:\n{done['error']}")
@@ -3249,49 +3390,56 @@ class ControllerWindow:
         dialog.after(50, poll)
 
     def check_vigembus_installation(self, save=True):
-        installed = is_vigembus_installed()
-        if not installed:
+        status = get_vigembus_status()
+        if not status.installed:
             CONFIG.vigembus_installed = False
             if save:
                 CONFIG.save_config()
-            
-            import webbrowser
-            
+
+            partial = status.state == VIGEMBUS_PARTIAL
             answer = self.ask_centered_yes_no(
-                "Install ViGEmBus Driver",
-                "ViGEmBus driver is not installed on your system.\n\nDo you want to open the download page to install it?\n(https://github.com/nefarius/ViGEmBus/releases)"
+                "Repair ViGEmBus Driver" if partial else "Install ViGEmBus Driver",
+                (("ViGEmBus is partially installed and cannot start.\n\n"
+                 f"{status.describe()}\n\nDo you want to clean it up and reinstall it now?\n")
+                 if partial else
+                 "ViGEmBus driver is not installed.\n\nDo you want to download and install it now?\n") +
+                "(Requires administrator privileges.)"
             )
-            
+
             if answer:
-                webbrowser.open("https://github.com/nefarius/ViGEmBus/releases")
+                if partial and not self.run_vigembus_uninstall():
+                    return False
+                installed = self.download_and_install_driver(
+                    "ViGEmBus",
+                    verify_vigembus_ready,
+                    show_success_msg=True)
+                if installed:
+                    CONFIG.vigembus_installed = True
+                    if save:
+                        CONFIG.save_config()
+                    return True
             return False
 
-        # If installed, test if the driver is actually functioning (accessible to Python via VBus connection)
-        try:
-            from virtual_controller import get_vigem
-            test_vigem = get_vigem()
-            # Test instantiating the bus (will throw Exception if service is not started/active)
-            bus = test_vigem.win.virtual_gamepad.VBus()
-            del bus
+        if verify_vigembus_runtime():
             CONFIG.vigembus_installed = True
             if save:
                 CONFIG.save_config()
             return True
-        except Exception as e:
-            self.show_centered_message(
-                "ViGEmBus Connection Error",
-                f"ViGEmBus driver was detected in the system registry, but it failed to initialize ({e}).\n\n"
-                "Please restart your computer to apply the installation, or reinstall the driver if the issue persists."
-            )
-            CONFIG.driver_type = "WinUHid"
-            CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
-            CONFIG.vigembus_installed = False
-            if save:
-                CONFIG.save_config()
-            if hasattr(self, 'driver_switch'):
-                self.driver_switch.set_value("WinUHid")
-            self.update_driver_button()
-            return False
+
+        self.show_centered_message(
+            "ViGEmBus Connection Error",
+            "ViGEmBus files and device are present, but the runtime bus connection failed.\n\n"
+            f"{status.describe()}\n\nUse Repair ViGEmBus Driver to cleanly reinstall it."
+        )
+        CONFIG.driver_type = "WinUHid"
+        CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
+        CONFIG.vigembus_installed = False
+        if save:
+            CONFIG.save_config()
+        if hasattr(self, 'driver_switch'):
+            self.driver_switch.set_value("WinUHid")
+        self.update_driver_button()
+        return False
 
     def check_driver_installation(self, save=True):
         # If driver type is USBIP, check USBIP driver instead
@@ -3313,7 +3461,8 @@ class ControllerWindow:
             return
 
         # 憒?yaml鋆⊥?撌脣?鋆?蝝????app???炎?交?行?摰?嚗璇辣??app
-        if is_driver_installed():
+        winuhid_status = get_winuhid_status()
+        if winuhid_status.installed:
             # 憒?瑼Ｘ蝯??臬歇摰?嚗???yaml鋆?
             CONFIG.driver_installed = True
             if save:
@@ -3326,19 +3475,277 @@ class ControllerWindow:
                 CONFIG.save_config()
             self.update_driver_button()
             
-        answer = self.ask_centered_yes_no(
-            "Install Virtual Controller Driver",
-            "WinUHid driver is not installed on your system.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
-        )
+        if winuhid_status.state == WINUHID_PARTIAL:
+            prompt = (
+                "WinUHid is only partially installed and cannot be used reliably.\n\n"
+                f"{winuhid_status.describe()}\n\n"
+                "Do you want to clean up and reinstall it now?\n(Requires administrator privileges.)"
+            )
+        else:
+            prompt = "WinUHid driver is not installed.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
+        answer = self.ask_centered_yes_no("Repair WinUHid Driver", prompt)
         
         if answer:
+            if winuhid_status.state == WINUHID_PARTIAL and not self.run_driver_uninstall():
+                return
             self.run_driver_install(show_success_msg=False)
 
+    def _launch_elevated(self, lp_file, lp_params, progress_win=None, lp_dir=None, hide=True):
+        """Launch a process elevated (UAC runas), bringing the consent prompt to the
+        foreground and hiding the child window. Used for every driver install/uninstall
+        so the PowerShell console never pops up (progress is shown in the app's own
+        dialog) and the UAC prompt doesn't just flash in the taskbar.
+        Returns hProcess (int) or None if the launch failed / UAC was declined.
+        """
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(info)
+        info.fMask = SEE_MASK_NOCLOSEPROCESS
+        info.hwnd = self.get_root_hwnd()
+        info.lpVerb = "runas"
+        info.lpFile = lp_file
+        info.lpParameters = lp_params
+        info.lpDirectory = lp_dir
+        info.nShow = 0 if hide else 1  # SW_HIDE vs SW_SHOWNORMAL
+        # Grant foreground rights + drop any modal grab so the UAC consent prompt comes
+        # to the front instead of only flashing in the taskbar.
+        try:
+            if progress_win is not None:
+                progress_win.grab_release()
+            self.root.focus_force()
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        except Exception:
+            pass
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+            return None
+        return info.hProcess
+
+    @staticmethod
+    def _ps_hidden_args(script_path):
+        """PowerShell args that run a script with no visible console window."""
+        return f'-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{script_path}"'
+
+    @staticmethod
+    def _read_winuhid_uninstall_log():
+        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_WinUHid_uninstall.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                content = stream.read().strip()
+            lines = content.splitlines()
+            keywords = ("error", "failed", "incomplete", "does not exist", "fallback")
+            important = [line for line in lines if any(word in line.lower() for word in keywords)]
+            summary = important[-12:] if important else lines[-12:]
+            return "\n".join(summary)[-1400:]
+        except Exception:
+            return "Uninstaller log was not available."
+
+    @staticmethod
+    def _read_vigembus_uninstall_log():
+        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_ViGEmBus_uninstall.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                lines = stream.read().strip().splitlines()
+            keywords = ("error", "failed", "incomplete", "does not exist")
+            important = [line for line in lines if any(word in line.lower() for word in keywords)]
+            return "\n".join((important or lines)[-12:])[-1400:]
+        except Exception:
+            return "Uninstaller log was not available."
+
+    def download_and_install_driver(self, driver_key, verify_fn, show_success_msg=True):
+        """Download a driver installer and run it silently with UAC elevation.
+
+        Used for ViGEmBus one-click install (both builds) and, in the MSIX-packaged
+        build, for WinUHid / USBIP / HidHide (which are not shipped inside the
+        package). Returns True if verify_fn() reports the driver installed afterwards.
+        """
+        return self._download_and_run_driver_action(driver_key, verify_fn, "install", show_success_msg)
+
+    def download_and_uninstall_driver(self, driver_key, verify_fn, show_success_msg=True):
+        """MSIX-packaged counterpart to the bundled uninstall scripts.
+
+        Downloads the driver's self-contained uninstall .ps1 from the project GitHub
+        and runs it elevated. verify_fn() must return True once the driver is GONE.
+        """
+        return self._download_and_run_driver_action(driver_key, verify_fn, "uninstall", show_success_msg)
+
+    def _download_and_run_driver_action(self, driver_key, verify_fn, action, show_success_msg=True):
+        """Shared core for packaged install/uninstall: download file(s) then run
+        elevated with a progress dialog. action is "install" or "uninstall".
+        verify_fn() returns True for the desired end-state (installed / removed).
+        """
+        from driver_install_helper import (
+            DRIVER_SPECS, UNINSTALL_SPECS, make_download_dir, download_spec_files,
+        )
+
+        specs = DRIVER_SPECS if action == "install" else UNINSTALL_SPECS
+        spec = specs.get(driver_key)
+        if spec is None:
+            self.show_centered_message("Error", f"Unknown driver: {driver_key}")
+            return False
+
+        # Present-tense / past-tense words for dialog and result messages.
+        gerund = "Installing" if action == "install" else "Uninstalling"
+        past = "installed" if action == "install" else "uninstalled"
+        title_verb = "Install" if action == "install" else "Uninstall"
+        dl_key = driver_key if action == "install" else f"{driver_key}_uninstall"
+
+        # Tracks whether the elevated installer/uninstaller actually started (vs a
+        # download failure or a declined UAC prompt). Callers can read it afterwards.
+        self._last_driver_action_launched = True
+
+        # Stop discoverer and release virtual controller handles first.
+        discoverer_was_running = False
+        if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
+            discoverer_was_running = True
+            self.stop_discoverer_thread()
+        from discoverer import emergency_cleanup
+        emergency_cleanup()
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title(f"{title_verb} {spec.display_name} Driver")
+        progress_w = int(460 * scaling_factor)
+        progress_h = int(140 * scaling_factor)
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        self.center_window_on_root(progress_win, progress_w, progress_h)
+
+        label = tk.Label(
+            progress_win,
+            text=f"Downloading {spec.display_name} driver...",
+            fg="white", bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")),
+            justify="center"
+        )
+        label.pack(pady=int(45 * scaling_factor))
+
+        state = {"result": None, "installer_path": None, "error": None, "exit_code": None}
+
+        def set_label(text):
+            try:
+                label.config(text=text)
+            except Exception:
+                pass
+
+        def progress_cb(filename, downloaded, total):
+            if total and total > 0:
+                pct = int(downloaded * 100 / total)
+                self.root.after(0, set_label, f"Downloading {spec.display_name} driver... {pct}%")
+            else:
+                mb = downloaded / (1024 * 1024)
+                self.root.after(0, set_label, f"Downloading {spec.display_name} driver... {mb:.1f} MB")
+
+        def do_download():
+            try:
+                dest_dir = make_download_dir(dl_key)
+                installer = download_spec_files(spec, dest_dir, progress_cb)
+                state["installer_path"] = installer
+            except Exception as e:
+                state["error"] = str(e)
+            self.root.after(0, after_download)
+
+        def after_download():
+            if state["error"]:
+                self._last_driver_action_launched = False
+                progress_win.grab_release()
+                progress_win.destroy()
+                self.show_centered_message(
+                    "Download Error",
+                    f"Failed to download the {spec.display_name} {action} script:\n{state['error']}\n\n"
+                    "Please check your internet connection and try again."
+                )
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+                return
+            set_label(f"{gerund} {spec.display_name} driver...\nPlease authorize the UAC prompt if asked.")
+            self.root.after(50, launch_installer)
+
+        def launch_installer():
+            kind = spec.run[0]
+            installer_path = state["installer_path"]
+            if kind == "exe":
+                lp_file = installer_path
+                lp_params = spec.run[2]
+            else:  # ps1
+                lp_file = "powershell.exe"
+                lp_params = self._ps_hidden_args(installer_path)
+
+            hProcess = self._launch_elevated(
+                lp_file, lp_params, progress_win=progress_win,
+                lp_dir=os.path.dirname(installer_path))
+            if not hProcess:
+                self._last_driver_action_launched = False
+                progress_win.grab_release()
+                progress_win.destroy()
+                self.show_centered_message(
+                    "Error",
+                    f"{spec.display_name} {action} was cancelled or failed to start (UAC prompt declined)."
+                )
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+                return
+
+            def check_process():
+                if hProcess:
+                    res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                    if res == WAIT_TIMEOUT:
+                        progress_win.after(200, check_process)
+                        return
+                    exit_code = wintypes.DWORD()
+                    ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                    state["exit_code"] = exit_code.value
+                    ctypes.windll.kernel32.CloseHandle(hProcess)
+                progress_win.grab_release()
+                progress_win.destroy()
+
+            progress_win.after(200, check_process)
+
+        threading.Thread(target=do_download, daemon=True).start()
+        self.root.wait_window(progress_win)
+
+        action_ok = False
+        try:
+            action_ok = state["exit_code"] == 0 and bool(verify_fn())
+        except Exception as e:
+            logger.error(f"Driver verification failed for {driver_key} ({action}): {e}")
+
+        if action_ok:
+            if show_success_msg:
+                self.show_centered_message("Success", f"{spec.display_name} driver {past} successfully.")
+        elif state["error"] is None:
+            detail = ""
+            if driver_key == "WinUHid" and action == "uninstall":
+                detail = "\n\n" + self._read_winuhid_uninstall_log()
+            elif driver_key == "ViGEmBus" and action == "uninstall":
+                detail = "\n\n" + self._read_vigembus_uninstall_log()
+            self.show_centered_message(
+                "Error",
+                f"{spec.display_name} {action} was not completed or failed "
+                f"(exit code: {state['exit_code']}).\n"
+                "A system restart may be required. Please try again if the issue persists."
+                f"{detail}"
+            )
+
+        if discoverer_was_running:
+            self.start_discoverer_thread()
+        return action_ok
+
     def run_driver_install(self, show_success_msg=True):
+        # In the MSIX-packaged build the driver files are not shipped inside the
+        # package; download and install WinUHid from the project GitHub instead.
+        if utils.is_packaged():
+            installed = self.download_and_install_driver(
+                "WinUHid", lambda: is_driver_installed() and verify_winuhid_runtime(), show_success_msg)
+            if installed:
+                CONFIG.driver_installed = True
+                CONFIG.save_config()
+            self.update_driver_button()
+            return installed
+
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before installation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3371,18 +3778,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{install_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(install_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3391,7 +3788,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3415,7 +3811,9 @@ class ControllerWindow:
                 
                 logger.info(f"Driver installer process exited with code: {proc_exit_code[0]}")
                 
-                driver_installed_ok = is_driver_installed()
+                driver_status = get_winuhid_status()
+                runtime_ok = driver_status.installed and verify_winuhid_runtime()
+                driver_installed_ok = proc_exit_code[0] == 0 and runtime_ok
                 if driver_installed_ok:
                     CONFIG.driver_installed = True
                     CONFIG.save_config()
@@ -3424,7 +3822,9 @@ class ControllerWindow:
                 else:
                     self.show_centered_message(
                         "Error",
-                        "Driver installation was not completed or failed.\nSome emulator functions may not work."
+                        "Driver installation was not completed or failed.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\nRuntime smoke test: {runtime_ok}\n"
+                        f"{driver_status.describe()}"
                     )
                 self.update_driver_button()
             except Exception as e:
@@ -3434,18 +3834,30 @@ class ControllerWindow:
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return bool(locals().get('driver_installed_ok', False))
 
     def run_driver_uninstall(self):
+        # In the MSIX-packaged build the uninstall script is not shipped inside the
+        # package; download it from the project GitHub and run it elevated.
+        if utils.is_packaged():
+            removed = self.download_and_uninstall_driver(
+                "WinUHid", lambda: get_winuhid_status().absent)
+            if removed:
+                CONFIG.driver_installed = False
+                CONFIG.save_config()
+            self.update_driver_button()
+            return removed
+
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before uninstallation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
             discoverer_was_running = True
             self.stop_discoverer_thread()
-            
+
         # Run emergency cleanup to close all virtual controller handles immediately
         from discoverer import emergency_cleanup
         emergency_cleanup()
@@ -3472,18 +3884,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(uninstall_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3492,7 +3894,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3517,15 +3918,19 @@ class ControllerWindow:
                 logger.info(f"Driver uninstaller process exited with code: {proc_exit_code[0]}")
                 
                 # Now that progress_win is destroyed, check if it was removed
-                driver_removed_ok = not is_driver_installed()
+                driver_status = get_winuhid_status()
+                driver_removed_ok = proc_exit_code[0] == 0 and driver_status.absent
                 if driver_removed_ok:
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
                     self.show_centered_message("Success", "WinUHid driver uninstalled successfully.")
                 else:
+                    uninstall_log = self._read_winuhid_uninstall_log()
                     self.show_centered_message(
                         "Error",
-                        "Driver uninstallation failed or was cancelled."
+                        "Driver uninstallation failed or left WinUHid components behind.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\n{driver_status.describe()}"
+                        f"\n\nUninstaller details:\n{uninstall_log}"
                     )
                 self.update_driver_button()
             except Exception as e:
@@ -3535,6 +3940,7 @@ class ControllerWindow:
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return bool(locals().get('driver_removed_ok', False))
 
     def stop_discoverer_thread(self):
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3557,10 +3963,20 @@ class ControllerWindow:
         self.discoverer_thread.start()
 
     def run_vigembus_uninstall(self):
+        # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
+        if utils.is_packaged():
+            removed = self.download_and_uninstall_driver(
+                "ViGEmBus", lambda: get_vigembus_status().absent)
+            if removed:
+                CONFIG.vigembus_installed = False
+                CONFIG.save_config()
+            self.update_driver_button()
+            return removed
+
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before uninstallation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3593,18 +4009,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(uninstall_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3613,7 +4019,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3637,7 +4042,8 @@ class ControllerWindow:
                 
                 logger.info(f"ViGEmBus uninstaller process exited with code: {proc_exit_code[0]}")
                 
-                driver_removed_ok = (proc_exit_code[0] == 0)
+                status = get_vigembus_status()
+                driver_removed_ok = proc_exit_code[0] == 0 and status.absent
                 if driver_removed_ok:
                     CONFIG.vigembus_installed = False
                     CONFIG.save_config()
@@ -3645,7 +4051,9 @@ class ControllerWindow:
                 else:
                     self.show_centered_message(
                         "Error",
-                        "ViGEmBus uninstallation failed or was cancelled."
+                        "ViGEmBus uninstallation failed or left components behind.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\n{status.describe()}\n\n"
+                        f"Uninstaller details:\n{self._read_vigembus_uninstall_log()}"
                     )
                 self.update_driver_button()
             except Exception as e:
@@ -3655,20 +4063,52 @@ class ControllerWindow:
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return bool(locals().get('driver_removed_ok', False))
 
     def on_driver_btn_clicked(self):
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         if driver_type == "ViGEmBus":
-            if getattr(CONFIG, 'vigembus_installed', False):
+            vigem_status = get_vigembus_status()
+            if vigem_status.state == VIGEMBUS_HEALTHY:
                 if self.ask_centered_yes_no("Uninstall Driver", "Are you sure you want to uninstall the ViGEmBus driver?\n(Requires administrator privileges.)"):
                     self.run_vigembus_uninstall()
+            elif vigem_status.state == VIGEMBUS_PARTIAL:
+                if self.ask_centered_yes_no(
+                    "Repair Driver",
+                    "ViGEmBus is partially installed. Clean up all broken nodes and reinstall it?\n\n"
+                    f"{vigem_status.describe()}\n\n(Requires administrator privileges.)"
+                ):
+                    if self.run_vigembus_uninstall():
+                        installed = self.download_and_install_driver(
+                            "ViGEmBus",
+                            verify_vigembus_ready,
+                            show_success_msg=True)
+                        if installed:
+                            CONFIG.vigembus_installed = True
+                            CONFIG.save_config()
+                        self.update_driver_button()
             else:
-                import webbrowser
-                webbrowser.open("https://github.com/nefarius/ViGEmBus/releases")
+                installed = self.download_and_install_driver(
+                    "ViGEmBus",
+                    verify_vigembus_ready,
+                    show_success_msg=True)
+                if installed:
+                    CONFIG.vigembus_installed = True
+                    CONFIG.save_config()
+                self.update_driver_button()
         else:
-            if getattr(CONFIG, 'driver_installed', False):
+            winuhid_status = get_winuhid_status()
+            if winuhid_status.state == WINUHID_HEALTHY:
                 if self.ask_centered_yes_no("Uninstall Driver", "Are you sure you want to uninstall the WinUHid driver?\n(Requires administrator privileges.)"):
                     self.run_driver_uninstall()
+            elif winuhid_status.state == WINUHID_PARTIAL:
+                if self.ask_centered_yes_no(
+                    "Repair Driver",
+                    "WinUHid is partially installed. Clean up the broken installation and reinstall it?\n\n"
+                    f"{winuhid_status.describe()}\n\n(Requires administrator privileges.)"
+                ):
+                    if self.run_driver_uninstall():
+                        self.run_driver_install()
             else:
                 self.run_driver_install()
 
@@ -3822,11 +4262,15 @@ class ControllerWindow:
             return
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         if driver_type == "ViGEmBus":
-            installed = getattr(CONFIG, 'vigembus_installed', False)
-            text = "Uninstall ViGEmBus Driver" if installed else "Download ViGEmBus Driver"
+            vigem_state = get_vigembus_status().state
+            text = ("Uninstall ViGEmBus Driver" if vigem_state == VIGEMBUS_HEALTHY
+                    else "Repair ViGEmBus Driver" if vigem_state == VIGEMBUS_PARTIAL
+                    else "Install ViGEmBus Driver")
         else:
-            installed = getattr(CONFIG, 'driver_installed', False)
-            text = "Uninstall WinUHid Driver" if installed else "Install WinUHid Driver"
+            winuhid_state = get_winuhid_status().state
+            text = ("Uninstall WinUHid Driver" if winuhid_state == WINUHID_HEALTHY
+                    else "Repair WinUHid Driver" if winuhid_state == WINUHID_PARTIAL
+                    else "Install WinUHid Driver")
         self.driver_btn.config(text=text)
         self.update_driver_buttons_visibility()
 
@@ -3853,16 +4297,24 @@ class ControllerWindow:
                 self.run_usbip_install()
 
     def run_usbip_install(self, show_success_msg=True):
+        # In the MSIX-packaged build, download the USBIP driver from the project
+        # GitHub instead of running a bundled installer.
+        if utils.is_packaged():
+            def usbip_installed():
+                return os.path.exists("C:\\Program Files\\USBip\\usbip.exe")
+            self.download_and_install_driver("USBIP", usbip_installed, show_success_msg)
+            return
+
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before installation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
             discoverer_was_running = True
             self.stop_discoverer_thread()
-            
+
         # Run emergency cleanup to close all virtual controller handles immediately
         from discoverer import emergency_cleanup
         emergency_cleanup()
@@ -3889,18 +4341,8 @@ class ControllerWindow:
                 label.pack(pady=int(40 * scaling_factor))
                 
                 # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = "powershell.exe"
-                info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{install_ps1}"'
-                info.lpDirectory = None
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(install_ps1), progress_win=progress_win)
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -3908,8 +4350,7 @@ class ControllerWindow:
                     if discoverer_was_running:
                         self.start_discoverer_thread()
                     return
-                
-                hProcess = info.hProcess
+
                 proc_exit_code = [0]
 
                 def check_process():
@@ -3953,10 +4394,18 @@ class ControllerWindow:
             self.start_discoverer_thread()
 
     def run_usbip_uninstall(self):
+        # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
+        # The script handles both the Program Files uninstaller and manual cleanup.
+        if utils.is_packaged():
+            def usbip_removed():
+                return not os.path.exists("C:\\Program Files\\USBip\\usbip.exe")
+            self.download_and_uninstall_driver("USBIP", usbip_removed)
+            return
+
         import sys
         import os
         from tkinter import messagebox
-        
+
         # Stop discoverer before uninstallation
         discoverer_was_running = False
         if hasattr(self, 'discoverer_thread') and self.discoverer_thread and self.discoverer_thread.is_alive():
@@ -3988,19 +4437,11 @@ class ControllerWindow:
                 )
                 label.pack(pady=int(40 * scaling_factor))
                 
-                # Bypassing CMD and launching the uninstaller directly via ShellExecuteExW (runas verb)
-                info = SHELLEXECUTEINFOW()
-                info.cbSize = ctypes.sizeof(info)
-                info.fMask = SEE_MASK_NOCLOSEPROCESS
-                info.hwnd = self.get_root_hwnd()
-                info.lpVerb = "runas"
-                info.lpFile = uninstaller_exe
-                info.lpParameters = ""
-                info.lpDirectory = "C:\\Program Files\\USBip"
-                info.nShow = 1  # SW_SHOWNORMAL
-                
-                launched = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info))
-                if not launched:
+                # Run the Inno Setup uninstaller silently (no window) via the elevated helper.
+                hProcess = self._launch_elevated(
+                    uninstaller_exe, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                    progress_win=progress_win, lp_dir="C:\\Program Files\\USBip")
+                if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
                     progress_win.destroy()
@@ -4009,7 +4450,6 @@ class ControllerWindow:
                         self.start_discoverer_thread()
                     return
 
-                hProcess = info.hProcess
                 proc_exit_code = [0]
 
                 def check_process():
@@ -4085,12 +4525,9 @@ class ControllerWindow:
             photo = tk.PhotoImage(file=get_resource('images/icon.png'))
             self.root.wm_iconphoto(False, photo)
         except: pass
-        import sys
-        exe_name = os.path.basename(sys.argv[0])
-        if exe_name.lower().endswith('.exe'):
-            self.root.title(os.path.splitext(exe_name)[0])
-        else:
-            self.root.title(f"Switch 2 Connect")
+        # Window title is always the branded name (the executable file name stays
+        # Switch2Connect.exe; the MSIX Store DisplayName is also "Switch 2 Connect").
+        self.root.title("Switch 2 Connect")
         
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1270 * window_resolution_ratio)
@@ -9441,16 +9878,24 @@ bg_color=panel_bg, widths=[8, 10])
                     self.driver_switch.set_value(old_driver)
                     return
         else:
-            if not is_driver_installed():
+            winuhid_status = get_winuhid_status()
+            if not winuhid_status.installed:
                 if getattr(CONFIG, 'driver_installed', False):
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
                     self.update_driver_button()
                 answer = self.ask_centered_yes_no(
-                    "Install Virtual Controller Driver",
-                    "WinUHid driver is not installed on your system.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
+                    "Repair Virtual Controller Driver" if winuhid_status.state == WINUHID_PARTIAL else "Install Virtual Controller Driver",
+                    (("WinUHid is partially installed.\n\n" + winuhid_status.describe() + "\n\n"
+                      "Do you want to clean up and reinstall it now?")
+                     if winuhid_status.state == WINUHID_PARTIAL else
+                     "WinUHid driver is not installed.\n\nDo you want to install it now?")
+                    + "\n(Requires administrator privileges.)"
                 )
                 if answer:
+                    if winuhid_status.state == WINUHID_PARTIAL and not self.run_driver_uninstall():
+                        self.driver_switch.set_value(old_driver)
+                        return
                     self.run_driver_install(show_success_msg=False)
                     if not is_driver_installed():
                         self.driver_switch.set_value(old_driver)
@@ -10431,32 +10876,13 @@ bg_color=panel_bg, widths=[8, 10])
             tk.Label(progress_win, text=wait_text, fg="white", bg="#1E1E1E",
                      font=scale_font(("Arial", 11, "bold"))).pack(pady=int(40 * scaling_factor))
 
-            info = SHELLEXECUTEINFOW()
-            info.cbSize = ctypes.sizeof(info)
-            info.fMask = SEE_MASK_NOCLOSEPROCESS
-            info.hwnd = self.get_root_hwnd()
-            info.lpVerb = "runas"
-            info.lpFile = "powershell.exe"
-            info.lpParameters = f'-NoProfile -ExecutionPolicy Bypass -File "{ps1}"'
-            info.lpDirectory = None
-            info.nShow = 1
-
-            # Grant foreground rights + release the modal grab so the UAC consent prompt
-            # comes to the front instead of only flashing in the taskbar.
-            try:
-                progress_win.grab_release()
-                self.root.focus_force()
-                ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
-            except Exception:
-                pass
-
-            if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+            hProcess = self._launch_elevated(
+                "powershell.exe", self._ps_hidden_args(ps1), progress_win=progress_win)
+            if not hProcess:
                 progress_win.grab_release()
                 progress_win.destroy()
                 self.show_centered_message("Error", "HidHide operation was cancelled (UAC prompt declined).")
                 return None
-
-            hProcess = info.hProcess
 
             def check_process():
                 if hProcess and ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0) == WAIT_TIMEOUT:
@@ -10477,6 +10903,32 @@ bg_color=panel_bg, widths=[8, 10])
         return exit_code[0]
 
     def run_hidhide_install(self, prompt_restart=True):
+        # In the MSIX-packaged build, download HidHide from the project GitHub
+        # instead of running the bundled installer script.
+        if utils.is_packaged():
+            def hidhide_installed():
+                try:
+                    import hidhide
+                    return hidhide.is_available()
+                except Exception:
+                    return False
+            ok = self.download_and_install_driver("HidHide", hidhide_installed, show_success_msg=True)
+            CONFIG.hidhide_installed = ok
+            CONFIG.save_config()
+            self._hidhide_installed_cached = ok
+            self.update_driver_buttons_visibility()
+            if ok and prompt_restart and self.ask_centered_yes_no(
+                "Restart Required",
+                "A restart is required to finish HidHide setup and hide the physical "
+                "controller.\n\nRestart now?",
+            ):
+                try:
+                    import subprocess
+                    subprocess.Popen(["shutdown", "/r", "/t", "0"])
+                except Exception:
+                    pass
+            return ok
+
         code = self._run_hidhide_script("install_hidhide.ps1", "Installing HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return False  # cancelled / could not start
@@ -10512,6 +10964,37 @@ bg_color=panel_bg, widths=[8, 10])
         return bool(ok or code in (0, 3010))
 
     def run_hidhide_uninstall(self):
+        # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
+        # HidHide's driver unloads only on reboot, so success is reported as "started".
+        if utils.is_packaged():
+            # verify=lambda:True + no auto message; we do the reboot-aware messaging below.
+            self.download_and_uninstall_driver("HidHide", lambda: True, show_success_msg=False)
+            if not getattr(self, "_last_driver_action_launched", False):
+                return  # download failed or UAC declined (already reported)
+            try:
+                import hidhide
+                still = hidhide.is_available()
+            except Exception:
+                still = False
+            CONFIG.hidhide_installed = still
+            CONFIG.save_config()
+            self._hidhide_installed_cached = still
+            self.update_driver_buttons_visibility()
+            self.show_centered_message(
+                "Success",
+                "HidHide removal started. A restart is required to complete the uninstall.",
+            )
+            if self.ask_centered_yes_no(
+                "Restart Required",
+                "A restart is required to finish removing HidHide.\n\nRestart now?",
+            ):
+                try:
+                    import subprocess
+                    subprocess.Popen(["shutdown", "/r", "/t", "0"])
+                except Exception as e:
+                    self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
+            return
+
         code = self._run_hidhide_script("uninstall_hidhide.ps1", "Uninstalling HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return  # cancelled / could not start

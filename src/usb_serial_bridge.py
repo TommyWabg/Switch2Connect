@@ -1543,11 +1543,76 @@ async def create_esp32s3_controller(quit_event=None):
 
 import subprocess
 
+_STAGED_ESP32S3_ROOT = None
+
+def _esp32s3_root():
+    """Return the folder that holds the esp32s3 tools/firmware to run from.
+
+    Standalone .exe build: the bundled location (get_driver_path).
+
+    MSIX-packaged build: a writable copy under %LOCALAPPDATA%. The package installs
+    to C:\\Program Files\\WindowsApps\\... which is read-only with restrictive ACLs;
+    launching the bundled PyInstaller-onefile esptool.exe from there is unreliable
+    under the MSIX container (self-extraction/startup delay makes esptool miss the
+    reset->sync window -> "Could not enter flashing mode"). Staging the whole tree to
+    a normal writable dir and running from there avoids that. Copied once per process.
+    """
+    global _STAGED_ESP32S3_ROOT
+    try:
+        from utils import is_packaged
+        packaged = is_packaged()
+    except Exception:
+        packaged = False
+    if not packaged:
+        return get_driver_path("esp32s3")
+
+    if _STAGED_ESP32S3_ROOT and os.path.exists(os.path.join(_STAGED_ESP32S3_ROOT, "tools", "esptool.exe")):
+        return _STAGED_ESP32S3_ROOT
+
+    import shutil
+    src = get_driver_path("esp32s3")
+    base = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", os.path.expanduser("~"))),
+        "Switch 2 Connect", "esp32s3_runtime",
+    )
+    try:
+        if os.path.exists(base):
+            shutil.rmtree(base, ignore_errors=True)
+        shutil.copytree(src, base)
+        _STAGED_ESP32S3_ROOT = base
+        logger.info("Staged ESP32-S3 tools/firmware to writable dir for packaged build: %s", base)
+        return base
+    except Exception as e:
+        # Fall back to the bundled location; flashing may still work in some setups.
+        logger.error("Failed to stage ESP32-S3 assets to %s: %s", base, e)
+        return src
+
 def get_firmware_root():
-    return get_driver_path(os.path.join("esp32s3", "firmware", "v5.9"))
+    return os.path.join(_esp32s3_root(), "firmware", "v5.9")
 
 def get_esptool_path():
-    return get_driver_path(os.path.join("esp32s3", "tools", "esptool.exe"))
+    return os.path.join(_esp32s3_root(), "tools", "esptool.exe")
+
+def get_flash_log_path():
+    base = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", os.path.expanduser("~"))),
+        "Switch 2 Connect", "logs",
+    )
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base, "esp32_flash.log")
+
+def flash_log(message):
+    """Append a line to the ESP32-S3 flash log so the actual esptool output can be
+    inspected after a failure (the GUI error dialog hides esptool's detail, and
+    there is no console in the windowed/MSIX build). Best-effort; never raises."""
+    try:
+        with open(get_flash_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
 
 def load_firmware_manifest():
     manifest_path = os.path.join(get_firmware_root(), "firmware_manifest.json")
@@ -1556,7 +1621,16 @@ def load_firmware_manifest():
 
 def _run_esptool(args, progress=None, timeout=None):
     esptool = get_esptool_path()
+    try:
+        from utils import is_packaged
+        packaged = is_packaged()
+    except Exception:
+        packaged = False
+    flash_log(f"--- run esptool (packaged={packaged}) ---")
+    flash_log(f"exe: {esptool} (exists={os.path.exists(esptool)})")
+    flash_log("cmd: esptool " + " ".join(args))
     if not os.path.exists(esptool):
+        flash_log(f"ERROR: Missing esptool.exe: {esptool}")
         raise FileNotFoundError(f"Missing esptool.exe: {esptool}")
     cmd = [esptool] + args
     if progress:
@@ -1576,6 +1650,7 @@ def _run_esptool(args, progress=None, timeout=None):
             if not line:
                 continue
             lines.append(line)
+            flash_log("  " + line)
             if progress:
                 progress(line)
                 match = re.search(r"\((\d{1,3})\s*%\)", line)
@@ -1583,13 +1658,15 @@ def _run_esptool(args, progress=None, timeout=None):
                     percent = max(0, min(100, int(match.group(1))))
                     progress({"write_percent": percent, "message": line})
         proc.wait(timeout=timeout)
-    except Exception:
+    except Exception as e:
+        flash_log(f"EXCEPTION while running esptool: {e}")
         try:
             proc.kill()
         except Exception:
             pass
         raise
     output = "\n".join(lines)
+    flash_log(f"exit code: {proc.returncode}")
     if proc.returncode != 0:
         raise RuntimeError(f"esptool failed with exit code {proc.returncode}\n{output}")
     return output

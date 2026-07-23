@@ -159,11 +159,59 @@ def quaternion_from_vectors(v_from, v_to):
     cross = vector_cross(v_from, v_to)
     return quaternion_normalize((s * 0.5, cross[0] * inv_s, cross[1] * inv_s, cross[2] * inv_s))
 
+_IS_PACKAGED_CACHE = None
+
+def is_packaged():
+    """Return True when running from inside an MSIX package (has package identity).
+
+    MSIX-packaged builds behave differently from the standalone GitHub .exe:
+    driver installation is delegated to external download+install, and startup
+    uses a StartupTask instead of the HKCU\\Run registry value (which is
+    virtualized and ineffective inside the package).
+    """
+    global _IS_PACKAGED_CACHE
+    if _IS_PACKAGED_CACHE is not None:
+        return _IS_PACKAGED_CACHE
+    packaged = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        length = ctypes.c_uint32(0)
+        # ERROR_INSUFFICIENT_BUFFER (122) means we have identity; APPMODEL_ERROR_NO_PACKAGE (15700) means none.
+        rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
+        packaged = (rc != 15700)
+    except Exception:
+        packaged = False
+    _IS_PACKAGED_CACHE = packaged
+    return packaged
+
+def _set_startup_task(enabled: bool):
+    """Enable/disable startup for MSIX-packaged builds via the manifest StartupTask.
+
+    The TaskId must match the desktop:StartupTask Id declared in AppxManifest.xml.
+    """
+    try:
+        from winrt.windows.applicationmodel import StartupTask, StartupTaskState
+        task = StartupTask.get_async("Switch2ConnectStartup").get()
+        if enabled:
+            if task.state in (StartupTaskState.DISABLED, StartupTaskState.DISABLED_BY_USER):
+                task.request_enable_async().get()
+        else:
+            if task.state == StartupTaskState.ENABLED:
+                task.disable()
+        return True
+    except Exception as e:
+        print(f"Error setting MSIX StartupTask: {e}")
+        return False
+
 def set_startup(enabled: bool):
+    if is_packaged():
+        return _set_startup_task(enabled)
+
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     app_name = "Switch 2 Connect"
     legacy_app_name = "Switch2Controllers"
-    
+
     if hasattr(sys, 'frozen'):
         # Executable path
         app_path = sys.executable
