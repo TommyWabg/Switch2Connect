@@ -1,7 +1,9 @@
+$ErrorActionPreference = "Stop"
+
 # Get Administrator permissions
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Please run this script as Administrator!" -ForegroundColor Red
-    Exit
+    Exit 1
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -59,7 +61,25 @@ if (-not $CertPath -or -not (Test-Path $CertPath)) {
 
 # 1. Clean up existing WinUHid devices
 Write-Host "Removing existing WinUHid device nodes..." -ForegroundColor Yellow
-pnputil /remove-device /deviceid "Root\WinUHid"
+$deviceOutput = pnputil /enum-devices /deviceid "Root\WinUHid" /properties 2>&1
+$deviceInstances = @($deviceOutput | Select-String -AllMatches -Pattern 'ROOT\\WINUHID\\[^\s]+' | ForEach-Object {
+    $_.Matches | ForEach-Object { $_.Value.Trim().ToUpperInvariant() }
+} | Select-Object -Unique)
+foreach ($instance in $deviceInstances) {
+    pnputil /remove-device $instance /force
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Exact removal failed for $instance; trying device-ID fallback." -ForegroundColor Yellow
+    }
+}
+if ($deviceInstances.Count -gt 0) {
+    $remainingOutput = pnputil /enum-devices /deviceid "Root\WinUHid" /properties 2>&1
+    if (($remainingOutput -join "`n") -match '(?i)ROOT\\WINUHID\\') {
+        pnputil /remove-device /deviceid "Root\WinUHid" /force
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Historical WinUHid records could not be removed; installation will use a new Root instance ID." -ForegroundColor Yellow
+        }
+    }
+}
 
 # 2. Clean up existing driver packages from Driver Store
 Write-Host "Scanning Driver Store for old WinUHid packages..." -ForegroundColor Yellow
@@ -83,13 +103,19 @@ foreach ($line in $drivers) {
 foreach ($inf in $oldInfs) {
     Write-Host "Deleting old driver package $inf from Driver Store..." -ForegroundColor Yellow
     pnputil /delete-driver $inf /uninstall /force
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Failed to remove old Driver Store package $inf" -ForegroundColor Red
+        Exit 1
+    }
 }
 
 
 # 4. Install certificate to TrustedPublisher and Root store
 Write-Host "Installing certificate to TrustedPublisher and Root stores..." -ForegroundColor Cyan
 certutil -addstore -f "TrustedPublisher" $CertPath
+if ($LASTEXITCODE -ne 0) { Write-Host "Failed to install TrustedPublisher certificate" -ForegroundColor Red; Exit 1 }
 certutil -addstore -f "Root" $CertPath
+if ($LASTEXITCODE -ne 0) { Write-Host "Failed to install Root certificate" -ForegroundColor Red; Exit 1 }
 
 # 5. Install the driver and create the device node using SetupAPI & NewDev.dll
 Write-Host "Installing new driver package and creating device node programmatically..." -ForegroundColor Cyan
@@ -168,18 +194,28 @@ public class DeviceInstaller {
             SP_DEVINFO_DATA devInfoData = new SP_DEVINFO_DATA();
             devInfoData.cbSize = Marshal.SizeOf(devInfoData);
 
-            if (!SetupDiCreateDeviceInfo(devInfoSet, @"Root\WinUHid\0000", ref classGuid, null, IntPtr.Zero, 0, ref devInfoData)) {
-                int err = Marshal.GetLastWin32Error();
-                // 0xE0000207 is ERROR_DEVINST_ALREADY_EXISTS
-                if ((uint)err == 0xE0000207) {
-                    Console.WriteLine("Device instance already exists in registry.");
+            // A previous uninstall can leave a non-present Enum history entry which
+            // pnputil correctly says is not in the hardware tree. Try the next Root
+            // instance ID instead of treating ERROR_DEVINST_ALREADY_EXISTS as a
+            // usable SP_DEVINFO_DATA record.
+            for (int instance = 0; instance < 100; instance++) {
+                string deviceName = string.Format(@"Root\WinUHid\{0:D4}", instance);
+                if (SetupDiCreateDeviceInfo(devInfoSet, deviceName, ref classGuid, null, IntPtr.Zero, 0, ref devInfoData)) {
                     created = true;
-                } else {
+                    Console.WriteLine("Created device instance " + deviceName);
+                    break;
+                }
+                int err = Marshal.GetLastWin32Error();
+                if ((uint)err != 0xE0000207) {
                     Console.WriteLine("SetupDiCreateDeviceInfo failed: " + err);
                     return false;
                 }
-            } else {
-                created = true;
+                devInfoData = new SP_DEVINFO_DATA();
+                devInfoData.cbSize = Marshal.SizeOf(devInfoData);
+            }
+            if (!created) {
+                Console.WriteLine("No free WinUHid Root instance ID was available.");
+                return false;
             }
 
             if (created) {
@@ -221,8 +257,20 @@ if (-not $success) {
 Write-Host "Starting WUDFRd service if needed..." -ForegroundColor Cyan
 sc.exe start WUDFRd
 
+# 7. Verify every layer used by the application health check.
+$verifyDevices = pnputil /enum-devices /deviceid "Root\WinUHid" /properties 2>&1
+$devicePresent = (($verifyDevices -join "`n") -match '(?is)ROOT\\WINUHID\\[^\s]+.*DEVPKEY_Device_IsPresent[^\r\n]*[\r\n]+\s*TRUE')
+$verifyDrivers = pnputil /enum-drivers 2>&1
+$packagePresent = (($verifyDrivers -join "`n") -match '(?i)winuhiddriver\.inf')
+$serviceKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver"
+$registryPresent = Test-Path $serviceKey
+if (-not $devicePresent -or -not $packagePresent -or -not $registryPresent) {
+    Write-Host "Driver verification failed: devicePresent=$devicePresent packagePresent=$packagePresent registryPresent=$registryPresent" -ForegroundColor Red
+    Exit 1
+}
+
 Write-Host "Driver installation complete!" -ForegroundColor Green
 if ($rebootRequired) {
     Write-Host "A system reboot is required for this installation to take effect." -ForegroundColor Yellow
 }
-
+Exit 0
