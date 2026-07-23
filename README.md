@@ -138,8 +138,8 @@ Rumble Delay Configuration: Featuring a customizable rumble delay setting in mi
 * **Operating System:** Windows 10 (22H2 or above) or Windows 11.
     * *Note:* **Windows 11 is highly recommended** for the best experience. It supports a maximum Bluetooth LE polling rate of **70Hz**, while Windows 10 is limited to **20Hz** due to the lack of OS driver support for the BLE protocol.
 * **Bluetooth Hardware:** Bluetooth 5.0 or above is required for stable connectivity and low-latency performance. The optional ESP32-S3 N16R8 is highly recommended for reaching 133Hz, bringing the native Switch 2 console experience to PC.
-* **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for Xbox One, PS4, and PS5/DualSense controller emulation. [nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus) is required for Xbox360 and PS4 controller emulation. [usbip-win2 driver](https://github.com/czgdp1807/usbip-win2) is required for Switch 1 Joy-Cons/Pro Controller, Switch 2 Pro Controller, and PS5/DualSense (with audio haptics) controller emulation.
-    * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid, ViGEmBus, or USBIP) is missing and guide you through a one-click installation (requires administrator privileges) or open the download link for ViGEmBus.
+* **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for Xbox One, PS4, and PS5/DualSense controller emulation. [nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus) is required for Xbox360 and PS4 controller emulation. [usbip-win2 driver](https://github.com/vadimgrn/usbip-win2) is required for Switch 1 Joy-Cons/Pro Controller, Switch 2 Pro Controller, and PS5/DualSense (with audio haptics) controller emulation.
+    * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid, ViGEmBus, or ) is missing and guide you through a one-click installation (requires administrator privileges) or open the download link for ViGEmBus.
 
 ### ESP32-S3 N16R8
 
@@ -201,7 +201,7 @@ Happy gaming, and thank you for your generous support!
 **This project is developed based on and has been extensively modified from [Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers). I would like to thank the original author for her foundational work.**
 * **[Nadeflore/switch2-controllers](https://github.com/Nadeflore/switch2-controllers):** The core foundation of this project.
 * **[TheFrano/joycon2py](https://github.com/TheFrano/joycon2py), [german77/JoyconDriver](https://github.com/german77/JoyconDriver), [darthcloud/BlueRetro](https://github.com/darthcloud/BlueRetro/issues/1249):** The script and reverse-engineering information that the original switch2-controllers project was based on.
-* **[nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus), [lurebat/WinUHid](https://github.com/lurebat/WinUHid), [dorssel/usbipd-win](https://github.com/dorssel/usbipd-win):** The drivers for virtual controller emulations.
+* **[nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus), [lurebat/WinUHid](https://github.com/lurebat/WinUHid), [vadimgrn/usbip-win2](https://github.com/vadimgrn/usbip-win2):** The drivers for virtual controller emulations.
 * **[ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research):** Reverse-engineering for virtual Switch 2 Pro Controller emulation and real wired Switch 2 Pro Controller input translation.
 * **[dekuNukem/Nintendo_Switch_Reverse_Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering):** Reverse-engineering for Switch 1 Pro Controller and Joy-Cons emulation.
 * **[mart1nro/joycontrol](https://github.com/mart1nro/joycontrol):** Reference for Switch 1 Pro Controller and Joy-Cons emulation.
