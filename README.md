@@ -1,11 +1,11 @@
 # Switch 2 Connect
 ### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
- <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.3.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
+ <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.4.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
 <p align="center">
   <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
-  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.3.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.4.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
   <br>
   <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
@@ -18,7 +18,7 @@
 
 ## Quick Start
 
-1. Download the latest version of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.3.exe)**.
+1. Download the latest version of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.4.exe)**.
 2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
 3. Once the installation completes, the setup window will close automatically, and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
@@ -26,22 +26,21 @@
 
 ## Feature Descriptions
 
-* **Windows 10 Native Compatibility:** Runs flawlessly on Windows 10 (22H2 and above). Windows 11 is still recommended for a 70Hz max Bluetooth polling rate, while only 20Hz max on Windows 10 due to the lack of OS driver support for the BLE protocol.
-* **Low Latency Bluetooth Mode:** The application forces Windows Bluetooth LE into `ThroughputOptimized` mode upon connection. This drastically drops the connection interval, massively reducing native Bluetooth input delay across the board.
-* **ESP32-S3 N16R8 Low-Latency Connection:** Native support for the ESP32-S3 N16R8 development board as a low-latency BLE bridge, which enables 133Hz polling rate. The application provides firmware installation, controller pairing via the SYNC button, and seamless reconnection for controllers previously bonded to the bridge.
+* **Windows 10 Native Compatibility:** Supports Windows 10 22H2 and Windows 11. Windows 11 supports Bluetooth LE polling rates up to 70Hz, while Windows 10 is limited to 20Hz by the operating system’s BLE driver implementation.
+* **Low Latency Bluetooth Mode:** Configures Windows Bluetooth LE connections with the ThroughputOptimized mode to reduce the connection interval and controller input latency.
+* **ESP32-S3 N16R8 Low-Latency Connection:** Supports the ESP32-S3 N16R8 development board as a BLE bridge with polling rates up to 133Hz. The application provides firmware installation and repair, controller pairing through the SYNC button, and reconnection for controllers bonded to the bridge.
 * **Wired Pro Controller Support:** Supports wired connected Switch 2 Pro Controller with up to 500Hz polling rate. The **Wired Pro Controller** menu allows users to manage HidHide, toggle automatic discovery, and run a one-time manual scan when needed.
-* **Flexible Multi-Driver & Emulation Backend (WinUHid, ViGEmBus & USBIP):** Users can seamlessly toggle between the built-in WinUHid driver, the industry-standard ViGEmBus virtual gamepad emulator, and a USBIP-based emulation mode, which enables emulating a physical USB-connected Switch 2 Pro Controller.
-A special thank you to LeonChrome for proactively reaching out and sharing their open-source project y700-switch2-pro-bridge, which served as a crucial reference for successfully building this Switch 2 emulation mode.
-* **Dynamic Emu Mode Toggle:** Instantly switch between Xbox One, PS4 (DualShock 4), and PS5 (DualSense) emulation modes directly from the settings panel. This allows you to choose the best protocol for your specific game or platform without restarting the app.
-* **Tabs Organized Settings Interface:** The settings interface is organized into distinct "Controller Mapping", "Mode Shift Mapping", and "Gyro Settings" tabs for easy navigation.
-* **DualSense Audio Haptic Feedback Support:** Featuring the  USBIP-based PS5 emu mode, which can establish a 4-channel audio playback device to receive DualSense audio haptic feedback from supported games. This architecture unifies PS5 Audio Haptics, Traditional PS5 Rumble, and Xbox Rumble. Translated DualSense Adaptive Trigger signals to generate independent HD Rumble pulses, which specifically trigger upon physical trigger press (ZL/ZR) or when a payload change occurs while the physical trigger is actively held.
+* **Multiple Driver and Emulation Backends:** Supports WinUHid, ViGEmBus, and USBIP backends. WinUHid provides Xbox One, PS4, and PS5 emulation; ViGEmBus provides Xbox 360 and PS4 emulation; USBIP provides USB-connected Switch 2 Pro Controller and DualSense emulation. The application detects missing or incomplete WinUHid and ViGEmBus installations and provides Install, Repair, and Uninstall actions. ViGEmBus can be downloaded and installed from the application after UAC authorization.
+* **Emulation Mode Selection:** Switch between Xbox One, PS4 (DualShock 4), and PS5 (DualSense) emulation modes from the settings interface without restarting the application.
+* **Tabbed Settings Interface:** Organizes settings into Controller Mapping, Mode Shift Mapping, and Gyro Settings tabs.
+* **DualSense Audio Haptic Feedback:** The USBIP-based PS5 emulation mode exposes a four-channel audio playback endpoint for games that support DualSense audio haptics. It supports DualSense audio haptics, standard PS5 rumble, Xbox rumble translation, and adaptive-trigger feedback translated into independent HD Rumble output for the left and right triggers.
 * **Xbox One Impulse Trigger Support:** In WinUHid Xbox One emulation mode, Xbox Impulse Trigger force-feedback values from LT and RT are translated into Switch 2 high-frequency HD Rumble output. Standard gamepad rumble is emitted as the same mono signal on both physical sides, while Impulse Trigger feedback is routed as independent left and right high-frequency overlays for trigger-specific effects.
   * **Impulse Trigger Settings:** The **Impulse Trigger Settings** button appears beside **Rumble Mode** in WinUHid Xbox One emulation mode. The floating settings window provides controls for enabling impulse feedback, selecting dynamic or fixed frequency behavior, adjusting impulse strength, and choosing a fixed frequency level.
   * **Dynamic Frequency:** When enabled, incoming impulse strength determines both output frequency and amplitude. During the release envelope, frequency continues to follow the current decaying output strength.
   * **Fixed Frequency:** When Dynamic Frequency is disabled, the **Frequency** slider selects the impulse output frequency independently from incoming impulse strength.
   * **Release Envelope:** When an Impulse Trigger stop command is received, the current output decays linearly to zero over 90 ms. A new command on the same side immediately replaces the pending release.
 * **Native Motion Support (PS4/PS5 Mode):** Switching to PS4 or PS5 mode enables native motion sensor reporting via the DS4 or DualSense protocol. This provides enhanced compatibility for Steam Input and games that support native DualShock 4 or DualSense gyro features.
-* **Cemuhook UDP Server Support:** Featuring the Cemuhook UDP server (127.0.0.1:26760) to transmit direct motion control data to Switch 1 emulators. To use this feature, select "Cemuhook" on the "Mode" toggle switch within the "Gyro Passthrough" settings panel.
+* **Cemuhook UDP Server:** Sends controller motion data to compatible applications through 127.0.0.1:26760. Select Cemuhook in the Gyro Pass-through settings to enable the server.
 * **Cemuhook Gyro Sensitivity Adjustment:** Featuring a Sensitivity slider (levels 1-5) to the "Gyro Passthrough" panel. The sensitivity specifically applies a linear multiplier only to the horizontal rotation (Yaw) axis sent via the Cemuhook UDP protocol.
   * **levels 1:** Virtual Switch 1 Joy-cons turn 360 degrees when the physical Switch 2 Joy-cons turn 360 degrees.
   * **levels 5:** Matches real Switch 1 Joycon sensitivity.
@@ -57,9 +56,9 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
 * **In-App Gyro Trigger Dampening:** Configurable within the In-App Gyro mapping pop-up window. Assign one or more buttons to proportionally reduce gyro sensitivity by a customizable percentage. Users can also customize how long the dampening effect remains active after the assigned button is released, allowing smoother control during aiming, steering, or other gyro-based actions.
 * **In-app Gyro Lock:** A dedicated mapping option to pause gyro control while remaining in In-app Gyro mode, supporting both Hold and Tap activation logic.
 * **Gyro Pass-through:**
-  * **9-Axis Assist:** Integrated the 9-axis IMU fusion bias correction directly into the raw sensor reading pipeline. Using the magnetometer to continuously correct yaw drift for pass-through gyro data.
-  * **Horizon Lock:** Featuring a toggle switch to apply horizon lock to passthrough gyro data. When enabled, it applies roll compensation and maintains the horizontal level. It disables roll data passthrough in this mode, eliminating off-axis cursor drift, roll crosstalk, and gimbal lock.
-  * **Adjustable Soft Deadzone Sliders:** Dedicated sliders for adjusting soft deadzone values for both In-App Gyro and Passthrough gyro data. Soft deadzone subtracts the active deadzone value from the input magnitude, ensuring output begins smoothly from 0.0 right at the threshold boundary and eliminating step-jump discontinuities.
+  * **9-Axis Assist:** Uses magnetometer-assisted IMU fusion to correct long-term yaw drift in pass-through motion data.
+  * **Horizon Lock:** Applies roll compensation and maintains a horizontal reference while suppressing roll output.
+  * **Adjustable Soft Deadzone Sliders:** Provides separate soft-deadzone controls for In-App Gyro and pass-through motion. Output starts from zero at the configured threshold to avoid a step change.
 * **Gyro Calibration:** **Calibrate Gyro** button to calculate and permanently save sensor bias, eliminating gyro drift.
 * **Magnetometer Calibration:** **Calibrate Mag** button for 9-axis accuracy. Perform a "figure-8" motion to calibrate the magnetometer (with a [quick link](https://youtu.be/J_cZnPcW-Yw?si=QWSizI49NQ_5OkA7) to a video tutorial).
 * **Dual Joy-con Gyro (DJG):** Featuring a gyro fusion system that combines motion data from both Left and Right Joy-cons when used as a merged pair for stutter-free aiming when ratcheting. This system designates a "Dominant" side for spatial orientation and uses the "Sub" side as an accelerator for larger movements. A magnitude threshold of 30 is applied to the sub side. It contributes to acceleration only when the dominant side exceeds this threshold. Sub side acceleration is strictly capped to a maximum of 2x the dominant movement, and its opposite directional movement will be ignored. When the dominant side's gyro is turned off, the sub side takes over control.
@@ -86,7 +85,7 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
   * Click the adjacent toggle button to switch between Tap (triggers the sequence once) and Hold (keeps the sequence pressed as long as you hold the controller button).
   * Click the X button to remove custom input and fall back to the default.
 * **Mode Shift Mapping System:** Applies an alternative button mapping layer utilizing the In-app Gyro mapping store. The Mode Shift layer is activated via a dedicated mapping option supporting both Hold (active while held) and Tap (toggle) logic. Tap and Hold share a unified state machine, where a Hold action temporarily inverts a Tap-entered Mode Shift. Additionally, entering In-app Gyro mode can automatically apply the Mode Shift layer based on per-profile Gyro Control settings.
-* **Categorized Button Mapping Profiles:** Segregated custom button mapping and rumble configurations into three independent target categories: Xbox, PS4, PS5, and Switch 2. Remap profiles are saved and loaded automatically based on the active emulation mode.
+* **Emulation-Specific Mapping Categories:** Stores button mappings and rumble settings separately for Xbox, PS4, PS5, and Switch 2 emulation modes. The corresponding configuration is loaded when the emulation mode changes.
 * **Custom Mapping Profile System:** A comprehensive profile management system allows users to create, rename, delete, and switch between multiple configurations. Each profile persistently stores button mappings, emulation mode, and driver settings. Profiles can be managed via a dedicated pop-up window that also configures the "Change Profile List" and "Profile Switching Combo" inputs. Features three seamless profile switching methods:
   * Profile Switching Combo: Users can record a custom Profile Switching Combo Trigger and assign specific Combo inputs for dedicated profiles. Pressing the Trigger input and a profile's Combo input simultaneously instantly switches to that dedicated profile. Both inputs function as standard mappings when not combined.
   * Auto Change Profile: Automatically switches to the selected checked profile in the Change Profile List after 2 seconds of trigger inactivity.
@@ -97,10 +96,10 @@ A special thank you to LeonChrome for proactively reaching out and sharing t
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Featuring V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
 * **Per-Joy-Con V/H Mode Persistence:** The application records and remembers whether each single Joy-Con is held vertically or horizontally. Layout preferences (Vertical or Horizontal) are dynamically mapped to each controller's Bluetooth MAC address and saved in `config.yaml`.
 * **Dual-Controller Gyro Selection (L/R Gyro):** When using a pair of Joy-cons as a single virtual controller, you can manually select which Joy-con (Left or Right) provides the motion data. This allows for greater flexibility, letting you choose your preferred hand for gyro aiming or motion controls.
-* **Customizable Rumble Strength:** Featuring a Vibration Strength slider in the settings panel (ranging from 0 to 10), allowing users to dynamically scale the intensity of the controller's haptic feedback.
-Rumble Frequency Slider: You can customize the vibration/rumble frequency directly from the settings panel.
-Rumble Delay Configuration: Featuring a customizable rumble delay setting in milliseconds. This allows users to manually synchronize haptic feedback with audio for games where sound and vibration are misaligned.
-* **Dual Rumble Mode Toggle:** Featuring a toggle switch in the user interface to easily switch between Xbox and Switch rumble modes.
+* **Customizable Rumble Strength:** Adjusts vibration intensity from 0 to 10.
+* **Rumble Frequency Slider:** Selects the vibration frequency used for translated rumble output.
+* **Rumble Delay Configuration:** Adds a configurable delay in milliseconds for synchronizing vibration with game audio.
+* **Dual Rumble Mode Toggle:** Switches between Xbox-style translated rumble and Switch HD Rumble output.
   * Xbox Mode: Tailored for standard PC games to simulate dual-motor rumble by activating dynamic frequency scaling and high-frequency masking to mimic traditional gamepad motors.
     * Strength 5 and Frequency 10 emulates the feel of a DualSense Edge controller.
     * Strength 10 and Frequency 10 emulates the rumble of an Xbox Elite Series 1 Controller.
@@ -111,19 +110,19 @@ Rumble Delay Configuration: Featuring a customizable rumble delay setting in mi
 * **Auto-Disconnect Options:** Featuring a 3-way Auto-Disconnect toggle (OFF, Inactive, Absolute).
   * Inactive: tracks physical button and stick inputs to automatically disconnect idle controllers while keeping active players connected.
   * Absolute: tracks the overall time each controller is connected to the app and disconnects the ones that reach the time limit.
-* **Dedicated UI Driver Controls:** Featuring an **Install/Uninstall WinUHid Driver** button to the left of the "Run At Startup" button.
-* **ESP32-S3 Bridge Firmware Management:** The ESP32-S3 N16R8 connection path includes bundled firmware installation and repair, BOOT-mode status detection, and bridge initialization handling after the device is unplugged or reconnected.
-* **Run at Startup:** Featuring a toggle to automatically launch the application with Windows.
-* **Start Minimized:** Option to launch directly to the system tray for a seamless background experience.
-* **Hide to system tray:** Featuring the ability to minimize the application to the Windows system tray.
+* **Driver Management Controls:** Provides Install, Repair, and Uninstall actions for the selected WinUHid, ViGEmBus, or USBIP backend. Driver status is determined from the active device, Driver Store package, service registration, and runtime availability instead of saved configuration alone.
+* **ESP32-S3 Bridge Firmware Management:** Provides firmware installation and repair, BOOT-mode detection, reconnection handling, and flash diagnostics. When flashing fails, the application records esptool output in a diagnostic log.
+* **Run at Startup:** Automatically launches the application with Windows.
+* **Start Minimized:** Starts the application in the system tray.
+* **Hide to System Tray:** Minimizes the application to the Windows system tray.
 * **Controller UI Navigation:** Use the left joystick or D-pad to navigate the application interface. The selected UI element is indicated by a white outline, and the outline hides after mouse interaction or when Navigation mode is exited with the B button.
   * **Active Window Focus:** When a floating window or pop-up dialog is open, navigation remains within that active top-level interface.
   * **Return Selection:** Pressing B closes the active floating window and returns selection to the control that opened it. Re-entering Navigation mode restores the last selected control.
   * **UI Component Interaction:** Press A to activate buttons or open dropdown menus. Press B to close an open floating window or exit Navigation mode.
   * **Text Input Adjustment:** Text input fields support value adjustment with the right joystick or by holding A while using the left joystick. Continuous adjustment accelerates while the input is held.
   * **Slider and Time Input Adjustment:** Sliders can be adjusted with the right joystick or A plus the left joystick.
-* **Window Position Persistence:** The application saves and restores the window's position on the screen.
-* **Standalone Executable (.exe):** Fully packed with all dependencies (including vgamepad DLLs). No Python installation required.
+* **Window Position Persistence:** Saves and restores the main window position.
+* **Standalone Executable (.exe):** Includes the required Python runtime and application dependencies; a separate Python installation is not required.
 
 ## Known Limitations
 
@@ -139,7 +138,7 @@ Rumble Delay Configuration: Featuring a customizable rumble delay setting in mi
     * *Note:* **Windows 11 is highly recommended** for the best experience. It supports a maximum Bluetooth LE polling rate of **70Hz**, while Windows 10 is limited to **20Hz** due to the lack of OS driver support for the BLE protocol.
 * **Bluetooth Hardware:** Bluetooth 5.0 or above is required for stable connectivity and low-latency performance. The optional ESP32-S3 N16R8 is highly recommended for reaching 133Hz, bringing the native Switch 2 console experience to PC.
 * **Driver:** [lurebat's WinUHid driver](https://github.com/lurebat/WinUHid) is required for Xbox One, PS4, and PS5/DualSense controller emulation. [nefarius/ViGEmBus](https://github.com/nefarius/ViGEmBus) is required for Xbox360 and PS4 controller emulation. [usbip-win2 driver](https://github.com/vadimgrn/usbip-win2) is required for Switch 1 Joy-Cons/Pro Controller, Switch 2 Pro Controller, and PS5/DualSense (with audio haptics) controller emulation.
-    * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid, ViGEmBus, or ) is missing and guide you through a one-click installation (requires administrator privileges) or open the download link for ViGEmBus.
+    * *Auto-Installation:* The app will automatically detect if the selected driver (WinUHid, ViGEmBus, or USBIP) is missing and guide you through a one-click installation (requires administrator privileges) or automatically download and install for ViGEmBus.
 
 ### ESP32-S3 N16R8
 
@@ -205,7 +204,7 @@ Happy gaming, and thank you for your generous support!
 * **[ndeadly/switch2_controller_research](https://github.com/ndeadly/switch2_controller_research):** Reverse-engineering for virtual Switch 2 Pro Controller emulation and real wired Switch 2 Pro Controller input translation.
 * **[dekuNukem/Nintendo_Switch_Reverse_Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering):** Reverse-engineering for Switch 1 Pro Controller and Joy-Cons emulation.
 * **[mart1nro/joycontrol](https://github.com/mart1nro/joycontrol):** Reference for Switch 1 Pro Controller and Joy-Cons emulation.
-* **[LeonChrome/XinHeLianSheng-Pro2-Bridge](https://github.com/LeonChrome/XinHeLianSheng-Pro2-Bridge):** Inspiration for the ESP32-S3 N16R8 implementation. Also a reference for DualSense audio haptics.
+* **[LeonChrome/XinHeLianSheng-Pro2-Bridge](https://github.com/LeonChrome/XinHeLianSheng-Pro2-Bridge):** Inspiration for the ESP32-S3 N16R8 implementation. Also a reference for DualSense audio haptics and the USBIP-based Switch 2 controller emulation implementation.
 * **[SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge):** Main reference for DualSense audio endpoint HID descriptor.
 * **[JibbSmart/JoyShockLibrary](https://github.com/JibbSmart/JoyShockLibrary):** Reference for Switch 1 Joy-Cons gyro direction.
 * **[RyanCopley/NSO-GameCube-Controller-Pairing-App](https://github.com/RyanCopley/NSO-GameCube-Controller-Pairing-App):** Reference for all NSO GameCube Controller related features. Also a reference for BLE throughput optimized mode.
