@@ -7,6 +7,7 @@ binaries = []
 if os.path.exists('drivers/dualsense_haptic_native.dll'):
     binaries.append(('drivers/dualsense_haptic_native.dll', 'drivers'))
 hiddenimports = [
+    'driver_install_helper',
     'usbip_server',
     'usbip_dualsense_server',
     'dualsense_descriptors',

@@ -12,6 +12,7 @@ winrt-Windows.Devices.Enumeration==3.2.1
 winrt-Windows.Foundation==3.2.1
 winrt-Windows.Foundation.Collections==3.2.1
 winrt-Windows.Storage.Streams==3.2.1
+winrt-Windows.ApplicationModel==3.2.1
 imufusion==1.2.11
 hidapi==0.14.0.post4
 pyusb==1.3.1
