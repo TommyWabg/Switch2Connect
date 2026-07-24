@@ -34,9 +34,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = 'package_temp\config.yaml'; $content = [System.IO.File]::ReadAllText($path); if ($content -notmatch '(?m)^driver_installed:\s*(true|false)\s*$') { throw 'driver_installed setting not found.' }; $content = [regex]::Replace($content, '(?m)^driver_installed:\s*(true|false)\s*$', 'driver_installed: false'); [System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$path = 'package_temp\config.yaml'; $content = [System.IO.File]::ReadAllText($path); $settings = @('driver_installed', 'hidhide_install_prompt_suppressed'); foreach ($setting in $settings) { $pattern = '(?m)^' + [regex]::Escape($setting) + ':\s*(true|false)\s*$'; if ($content -notmatch $pattern) { throw ($setting + ' setting not found.') }; $content = [regex]::Replace($content, $pattern, ($setting + ': false')) }; [System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))"
 if errorlevel 1 (
-    echo Failed to set driver_installed to false.
+    echo Failed to reset package-only settings.
     rmdir /S /Q "%PACKAGE_CONFIG_DIR%" >nul 2>nul
     pause
     exit /b 1

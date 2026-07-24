@@ -214,7 +214,8 @@ gyro_mode: World
 gyro_passthrough_mode: Cemuhook
 gyro_sensitivity: 4.0
 hidhide_hide_enabled: true
-hidhide_installed: true
+hidhide_install_prompt_suppressed: false
+hidhide_installed: false
 home_mapping: Default
 in_app_gyro_soft_deadzone: 0.0
 joycon_hold_mode: &id011 {}
@@ -4105,8 +4106,8 @@ virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1210
-window_y: 57
+window_x: 1236
+window_y: 49
 winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5
