@@ -48,7 +48,7 @@ _CROP_TOP = 0
 _CROP_RIGHT = 32
 # Bottom crop kept so the visible panel height stays exactly as before (507):
 # only what is shown at once is unchanged — the scrollable content grew.
-_CROP_BOTTOM = _IFRAME_HEIGHT - _CROP_TOP - 507
+_CROP_BOTTOM = _IFRAME_HEIGHT - _CROP_TOP - 950
 _VIEW_WIDTH = _WINDOW_WIDTH - _CROP_LEFT - _CROP_RIGHT
 _VIEW_HEIGHT = _IFRAME_HEIGHT - _CROP_TOP - _CROP_BOTTOM
 
@@ -56,12 +56,17 @@ _VIEW_HEIGHT = _IFRAME_HEIGHT - _CROP_TOP - _CROP_BOTTOM
 # or grow an internal scrollbar. A scroll container lets the shorter native
 # window reveal the taller iframe by scrolling vertically, while the horizontal
 # crop stays fixed. The scrollbar itself is hidden so the panel stays chromeless.
-_KOFI_HTML = """<!doctype html>
+_KOFI_HTML_TEMPLATE = """<!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
+      /* The window is sized by the app's scaling rule rather than the raw DPI
+         scale, so the page is zoomed by the same amount to match. Chromium's
+         `zoom` multiplies the used size of everything below it, iframe content
+         included, so physical px = design px * zoom * devicePixelRatio. */
+      html {{ zoom: {zoom}; }}
       html, body {{ margin:0; width:{view_width}px; height:{view_height}px;
         background:{bg}; overflow:hidden;
         font-family:"Segoe UI", Arial, sans-serif; }}
@@ -74,24 +79,48 @@ _KOFI_HTML = """<!doctype html>
       iframe {{ position:absolute; left:-{crop_left}px; top:-{crop_top}px; border:0;
         width:{width}px; height:{iframe_height}px;
         display:block; background:{bg}; }}
+      /* Shown until the Ko-fi page finishes loading, so the panel never looks
+         like an empty broken window. Static markup only - it must not add any
+         request of its own to the load we are waiting on. */
+      #placeholder {{ position:absolute; inset:0; display:flex;
+        align-items:center; justify-content:center;
+        background:{bg}; color:#8a8a8a; font-size:14px; }}
+      #placeholder.hidden {{ display:none; }}
     </style>
   </head>
   <body>
     <div id="scroller">
       <iframe id="kofiframe"
         src="https://ko-fi.com/tagayama/?hidefeed=true&widget=true&embed=true&preview=true"
-        title="tagayama" scrolling="no"></iframe>
+        title="tagayama" scrolling="no"
+        onload="document.getElementById('placeholder').classList.add('hidden')"></iframe>
     </div>
+    <div id="placeholder">Loading Ko-fi&hellip;</div>
   </body>
-</html>""".format(
-    bg=_PAGE_BG,
-    width=_WINDOW_WIDTH,
-    view_width=_VIEW_WIDTH,
-    view_height=_VIEW_HEIGHT,
-    crop_left=_CROP_LEFT,
-    crop_top=_CROP_TOP,
-    iframe_height=_IFRAME_HEIGHT,
-)
+</html>"""
+
+
+def build_kofi_html(zoom=1.0):
+    """The panel markup at a given page zoom.
+
+    The layout is always authored at the design size; only `zoom` changes, so
+    the Ko-fi page keeps its own layout and is simply rendered larger or smaller
+    along with the window.
+    """
+    return _KOFI_HTML_TEMPLATE.format(
+        bg=_PAGE_BG,
+        width=_WINDOW_WIDTH,
+        view_width=_VIEW_WIDTH,
+        view_height=_VIEW_HEIGHT,
+        crop_left=_CROP_LEFT,
+        crop_top=_CROP_TOP,
+        iframe_height=_IFRAME_HEIGHT,
+        zoom=round(float(zoom or 1.0), 6),
+    )
+
+
+# Unzoomed markup, kept so existing callers and tests can inspect the layout.
+_KOFI_HTML = build_kofi_html(1.0)
 
 
 def _find_native_window():
@@ -178,8 +207,14 @@ def _hwnd_number(hwnd):
     return int(value or 0)
 
 
-def _position_native_window(anchor_center_x, anchor_bottom_y, hwnd=None):
-    """Size the client in CSS/DPI pixels, then place it below the Ko-fi button."""
+def _position_native_window(anchor_center_x, anchor_bottom_y, hwnd=None, scale=None):
+    """Size the client to the app's scale, then place it below the Ko-fi button.
+
+    `scale` is the app's own scaling factor (physical px per design px). It is
+    used in place of the raw DPI ratio so the popup tracks the rest of the UI on
+    every display; the page is zoomed by a matching amount so the content scales
+    with the window rather than just being cropped differently.
+    """
     hwnd = hwnd or _find_native_window()
     if hwnd is None:
         return None
@@ -190,13 +225,15 @@ def _position_native_window(anchor_center_x, anchor_bottom_y, hwnd=None):
     if outer is None or client is None:
         return None
 
-    try:
-        get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
-        dpi_ratio = float(get_dpi(hwnd)) / 96.0 if get_dpi is not None else 1.0
-    except Exception:
-        dpi_ratio = 1.0
-    desired_client_width = int(round(_VIEW_WIDTH * dpi_ratio))
-    desired_client_height = int(round(_VIEW_HEIGHT * dpi_ratio))
+    if scale is None:
+        # No scale supplied (older parent): fall back to the raw DPI ratio.
+        try:
+            get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
+            scale = float(get_dpi(hwnd)) / 96.0 if get_dpi is not None else 1.0
+        except Exception:
+            scale = 1.0
+    desired_client_width = int(round(_VIEW_WIDTH * scale))
+    desired_client_height = int(round(_VIEW_HEIGHT * scale))
     desired_outer_width = desired_client_width + outer["width"] - client["width"]
     desired_outer_height = desired_client_height + outer["height"] - client["height"]
     left = int(round(anchor_center_x - desired_outer_width / 2.0))
@@ -205,7 +242,7 @@ def _position_native_window(anchor_center_x, anchor_bottom_y, hwnd=None):
     _log_event(
         "position_set",
         f"left={left}, top={top}, width={desired_outer_width}, "
-        f"height={desired_outer_height}, dpi_ratio={dpi_ratio}",
+        f"height={desired_outer_height}, scale={scale}",
     )
     if not ctypes.windll.user32.SetWindowPos(
             hwnd, 0, left, top, desired_outer_width, desired_outer_height, flags):
@@ -420,18 +457,52 @@ def _log_crash(exc_text):
         pass
 
 
+def _match_parent_dpi_awareness():
+    """Become per-monitor DPI aware, exactly like the parent GUI.
+
+    This has to run before pywebview creates anything: .NET otherwise settles the
+    process at SYSTEM_AWARE, and awareness can only be set once. The parent is
+    PER_MONITOR_AWARE and hands over positions and sizes in true physical pixels,
+    so a SYSTEM_AWARE child has Windows silently rescale every one of them by
+    (monitor DPI / system DPI) - the window then lands in the wrong place at the
+    wrong size on any display whose scale differs from the system DPI, and the
+    page is rendered at the wrong zoom to match.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main(argv=None):
     try:
         _log_event("process_started", f"argv={argv or []}")
+        # Before importing webview: pywebview's backend fixes the process's DPI
+        # awareness as soon as it initialises.
+        _match_parent_dpi_awareness()
         import webview
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--anchor-center-x", type=int)
         parser.add_argument("--anchor-bottom-y", type=int)
         parser.add_argument("--owner-hwnd", type=int)
+        # Started ahead of the click (the parent pre-warms on button hover): build
+        # the window and load the page, but park it off-screen instead of showing
+        # it at the anchor. A later `show` command moves it into place.
+        parser.add_argument("--prewarm", action="store_true")
+        # The app's own scaling factor (physical px per design px) and the page
+        # zoom that matches it. Sizing on the raw DPI ratio instead made the
+        # popup disagree with the rest of the UI on most displays.
+        parser.add_argument("--scale", type=float, default=None)
+        parser.add_argument("--zoom", type=float, default=None)
         args, _unknown = parser.parse_known_args(argv or [])
 
         window_options = dict(
-            html=_KOFI_HTML,
+            html=build_kofi_html(args.zoom if args.zoom else 1.0),
             width=_VIEW_WIDTH,
             height=_VIEW_HEIGHT,
             frameless=True,
@@ -453,6 +524,17 @@ def main(argv=None):
         # Cache the native handle so later show/hide commands can reposition the
         # already-loaded window without recreating it (see _command_loop below).
         state = {"hwnd": None}
+        # Where the window should end up once it is fit to be seen. None means
+        # "stay parked". A `show` can arrive before the native window even exists
+        # (the user clicks immediately after the hover that started a pre-warm),
+        # so the anchor is remembered rather than dropped.
+        wants_onscreen = {"anchor": None}
+        if not args.prewarm and args.anchor_center_x is not None:
+            wants_onscreen["anchor"] = (args.anchor_center_x, args.anchor_bottom_y)
+        # WebView2 paints a moment after the native window is up. Moving on-screen
+        # before that shows an empty panel, which reads as the loading text
+        # blinking out and back when the parent's stand-in is removed.
+        content_ready = {"done": False}
 
         def _reveal_window(stage):
             """Show the window that was created hidden, exactly once."""
@@ -462,6 +544,18 @@ def main(argv=None):
             except Exception:
                 import traceback
                 _log_event(f"{stage}_show_error", traceback.format_exc())
+
+        def place_onscreen_if_ready(stage):
+            """Move the window under the button, but only once it has painted."""
+            hwnd = state["hwnd"]
+            anchor = wants_onscreen["anchor"]
+            if hwnd is None or anchor is None or not content_ready["done"]:
+                return False
+            _position_native_window(anchor[0], anchor[1], hwnd, scale=args.scale)
+            _bring_to_top(hwnd)
+            wants_onscreen["anchor"] = None
+            _log_event(f"{stage}_placed_onscreen")
+            return True
 
         def position_final_window(stage):
             if positioned["done"]:
@@ -473,15 +567,14 @@ def main(argv=None):
                 # HWND can pick a WebView2 helper/controller window instead.
                 hwnd = _native_hwnd(window) or _find_native_window()
                 _log_event(f"{stage}_hwnd", f"hwnd={_hwnd_number(hwnd)}")
-                if (hwnd is not None and args.anchor_center_x is not None and
-                        args.anchor_bottom_y is not None):
-                    hwnd = _position_native_window(
-                        args.anchor_center_x, args.anchor_bottom_y, hwnd
-                    )
-                    _log_event(f"{stage}_positioned", f"hwnd={_hwnd_number(hwnd)}")
                 if hwnd is None:
                     _log_event(f"{stage}_no_hwnd")
                     return False
+                # Always start parked. The window has to be genuinely *shown* for
+                # WebView2 to render at all (a hidden one does not paint), so it
+                # is shown out of sight and only moved in once it has content.
+                _move_offscreen(hwnd)
+                _log_event(f"{stage}_parked", f"hwnd={_hwnd_number(hwnd)}")
                 state["hwnd"] = hwnd
                 # Own the popup to the main window so it is always kept above it
                 # in the z-order (this is what makes a re-show actually visible).
@@ -490,9 +583,8 @@ def main(argv=None):
                 # no taskbar button ever flashes before we reveal it.
                 _apply_tool_window_style(hwnd)
                 positioned["done"] = True
-                # Only now that the window sits below the Ko-fi button do we
-                # reveal it, so it never flashes at the screen centre.
                 _reveal_window(stage)
+                place_onscreen_if_ready(stage)
                 _log_event(f"{stage}_complete", f"hwnd={_hwnd_number(hwnd)}")
                 return True
             except Exception:
@@ -519,27 +611,34 @@ def main(argv=None):
                     command = parts[0]
                     _log_event("command", command)
                     if command == "hide":
+                        wants_onscreen["anchor"] = None
                         _move_offscreen(state["hwnd"] or _native_hwnd(window))
                     elif command == "show":
                         try:
-                            hwnd = state["hwnd"] or _native_hwnd(window)
-                            if (hwnd is not None and len(parts) >= 3):
-                                _position_native_window(
-                                    int(parts[1]), int(parts[2]), hwnd
-                                )
-                            # The window was only parked off-screen, so it is
-                            # still shown; just raise it above the main window.
-                            _bring_to_top(hwnd)
+                            if len(parts) >= 3:
+                                # Record the target either way. If the window is
+                                # not up yet, or has not painted, this is applied
+                                # the moment it is ready instead of being lost.
+                                wants_onscreen["anchor"] = (int(parts[1]), int(parts[2]))
+                            if not place_onscreen_if_ready("show_command"):
+                                _log_event("show_deferred")
                         except Exception:
                             _log_event("show_command_error")
                     elif command == "move":
                         # Follow the main window: reposition only, keep visibility.
                         try:
-                            hwnd = state["hwnd"] or _native_hwnd(window)
-                            if (hwnd is not None and len(parts) >= 3):
-                                _position_native_window(
-                                    int(parts[1]), int(parts[2]), hwnd
-                                )
+                            if len(parts) >= 3:
+                                if wants_onscreen["anchor"] is not None:
+                                    # Still waiting to appear - just update where.
+                                    wants_onscreen["anchor"] = (
+                                        int(parts[1]), int(parts[2]))
+                                else:
+                                    hwnd = state["hwnd"] or _native_hwnd(window)
+                                    if hwnd is not None:
+                                        _position_native_window(
+                                            int(parts[1]), int(parts[2]), hwnd,
+                                            scale=args.scale
+                                        )
                         except Exception:
                             _log_event("move_command_error")
                     elif command == "quit":
@@ -552,18 +651,40 @@ def main(argv=None):
                 import traceback
                 _log_event("command_loop_error", traceback.format_exc())
 
-        def reveal_fallback():
-            """Guarantee the hidden window is never stuck invisible.
+        def apply_measured_zoom(stage):
+            """Re-derive the page zoom from the window's own devicePixelRatio.
 
-            If `loaded` never fires (or positioning keeps failing), force one
-            positioning attempt and reveal the window regardless, so the popup
-            always becomes visible.
+            The window is sized to `scale` physical pixels per design pixel, and
+            WebView2 renders a CSS pixel as devicePixelRatio physical pixels, so
+            the page needs zoom = scale / devicePixelRatio to fill it exactly.
+            The parent can only guess that ratio from its own window; the page is
+            the only thing that knows it for certain. Applied while the window is
+            still parked off-screen, so the reflow is never visible.
             """
-            if positioned["done"]:
+            if args.scale is None:
                 return
+            try:
+                measured = window.evaluate_js(
+                    "(function(){var z=%.6f/window.devicePixelRatio;"
+                    "document.documentElement.style.zoom=z;"
+                    "return z+'@'+window.devicePixelRatio;})()" % args.scale)
+                _log_event(f"{stage}_zoom_applied", str(measured))
+            except Exception:
+                _log_event(f"{stage}_zoom_error")
+
+        def reveal_fallback():
+            """Guarantee the window is never stuck invisible.
+
+            If `loaded` never fires (no network, or positioning keeps failing),
+            treat the content as ready anyway: by now WebView2 has long since
+            painted the inline loading panel, so appearing is better than waiting.
+            """
             _log_event("timeout_fallback")
-            if not position_final_window("timeout_fallback"):
-                _reveal_window("timeout_fallback")
+            if not positioned["done"]:
+                if not position_final_window("timeout_fallback"):
+                    _reveal_window("timeout_fallback")
+            content_ready["done"] = True
+            place_onscreen_if_ready("timeout_fallback")
 
         def after_show(*_event_args):
             _log_event("shown")
@@ -573,6 +694,13 @@ def main(argv=None):
             _log_event("loaded")
             if not positioned["done"]:
                 position_final_window("loaded_ui_fallback")
+            # Correct the zoom against the real devicePixelRatio before anything
+            # is shown, so the page fills the window exactly.
+            apply_measured_zoom("loaded_ui")
+            # The page has painted, so the window can now be moved into view
+            # without showing an empty panel first.
+            content_ready["done"] = True
+            place_onscreen_if_ready("loaded_ui")
 
         window.events.shown += after_show
         window.events.loaded += after_load

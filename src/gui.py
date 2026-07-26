@@ -19,6 +19,16 @@
 
 import sys
 import os
+
+# The Ko-fi popup runs as a child of this same executable. Dispatching here,
+# before the heavy imports below, keeps the child from loading the controller
+# stack, numpy, pystray and PIL - none of which it uses. Measured on a warm
+# cache: ~650 ms of process start-up down to ~320 ms.
+if __name__ == "__main__" and "--show-kofi" in sys.argv:
+    from kofi_webview import main as _kofi_main
+    _kofi_main(sys.argv[1:])
+    sys.exit(0)
+
 import queue
 import time
 import json
@@ -4375,16 +4385,334 @@ class ControllerWindow:
             return
         self._spawn_kofi_window()
 
-    def _spawn_kofi_window(self):
-        """Launch the Ko-fi child process for the first time and show it."""
+    def _begin_kofi_placeholder_handoff(self):
+        """Show the stand-in now and hand over once the child window arrives.
+
+        Skipped when the child's window already exists on screen, where showing a
+        placeholder would only add a flash before an already-instant open.
+        """
+        if getattr(self, "_kofi_window_ready", False):
+            return
+        self._show_kofi_placeholder()
+        self._cancel_kofi_ready_poll()
+        self._poll_kofi_window_ready()
+
+    def _kofi_root_dpi_ratio(self):
+        """Windows' own DPI scale for the monitor the main window is on."""
+        try:
+            get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
+            root_hwnd = self.get_root_hwnd()
+            if get_dpi is not None and root_hwnd:
+                dpi = int(get_dpi(int(root_hwnd)))
+                if dpi > 0:
+                    return dpi / 96.0
+        except Exception:
+            pass
+        return 1.0
+
+    # Never shrink the popup past this, even on a very short work area; below it
+    # the Ko-fi form stops being usable and a scrollbar is the better trade.
+    _KOFI_MIN_SCALE = 0.55
+
+    def _kofi_scale(self, anchor_bottom_y=None):
+        """Scale for the popup, on the app's own scaling rule rather than raw DPI.
+
+        The rest of the UI is sized by `scaling_factor`, which is deliberately
+        DPI-independent and already tracks the usable work area. Sizing the popup
+        by the raw DPI ratio instead made it disagree with the app on every
+        display whose scale did not happen to match, and at the current design
+        height it ran off the bottom of a 1080p screen entirely.
+
+        The result is additionally clamped so the panel always fits between the
+        button and the bottom of the work area - that is what keeps the whole
+        Ko-fi page reachable on short screens.
+        """
+        from kofi_webview import _VIEW_WIDTH, _VIEW_HEIGHT
+
+        scale = float(scaling_factor) if scaling_factor else 1.0
+        if anchor_bottom_y is None:
+            anchor_bottom_y = self._kofi_anchor()[1]
+        try:
+            work_area = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(work_area), 0):
+                available_height = work_area.bottom - int(anchor_bottom_y)
+                available_width = work_area.right - work_area.left
+                if available_height > 0:
+                    scale = min(scale, available_height / float(_VIEW_HEIGHT))
+                if available_width > 0:
+                    scale = min(scale, available_width / float(_VIEW_WIDTH))
+        except Exception:
+            pass
+        return max(self._KOFI_MIN_SCALE, scale)
+
+    def _kofi_popup_geometry(self):
+        """(width, height, left, top) the Ko-fi popup will occupy, in screen pixels.
+
+        Must match _position_native_window in kofi_webview.py exactly, or the
+        hand-off from this placeholder to the real window is visible as a jump.
+        Tk's own screen coordinates are physical pixels here (verified against
+        GetWindowRect), which is the same space the child positions itself in.
+        """
+        from kofi_webview import _VIEW_WIDTH, _VIEW_HEIGHT
+
+        anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        # While a child is running it keeps the scale it was launched with, so
+        # the expected geometry has to use that too. Recomputing it here would
+        # disagree the moment the main window is dragged, and the hand-off waits
+        # on the two agreeing exactly.
+        scale = getattr(self, "_kofi_active_scale", None)
+        if not scale:
+            scale = self._kofi_scale(anchor_bottom_y)
+        width = int(round(_VIEW_WIDTH * scale))
+        height = int(round(_VIEW_HEIGHT * scale))
+        # Same rounding as the child: `- width // 2` would drift by a pixel.
+        left = int(round(anchor_center_x - width / 2.0))
+        return width, height, left, int(anchor_bottom_y)
+
+    def _show_kofi_placeholder(self):
+        """Put a stand-in window under the button immediately.
+
+        Starting the child costs about a second (process start-up plus WebView2
+        initialisation), which is long enough for the button to feel broken. This
+        Tk window takes single-digit milliseconds and looks identical to the
+        loading state the child shows, so the click always produces a window at
+        once and the real one takes over silently.
+        """
+        from kofi_webview import _PAGE_BG
+
+        width, height, left, top = self._kofi_popup_geometry()
+        placeholder = getattr(self, "_kofi_placeholder", None)
+        try:
+            if placeholder is None or not placeholder.winfo_exists():
+                placeholder = tk.Toplevel(self.root)
+                # Borderless and out of the taskbar, matching the child's
+                # tool-window style; overrideredirect also keeps focus put.
+                placeholder.overrideredirect(True)
+                placeholder.configure(bg=_PAGE_BG)
+                placeholder.transient(self.root)
+                tk.Label(
+                    placeholder,
+                    text="Loading Ko-fi…",
+                    bg=_PAGE_BG,
+                    fg="#8a8a8a",
+                    font=scale_font(("Segoe UI", 11)),
+                ).place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+                # Clicking the placeholder must not dismiss it, the same way
+                # clicking the real popup does not.
+                placeholder.bind("<ButtonPress>", lambda _e: "break")
+                self._kofi_placeholder = placeholder
+                self._own_placeholder_to_main_window(
+                    placeholder, self.get_root_hwnd())
+                self._round_placeholder_corners(placeholder)
+            placeholder.geometry(f"{width}x{height}+{left}+{top}")
+            placeholder.deiconify()
+            placeholder.lift()
+            placeholder.update_idletasks()
+        except Exception as e:
+            logger.debug(f"Failed to show Ko-fi placeholder: {e}")
+
+    @staticmethod
+    def _own_placeholder_to_main_window(placeholder, owner_hwnd):
+        """Make the stand-in an owned window of the main GUI window.
+
+        Tk's transient() does not establish a Win32 owner for an overrideredirect
+        window, so the main window would sit in front of it - and clicking the
+        Ko-fi button is itself what activates and raises the main window, so the
+        stand-in was being covered the instant it appeared. Windows always keeps
+        an owned window above its owner, which is the same mechanism the real
+        popup already uses (see _set_owner in kofi_webview.py).
+        """
+        if not owner_hwnd or sys.platform != "win32":
+            return
+        try:
+            # wm_frame() is the top-level handle and is only valid once realized;
+            # winfo_id() would give the inner Tk window instead.
+            placeholder.update_idletasks()
+            hwnd = int(placeholder.wm_frame(), 16)
+            user32 = ctypes.windll.user32
+            GWLP_HWNDPARENT = -8
+            set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+            set_long(wintypes.HWND(hwnd), GWLP_HWNDPARENT,
+                     wintypes.HWND(int(owner_hwnd)))
+        except Exception as e:
+            # Falling back to the previous behaviour is survivable: the popup
+            # still opens, it just may be covered by the main window.
+            logger.debug(f"Could not own the Ko-fi placeholder to the main window: {e}")
+
+    @staticmethod
+    def _round_placeholder_corners(placeholder):
+        """Round the stand-in's corners to match the real popup.
+
+        Windows 11 rounds ordinary top-level windows itself, which is why the
+        Ko-fi window has rounded corners, but an overrideredirect window has no
+        frame for it to round - so the stand-in came out square and the hand-off
+        changed shape. Asking DWM for rounded corners explicitly fixes that.
+        On Windows 10 the attribute does not exist and the call simply fails,
+        which is correct: nothing is rounded there, including the real popup.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            placeholder.update_idletasks()
+            hwnd = int(placeholder.wm_frame(), 16)
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_ROUND = 2
+            preference = ctypes.c_int(DWMWCP_ROUND)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd), DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(preference), ctypes.sizeof(preference))
+        except Exception as e:
+            logger.debug(f"Could not round the Ko-fi placeholder corners: {e}")
+
+    def _hide_kofi_placeholder(self):
+        """Remove the stand-in, either on hand-off or when the popup is dismissed."""
+        self._cancel_kofi_ready_poll()
+        placeholder = getattr(self, "_kofi_placeholder", None)
+        self._kofi_placeholder = None
+        if placeholder is None:
+            return
+        try:
+            placeholder.destroy()
+        except Exception:
+            pass
+
+    def _reposition_kofi_placeholder(self):
+        placeholder = getattr(self, "_kofi_placeholder", None)
+        if placeholder is None:
+            return
+        try:
+            if not placeholder.winfo_exists():
+                self._kofi_placeholder = None
+                return
+            width, height, left, top = self._kofi_popup_geometry()
+            placeholder.geometry(f"{width}x{height}+{left}+{top}")
+        except Exception:
+            pass
+
+    # The child's window may be a couple of pixels off if Windows clamps it.
+    _KOFI_MATCH_TOLERANCE = 2
+
+    def _kofi_child_window_in_place(self):
+        """True once the child's real window sits exactly where we expect it.
+
+        Matching the expected rectangle rather than just "visible somewhere" is
+        deliberate. The child process owns several top-level windows (WebView2
+        helpers), and pywebview's own window is briefly visible at its default
+        position - on a secondary monitor, at that monitor's scale - before it is
+        moved under the button. Handing over to that would flash a misplaced
+        window, so the geometry has to agree before the placeholder goes away.
+        """
+        process = getattr(self, "_kofi_process", None)
+        if process is None or process.poll() is not None:
+            return False
+        try:
+            expected_w, expected_h, expected_l, expected_t = self._kofi_popup_geometry()
+            user32 = ctypes.windll.user32
+            target_pid = process.pid
+            tolerance = self._KOFI_MATCH_TOLERANCE
+            found = []
+
+            enum_proc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def visit(hwnd, _lparam):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value != target_pid or not user32.IsWindowVisible(hwnd):
+                    return True
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    if (abs(rect.left - expected_l) <= tolerance
+                            and abs(rect.top - expected_t) <= tolerance
+                            and abs((rect.right - rect.left) - expected_w) <= tolerance
+                            and abs((rect.bottom - rect.top) - expected_h) <= tolerance):
+                        found.append(True)
+                return True
+
+            user32.EnumWindows(enum_proc(visit), 0)
+            return bool(found)
+        except Exception:
+            return False
+
+    # Give up waiting for the child after this long and drop the placeholder
+    # rather than leaving it stuck over the app.
+    _KOFI_READY_TIMEOUT_MS = 8000
+
+    def _cancel_kofi_ready_poll(self):
+        poll_id = getattr(self, "_kofi_ready_poll_id", None)
+        self._kofi_ready_poll_id = None
+        if poll_id:
+            try:
+                self.root.after_cancel(poll_id)
+            except Exception:
+                pass
+
+    def _poll_kofi_window_ready(self, deadline=None):
+        """Swap the placeholder out as soon as the real window is on screen."""
+        self._kofi_ready_poll_id = None
+        if getattr(self, "_kofi_placeholder", None) is None:
+            return
+        if deadline is None:
+            deadline = time.time() + self._KOFI_READY_TIMEOUT_MS / 1000.0
+        if self._kofi_child_window_in_place():
+            self._kofi_window_ready = True
+            self._hide_kofi_placeholder()
+            return
+        if time.time() >= deadline:
+            logger.debug("Ko-fi child window did not appear before the timeout.")
+            self._hide_kofi_placeholder()
+            return
+        try:
+            self._kofi_ready_poll_id = self.root.after(
+                50, lambda: self._poll_kofi_window_ready(deadline))
+        except Exception:
+            self._kofi_ready_poll_id = None
+
+    def _prewarm_kofi_window(self):
+        """Start the Ko-fi child while the pointer rests on the button.
+
+        The window is created parked off-screen and the page loads straight away,
+        so the click that usually follows only has to move it on-screen. Most of
+        the open cost is process start-up plus the page load, and hovering buys
+        enough time to absorb it. No-op when a child is already running, so a
+        user who never touches the button never pays for this.
+        """
+        process = getattr(self, "_kofi_process", None)
+        if process is not None and process.poll() is None:
+            return
+        self._spawn_kofi_window(prewarm=True)
+
+    def _spawn_kofi_window(self, prewarm=False):
+        """Launch the Ko-fi child process for the first time and show it.
+
+        With prewarm=True the child is started but left parked off-screen; the
+        window only appears when a later `show` command arrives.
+        """
         self._close_kofi_window()
+        if not prewarm:
+            # Put something under the button before doing any of the slow work,
+            # so the click always produces a window immediately.
+            self._begin_kofi_placeholder_handoff()
         try:
             import subprocess
             anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+            # Size the popup on the app's own scaling rule, and zoom the page by
+            # the same amount so the content scales with the window instead of
+            # just being cropped differently. physical px = design px * zoom * DPI,
+            # so zoom = scale / dpi_ratio makes design px land on `scale` px.
+            scale = self._kofi_scale(anchor_bottom_y)
+            zoom = scale / (self._kofi_root_dpi_ratio() or 1.0)
+            # Pin it for this child's lifetime; see _kofi_popup_geometry.
+            self._kofi_active_scale = scale
             position_args = [
                 "--anchor-center-x", str(anchor_center_x),
                 "--anchor-bottom-y", str(anchor_bottom_y),
+                "--scale", f"{scale:.6f}",
+                "--zoom", f"{zoom:.6f}",
             ]
+            if prewarm:
+                position_args.append("--prewarm")
             # Own the popup to the main window so Windows always keeps it above
             # the main window (a background child process cannot otherwise raise
             # itself above the foreground app via SetWindowPos).
@@ -4405,12 +4733,20 @@ class ControllerWindow:
             self._kofi_process = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, creationflags=flags
             )
+            self._poll_kofi_process()
+            if prewarm:
+                # Nothing is on screen yet, so there is no popup to dismiss.
+                # Reuse the idle timer so a hover that never becomes a click
+                # still releases the child.
+                self._kofi_visible = False
+                self._schedule_kofi_idle_close()
+                return
             self._kofi_visible = True
             self._kofi_shown_at = time.time()
             self._bind_kofi_outside_click()
-            self._poll_kofi_process()
         except Exception as e:
             self._close_kofi_window()
+            self._hide_kofi_placeholder()
             logger.error(f"Failed to open Ko-fi webview window, falling back to browser: {e}")
             try:
                 webbrowser.open("https://ko-fi.com/tagayama")
@@ -4433,6 +4769,9 @@ class ControllerWindow:
     def _show_kofi_window(self):
         """Reveal the already-loaded Ko-fi window under the button (no reload)."""
         anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        # A pre-warmed child that has not finished starting cannot show anything
+        # yet, so cover the gap exactly as a cold open does.
+        self._begin_kofi_placeholder_handoff()
         if self._send_kofi_command(f"show {anchor_center_x} {anchor_bottom_y}"):
             self._kofi_visible = True
             self._kofi_shown_at = time.time()
@@ -4445,6 +4784,7 @@ class ControllerWindow:
     def _hide_kofi_window(self):
         """Hide the Ko-fi window but keep the process alive for the next open."""
         self._send_kofi_command("hide")
+        self._hide_kofi_placeholder()
         self._kofi_visible = False
         # After staying hidden a while, fully close the child to free its
         # resources; the next open re-spawns (and reloads) it.
@@ -4476,6 +4816,7 @@ class ControllerWindow:
         if not getattr(self, "_kofi_visible", False):
             return
         anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        self._reposition_kofi_placeholder()
         self._send_kofi_command(f"move {anchor_center_x} {anchor_bottom_y}")
 
     def _close_kofi_window(self):
@@ -4483,6 +4824,11 @@ class ControllerWindow:
         process = getattr(self, "_kofi_process", None)
         self._kofi_process = None
         self._kofi_visible = False
+        # The next open starts a new child, so its window is not ready any more
+        # and will be sized for wherever the button is by then.
+        self._kofi_window_ready = False
+        self._kofi_active_scale = None
+        self._hide_kofi_placeholder()
         self._cancel_kofi_idle_close()
         if process is not None and process.poll() is None:
             try:
@@ -5235,6 +5581,10 @@ class ControllerWindow:
             # Centered horizontally; vertically centered on the header text.
             self.kofi_button.place(relx=0.5, y=int(12 * scaling_factor), anchor=tk.CENTER)
             self.kofi_button.bind("<Button-1>", lambda e: self._open_kofi_window())
+            # Start the popup process on hover so the click that follows is
+            # near-instant. add="+" because the tooltip helper also binds <Enter>.
+            self.kofi_button.bind(
+                "<Enter>", lambda e: self._prewarm_kofi_window(), add="+")
         except Exception as e:
             logger.error(f"Failed to load/scale Ko-fi button image: {e}")
 
@@ -12981,10 +13331,8 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 
 if __name__ == "__main__":
-    if "--show-kofi" in sys.argv:
-        from kofi_webview import main as _kofi_main
-        _kofi_main(sys.argv[1:])
-        sys.exit(0)
+    # NOTE: --show-kofi is dispatched at the top of this file, before the heavy
+    # imports, so the popup child never loads the controller stack.
 
     if "--dualsense-server" in sys.argv:
         idx = sys.argv.index("--dualsense-server")
