@@ -59,12 +59,104 @@ if (-not $CertPath -or -not (Test-Path $CertPath)) {
     Exit 1
 }
 
+# cfgmgr32 is the API pnputil itself calls. It has been stable since Windows 2000
+# and needs no elevation, unlike pnputil's /enum-devices options, whose command
+# surface varies by Windows release. It is the primary enumeration source here.
+$script:CfgMgrReady = $null
+
+function Initialize-CfgMgr {
+    if ($null -ne $script:CfgMgrReady) { return $script:CfgMgrReady }
+    try {
+        if (-not ("Switch2.CfgMgrInstall" -as [type])) {
+            Add-Type -Namespace Switch2 -Name CfgMgrInstall -MemberDefinition @'
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Get_Device_ID_List_SizeW(out int pulLen, string pszFilter, int ulFlags);
+
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Get_Device_ID_ListW(string pszFilter, [Out] char[] Buffer, int BufferLen, int ulFlags);
+
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, int ulFlags);
+'@ -ErrorAction Stop
+        }
+        $script:CfgMgrReady = $true
+    }
+    catch {
+        Write-Host "cfgmgr32 unavailable ($($_.Exception.Message)); falling back to pnputil." -ForegroundColor Yellow
+        $script:CfgMgrReady = $false
+    }
+    return $script:CfgMgrReady
+}
+
+function Get-CfgMgrWinUHidInstances {
+    # Returns $null when the query could not be answered, @() when there are none.
+    if (-not (Initialize-CfgMgr)) { return $null }
+    try {
+        $len = 0
+        if ([Switch2.CfgMgrInstall]::CM_Get_Device_ID_List_SizeW([ref]$len, "ROOT", 1) -ne 0) { return $null }
+        if ($len -le 0) { return @() }
+        $buffer = New-Object char[] $len
+        if ([Switch2.CfgMgrInstall]::CM_Get_Device_ID_ListW("ROOT", $buffer, $len, 1) -ne 0) { return $null }
+        return @((-join $buffer).Split([char]0) | Where-Object { $_ } |
+            Where-Object { $_.ToUpperInvariant().StartsWith("ROOT\WINUHID\") } |
+            ForEach-Object { $_.ToUpperInvariant() } | Select-Object -Unique)
+    }
+    catch { return $null }
+}
+
+function Test-CfgMgrPresent {
+    # A phantom node cannot be located at all, so locating it is exactly
+    # equivalent to DEVPKEY_Device_IsPresent being TRUE.
+    param([Parameter(Mandatory = $true)][string]$InstanceId)
+    if (-not (Initialize-CfgMgr)) { return $null }
+    try {
+        $devinst = [uint32]0
+        return ([Switch2.CfgMgrInstall]::CM_Locate_DevNodeW([ref]$devinst, $InstanceId, 0) -eq 0)
+    }
+    catch { return $null }
+}
+
+# `/enum-devices` only gained `/properties` in Windows 11 21H2; older pnputil exits
+# with code 1 and prints usage, so every enumeration here degrades to the plain form.
+$script:PnpUtilRichEnum = $null   # $null unknown / $true supported / $false not
+
+function Invoke-PnpUtilEnum {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$BaseArguments,
+        [string[]]$RichOptions = @("/properties")
+    )
+    $attempts = @()
+    if ($RichOptions.Count -gt 0 -and $script:PnpUtilRichEnum -ne $false) {
+        $attempts += ,($BaseArguments + $RichOptions)
+    }
+    $attempts += ,$BaseArguments
+    foreach ($attempt in $attempts) {
+        $output = & pnputil @attempt 2>&1
+        $code = $LASTEXITCODE
+        if ($code -eq 0 -or $code -eq 259) {
+            if ($attempt.Count -gt $BaseArguments.Count) { $script:PnpUtilRichEnum = $true }
+            return @($output)
+        }
+        if ($attempt.Count -gt $BaseArguments.Count) {
+            $script:PnpUtilRichEnum = $false
+            Write-Host "pnputil does not support $($RichOptions -join ' ') (exit $code); retrying plain enumeration." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "pnputil $($BaseArguments -join ' ') failed with exit code $code; assuming no matching devices." -ForegroundColor Yellow
+        }
+    }
+    return @()
+}
+
 # 1. Clean up existing WinUHid devices
 Write-Host "Removing existing WinUHid device nodes..." -ForegroundColor Yellow
-$deviceOutput = pnputil /enum-devices /deviceid "Root\WinUHid" /properties 2>&1
-$deviceInstances = @($deviceOutput | Select-String -AllMatches -Pattern 'ROOT\\WINUHID\\[^\s]+' | ForEach-Object {
-    $_.Matches | ForEach-Object { $_.Value.Trim().ToUpperInvariant() }
-} | Select-Object -Unique)
+$deviceInstances = Get-CfgMgrWinUHidInstances
+if ($null -eq $deviceInstances) {
+    $deviceOutput = Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/deviceid", "Root\WinUHid")
+    $deviceInstances = @($deviceOutput | Select-String -AllMatches -Pattern 'ROOT\\WINUHID\\[^\s]+' | ForEach-Object {
+        $_.Matches | ForEach-Object { $_.Value.Trim().ToUpperInvariant() }
+    } | Select-Object -Unique)
+}
 foreach ($instance in $deviceInstances) {
     pnputil /remove-device $instance /force
     if ($LASTEXITCODE -ne 0) {
@@ -72,7 +164,7 @@ foreach ($instance in $deviceInstances) {
     }
 }
 if ($deviceInstances.Count -gt 0) {
-    $remainingOutput = pnputil /enum-devices /deviceid "Root\WinUHid" /properties 2>&1
+    $remainingOutput = Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/deviceid", "Root\WinUHid")
     if (($remainingOutput -join "`n") -match '(?i)ROOT\\WINUHID\\') {
         pnputil /remove-device /deviceid "Root\WinUHid" /force
         if ($LASTEXITCODE -ne 0) {
@@ -258,13 +350,52 @@ Write-Host "Starting WUDFRd service if needed..." -ForegroundColor Cyan
 sc.exe start WUDFRd
 
 # 7. Verify every layer used by the application health check.
-$verifyDevices = pnputil /enum-devices /deviceid "Root\WinUHid" /properties 2>&1
-$devicePresent = (($verifyDevices -join "`n") -match '(?is)ROOT\\WINUHID\\[^\s]+.*DEVPKEY_Device_IsPresent[^\r\n]*[\r\n]+\s*TRUE')
+$deviceLayerVerified = $true
+$verifyInstances = Get-CfgMgrWinUHidInstances
+if ($null -ne $verifyInstances) {
+    $devicePresent = @($verifyInstances | Where-Object { (Test-CfgMgrPresent -InstanceId $_) -eq $true }).Count -gt 0
+}
+else {
+    $verifyDevices = Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/deviceid", "Root\WinUHid")
+    $verifyText = ($verifyDevices -join "`n")
+    if ($verifyText -match 'DEVPKEY_Device_IsPresent') {
+        $devicePresent = ($verifyText -match '(?is)ROOT\\WINUHID\\[^\s]+.*DEVPKEY_Device_IsPresent[^\r\n]*[\r\n]+\s*TRUE')
+    }
+    else {
+        # Plain listing has no DEVPKEY properties, so the DEVPKEY regex could never
+        # match and a perfectly good install would report as failed. `/connected`
+        # answers the same question and pre-dates /properties, but it cannot be
+        # combined with /deviceid (pnputil exits 87), so filter the full listing.
+        $connected = Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/connected") -RichOptions @()
+        if ($null -eq $connected) {
+            $deviceLayerVerified = $false
+            $devicePresent = $false
+        }
+        else {
+            $devicePresent = (($connected -join "`n") -match '(?i)ROOT\\WINUHID\\')
+        }
+    }
+}
 $verifyDrivers = pnputil /enum-drivers 2>&1
 $packagePresent = (($verifyDrivers -join "`n") -match '(?i)winuhiddriver\.inf')
+if (-not $packagePresent) {
+    # /enum-drivers needs elevation and can fail; the driver database answers the
+    # same question from the registry.
+    $dbRoot = "HKLM:\SYSTEM\DriverDatabase\DriverPackages"
+    if (Test-Path -LiteralPath $dbRoot) {
+        $packagePresent = @(Get-ChildItem -LiteralPath $dbRoot -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -like "winuhiddriver.inf_*" }).Count -gt 0
+    }
+}
 $serviceKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\WinUHidDriver"
 $registryPresent = Test-Path $serviceKey
-if (-not $devicePresent -or -not $packagePresent -or -not $registryPresent) {
+if (-not $deviceLayerVerified -and $packagePresent -and $registryPresent) {
+    # Every layer we can still read says the install succeeded, and only the device
+    # query was unanswerable. Failing here would report a working driver as broken;
+    # the app's own runtime smoke test makes the final call.
+    Write-Host "Driver installed; device enumeration unavailable so the device layer was not verified." -ForegroundColor Yellow
+}
+elseif (-not $devicePresent -or -not $packagePresent -or -not $registryPresent) {
     Write-Host "Driver verification failed: devicePresent=$devicePresent packagePresent=$packagePresent registryPresent=$registryPresent" -ForegroundColor Red
     Exit 1
 }

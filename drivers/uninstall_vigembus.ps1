@@ -28,11 +28,156 @@ function Invoke-PnpUtil {
     return @($output)
 }
 
+# cfgmgr32 is the API pnputil itself calls. It has been stable since Windows 2000
+# and needs no elevation, unlike pnputil's /enum-devices options, whose command
+# surface varies by Windows release. It is the primary enumeration source here.
+$script:CfgMgrReady = $null
+
+function Initialize-CfgMgr {
+    if ($null -ne $script:CfgMgrReady) { return $script:CfgMgrReady }
+    try {
+        if (-not ("Switch2.CfgMgrViGEm" -as [type])) {
+            Add-Type -Namespace Switch2 -Name CfgMgrViGEm -MemberDefinition @'
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Get_Device_ID_List_SizeW(out int pulLen, string pszFilter, int ulFlags);
+
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Get_Device_ID_ListW(string pszFilter, [Out] char[] Buffer, int BufferLen, int ulFlags);
+
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, int ulFlags);
+
+[DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+public static extern int CM_Get_DevNode_Registry_PropertyW(uint dnDevInst, int ulProperty, out int pulRegDataType, byte[] Buffer, ref int pulLength, int ulFlags);
+'@ -ErrorAction Stop
+        }
+        $script:CfgMgrReady = $true
+    }
+    catch {
+        Write-CleanupLog "cfgmgr32 unavailable ($($_.Exception.Message)); falling back to pnputil."
+        $script:CfgMgrReady = $false
+    }
+    return $script:CfgMgrReady
+}
+
+function Get-CfgMgrIdList {
+    # Flags: 1 = filter by enumerator, 2 = filter by driver service.
+    # Returns $null when the query could not be answered, @() when there are none.
+    param(
+        [Parameter(Mandatory = $true)][string]$Filter,
+        [Parameter(Mandatory = $true)][int]$Flags
+    )
+    if (-not (Initialize-CfgMgr)) { return $null }
+    try {
+        $len = 0
+        if ([Switch2.CfgMgrViGEm]::CM_Get_Device_ID_List_SizeW([ref]$len, $Filter, $Flags) -ne 0) { return $null }
+        if ($len -le 0) { return @() }
+        $buffer = New-Object char[] $len
+        if ([Switch2.CfgMgrViGEm]::CM_Get_Device_ID_ListW($Filter, $buffer, $len, $Flags) -ne 0) { return $null }
+        return @((-join $buffer).Split([char]0) | Where-Object { $_ } |
+            ForEach-Object { $_.ToUpperInvariant() } | Select-Object -Unique)
+    }
+    catch { return $null }
+}
+
+function Get-CfgMgrHardwareIds {
+    # Empty for phantom nodes, which carry no properties at all.
+    param([Parameter(Mandatory = $true)][string]$InstanceId)
+    if (-not (Initialize-CfgMgr)) { return @() }
+    try {
+        $devinst = [uint32]0
+        if ([Switch2.CfgMgrViGEm]::CM_Locate_DevNodeW([ref]$devinst, $InstanceId, 0) -ne 0) { return @() }
+        $len = 0
+        $kind = 0
+        # CM_DRP_HARDWAREID is 2; this property length is reported in bytes.
+        [Switch2.CfgMgrViGEm]::CM_Get_DevNode_Registry_PropertyW($devinst, 2, [ref]$kind, $null, [ref]$len, 0) | Out-Null
+        if ($len -le 0) { return @() }
+        $bytes = New-Object byte[] $len
+        if ([Switch2.CfgMgrViGEm]::CM_Get_DevNode_Registry_PropertyW($devinst, 2, [ref]$kind, $bytes, [ref]$len, 0) -ne 0) { return @() }
+        return @([Text.Encoding]::Unicode.GetString($bytes, 0, $len).Split([char]0) |
+            Where-Object { $_ } | ForEach-Object { $_.ToUpperInvariant() })
+    }
+    catch { return @() }
+}
+
+function Get-CfgMgrViGEmInstances {
+    # ViGEmBus's instance id is ROOT\SYSTEM\NNNN and contains no trace of
+    # "ViGEmBus"; matching that pattern would also catch SWENUM and HidHide nodes.
+    # Only the hardware id identifies it, plus the service's own bound list.
+    $bound = Get-CfgMgrIdList -Filter "ViGEmBus" -Flags 2
+    $rootIds = Get-CfgMgrIdList -Filter "ROOT" -Flags 1
+    if ($null -eq $bound -and $null -eq $rootIds) { return $null }
+    $wanted = @("ROOT\VIGEMBUS", "NEFARIUS\VIGEMBUS\GEN1")
+    $matched = @()
+    foreach ($id in @($rootIds)) {
+        if (-not $id) { continue }
+        $hwids = @(Get-CfgMgrHardwareIds -InstanceId $id)
+        if (@($hwids | Where-Object { $wanted -contains $_ }).Count -gt 0) { $matched += $id }
+    }
+    $matched += @($bound)
+    return @($matched | Where-Object { $_ } | Select-Object -Unique)
+}
+
+# `/enum-devices` only gained `/properties` in Windows 11 21H2; older pnputil exits
+# with code 1 and prints usage. Enumeration must degrade instead of throwing, or the
+# whole uninstall dies before it removes anything.
+$script:PnpUtilRichEnum = $null   # $null unknown / $true supported / $false not
+
+function Invoke-PnpUtilEnum {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$BaseArguments,
+        [string[]]$RichOptions = @("/properties")
+    )
+    $attempts = @()
+    if ($RichOptions.Count -gt 0 -and $script:PnpUtilRichEnum -ne $false) {
+        $attempts += ,($BaseArguments + $RichOptions)
+    }
+    $attempts += ,$BaseArguments
+    foreach ($attempt in $attempts) {
+        $output = & pnputil @attempt 2>&1
+        $code = $LASTEXITCODE
+        if ($code -eq 0 -or $code -eq 259) {
+            if ($attempt.Count -gt $BaseArguments.Count) { $script:PnpUtilRichEnum = $true }
+            return @($output)
+        }
+        if ($attempt.Count -gt $BaseArguments.Count) {
+            $script:PnpUtilRichEnum = $false
+            Write-CleanupLog "pnputil does not support $($RichOptions -join ' ') (exit $code); retrying plain enumeration."
+        }
+        else {
+            Write-CleanupLog "pnputil $($BaseArguments -join ' ') failed with exit code $code; assuming no matching devices."
+        }
+    }
+    return @()
+}
+
 function Get-ViGEmDeviceInstances {
     param([switch]$PresentOnly)
+    # Hardware-id matching only ever finds present nodes (phantoms carry no
+    # properties), which is exactly the -PresentOnly question; phantom leftovers
+    # are handled by the blind /remove-device /deviceid pass instead.
+    $viaCfgMgr = Get-CfgMgrViGEmInstances
+    if ($null -ne $viaCfgMgr) { return $viaCfgMgr }
     $instances = @()
     foreach ($deviceId in @("Root\ViGEmBus", "Nefarius\ViGEmBus\Gen1")) {
-        $output = Invoke-PnpUtil -Arguments @("/enum-devices", "/deviceid", $deviceId, "/properties") -AllowedExitCodes @(0, 259) -LogOutput $false
+        $output = Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/deviceid", $deviceId)
+        if (-not ($output | Select-String -Quiet -Pattern 'DEVPKEY_Device_IsPresent')) {
+            # Plain listing carries no IsPresent property. `/connected` cannot be
+            # combined with /deviceid (pnputil exits 87), and ROOT\SYSTEM\NNNN also
+            # matches unrelated devices, so intersect with this device id's own nodes.
+            $found = @($output | Select-String -AllMatches -Pattern 'ROOT\\(?:SYSTEM|VIGEMBUS)\\\d+' | ForEach-Object {
+                $_.Matches | ForEach-Object { $_.Value.Trim().ToUpperInvariant() }
+            })
+            if ($PresentOnly) {
+                $connected = @(Invoke-PnpUtilEnum -BaseArguments @("/enum-devices", "/connected") -RichOptions @() |
+                    Select-String -AllMatches -Pattern 'ROOT\\(?:SYSTEM|VIGEMBUS)\\\d+' | ForEach-Object {
+                        $_.Matches | ForEach-Object { $_.Value.Trim().ToUpperInvariant() }
+                    })
+                $found = @($found | Where-Object { $connected -contains $_ })
+            }
+            $instances += $found
+            continue
+        }
         $current = $null
         $awaitingPresence = $false
         foreach ($lineObject in $output) {
@@ -62,8 +207,29 @@ function Get-ViGEmDeviceInstances {
     return @($instances | Select-Object -Unique)
 }
 
+function Get-DriverDatabasePackages {
+    param([Parameter(Mandatory = $true)][string]$OriginalInf)
+    # Same answer as /enum-drivers, but readable even when that call fails. Each
+    # subkey is "<original>.inf_<arch>_<hash>" with the oemNN.inf as default value.
+    $root = "HKLM:\SYSTEM\DriverDatabase\DriverPackages"
+    if (-not (Test-Path -LiteralPath $root)) { return @() }
+    try { $keys = Get-ChildItem -LiteralPath $root -ErrorAction Stop }
+    catch { return @() }
+    return @($keys | Where-Object { $_.PSChildName -like "$OriginalInf`_*" } | ForEach-Object {
+        $value = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).'(default)'
+        if ("$value" -match '(?i)\b(oem\d+\.inf)\b') { $Matches[1].ToLowerInvariant() }
+    } | Where-Object { $_ } | Select-Object -Unique)
+}
+
 function Get-ViGEmDriverPackages {
-    $lines = Invoke-PnpUtil -Arguments @("/enum-drivers") -LogOutput $false
+    $lines = @()
+    try {
+        $lines = Invoke-PnpUtil -Arguments @("/enum-drivers") -LogOutput $false
+    }
+    catch {
+        Write-CleanupLog "pnputil /enum-drivers failed; falling back to the driver database. $($_.Exception.Message)"
+        return @(Get-DriverDatabasePackages -OriginalInf "vigembus.inf")
+    }
     $packages = @()
     $publishedInf = $null
     foreach ($lineObject in $lines) {

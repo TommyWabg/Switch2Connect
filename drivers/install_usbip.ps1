@@ -22,12 +22,31 @@ if ($Process.ExitCode -ne 0) {
     Write-Host "Warning: Installer returned exit code $($Process.ExitCode)" -ForegroundColor Yellow
 }
 
-# Verify installation
+# Verify installation. usbip.exe alone is not proof the driver landed - the
+# Driver Store package and the services are what actually make USBIP work.
 $UsbIpExe = "C:\Program Files\USBip\usbip.exe"
-if (Test-Path $UsbIpExe) {
+$FilesPresent = Test-Path $UsbIpExe
+
+$ServicesPresent = @(@('usbip2_ude', 'usbip2_filter') | Where-Object {
+    Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$_"
+}).Count -gt 0
+
+$PackagePresent = $false
+$dbRoot = "HKLM:\SYSTEM\DriverDatabase\DriverPackages"
+if (Test-Path -LiteralPath $dbRoot) {
+    $PackagePresent = @(Get-ChildItem -LiteralPath $dbRoot -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -like "usbip2_ude.inf_*" -or $_.PSChildName -like "usbip2_filter.inf_*" }).Count -gt 0
+}
+
+if ($FilesPresent -and $ServicesPresent -and $PackagePresent) {
     Write-Host "USBIP-win2 installed successfully!" -ForegroundColor Green
     Exit 0
-} else {
-    Write-Host "Error: Installation completed but usbip.exe was not found." -ForegroundColor Red
-    Exit 1
 }
+if ($FilesPresent -and ($ServicesPresent -or $PackagePresent)) {
+    # Some layers are still settling (the installer restarts USB hubs); the app's
+    # own status check makes the final call rather than failing outright here.
+    Write-Host "USBIP-win2 installed; driver layers still settling (services=$ServicesPresent package=$PackagePresent)." -ForegroundColor Yellow
+    Exit 0
+}
+Write-Host "Error: installation incomplete. files=$FilesPresent services=$ServicesPresent package=$PackagePresent" -ForegroundColor Red
+Exit 1
