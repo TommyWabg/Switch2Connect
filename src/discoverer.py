@@ -1403,6 +1403,7 @@ async def run_usb_hid_discovery(quit_event):
     known: dict = {}          # device key -> USBHidController
     connecting: set = set()
     removing: set = set()
+    arrival_retry_tasks: dict = {}
     # Every physical HID instance we've added to the HidHide blacklist. Entries persist
     # across unplug/replug so a reconnecting controller stays hidden the instant it
     # reappears (never briefly visible to third-party software). Cleared only on teardown.
@@ -1424,9 +1425,59 @@ async def run_usb_hid_discovery(quit_event):
         read_thread = getattr(client, "_read_thread", None)
         if read_thread is not None and not read_thread.is_alive():
             return True
+        # Second line of defence for a silently stalled pad. The client has its own
+        # staleness watchdog; this only catches the case where that failed to fire,
+        # so the window is a generous multiple of the client's timeout and never
+        # races an in-progress recovery.
+        io_pause = getattr(client, "_io_pause", None)
+        if io_pause is not None and io_pause.is_set():
+            return False
+        last_input = getattr(client, "_last_input_time", 0.0)
+        stall_timeout = getattr(client, "_STALL_TIMEOUT", 2.0)
+        if last_input > 0 and time.perf_counter() - last_input > stall_timeout * 4:
+            return True
         return False
 
-    async def _remove(controller, key):
+    def _cancel_arrival_retry(path):
+        if not path:
+            return
+        task = arrival_retry_tasks.pop(str(path).lower(), None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_arrival_retries(path):
+        if not path:
+            return
+        retry_key = str(path).lower()
+        existing = arrival_retry_tasks.get(retry_key)
+        if existing is not None and not existing.done():
+            return
+
+        async def _retry():
+            # Absolute targets: 0.25s, 0.75s, 1.5s and 3s after scheduling.
+            previous = 0.0
+            try:
+                for attempt, target in enumerate((0.25, 0.75, 1.5, 3.0), start=1):
+                    await asyncio.sleep(target - previous)
+                    previous = target
+                    if (quit_event.is_set() or
+                            not getattr(CONFIG, "wired_auto_scan_enabled",
+                                        getattr(CONFIG, "wired_usb_enabled", True))):
+                        return
+                    logger.debug("Wired HID arrival retry %d/4 for %s", attempt, path)
+                    request_wired_rescan(
+                        f"device_arrival_retry_{attempt}",
+                        candidate_path=path,
+                    )
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if arrival_retry_tasks.get(retry_key) is asyncio.current_task():
+                    arrival_retry_tasks.pop(retry_key, None)
+
+        arrival_retry_tasks[retry_key] = asyncio.create_task(_retry())
+
+    async def _remove(controller, key, request_rescan=False):
         if key in removing:
             return
         removing.add(key)
@@ -1459,6 +1510,16 @@ async def run_usb_hid_discovery(quit_event):
         # instead of it being briefly visible until the watcher re-hides it. The blacklist
         # entry is cleaned up on app teardown (see the finally block below).
 
+        # A transport that died while the cable stayed plugged in produces no
+        # WM_DEVICECHANGE, so nothing else would ever ask for a rescan and the pad
+        # would stay gone until the app restarts. Ask once, and reuse the bounded
+        # arrival retries for the case where the pad is still re-enumerating.
+        # Deliberately not a periodic scan: repeated enumeration is known to wedge
+        # HID on some low-end systems.
+        if request_rescan and not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+            request_wired_rescan("transport_recovery", candidate_path=key)
+            _schedule_arrival_retries(key)
+
     async def _add(entry, key):
         controller = None
         instance_id = None
@@ -1476,7 +1537,10 @@ async def run_usb_hid_discovery(quit_event):
             controller._hidhide_instance_id = instance_id
 
             async def _on_disc(c, _k=key):
-                await _remove(c, _k)
+                # This fires when the transport itself died (read error or a
+                # silent stall), not on a user-initiated removal, so ask for the
+                # one-shot rescan that lets the pad come back on its own.
+                await _remove(c, _k, request_rescan=True)
             controller.disconnected_callback = _on_disc
 
             await controller.initialize()
@@ -1526,10 +1590,13 @@ async def run_usb_hid_discovery(quit_event):
                 try:
                     await asyncio.wait_for(WIRED_RESCAN_EVENT.wait(), timeout=0.5)
                 except asyncio.TimeoutError:
+                    if not getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
+                        for retry_path in list(arrival_retry_tasks):
+                            _cancel_arrival_retry(retry_path)
                     for key, controller in list(known.items()):
                         if _controller_transport_dead(controller):
                             logger.info("Wired USB controller transport ended; removing stale controller (%s)", getattr(controller.device, "address", key))
-                            await _remove(controller, key)
+                            await _remove(controller, key, request_rescan=True)
                     continue
                 WIRED_RESCAN_EVENT.clear()
                 await asyncio.sleep(0.5)
@@ -1546,17 +1613,37 @@ async def run_usb_hid_discovery(quit_event):
                     continue
                 reason = "+".join(sorted({str(reason) for reason, _path, _manual in requests}))
                 candidate_path = next((path for _reason, path, _manual in reversed(requests) if path), None)
+                if removal_requested:
+                    _cancel_arrival_retry(candidate_path)
+
+                if hidhide.is_available():
+                    visible = await asyncio.to_thread(hidhide.prepare_self_visibility)
+                    logger.debug(
+                        "HidHide self-visibility prepared=%s before wired scan (%s)",
+                        visible,
+                        reason,
+                    )
+                    if not visible:
+                        logger.warning(
+                            "HidHide application-list configuration could not be verified; "
+                            "the wired controller may not be visible to this process."
+                        )
                 chosen = {}
                 entries = await asyncio.to_thread(
                     enumerate_pro_controller2,
                     reason,
-                    candidate_path,
+                    None,
                     False,
                 )
                 for entry in entries:
                     key = _device_key(entry)
                     if key and key not in chosen:
                         chosen[key] = entry
+                if chosen:
+                    _cancel_arrival_retry(candidate_path)
+                elif (candidate_path and "device_arrival" in reason
+                      and "device_arrival_retry" not in reason):
+                    _schedule_arrival_retries(candidate_path)
                 for key, entry in chosen.items():
                     if key in known or key in connecting:
                         continue
@@ -1572,6 +1659,9 @@ async def run_usb_hid_discovery(quit_event):
                 logger.exception("Wired USB discovery scan error")
     finally:
         WIRED_RESCAN_EVENT = None
+        for retry_task in list(arrival_retry_tasks.values()):
+            retry_task.cancel()
+        arrival_retry_tasks.clear()
         # Unhide everything we ever hid — including instances whose controllers were already
         # unplugged (and thus dropped from `known`) — so no device is left invisible to the
         # system after teardown.

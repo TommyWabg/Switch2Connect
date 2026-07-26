@@ -103,10 +103,55 @@ def _open_control():
     return handle
 
 
+def service_state():
+    """Registration state of the HidHide kernel service.
+
+    True  - registered and not pending deletion.
+    False - definitely not registered (or deletion is pending).
+    None  - could not be determined, e.g. the key exists but is not readable.
+
+    The None case matters: PermissionError is an OSError, so folding it into
+    False would report a perfectly good installation as missing and let the GUI
+    persist that wrong answer into config.yaml.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services\HidHide",
+            0,
+            winreg.KEY_READ,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        try:
+            delete_pending, _ = winreg.QueryValueEx(key, "DeleteFlag")
+        except FileNotFoundError:
+            delete_pending = 0
+        except OSError:
+            return None
+    finally:
+        winreg.CloseKey(key)
+    return not bool(delete_pending)
+
+
 def is_available() -> bool:
-    """True if the HidHide driver is installed."""
-    import os
-    return os.path.exists(r"C:\Windows\System32\drivers\HidHide.sys")
+    """True when the HidHide kernel service is registered.
+
+    The .sys file can remain on disk until reboot after a successful uninstall,
+    and using only that file as the installation signal makes the GUI continue
+    to display HidHide as installed.  The service registration is the component
+    Windows uses to load the driver and is removed as part of uninstallation.
+
+    An undeterminable state reads as False here to preserve the existing
+    contract; callers that must distinguish it use service_state() directly.
+    """
+    return service_state() is True
 
 
 def _ioctl_get_multisz(handle, code) -> list[str]:
@@ -250,9 +295,22 @@ def _self_image_path() -> str | None:
 
 
 def whitelist_self() -> bool:
-    """Add this process's image to the HidHide application whitelist so it keeps access
-    to hidden devices. Preserves any existing whitelist entries.
-    If Inverse Cloak is ON, the user prefers manual management, so we do NOT add ourselves."""
+    """Configure the application list so this process can access hidden devices.
+
+    Normal Cloak adds the process; Reverse/Inverse Cloak removes it because the
+    application-list meaning is inverted. Other entries are preserved.
+    """
+    return prepare_self_visibility()
+
+
+def prepare_self_visibility() -> bool:
+    """Ensure this process can see HidHide-cloaked devices in either cloak mode.
+
+    In normal cloak mode the application list is an allow-list, so this process
+    must be present. In Reverse/Inverse Cloak mode the list meaning is inverted,
+    so a path previously added in normal mode must be removed. Other application
+    entries and the user's selected cloak mode are preserved.
+    """
     handle = _open_control()
     if handle is None:
         return False
@@ -260,18 +318,22 @@ def whitelist_self() -> bool:
         dos = _self_image_path()
         if not dos:
             return False
-            
+
+        current = _ioctl_get_multisz(handle, IOCTL_GET_WHITELIST)
         is_inverse_mode = _is_inverse(handle)
         if is_inverse_mode:
-            # User wants to manually manage Inverse Cloak mode. Do not add ourselves.
-            return True
-            
-        current = _ioctl_get_multisz(handle, IOCTL_GET_WHITELIST)
-        if any(e.lower() == dos.lower() for e in current):
-            return True
-            
-        current.append(dos)
-        return _ioctl_set_multisz(handle, IOCTL_SET_WHITELIST, current)
+            desired = [entry for entry in current if entry.lower() != dos.lower()]
+            if desired != current and not _ioctl_set_multisz(handle, IOCTL_SET_WHITELIST, desired):
+                return False
+            verified = _ioctl_get_multisz(handle, IOCTL_GET_WHITELIST)
+            return not any(entry.lower() == dos.lower() for entry in verified)
+
+        if not any(entry.lower() == dos.lower() for entry in current):
+            current.append(dos)
+            if not _ioctl_set_multisz(handle, IOCTL_SET_WHITELIST, current):
+                return False
+        verified = _ioctl_get_multisz(handle, IOCTL_GET_WHITELIST)
+        return any(entry.lower() == dos.lower() for entry in verified)
     finally:
         _k32.CloseHandle(handle)
 

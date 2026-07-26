@@ -725,6 +725,10 @@ class Config:
         # automatic wired discovery, not whether manual wired support exists.
         self.wired_usb_enabled = self.wired_auto_scan_enabled
         self.hidhide_installed = config.get("hidhide_installed", False)
+        # Suppresses only the automatic HidHide installation prompt shown when a
+        # wired Pro Controller 2 is detected. Manual Install HidHide remains available.
+        self.hidhide_install_prompt_suppressed = config.get(
+            "hidhide_install_prompt_suppressed", False)
         # User preference: whether the physical Pro Controller 2 HID should be hidden via
         # HidHide when connected. Disabling in the HidHide window sets this False so a later
         # replug is NOT re-hidden (third-party software can see the controller again).
@@ -1676,6 +1680,7 @@ class Config:
             'wired_auto_scan_enabled': self.wired_auto_scan_enabled,
             'wired_usb_enabled': self.wired_auto_scan_enabled,
             'hidhide_installed': self.hidhide_installed,
+            'hidhide_install_prompt_suppressed': self.hidhide_install_prompt_suppressed,
             'hidhide_hide_enabled': self.hidhide_hide_enabled,
             'driver_type': self.driver_type,
             'ready_driven_controller_init': self.ready_driven_controller_init,

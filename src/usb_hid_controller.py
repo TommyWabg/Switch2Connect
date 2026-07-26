@@ -808,6 +808,75 @@ class _UsbHidClient:
         self.on_disconnect_callback = None
         self._disconnect_notified = False
 
+    # A single transient read failure used to kill the wired pad permanently. The
+    # handle is reopened in place instead, with a backoff: the drop is caused by
+    # the pad itself glitching (brown-out, endpoint stall, selective suspend), so
+    # reopening immediately just fails again and adds bus load.
+    _RECOVER_BACKOFF = (0.25, 1.0, 2.0)
+    _MAX_RECOVER_ATTEMPTS = len(_RECOVER_BACKOFF)
+    # A healthy wired pad reports continuously at its polling rate (that is what
+    # makes the polling-rate detection below possible), so a multi-second gap is a
+    # stall, not idleness. Three orders of magnitude of headroom over a ~1 ms pad.
+    _STALL_TIMEOUT = 2.0
+    # Consecutive failed output writes (~15 ms apart) before treating the OUT pipe
+    # as stalled and reopening.
+    _STALL_WRITE_STREAK = 20
+    # Healthy input for this long after a recovery refunds the retry budget, so a
+    # session that glitches once an hour keeps recovering instead of running out.
+    _RECOVER_SETTLE = 10.0
+
+    def _reopen(self):
+        """Close and re-open the HID handle in place. True when input can resume.
+
+        Runs on whichever worker noticed the fault. `_io_pause` stands the read and
+        rumble loops down while the handle is swapped, and `_write_lock` is held so
+        no writer is inside `dev.write()` when the handle goes away.
+        """
+        if self._read_stop.is_set():
+            return False
+        if self._recover_attempts >= self._MAX_RECOVER_ATTEMPTS:
+            return False
+        delay = self._RECOVER_BACKOFF[self._recover_attempts]
+        self._recover_attempts += 1
+        self._last_recover = time.time()
+
+        self._io_pause.set()
+        try:
+            with self._write_lock:
+                if self.dev is not None:
+                    try:
+                        self.dev.close()
+                    except Exception:
+                        logger.debug("Wired USB HID close during recovery failed", exc_info=True)
+                    self.dev = None
+            time.sleep(delay)
+            if self._read_stop.is_set():
+                return False
+            try:
+                self.open()
+            except Exception as exc:
+                logger.warning(
+                    "Wired USB HID reopen attempt %d/%d failed: %s",
+                    self._recover_attempts, self._MAX_RECOVER_ATTEMPTS, exc)
+                return False
+            # Do not resume driving the motors with the pre-fault payload; a pad
+            # that just glitched should not be hit with rumble the instant it
+            # comes back.
+            with self._rumble_slot_lock:
+                self._rumble_slot = None
+            self._inactive_run = 0
+            self._stall_streak = 0
+            # Restart the staleness clock, otherwise the watchdog fires again
+            # immediately on the gap the fault itself created.
+            self._last_input_time = 0.0
+            self._input_deltas = []
+            logger.info(
+                "Wired USB HID handle reopened (attempt %d/%d)",
+                self._recover_attempts, self._MAX_RECOVER_ATTEMPTS)
+            return True
+        finally:
+            self._io_pause.clear()
+
     def open(self):
         if self.dev is not None:
             return
@@ -897,6 +966,12 @@ class _UsbHidClient:
             if self._rumble_stop.is_set():
                 break
             self._rumble_wake.clear()
+            # Stand down while the handle is being swapped: write_output_report
+            # calls open() outside _write_lock, so writing here during a reopen
+            # would race with self.dev being None.
+            if self._io_pause.is_set():
+                time.sleep(0.01)
+                continue
             with self._rumble_slot_lock:
                 data = self._rumble_slot
                 self._rumble_slot = None
@@ -965,6 +1040,7 @@ class _UsbHidClient:
             return
 
         self._hid_rumble_fail_streak += 1
+        self._stall_streak += 1
 
         # Only fall back to the expensive Bulk/WinUSB path when the device has NEVER
         # accepted a hid report (init-time transport probe). Once hid writes have
@@ -974,6 +1050,17 @@ class _UsbHidClient:
         if not self._hid_rumble_ok and now - self._last_bulk_fallback >= 0.5:
             self._last_bulk_fallback = now
             self.write_rumble_command(data)
+            return
+
+        # A sustained run of rejected writes means the OUT pipe has stalled. Heal it
+        # by reopening rather than letting the read side wait for a fault that may
+        # never come.
+        if self._hid_rumble_ok and self._stall_streak >= self._STALL_WRITE_STREAK:
+            logger.warning(
+                "Wired USB HID output stalled for %d consecutive writes; attempting recovery",
+                self._stall_streak)
+            self._stall_streak = 0
+            self._reopen()
 
     def write_rumble_command(self, data):
         active = _pro2_rumble_payload_is_active(data)
@@ -1070,12 +1157,38 @@ class _UsbHidClient:
             except Exception as e:
                 if self._io_pause.is_set():
                     continue
-                logger.info("USB HID read loop ended: %s", e)
+                logger.warning("Wired USB HID read failed (%s); attempting recovery", e)
+                if self._reopen():
+                    continue
+                if self._read_stop.is_set():
+                    break  # normal shutdown raced the recovery; not a failure
+                logger.warning(
+                    "Wired USB HID recovery exhausted after %d attempts; disconnecting",
+                    self._recover_attempts)
                 self._notify_disconnect("read_error")
                 break
             if not data:
+                # A read timeout is indistinguishable from a silently stalled pad,
+                # so a gap this long is treated as a fault. Without this the pad can
+                # stop reporting forever while still looking connected: no exception
+                # is raised, the thread stays alive and nothing ever notices.
+                if (self._last_input_time > 0
+                        and not self._io_pause.is_set()
+                        and time.perf_counter() - self._last_input_time > self._STALL_TIMEOUT):
+                    stalled_for = time.perf_counter() - self._last_input_time
+                    logger.warning(
+                        "Wired USB HID input stalled for %.1fs with no error; attempting recovery",
+                        stalled_for)
+                    if self._reopen():
+                        continue
+                    logger.warning(
+                        "Wired USB HID recovery exhausted after %d attempts; disconnecting",
+                        self._recover_attempts)
+                    self._notify_disconnect("input_stalled")
+                    break
                 continue
-                
+
+
             now = time.perf_counter()
             if self._last_input_time > 0:
                 delta = now - self._last_input_time
@@ -1091,7 +1204,18 @@ class _UsbHidClient:
                             logger.info(f"Wired USB Polling Rate Detected: {rate:.1f} Hz (avg interval: {avg_delta*1000:.2f} ms). High Speed: {new_is_high_speed_usb}")
                         self.is_high_speed_usb = new_is_high_speed_usb
             self._last_input_time = now
-            
+
+            # Restore the recovery budget once input has been flowing again for a
+            # while. Without this the budget is only ever refunded by a successful
+            # rumble write, so an idle pad would permanently exhaust it after a few
+            # unrelated glitches spread over a long session.
+            if (self._recover_attempts
+                    and time.time() - self._last_recover >= self._RECOVER_SETTLE):
+                logger.debug("Wired USB HID input healthy again; resetting recovery budget")
+                self._recover_attempts = 0
+                self._stall_streak = 0
+
+
             report_id = data[0]
             if report_id in INPUT_REPORT_IDS:
                 translated = translate_usb_report(data)

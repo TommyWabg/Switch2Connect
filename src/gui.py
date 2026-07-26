@@ -33,6 +33,7 @@ import asyncio
 import os
 import re
 import ctypes
+import uuid
 from controller import Controller, INPUT_REPORT_UUID, COMMAND_RESPONSE_UUID, NSO_GAMECUBE_CONTROLLER_PID, controller_calibration_keys, normalize_calibration_key
 from discoverer import (
     start_discoverer,
@@ -55,12 +56,23 @@ import win32gui
 import win32con
 from ctypes import wintypes
 from driver_install_helper import (
+    HIDHIDE_HEALTHY,
+    HIDHIDE_PARTIAL,
+    HIDHIDE_UNKNOWN,
+    USBIP_HEALTHY,
+    USBIP_PARTIAL,
+    USBIP_UNKNOWN,
     VIGEMBUS_ABSENT,
     VIGEMBUS_HEALTHY,
     VIGEMBUS_PARTIAL,
+    VIGEMBUS_UNKNOWN,
     WINUHID_ABSENT,
     WINUHID_HEALTHY,
     WINUHID_PARTIAL,
+    WINUHID_UNKNOWN,
+    invalidate_driver_status_cache,
+    get_hidhide_status,
+    get_usbip_status,
     get_winuhid_status,
     get_vigembus_status,
 )
@@ -70,7 +82,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.3"
+APP_VERSION = "v1.6"
 
 def _set_current_thread_priority(level):
     try:
@@ -110,6 +122,38 @@ class WINDOWPLACEMENT(ctypes.Structure):
         ("rcNormalPosition", wintypes.RECT),
     ]
 
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+    @classmethod
+    def from_string(cls, value):
+        parsed = uuid.UUID(str(value).strip("{}"))
+        return cls.from_buffer_copy(parsed.bytes_le)
+
+
+class DEV_BROADCAST_HDR(ctypes.Structure):
+    _fields_ = [
+        ("dbch_size", wintypes.DWORD),
+        ("dbch_devicetype", wintypes.DWORD),
+        ("dbch_reserved", wintypes.DWORD),
+    ]
+
+
+class DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
+    _fields_ = [
+        ("dbcc_size", wintypes.DWORD),
+        ("dbcc_devicetype", wintypes.DWORD),
+        ("dbcc_reserved", wintypes.DWORD),
+        ("dbcc_classguid", GUID),
+        ("dbcc_name", wintypes.WCHAR * 1),
+    ]
+
 # Explicitly set types for Win32 API to ensure compatibility
 ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
 ctypes.windll.shell32.ShellExecuteExW.restype = wintypes.BOOL
@@ -133,6 +177,12 @@ ctypes.windll.user32.SetWindowPos.argtypes = [
     ctypes.c_int, ctypes.c_int, wintypes.UINT,
 ]
 ctypes.windll.user32.SetWindowPos.restype = wintypes.BOOL
+ctypes.windll.user32.RegisterDeviceNotificationW.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+]
+ctypes.windll.user32.RegisterDeviceNotificationW.restype = wintypes.HANDLE
+ctypes.windll.user32.UnregisterDeviceNotification.argtypes = [wintypes.HANDLE]
+ctypes.windll.user32.UnregisterDeviceNotification.restype = wintypes.BOOL
 
 ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 ctypes.windll.kernel32.CloseHandle.restype = wintypes.BOOL
@@ -180,13 +230,13 @@ def get_exe_display_name(path):
     return os.path.splitext(os.path.basename(path))[0] or "Choose App"
 
 def check_driver_registry():
-    return get_winuhid_status().registry_exists
+    return bool(get_winuhid_status(use_cache=True).registry_exists)
 
 def check_driver_pnputil():
-    return bool(get_winuhid_status().present_instances)
+    return bool(get_winuhid_status(use_cache=True).present_instances)
 
 def is_driver_installed():
-    return get_winuhid_status().installed
+    return get_winuhid_status(use_cache=True).installed
 
 
 def verify_winuhid_runtime(attempts=10, delay_seconds=0.5):
@@ -211,16 +261,45 @@ def verify_winuhid_runtime(attempts=10, delay_seconds=0.5):
     logger.error("WinUHid runtime smoke test failed after %d attempts", attempts)
     return False
 
+def hidhide_service_state():
+    """HidHide service registration: True / False / None (undeterminable).
+
+    Never raises. None must not be persisted as "not installed" - a registry key
+    that exists but cannot be read would otherwise write a wrong answer into
+    config.yaml that survives restarts.
+    """
+    try:
+        import hidhide
+        return hidhide.service_state()
+    except Exception as exc:
+        logger.debug("HidHide state could not be read: %s", exc)
+        return None
+
+
+def removal_verified(status, runtime_probe):
+    """True when a driver can be considered gone.
+
+    Normally every layer must read absent. When the layers cannot be read at all
+    (older pnputil), fall back to the runtime probe: if a client can no longer be
+    created, the driver is effectively removed.
+    """
+    if status.absent:
+        return True
+    if status.unknown:
+        return not runtime_probe(attempts=2)
+    return False
+
+
 def check_vigembus_registry():
-    status = get_vigembus_status()
-    return status.service_exists or bool(status.msi_entries)
+    status = get_vigembus_status(use_cache=True)
+    return bool(status.service_exists) or bool(status.msi_entries)
 
 def check_vigembus_pnputil():
-    status = get_vigembus_status()
+    status = get_vigembus_status(use_cache=True)
     return bool(status.bound_instances and status.driver_packages)
 
 def is_vigembus_installed():
-    return get_vigembus_status().installed
+    return get_vigembus_status(use_cache=True).installed
 
 
 def verify_vigembus_runtime(attempts=10, delay_seconds=0.5):
@@ -245,9 +324,15 @@ def verify_vigembus_runtime(attempts=10, delay_seconds=0.5):
 
 
 def verify_vigembus_ready(attempts=12, delay_seconds=0.5):
-    """Wait for both PnP/service health and an actual client connection."""
+    """Wait for both PnP/service health and an actual client connection.
+
+    When the PnP layers cannot be determined (pnputil without /properties), the
+    runtime connection alone decides - it is what the app actually depends on.
+    """
     for attempt in range(max(1, attempts)):
-        if get_vigembus_status().installed and verify_vigembus_runtime(attempts=1):
+        invalidate_driver_status_cache("vigembus")
+        status = get_vigembus_status()
+        if (status.installed or status.unknown) and verify_vigembus_runtime(attempts=1):
             return True
         if attempt + 1 < attempts:
             time.sleep(delay_seconds)
@@ -668,6 +753,9 @@ class WiredDeviceChangeListener:
     WM_DEVICECHANGE = 0x0219
     DBT_DEVICEARRIVAL = 0x8000
     DBT_DEVICEREMOVECOMPLETE = 0x8004
+    DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
+    DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+    HID_INTERFACE_GUID = "{4D1E55B2-F16F-11CF-88CB-001111000030}"
 
     def __init__(self, event_queue):
         self.event_queue = event_queue
@@ -675,6 +763,7 @@ class WiredDeviceChangeListener:
         self.thread = None
         self._stop_event = threading.Event()
         self._class_name = f"Switch2WiredDeviceChangeWindow_{id(self)}"
+        self.notification_handle = None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -705,10 +794,28 @@ class WiredDeviceChangeListener:
         try:
             class_atom = win32gui.RegisterClass(wc)
             self.hwnd = win32gui.CreateWindow(class_atom, self._class_name, 0, 0, 0, 0, 0, 0, 0, hinstance, None)
+            device_filter = DEV_BROADCAST_DEVICEINTERFACE_W()
+            device_filter.dbcc_size = ctypes.sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)
+            device_filter.dbcc_devicetype = self.DBT_DEVTYP_DEVICEINTERFACE
+            device_filter.dbcc_classguid = GUID.from_string(self.HID_INTERFACE_GUID)
+            self.notification_handle = ctypes.windll.user32.RegisterDeviceNotificationW(
+                self.hwnd,
+                ctypes.byref(device_filter),
+                self.DEVICE_NOTIFY_WINDOW_HANDLE,
+            )
+            if not self.notification_handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            logger.info("Wired HID device notification registered.")
             win32gui.PumpMessages()
         except Exception as e:
-            logger.debug("Wired device change listener failed: %s", e)
+            logger.error("Wired device change listener failed: %s", e)
         finally:
+            if self.notification_handle:
+                try:
+                    ctypes.windll.user32.UnregisterDeviceNotification(self.notification_handle)
+                except Exception:
+                    pass
+                self.notification_handle = None
             self.hwnd = None
             try:
                 win32gui.UnregisterClass(self._class_name, hinstance)
@@ -722,11 +829,22 @@ class WiredDeviceChangeListener:
                 reason = "device_arrival"
             elif int(wparam) == self.DBT_DEVICEREMOVECOMPLETE:
                 reason = "device_removal"
-            if reason:
+            path = None
+            if reason and lparam:
+                try:
+                    header = ctypes.cast(
+                        lparam, ctypes.POINTER(DEV_BROADCAST_HDR)).contents
+                    if header.dbch_devicetype == self.DBT_DEVTYP_DEVICEINTERFACE:
+                        path = ctypes.wstring_at(
+                            lparam + DEV_BROADCAST_DEVICEINTERFACE_W.dbcc_name.offset)
+                except Exception:
+                    path = None
+            target_path = (path or "").upper()
+            if reason and "VID_057E&PID_2069" in target_path:
                 try:
                     self.event_queue.put_nowait({
                         "reason": reason,
-                        "path": None,
+                        "path": path,
                         "timestamp": time.time(),
                     })
                 except Exception:
@@ -3391,6 +3509,17 @@ class ControllerWindow:
 
     def check_vigembus_installation(self, save=True):
         status = get_vigembus_status()
+        if status.unknown:
+            # The query failed (e.g. pnputil without /properties); asking the user to
+            # repair a state we cannot read only nags them. The runtime bus connection
+            # is the authoritative answer, so try that before prompting for anything.
+            logger.warning("ViGEmBus status undetermined: %s", status.describe())
+            if verify_vigembus_runtime(attempts=2):
+                CONFIG.vigembus_installed = True
+                if save:
+                    CONFIG.save_config()
+                return True
+
         if not status.installed:
             CONFIG.vigembus_installed = False
             if save:
@@ -3444,14 +3573,28 @@ class ControllerWindow:
     def check_driver_installation(self, save=True):
         # If driver type is USBIP, check USBIP driver instead
         if getattr(CONFIG, "driver_type", "") == "USBIP":
-            usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-            if not os.path.exists(usbip_exe):
+            usbip_status = get_usbip_status()
+            if usbip_status.unknown:
+                # Undetermined is not "missing": fall back to the executable the
+                # rest of the app invokes rather than nagging on every launch.
+                logger.warning("USBIP status undetermined: %s", usbip_status.describe())
+            usbip_ready = usbip_status.installed or (
+                usbip_status.unknown
+                and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
+            if not usbip_ready:
+                partial = usbip_status.state == USBIP_PARTIAL
                 answer = self.ask_centered_yes_no(
-                    "Install USBIP Driver",
-                    "Switch emulation is selected, but the USBIP driver is not installed.\n\n"
-                    "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
+                    "Repair USBIP Driver" if partial else "Install USBIP Driver",
+                    (("USBIP is partially installed and cannot be used reliably.\n\n"
+                      f"{usbip_status.describe()}\n\nDo you want to clean it up and reinstall it now?\n")
+                     if partial else
+                     "Switch emulation is selected, but the USBIP driver is not installed.\n\n"
+                     "Do you want to install it now?\n") +
+                    "(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
+                    if partial and not self.run_usbip_uninstall():
+                        return
                     self.run_usbip_install(show_success_msg=False)
             return
 
@@ -3462,6 +3605,16 @@ class ControllerWindow:
 
         # 憒?yaml鋆⊥?撌脣?鋆?蝝????app???炎?交?行?摰?嚗璇辣??app
         winuhid_status = get_winuhid_status()
+        if winuhid_status.unknown:
+            # Undetermined is not broken: fall back to the runtime smoke test rather
+            # than prompting for a repair that this machine's pnputil cannot perform.
+            logger.warning("WinUHid status undetermined: %s", winuhid_status.describe())
+            if verify_winuhid_runtime(attempts=2):
+                CONFIG.driver_installed = True
+                if save:
+                    CONFIG.save_config()
+                return
+
         if winuhid_status.installed:
             # 憒?瑼Ｘ蝯??臬歇摰?嚗???yaml鋆?
             CONFIG.driver_installed = True
@@ -3475,7 +3628,8 @@ class ControllerWindow:
                 CONFIG.save_config()
             self.update_driver_button()
             
-        if winuhid_status.state == WINUHID_PARTIAL:
+        partial = winuhid_status.state == WINUHID_PARTIAL
+        if partial:
             prompt = (
                 "WinUHid is only partially installed and cannot be used reliably.\n\n"
                 f"{winuhid_status.describe()}\n\n"
@@ -3483,7 +3637,8 @@ class ControllerWindow:
             )
         else:
             prompt = "WinUHid driver is not installed.\n\nDo you want to install it now?\n(Requires administrator privileges.)"
-        answer = self.ask_centered_yes_no("Repair WinUHid Driver", prompt)
+        answer = self.ask_centered_yes_no(
+            "Repair WinUHid Driver" if partial else "Install WinUHid Driver", prompt)
         
         if answer:
             if winuhid_status.state == WINUHID_PARTIAL and not self.run_driver_uninstall():
@@ -3734,8 +3889,13 @@ class ControllerWindow:
         # In the MSIX-packaged build the driver files are not shipped inside the
         # package; download and install WinUHid from the project GitHub instead.
         if utils.is_packaged():
+            def winuhid_ready():
+                invalidate_driver_status_cache("winuhid")
+                status = get_winuhid_status()
+                return (status.installed or status.unknown) and verify_winuhid_runtime()
+
             installed = self.download_and_install_driver(
-                "WinUHid", lambda: is_driver_installed() and verify_winuhid_runtime(), show_success_msg)
+                "WinUHid", winuhid_ready, show_success_msg)
             if installed:
                 CONFIG.driver_installed = True
                 CONFIG.save_config()
@@ -3811,8 +3971,12 @@ class ControllerWindow:
                 
                 logger.info(f"Driver installer process exited with code: {proc_exit_code[0]}")
                 
+                invalidate_driver_status_cache("winuhid")
                 driver_status = get_winuhid_status()
-                runtime_ok = driver_status.installed and verify_winuhid_runtime()
+                # When the layers cannot be read, the runtime smoke test is the verdict;
+                # otherwise a Win10 install that actually succeeded reports as failed.
+                runtime_ok = ((driver_status.installed or driver_status.unknown)
+                              and verify_winuhid_runtime())
                 driver_installed_ok = proc_exit_code[0] == 0 and runtime_ok
                 if driver_installed_ok:
                     CONFIG.driver_installed = True
@@ -3841,7 +4005,8 @@ class ControllerWindow:
         # package; download it from the project GitHub and run it elevated.
         if utils.is_packaged():
             removed = self.download_and_uninstall_driver(
-                "WinUHid", lambda: get_winuhid_status().absent)
+                "WinUHid",
+                lambda: removal_verified(get_winuhid_status(), verify_winuhid_runtime))
             if removed:
                 CONFIG.driver_installed = False
                 CONFIG.save_config()
@@ -3918,8 +4083,10 @@ class ControllerWindow:
                 logger.info(f"Driver uninstaller process exited with code: {proc_exit_code[0]}")
                 
                 # Now that progress_win is destroyed, check if it was removed
+                invalidate_driver_status_cache("winuhid")
                 driver_status = get_winuhid_status()
-                driver_removed_ok = proc_exit_code[0] == 0 and driver_status.absent
+                driver_removed_ok = proc_exit_code[0] == 0 and removal_verified(
+                    driver_status, verify_winuhid_runtime)
                 if driver_removed_ok:
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
@@ -3966,7 +4133,8 @@ class ControllerWindow:
         # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
         if utils.is_packaged():
             removed = self.download_and_uninstall_driver(
-                "ViGEmBus", lambda: get_vigembus_status().absent)
+                "ViGEmBus",
+                lambda: removal_verified(get_vigembus_status(), verify_vigembus_runtime))
             if removed:
                 CONFIG.vigembus_installed = False
                 CONFIG.save_config()
@@ -4042,8 +4210,10 @@ class ControllerWindow:
                 
                 logger.info(f"ViGEmBus uninstaller process exited with code: {proc_exit_code[0]}")
                 
+                invalidate_driver_status_cache("vigembus")
                 status = get_vigembus_status()
-                driver_removed_ok = proc_exit_code[0] == 0 and status.absent
+                driver_removed_ok = proc_exit_code[0] == 0 and removal_verified(
+                    status, verify_vigembus_runtime)
                 if driver_removed_ok:
                     CONFIG.vigembus_installed = False
                     CONFIG.save_config()
@@ -4168,6 +4338,237 @@ class ControllerWindow:
 
         self.update_header_status()
 
+    def _kofi_anchor(self):
+        """Return (center_x, bottom_y) in screen pixels just below the Ko-fi button."""
+        self.root.update_idletasks()
+        button = getattr(self, "kofi_button", None)
+        if button is not None and button.winfo_exists():
+            return (
+                button.winfo_rootx() + button.winfo_width() // 2,
+                button.winfo_rooty() + button.winfo_height(),
+            )
+        return (
+            self.root.winfo_rootx() + self.root.winfo_width() // 2,
+            self.root.winfo_rooty(),
+        )
+
+    def _open_kofi_window(self):
+        """Toggle the Ko-fi donation popup.
+
+        The widget runs in a separate pywebview process (mirrors the DualSense
+        server child) so pywebview owns its own main thread/event loop and does
+        not collide with the Tkinter main loop. The process is kept alive across
+        opens: dismissing only *hides* the window so the Ko-fi page never
+        reloads. Clicking the button toggles show/hide; clicking elsewhere in the
+        app hides it. Falls back to the system browser if the child cannot be
+        launched, so the donation link never breaks.
+        """
+        process = getattr(self, "_kofi_process", None)
+        if process is not None and process.poll() is None:
+            # The button toggles: hide when shown, show when hidden. (Clicks that
+            # land on the button are excluded from the outside-click dismissal by
+            # _click_on_kofi_button, so this handler alone drives the toggle.)
+            if getattr(self, "_kofi_visible", False):
+                self._hide_kofi_window()
+            else:
+                self._show_kofi_window()
+            return
+        self._spawn_kofi_window()
+
+    def _spawn_kofi_window(self):
+        """Launch the Ko-fi child process for the first time and show it."""
+        self._close_kofi_window()
+        try:
+            import subprocess
+            anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+            position_args = [
+                "--anchor-center-x", str(anchor_center_x),
+                "--anchor-bottom-y", str(anchor_bottom_y),
+            ]
+            # Own the popup to the main window so Windows always keeps it above
+            # the main window (a background child process cannot otherwise raise
+            # itself above the foreground app via SetWindowPos).
+            owner_hwnd = self.get_root_hwnd()
+            if owner_hwnd:
+                position_args += ["--owner-hwnd", str(int(owner_hwnd))]
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--show-kofi", *position_args]
+            else:
+                cmd = [
+                    sys.executable,
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.py"),
+                    "--show-kofi",
+                    *position_args,
+                ]
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            # stdin is our command channel for later hide/show/quit requests.
+            self._kofi_process = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, creationflags=flags
+            )
+            self._kofi_visible = True
+            self._kofi_shown_at = time.time()
+            self._bind_kofi_outside_click()
+            self._poll_kofi_process()
+        except Exception as e:
+            self._close_kofi_window()
+            logger.error(f"Failed to open Ko-fi webview window, falling back to browser: {e}")
+            try:
+                webbrowser.open("https://ko-fi.com/tagayama")
+            except Exception:
+                pass
+
+    def _send_kofi_command(self, command):
+        """Write a single command line to the Ko-fi child's stdin."""
+        process = getattr(self, "_kofi_process", None)
+        if process is None or process.poll() is not None or process.stdin is None:
+            return False
+        try:
+            process.stdin.write((command + "\n").encode("utf-8"))
+            process.stdin.flush()
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send Ko-fi command '{command}': {e}")
+            return False
+
+    def _show_kofi_window(self):
+        """Reveal the already-loaded Ko-fi window under the button (no reload)."""
+        anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        if self._send_kofi_command(f"show {anchor_center_x} {anchor_bottom_y}"):
+            self._kofi_visible = True
+            self._kofi_shown_at = time.time()
+            self._cancel_kofi_idle_close()
+            self._bind_kofi_outside_click()
+        else:
+            # The child is gone (e.g. crashed); start a fresh one.
+            self._spawn_kofi_window()
+
+    def _hide_kofi_window(self):
+        """Hide the Ko-fi window but keep the process alive for the next open."""
+        self._send_kofi_command("hide")
+        self._kofi_visible = False
+        # After staying hidden a while, fully close the child to free its
+        # resources; the next open re-spawns (and reloads) it.
+        self._schedule_kofi_idle_close()
+
+    # Auto-close the popup process after it has been hidden this long (ms).
+    _KOFI_IDLE_CLOSE_MS = 180000  # 3 minutes
+
+    def _schedule_kofi_idle_close(self):
+        self._cancel_kofi_idle_close()
+        try:
+            self._kofi_idle_close_id = self.root.after(
+                self._KOFI_IDLE_CLOSE_MS, self._close_kofi_window
+            )
+        except Exception:
+            self._kofi_idle_close_id = None
+
+    def _cancel_kofi_idle_close(self):
+        idle_id = getattr(self, "_kofi_idle_close_id", None)
+        self._kofi_idle_close_id = None
+        if idle_id:
+            try:
+                self.root.after_cancel(idle_id)
+            except Exception:
+                pass
+
+    def _reposition_kofi_window(self):
+        """Keep the popup anchored under its button as the main window moves."""
+        if not getattr(self, "_kofi_visible", False):
+            return
+        anchor_center_x, anchor_bottom_y = self._kofi_anchor()
+        self._send_kofi_command(f"move {anchor_center_x} {anchor_bottom_y}")
+
+    def _close_kofi_window(self):
+        """Terminate the managed Ko-fi child and drop all popup state (on quit)."""
+        process = getattr(self, "_kofi_process", None)
+        self._kofi_process = None
+        self._kofi_visible = False
+        self._cancel_kofi_idle_close()
+        if process is not None and process.poll() is None:
+            try:
+                if process.stdin is not None:
+                    try:
+                        process.stdin.write(b"quit\n")
+                        process.stdin.flush()
+                    except Exception:
+                        pass
+                process.terminate()
+            except Exception as e:
+                logger.debug(f"Failed to close Ko-fi webview process: {e}")
+        self._unbind_kofi_outside_click()
+
+    def _click_on_kofi_button(self, button, event):
+        """DPI-safe test for whether a <ButtonPress> landed on the Ko-fi button.
+
+        Prefers Tk's own hit-testing (winfo_containing) at the click's screen
+        coordinates, which stays correct under per-monitor DPI scaling where the
+        manual winfo_* vs event-coordinate rectangle math can disagree. Walks up
+        the widget's parents so a click on any child of the button still counts.
+        Falls back to the bounding-box check if hit-testing is unavailable.
+        """
+        if button is None or not button.winfo_exists():
+            return False
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            widget = None
+        walker = widget
+        while walker is not None:
+            if walker is button:
+                return True
+            walker = getattr(walker, "master", None)
+        return self._event_in_widget(button, event)
+
+    def _unbind_kofi_outside_click(self):
+        bind_id = getattr(self, "_kofi_outside_click_bind_id", None)
+        self._kofi_outside_click_bind_id = None
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+
+    def _bind_kofi_outside_click(self):
+        """Make Ko-fi behave like an in-window popup owned by its header button.
+
+        Bound once and left in place for the popup's lifetime (unbound in
+        _close_kofi_window). The handler consults the live visibility state and a
+        short grace period, so the click that *opens* the popup can never be
+        misjudged as an outside click and immediately hide it — even when clicking
+        the button first activates the main window and the coordinates are scaled
+        by DPI awareness.
+        """
+        if getattr(self, "_kofi_outside_click_bind_id", None):
+            return
+
+        def hide_on_other_main_window_click(event):
+            # Nothing to dismiss unless the popup is currently shown.
+            if not getattr(self, "_kofi_visible", False):
+                return
+            # Clicking the Ko-fi button (or anything inside it) must never close
+            # the popup. Use Tk's own hit-testing (winfo_containing) as the
+            # primary check because manual rect math with winfo_* vs event coords
+            # can disagree under per-monitor DPI scaling; keep the rect check as a
+            # fallback.
+            button = getattr(self, "kofi_button", None)
+            if self._click_on_kofi_button(button, event):
+                return
+            self._hide_kofi_window()
+
+        self._kofi_outside_click_bind_id = self.root.bind(
+            "<ButtonPress>", hide_on_other_main_window_click, add="+"
+        )
+
+    def _poll_kofi_process(self):
+        """Clear stale state if the WebView is closed externally (for example Alt+F4)."""
+        process = getattr(self, "_kofi_process", None)
+        if process is None:
+            return
+        if process.poll() is not None:
+            self._close_kofi_window()
+            return
+        self.root.after(500, self._poll_kofi_process)
+
     def update_header_status(self):
         if not hasattr(self, 'header_label'):
             return
@@ -4261,13 +4662,16 @@ class ControllerWindow:
         if not hasattr(self, 'driver_btn') or not self.driver_btn:
             return
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        # Only a genuinely half-installed driver offers "Repair"; VIGEMBUS_UNKNOWN /
+        # WINUHID_UNKNOWN must fall through to "Install", which is idempotent (the
+        # install script cleans up first) and cannot dead-end like repair does.
         if driver_type == "ViGEmBus":
-            vigem_state = get_vigembus_status().state
+            vigem_state = get_vigembus_status(use_cache=True).state
             text = ("Uninstall ViGEmBus Driver" if vigem_state == VIGEMBUS_HEALTHY
                     else "Repair ViGEmBus Driver" if vigem_state == VIGEMBUS_PARTIAL
                     else "Install ViGEmBus Driver")
         else:
-            winuhid_state = get_winuhid_status().state
+            winuhid_state = get_winuhid_status(use_cache=True).state
             text = ("Uninstall WinUHid Driver" if winuhid_state == WINUHID_HEALTHY
                     else "Repair WinUHid Driver" if winuhid_state == WINUHID_PARTIAL
                     else "Install WinUHid Driver")
@@ -4277,22 +4681,39 @@ class ControllerWindow:
     def update_usbip_button(self):
         if not hasattr(self, 'usbip_btn') or not self.usbip_btn:
             return
-        usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-        text = "Uninstall USBIP Driver" if os.path.exists(usbip_exe) else "Install USBIP Driver"
+        # Only a genuinely half-installed driver offers "Repair"; USBIP_UNKNOWN
+        # falls through to "Install", which cleans up first and cannot dead-end.
+        usbip_state = get_usbip_status(use_cache=True).state
+        text = ("Uninstall USBIP Driver" if usbip_state == USBIP_HEALTHY
+                else "Repair USBIP Driver" if usbip_state == USBIP_PARTIAL
+                else "Install USBIP Driver")
         self.usbip_btn.config(text=text)
         self.update_driver_buttons_visibility()
 
     def on_usbip_btn_clicked(self):
-        usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-        if os.path.exists(usbip_exe):
+        install_warning = (
+            "WARNING: During the installation of USBIP-win2, Windows USB hubs will restart briefly, "
+            "which will temporarily disconnect other USB peripherals (mice, keyboards, etc.).\n\n"
+            "Do you want to proceed?\n(Requires administrator privileges.)"
+        )
+        status = get_usbip_status()
+        if status.state == USBIP_HEALTHY:
             if self.ask_centered_yes_no("Uninstall USBIP Driver", "Are you sure you want to uninstall the USBIP driver?\n(Requires administrator privileges.)"):
                 self.run_usbip_uninstall()
+        elif status.state == USBIP_PARTIAL:
+            if self.ask_centered_yes_no(
+                "Repair USBIP Driver",
+                "USBIP is partially installed. Clean up the broken installation and reinstall it?\n\n"
+                f"{status.describe()}\n\n{install_warning}"
+            ):
+                if self.run_usbip_uninstall():
+                    self.run_usbip_install()
         else:
+            if status.unknown:
+                logger.warning("USBIP status undetermined: %s", status.describe())
             if self.ask_centered_yes_no(
                 "Install USBIP Driver",
-                "Are you sure you want to install the USBIP driver?\n\n"
-                "WARNING: During the installation of USBIP-win2, Windows USB hubs will restart briefly, which will temporarily disconnect other USB peripherals (mice, keyboards, etc.).\n\n"
-                "Do you want to proceed?\n(Requires administrator privileges.)"
+                "Are you sure you want to install the USBIP driver?\n\n" + install_warning
             ):
                 self.run_usbip_install()
 
@@ -4301,7 +4722,12 @@ class ControllerWindow:
         # GitHub instead of running a bundled installer.
         if utils.is_packaged():
             def usbip_installed():
-                return os.path.exists("C:\\Program Files\\USBip\\usbip.exe")
+                invalidate_driver_status_cache("usbip")
+                status = get_usbip_status()
+                # An undeterminable state falls back to the executable, which is
+                # what the rest of the app actually invokes.
+                return status.installed or (
+                    status.unknown and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
             self.download_and_install_driver("USBIP", usbip_installed, show_success_msg)
             return
 
@@ -4374,15 +4800,19 @@ class ControllerWindow:
                 
                 logger.info(f"USBIP driver installer process exited with code: {proc_exit_code[0]}")
                 
-                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-                usbip_installed_ok = os.path.exists(usbip_exe)
+                invalidate_driver_status_cache("usbip")
+                usbip_status = get_usbip_status()
+                usbip_installed_ok = usbip_status.installed or (
+                    usbip_status.unknown
+                    and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
                 if usbip_installed_ok:
                     if show_success_msg:
                         self.show_centered_message("Success", "USBIP-win2 driver installed successfully.")
                 else:
                     self.show_centered_message(
                         "Error",
-                        "USBIP driver installation was not completed or failed."
+                        "USBIP driver installation was not completed or failed.\n\n"
+                        f"Exit code: {proc_exit_code[0]}\n{usbip_status.describe()}"
                     )
                 self.update_usbip_button()
             except Exception as e:
@@ -4393,14 +4823,86 @@ class ControllerWindow:
         if discoverer_was_running:
             self.start_discoverer_thread()
 
+    def _run_usbip_cleanup_script(self):
+        """Run the bundled uninstall_usbip.ps1 elevated. Returns its exit code or None.
+
+        This is the manual-cleanup path (detach, device node, Driver Store, files).
+        It used to be unreachable in the standalone build, which meant a USBIP
+        install whose unins000.exe had gone missing could never be removed.
+        """
+        cleanup_ps1 = get_driver_path("uninstall_usbip.ps1")
+        if not os.path.exists(cleanup_ps1):
+            return None
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("USBIP Driver Cleanup")
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        self.center_window_on_root(
+            progress_win, int(450 * scaling_factor), int(130 * scaling_factor))
+        tk.Label(
+            progress_win,
+            text="Cleaning up USBIP driver components...\nPlease authorize the UAC prompt if asked.",
+            fg="white", bg="#1E1E1E", font=scale_font(("Arial", 11, "bold"))
+        ).pack(pady=int(40 * scaling_factor))
+
+        hProcess = self._launch_elevated(
+            "powershell.exe", self._ps_hidden_args(cleanup_ps1), progress_win=progress_win)
+        if not hProcess:
+            progress_win.grab_release()
+            progress_win.destroy()
+            return None
+
+        proc_exit_code = [None]
+
+        def check_process():
+            res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+            if res == WAIT_TIMEOUT:
+                progress_win.after(200, check_process)
+            else:
+                exit_code = wintypes.DWORD()
+                ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+                proc_exit_code[0] = exit_code.value
+                progress_win.grab_release()
+                progress_win.destroy()
+
+        progress_win.after(200, check_process)
+        self.root.wait_window(progress_win)
+        logger.info("USBIP cleanup script exited with code: %s", proc_exit_code[0])
+        return proc_exit_code[0]
+
+    @staticmethod
+    def _read_usbip_uninstall_log():
+        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_USBIP_uninstall.log")
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
+                lines = stream.read().strip().splitlines()
+            keywords = ("error", "failed", "incomplete", "unavailable", "verification")
+            important = [line for line in lines if any(word in line.lower() for word in keywords)]
+            summary = important[-12:] if important else lines[-12:]
+            return "\n".join(summary)[-1400:]
+        except Exception:
+            return "Cleanup log was not available."
+
+    def _usbip_removal_verified(self):
+        invalidate_driver_status_cache("usbip")
+        status = get_usbip_status()
+        if status.absent:
+            return True, status
+        if status.unknown:
+            # Fall back to the executable the rest of the app actually invokes.
+            return not os.path.exists("C:\\Program Files\\USBip\\usbip.exe"), status
+        return False, status
+
     def run_usbip_uninstall(self):
         # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
         # The script handles both the Program Files uninstaller and manual cleanup.
         if utils.is_packaged():
             def usbip_removed():
-                return not os.path.exists("C:\\Program Files\\USBip\\usbip.exe")
-            self.download_and_uninstall_driver("USBIP", usbip_removed)
-            return
+                return self._usbip_removal_verified()[0]
+            return bool(self.download_and_uninstall_driver("USBIP", usbip_removed))
 
         import sys
         import os
@@ -4472,21 +4974,37 @@ class ControllerWindow:
                 self.root.wait_window(progress_win)
                 
                 logger.info(f"USBIP driver uninstaller process exited with code: {proc_exit_code[0]}")
-                
-                usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-                usbip_removed_ok = not os.path.exists(usbip_exe)
-                if usbip_removed_ok:
-                    self.show_centered_message("Success", "USBIP driver uninstalled successfully.")
-                else:
-                    self.show_centered_message("Information", "USBIP driver uninstaller closed.")
-                self.update_usbip_button()
             except Exception as e:
                 self.show_centered_message("Error", f"Failed to start the USBIP uninstaller: {e}")
         else:
-            self.show_centered_message("Error", f"Could not find uninstaller at {uninstaller_exe}.")
+            logger.warning("USBIP uninstaller missing at %s; using the cleanup script.", uninstaller_exe)
+
+        # The vendor uninstaller only removes what it installed, and it may be
+        # missing entirely on a broken install. Fall back to the cleanup script,
+        # which removes the device node, Driver Store packages and files itself.
+        usbip_removed_ok, status = self._usbip_removal_verified()
+        if not usbip_removed_ok:
+            cleanup_code = self._run_usbip_cleanup_script()
+            if cleanup_code is None:
+                self.show_centered_message(
+                    "Error",
+                    "Could not run the USBIP cleanup script.\n\n"
+                    f"{status.describe()}")
+            else:
+                usbip_removed_ok, status = self._usbip_removal_verified()
+
+        if usbip_removed_ok:
+            self.show_centered_message("Success", "USBIP driver uninstalled successfully.")
+        else:
+            self.show_centered_message(
+                "Error",
+                "USBIP uninstallation failed or left components behind.\n\n"
+                f"{status.describe()}\n\nCleanup details:\n{self._read_usbip_uninstall_log()}")
+        self.update_usbip_button()
 
         if discoverer_was_running:
             self.start_discoverer_thread()
+        return usbip_removed_ok
 
 
     def init_interface(self):
@@ -4692,9 +5210,42 @@ class ControllerWindow:
         )
         self.header_label.pack(side=tk.RIGHT, padx=int(12 * scaling_factor), fill=tk.Y)
 
+        # Ko-fi donation button — centered in the header, vertically aligned with
+        # the header text. Placed on the root (not packed) so it stays independent
+        # and never displaces the version/status labels. Its height is 1.5× the
+        # header height (24 -> 36), so it slightly overflows the header bar.
+        try:
+            kofi_target_h = int(30 * scaling_factor)  # half of the previous 1.5× header height
+            kofi_img = Image.open(get_resource("images/support_me_on_kofi_dark.png"))
+            _kw, _kh = kofi_img.size
+            kofi_target_w = max(1, int(round(_kw * (kofi_target_h / _kh))))
+            kofi_img = kofi_img.resize(
+                (kofi_target_w, kofi_target_h),
+                Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS,
+            )
+            self.kofi_image = ImageTk.PhotoImage(kofi_img)
+            self.kofi_button = tk.Label(
+                self.root,
+                image=self.kofi_image,
+                bg=background_color,
+                cursor="hand2",
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            # Centered horizontally; vertically centered on the header text.
+            self.kofi_button.place(relx=0.5, y=int(12 * scaling_factor), anchor=tk.CENTER)
+            self.kofi_button.bind("<Button-1>", lambda e: self._open_kofi_window())
+        except Exception as e:
+            logger.error(f"Failed to load/scale Ko-fi button image: {e}")
+
         self.main_frame = tk.Frame(self.root, bg=background_color)
         self.main_frame.pack(side=tk.TOP, pady=(10, 5), fill=tk.Y)
         self.players_info = None
+
+        # Keep the Ko-fi button on top so its slight overflow below the header
+        # bar is not hidden behind subsequently-packed frames.
+        if hasattr(self, 'kofi_button'):
+            self.kofi_button.lift()
 
         self.init_settings_panel()
         self.init_compensation_panel(parent=self.tab_content_frame)
@@ -5266,6 +5817,12 @@ class ControllerWindow:
                         self.last_y = ry
             except Exception:
                 pass
+            # Keep the Ko-fi popup glued under its button as the window moves.
+            if getattr(self, "_kofi_visible", False):
+                try:
+                    self._reposition_kofi_window()
+                except Exception:
+                    pass
 
     def init_compensation_panel(self, parent=None):
         parent = parent or self.root
@@ -9863,15 +10420,31 @@ bg_color=panel_bg, widths=[8, 10])
                 return
         elif val == "USBIP":
             usbip_exe = "C:\\Program Files\\USBip\\usbip.exe"
-            if not os.path.exists(usbip_exe):
+
+            def usbip_ready():
+                invalidate_driver_status_cache("usbip")
+                status = get_usbip_status()
+                return status.installed or (
+                    status.unknown and os.path.exists(usbip_exe)), status
+
+            ready, usbip_status = usbip_ready()
+            if not ready:
+                partial = usbip_status.state == USBIP_PARTIAL
                 answer = self.ask_centered_yes_no(
-                    "Install USBIP Driver",
-                    "The USBIP driver is required but is not installed.\n\n"
-                    "Do you want to install it now?\n(Requires administrator privileges and will temporarily reset USB connections.)"
+                    "Repair USBIP Driver" if partial else "Install USBIP Driver",
+                    (("USBIP is partially installed.\n\n" + usbip_status.describe() + "\n\n"
+                      "Do you want to clean it up and reinstall it now?\n")
+                     if partial else
+                     "The USBIP driver is required but is not installed.\n\n"
+                     "Do you want to install it now?\n") +
+                    "(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
+                    if partial and not self.run_usbip_uninstall():
+                        self.driver_switch.set_value(old_driver)
+                        return
                     self.run_usbip_install(show_success_msg=True)
-                    if not os.path.exists(usbip_exe):
+                    if not usbip_ready()[0]:
                         self.driver_switch.set_value(old_driver)
                         return
                 else:
@@ -9879,7 +10452,11 @@ bg_color=panel_bg, widths=[8, 10])
                     return
         else:
             winuhid_status = get_winuhid_status()
-            if not winuhid_status.installed:
+            if winuhid_status.unknown and verify_winuhid_runtime(attempts=2):
+                # State unreadable but the driver actually works - do not prompt.
+                logger.warning("WinUHid status undetermined: %s", winuhid_status.describe())
+                winuhid_status = None
+            if winuhid_status is not None and not winuhid_status.installed:
                 if getattr(CONFIG, 'driver_installed', False):
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
@@ -9897,7 +10474,10 @@ bg_color=panel_bg, widths=[8, 10])
                         self.driver_switch.set_value(old_driver)
                         return
                     self.run_driver_install(show_success_msg=False)
-                    if not is_driver_installed():
+                    invalidate_driver_status_cache("winuhid")
+                    installed_now = get_winuhid_status()
+                    if not (installed_now.installed
+                            or (installed_now.unknown and verify_winuhid_runtime(attempts=2))):
                         self.driver_switch.set_value(old_driver)
                         return
                 else:
@@ -10544,25 +11124,15 @@ bg_color=panel_bg, widths=[8, 10])
         self.wired_pro_settings_popup = popup
         self.wired_pro_settings_popup_anchor = anchor_widget
 
-        def read_hidhide_installed():
-            try:
-                import hidhide
-                return hidhide.is_available()
-            except Exception:
-                return False
-
         def refresh_hidhide_button():
-            installed = read_hidhide_installed()
-            self._hidhide_installed_cached = installed
-            CONFIG.hidhide_installed = installed
-            CONFIG.save_config()
+            installed = self._sync_hidhide_installed()
             hidhide_btn.config(text="HidHide" if installed else "Install HidHide")
 
         hidhide_frame = tk.Frame(popup, bg=button_gray)
         hidhide_frame.pack(fill=tk.X)
         hidhide_btn = tk.Button(
             hidhide_frame,
-            text="HidHide" if read_hidhide_installed() else "Install HidHide",
+            text="HidHide" if hidhide_service_state() is True else "Install HidHide",
             bg=button_gray,
             fg=text_color,
             bd=0,
@@ -10625,12 +11195,24 @@ bg_color=panel_bg, widths=[8, 10])
         self._place_popup_within_root_bounds(popup, anchor_widget, position_adjust=(2, -2))
         self.root.after(100, self.bind_wired_pro_controller_settings_popup_outside_click)
 
+    def _sync_hidhide_installed(self, save=True):
+        """Refresh the cached and persisted HidHide flag without guessing.
+
+        Returns the effective installed flag. An undeterminable state keeps the
+        previous answer rather than persisting a wrong False.
+        """
+        state = hidhide_service_state()
+        if state is None:
+            logger.warning("HidHide state undetermined; keeping the previous value.")
+            return bool(getattr(CONFIG, "hidhide_installed", False))
+        self._hidhide_installed_cached = state
+        CONFIG.hidhide_installed = state
+        if save:
+            CONFIG.save_config()
+        return state
+
     def on_hidhide_button(self):
-        try:
-            import hidhide
-            installed = hidhide.is_available()
-        except Exception:
-            installed = False
+        installed = hidhide_service_state() is True
         if installed:
             if self.ask_centered_yes_no("Uninstall HidHide", "Uninstall the HidHide driver?\n(Requires administrator privileges.)"):
                 self.run_hidhide_uninstall()
@@ -10643,26 +11225,92 @@ bg_color=panel_bg, widths=[8, 10])
             ):
                 self.run_hidhide_install()
 
+    def ask_hidhide_auto_install(self):
+        """Show the automatic HidHide prompt with a persistent opt-out checkbox."""
+        dialog_w = int(520 * scaling_factor)
+        dialog_h = int(260 * scaling_factor)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Install HidHide")
+        dialog.resizable(False, False)
+        dialog.config(bg="#1E1E1E")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.center_window_on_root(dialog, dialog_w, dialog_h)
+
+        result = {"install": False}
+        suppress_var = tk.BooleanVar(value=False)
+
+        tk.Label(
+            dialog,
+            text=(
+                "A wired Pro Controller 2 was detected.\n\n"
+                "HidHide hides the controller's physical HID so games only see "
+                "the virtual controller (no double input).\n\n"
+                "Install it now?\n(Requires administrator privileges.)"
+            ),
+            fg="white",
+            bg="#1E1E1E",
+            font=scale_font(("Arial", 11, "bold")),
+            justify=tk.CENTER,
+            wraplength=int(460 * scaling_factor),
+        ).pack(padx=int(24 * scaling_factor), pady=(int(22 * scaling_factor), int(10 * scaling_factor)))
+
+        tk.Checkbutton(
+            dialog,
+            text="Do not show again",
+            variable=suppress_var,
+            bg="#1E1E1E",
+            fg="white",
+            activebackground="#1E1E1E",
+            activeforeground="white",
+            selectcolor=button_gray,
+            font=scale_font(("Arial", 10)),
+        ).pack(pady=(0, int(12 * scaling_factor)))
+
+        button_frame = tk.Frame(dialog, bg="#1E1E1E")
+        button_frame.pack(pady=(0, int(18 * scaling_factor)))
+
+        def close(install):
+            result["install"] = bool(install)
+            if suppress_var.get():
+                CONFIG.hidhide_install_prompt_suppressed = True
+                CONFIG.save_config()
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        for text, install in (("Yes", True), ("No", False)):
+            frame = tk.Frame(button_frame, bg=button_gray)
+            frame.pack(side=tk.LEFT, padx=int(6 * scaling_factor))
+            tk.Button(
+                frame,
+                text=text,
+                bg=button_gray,
+                fg=text_color,
+                bd=0,
+                relief=tk.FLAT,
+                font=scale_font(("Arial", 10, "bold")),
+                width=8,
+                command=lambda value=install: close(value),
+            ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self.root.wait_window(dialog)
+        return result["install"]
+
     def on_wired_usb_driver_button(self):
         # WinUSB is auto-installed by the controller's MS OS descriptor, so the only
         # optional driver here is HidHide. If it's not installed, prompt to install it
         # directly (a centered notification). If it is installed, open a small options
         # window to enable/disable filtering or uninstall.
-        try:
-            import hidhide
-            hidhide_installed = hidhide.is_available()
-        except Exception:
-            hidhide_installed = False
-
-        self._hidhide_installed_cached = hidhide_installed
-        CONFIG.hidhide_installed = hidhide_installed
-        CONFIG.save_config()
+        hidhide_installed = self._sync_hidhide_installed()
         self.update_driver_buttons_visibility()
 
         if not hidhide_installed:
             if self.ask_centered_yes_no(
                 "Install HidHide",
-                "A wired Pro Controller 2 was detected.\n\n"
                 "HidHide hides the controller's physical HID so games only see the virtual "
                 "controller (no double input). Install it now?\n"
                 "(Optional. Requires administrator privileges.)",
@@ -10672,6 +11320,7 @@ bg_color=panel_bg, widths=[8, 10])
 
         # HidHide installed → options window (enable/disable filtering, uninstall).
         try:
+            import hidhide
             hidhide_active = hidhide.is_active()
         except Exception:
             hidhide_active = False
@@ -10720,16 +11369,12 @@ bg_color=panel_bg, widths=[8, 10])
 
         def recheck_and_refresh():
             nonlocal hidhide_installed, hidhide_active
+            hidhide_installed = self._sync_hidhide_installed()
             try:
                 import hidhide
-                hidhide_installed = hidhide.is_available()
                 hidhide_active = hidhide.is_active() if hidhide_installed else False
             except Exception:
-                hidhide_installed = False
                 hidhide_active = False
-            self._hidhide_installed_cached = hidhide_installed
-            CONFIG.hidhide_installed = hidhide_installed
-            CONFIG.save_config()
             self.update_driver_buttons_visibility()
             if not hidhide_installed and dialog.winfo_exists():
                 dialog.destroy()
@@ -10755,7 +11400,7 @@ bg_color=panel_bg, widths=[8, 10])
             # Capture the intended target once, from the current live driver state.
             try:
                 import hidhide
-                if not hidhide.is_available():
+                if hidhide_service_state() is not True:
                     unlock_and_refresh()
                     return
                 target_active = not hidhide.is_active()
@@ -10907,15 +11552,14 @@ bg_color=panel_bg, widths=[8, 10])
         # instead of running the bundled installer script.
         if utils.is_packaged():
             def hidhide_installed():
-                try:
-                    import hidhide
-                    return hidhide.is_available()
-                except Exception:
-                    return False
+                invalidate_driver_status_cache("hidhide")
+                status = get_hidhide_status()
+                # An undeterminable status defers to the service registration,
+                # which is what the driver actually needs to load.
+                return status.installed or (
+                    status.unknown and hidhide_service_state() is True)
             ok = self.download_and_install_driver("HidHide", hidhide_installed, show_success_msg=True)
-            CONFIG.hidhide_installed = ok
-            CONFIG.save_config()
-            self._hidhide_installed_cached = ok
+            self._sync_hidhide_installed()
             self.update_driver_buttons_visibility()
             if ok and prompt_restart and self.ask_centered_yes_no(
                 "Restart Required",
@@ -10932,18 +11576,15 @@ bg_color=panel_bg, widths=[8, 10])
         code = self._run_hidhide_script("install_hidhide.ps1", "Installing HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return False  # cancelled / could not start
-        try:
-            import hidhide
-            ok = hidhide.is_available()
-        except Exception:
-            ok = False
-        CONFIG.hidhide_installed = ok
-        CONFIG.save_config()
-        self._hidhide_installed_cached = ok
+        ok = self._sync_hidhide_installed()
         self.update_driver_buttons_visibility()
 
         if code not in (0, 3010) and not ok:
-            self.show_centered_message("Error", "HidHide installation did not complete.")
+            invalidate_driver_status_cache("hidhide")
+            self.show_centered_message(
+                "Error",
+                "HidHide installation did not complete.\n\n"
+                f"Exit code: {code}\n{get_hidhide_status().describe()}")
             return False
 
         # Centered success notification (on the main window).
@@ -10967,18 +11608,16 @@ bg_color=panel_bg, widths=[8, 10])
         # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
         # HidHide's driver unloads only on reboot, so success is reported as "started".
         if utils.is_packaged():
-            # verify=lambda:True + no auto message; we do the reboot-aware messaging below.
-            self.download_and_uninstall_driver("HidHide", lambda: True, show_success_msg=False)
-            if not getattr(self, "_last_driver_action_launched", False):
-                return  # download failed or UAC declined (already reported)
-            try:
-                import hidhide
-                still = hidhide.is_available()
-            except Exception:
-                still = False
-            CONFIG.hidhide_installed = still
-            CONFIG.save_config()
-            self._hidhide_installed_cached = still
+            # The cleanup script verifies the service and Driver Store package;
+            # the .sys file itself may remain locked until the requested reboot.
+            removed = self.download_and_uninstall_driver(
+                "HidHide",
+                lambda: hidhide_service_state() is False,
+                show_success_msg=False,
+            )
+            if not removed:
+                return  # download/UAC/script/verification failure was already reported
+            self._sync_hidhide_installed()
             self.update_driver_buttons_visibility()
             self.show_centered_message(
                 "Success",
@@ -10993,24 +11632,36 @@ bg_color=panel_bg, widths=[8, 10])
                     subprocess.Popen(["shutdown", "/r", "/t", "0"])
                 except Exception as e:
                     self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
-            return
+            return True
 
         code = self._run_hidhide_script("uninstall_hidhide.ps1", "Uninstalling HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return  # cancelled / could not start
-        try:
-            import hidhide
-            still = hidhide.is_available()
-        except Exception:
-            still = False
-        CONFIG.hidhide_installed = still
-        CONFIG.save_config()
-        self._hidhide_installed_cached = still
+        # An undeterminable state must not read as "removed" here, so require a
+        # definite False before declaring the service gone.
+        still = hidhide_service_state() is not False
+        self._sync_hidhide_installed()
         self.update_driver_buttons_visibility()
 
-        # HidHide's kernel driver stays loaded until the next boot, so the removal only
-        # finishes after a restart (is_available() is still True right now). Report this
-        # accurately and offer to restart, mirroring the install flow.
+        if code not in (0, 3010) or still:
+            log_path = os.path.join(
+                os.environ.get("TEMP", ""), "Switch2Connect_HidHide_uninstall.log")
+            try:
+                with open(log_path, "r", encoding="utf-8-sig", errors="replace") as stream:
+                    details = stream.read().strip().splitlines()[-12:]
+                detail_text = "\n\n" + "\n".join(details) if details else ""
+            except OSError:
+                detail_text = ""
+            self.show_centered_message(
+                "Error",
+                "HidHide uninstallation failed or left the driver service installed."
+                f"\n\nExit code: {code}{detail_text}",
+            )
+            return False
+
+        # The service and package are gone, but the loaded driver file may remain
+        # pending removal until reboot. Report the pending restart without restoring
+        # the Installed state in the UI.
         self.show_centered_message(
             "Success",
             "HidHide removal started. A restart is required to complete the uninstall.",
@@ -11024,6 +11675,7 @@ bg_color=panel_bg, widths=[8, 10])
                 subprocess.Popen(["shutdown", "/r", "/t", "0"])
             except Exception as e:
                 self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
+        return True
 
     def custom_askstring(self, title, prompt, initialvalue=""):
         dialog = tk.Toplevel(self.root)
@@ -11130,7 +11782,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def set_profile_assigned_apps(self, profile_name, apps):
         if profile_name not in CONFIG.profiles:
-            return
+            return True
         normalized_seen = set()
         normalized_apps = []
         for app in apps:
@@ -11979,6 +12631,7 @@ bg_color=panel_bg, widths=[8, 10])
 
     def on_quit(self):
         if getattr(self, 'is_cleaning_up', False): return
+        self._close_kofi_window()
         try:
             if getattr(self, "wired_device_listener", None):
                 self.wired_device_listener.stop()
@@ -12177,11 +12830,11 @@ bg_color=panel_bg, widths=[8, 10])
             hh_installed = False
             winusb_bound = True
             if detected:
-                try:
-                    import hidhide
-                    hh_installed = hidhide.is_available()
-                except Exception:
-                    hh_installed = False
+                state = hidhide_service_state()
+                # Undetermined keeps the last known answer instead of flickering
+                # the button to "Install HidHide" on a transient read failure.
+                hh_installed = (self._hidhide_installed_cached if state is None
+                                else state)
             if detected:
                 # Safety-net only: WinUSB should be auto-bound. If it isn't, activation
                 # (input) will fail, so we warn the user once.
@@ -12204,9 +12857,11 @@ bg_color=panel_bg, widths=[8, 10])
 
                 # Auto-prompt HidHide install on first detection while it's absent.
                 if (detected and not hh_installed
+                        and not getattr(CONFIG, 'hidhide_install_prompt_suppressed', False)
                         and not getattr(self, '_wired_pro2_prompt_shown', False)):
                     self._wired_pro2_prompt_shown = True
-                    self.on_wired_usb_driver_button()
+                    if self.ask_hidhide_auto_install():
+                        self.run_hidhide_install(prompt_restart=True)
 
                 if not detected:
                     # Allow the prompts again next time a pad is (re)connected.
@@ -12326,6 +12981,11 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit); self.root.mainloop()
 
 if __name__ == "__main__":
+    if "--show-kofi" in sys.argv:
+        from kofi_webview import main as _kofi_main
+        _kofi_main(sys.argv[1:])
+        sys.exit(0)
+
     if "--dualsense-server" in sys.argv:
         idx = sys.argv.index("--dualsense-server")
         try:
