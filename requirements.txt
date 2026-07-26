@@ -20,6 +20,7 @@ libusb-package==1.0.26.3
 numpy==1.26.4
 pystray==0.19.5
 Pillow==12.1.1
+pywebview==5.4
 pyinstaller==6.20.0
 
 # External C/C++ Driver & Sub-library Repositories (For reference / self-compilation)
