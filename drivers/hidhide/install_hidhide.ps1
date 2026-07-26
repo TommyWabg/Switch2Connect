@@ -8,7 +8,7 @@ if (-not (Test-Path $installer)) {
     # Fallback: fetch the latest official installer if the bundled one is missing.
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $h = @{ 'User-Agent' = 'Switch2Controllers' }
+        $h = @{ 'User-Agent' = 'Switch 2 Connect' }
         $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/nefarius/HidHide/releases/latest' -Headers $h
         $asset = $rel.assets | Where-Object { $_.name -like '*_x64.exe' } | Select-Object -First 1
         if ($asset) {
