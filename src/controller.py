@@ -2033,12 +2033,14 @@ class Controller:
         device = await BleakScanner.find_device_by_address(mac_address)
         return await cls.create_from_device(device)
         
-    async def disconnect(self):
-        if not getattr(self, 'interp_running', False) and not self.client:
-            return
-            
-        logger.info(f"Controller {self.device.address}: Suspending interpolation...")
-        self.interp_running = False
+    def _stop_worker_threads(self):
+        """Stop the always-on background threads started in __init__.
+
+        Kept separate from disconnect() so subclasses that override disconnect() (the wired
+        USB pad does) can still shut these down. Missing this leaks one ~666 Hz rumble
+        scheduler thread per connect/disconnect cycle, which is why repeated reconnects got
+        progressively slower and more failure-prone.
+        """
         self._rumble_scheduler_running = False
         self._poke_rumble_scheduler()
         if hasattr(self, '_rumble_scheduler_thread') and self._rumble_scheduler_thread.is_alive():
@@ -2053,7 +2055,15 @@ class Controller:
         sender_thread = self._audio_haptic_sender_thread
         if sender_thread and sender_thread.is_alive():
             sender_thread.join(timeout=0.25)
-        
+
+    async def disconnect(self):
+        if not getattr(self, 'interp_running', False) and not self.client:
+            return
+
+        logger.info(f"Controller {self.device.address}: Suspending interpolation...")
+        self.interp_running = False
+        self._stop_worker_threads()
+
         # Join the interpolation thread if it exists and is running
         if hasattr(self, 'interp_thread') and self.interp_thread.is_alive():
             logger.info(f"Controller {self.device.address}: Joining interpolation thread...")

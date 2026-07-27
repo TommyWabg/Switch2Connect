@@ -3727,6 +3727,11 @@ class VirtualController:
             return False
             
         self.controllers.remove(controller)
+        # Drop the back-reference set in init_added_controller(). Any rumble-scheduler tick
+        # that outlives this call then returns immediately at its `vc is None` guard instead
+        # of doing full work against a virtual device that is being torn down.
+        if getattr(controller, "virtual_controller", None) is self:
+            controller.virtual_controller = None
         self._refresh_controller_cache()
         if clear_mac_port:
                 # Only clear the MAC->port mapping when the physical controller truly disconnects

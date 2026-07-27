@@ -55,6 +55,17 @@ WIRED_RESCAN_EVENT = None
 WIRED_RESCAN_REQUESTS = []
 WIRED_RESCAN_LOCK = threading.Lock()
 
+# Ceilings for the wired add/remove path. These only bound how long a *stuck* operation
+# can block; they add no background work. Without them a single hung driver or libusb
+# call leaves the device key in `connecting` forever, and every later scan -- including
+# a manual one -- skips that device until the app is restarted.
+ADD_INITIALIZE_TIMEOUT = 8.0
+ADD_SETUP_TIMEOUT = 8.0
+DISCONNECT_TIMEOUT = 5.0
+# A `connecting` entry older than this is a task that died without running its `finally`
+# (or is wedged past every ceiling above). Swept from the watcher's existing idle tick.
+CONNECTING_STALE_TIMEOUT = 15.0
+
 def request_wired_rescan(reason: str = "manual_refresh", candidate_path=None, manual: bool = False):
     """Request one wired Pro Controller discovery pass from any thread."""
     global WIRED_RESCAN_EVENT
@@ -1401,7 +1412,10 @@ async def run_usb_hid_discovery(quit_event):
     logger.info("Wired USB watcher started (event-driven, VID 057E/PID 2069).")
 
     known: dict = {}          # device key -> USBHidController
-    connecting: set = set()
+    # device key -> time.monotonic() when the _add task started. Timestamped (rather than a
+    # plain set) so a task that wedged or died without unwinding can be swept, instead of
+    # blocking that key from ever being re-added.
+    connecting: dict = {}
     removing: set = set()
     arrival_retry_tasks: dict = {}
     # Every physical HID instance we've added to the HidHide blacklist. Entries persist
@@ -1500,7 +1514,11 @@ async def run_usb_hid_discovery(quit_event):
                         UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
                     await update_all_player_leds()
             try:
-                await controller.disconnect()
+                # Bounded: disconnect() joins the interpolation, rumble and read threads and
+                # closes the HID handle. A wedged join must not pin this task forever.
+                await asyncio.wait_for(controller.disconnect(), timeout=DISCONNECT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Wired USB controller disconnect timed out (%s)", key)
             except Exception:
                 pass
         finally:
@@ -1523,6 +1541,13 @@ async def run_usb_hid_discovery(quit_event):
     async def _add(entry, key):
         controller = None
         instance_id = None
+        # Slot this call claimed in VIRTUAL_CONTROLLERS. Tracked so the failure path can
+        # hand it back: a claimed-but-never-finished slot is invisible to every cleanup
+        # path (the controller never reaches `known`, so neither _remove() nor the
+        # dead-transport sweep can ever see it) and would be lost until the app restarts.
+        # Four of those and the "no free player slot" branch below rejects every
+        # subsequent scan -- including manual ones.
+        claimed_vc = None
         try:
             # Hide the physical HID first (whitelists our own process so we keep access).
             instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
@@ -1543,12 +1568,19 @@ async def run_usb_hid_discovery(quit_event):
                 await _remove(c, _k, request_rescan=True)
             controller.disconnected_callback = _on_disc
 
-            await controller.initialize()
+            # Bounded: initialize() reaches pyusb/WinUSB, which can block indefinitely on a
+            # wedged device. Without a ceiling this task never finishes, `key` stays in
+            # `connecting` forever and every later scan skips the pad.
+            await asyncio.wait_for(controller.initialize(), timeout=ADD_INITIALIZE_TIMEOUT)
 
             async with GLOBAL_LOCK:
                 slot_index = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c is None), None)
                 if slot_index is None:
-                    logger.warning("Wired USB pad connected but no free player slot.")
+                    logger.warning(
+                        "Wired USB pad connected but no free player slot. Slots: %s",
+                        [None if c is None else
+                         f"{getattr(c, 'mode', '?')}/{len(getattr(c, 'controllers', []))}"
+                         for c in VIRTUAL_CONTROLLERS])
                     await controller.disconnect()
                     if instance_id:
                         hidhide.unhide_device(instance_id)
@@ -1556,23 +1588,55 @@ async def run_usb_hid_discovery(quit_event):
                     return
                 vc = VirtualController(slot_index + 1, [controller], _on_disc, setup_usb=False)
                 VIRTUAL_CONTROLLERS[slot_index] = vc
+                claimed_vc = vc
                 await vc.init_added_controller(controller)
                 reorder_controllers()
                 if UPDATE_CALLBACK is not None:
                     UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
                 await update_all_player_leds()
 
-            await asyncio.to_thread(vc.setup_virtual_device)
+            # Bounded for the same reason: WinUHid creation takes VIRTUAL_DEVICE_CREATION_LOCK
+            # and the driver call can hang, and setup_virtual_device() also raises outright when
+            # the neutral readiness probe is rejected.
+            await asyncio.wait_for(
+                asyncio.to_thread(vc.setup_virtual_device), timeout=ADD_SETUP_TIMEOUT)
             async def _connection_haptics(c_ref=controller):
                 await c_ref.trigger_connection_haptics()
             asyncio.create_task(_connection_haptics())
             known[key] = controller
             logger.info("Wired USB Pro Controller 2 added (%s)", controller.device.address)
-        except Exception:
-            logger.exception("Failed to add wired USB controller")
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                logger.warning("Timed out adding wired USB controller (%s); releasing slot", key)
+            else:
+                logger.exception("Failed to add wired USB controller")
+            # Hand the player slot back. Skipping this strands a half-built VirtualController
+            # in VIRTUAL_CONTROLLERS that nothing else can ever reap, permanently shrinking
+            # the pool until the app is restarted.
+            if claimed_vc is not None:
+                try:
+                    async with GLOBAL_LOCK:
+                        # Located by identity, not by the index we claimed:
+                        # reorder_controllers() compacts and re-indexes the list, so the vc
+                        # may well have moved since.
+                        current = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS)
+                                        if c is claimed_vc), None)
+                        if current is not None:
+                            try:
+                                await claimed_vc.remove_controller(controller)
+                            except Exception:
+                                logger.debug("Slot rollback remove_controller failed", exc_info=True)
+                            VIRTUAL_CONTROLLERS[current] = None
+                            logger.info("Released player slot %d after failed wired add", current + 1)
+                        if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+                            reorder_controllers()
+                            if UPDATE_CALLBACK is not None:
+                                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                except Exception:
+                    logger.exception("Failed to release player slot after wired USB add error")
             if controller is not None:
                 try:
-                    await controller.disconnect()
+                    await asyncio.wait_for(controller.disconnect(), timeout=DISCONNECT_TIMEOUT)
                 except Exception:
                     pass
             if instance_id:
@@ -1582,7 +1646,7 @@ async def run_usb_hid_discovery(quit_event):
                 except Exception:
                     pass
         finally:
-            connecting.discard(key)
+            connecting.pop(key, None)
 
     try:
         while not quit_event.is_set():
@@ -1593,10 +1657,25 @@ async def run_usb_hid_discovery(quit_event):
                     if not getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
                         for retry_path in list(arrival_retry_tasks):
                             _cancel_arrival_retry(retry_path)
+                    # Reap `connecting` entries whose _add task never unwound. Piggybacks on
+                    # this existing idle tick, so it costs no extra wakeups.
+                    now_mono = time.monotonic()
+                    for stale_key, started in list(connecting.items()):
+                        if now_mono - started > CONNECTING_STALE_TIMEOUT:
+                            connecting.pop(stale_key, None)
+                            logger.warning(
+                                "Wired USB add for %s never completed after %.0fs; "
+                                "clearing so it can be retried", stale_key,
+                                now_mono - started)
                     for key, controller in list(known.items()):
                         if _controller_transport_dead(controller):
                             logger.info("Wired USB controller transport ended; removing stale controller (%s)", getattr(controller.device, "address", key))
-                            await _remove(controller, key, request_rescan=True)
+                            # Fire-and-forget: _remove() tears down WinUHid/USBIP and joins
+                            # worker threads, which can take seconds. Awaiting it here would
+                            # stall this loop and leave WIRED_RESCAN_EVENT unserviced -- which
+                            # is exactly why pressing manual scan appeared to do nothing.
+                            # `removing` already de-duplicates concurrent calls.
+                            asyncio.create_task(_remove(controller, key, request_rescan=True))
                     continue
                 WIRED_RESCAN_EVENT.clear()
                 await asyncio.sleep(0.5)
@@ -1628,17 +1707,47 @@ async def run_usb_hid_discovery(quit_event):
                             "HidHide application-list configuration could not be verified; "
                             "the wired controller may not be visible to this process."
                         )
+                if manual_requested:
+                    # A manual scan is the user's explicit "get it back" action, so make it a
+                    # best-effort recovery rather than a plain repeat of the auto path.
+                    # Re-assert HidHide for instances whose controller is gone: unhide, then
+                    # hide again on re-add. Leaving an orphaned instance blacklisted keeps it
+                    # invisible, and hidapi's enumerate opens every device and silently skips
+                    # the ones it cannot open -- so the pad vanishes from the scan entirely.
+                    # This is what an app restart does in its teardown, and it is why only a
+                    # restart used to bring the controller back.
+                    orphaned = [i for i in hidden_instances
+                                if not any(getattr(c, "_hidhide_instance_id", None) == i
+                                           for c in known.values())]
+                    for orphan in orphaned:
+                        try:
+                            await asyncio.to_thread(hidhide.unhide_device, orphan)
+                            hidden_instances.discard(orphan)
+                            logger.info("Manual scan: released orphaned HidHide instance %s", orphan)
+                        except Exception:
+                            logger.debug("Manual scan unhide failed for %s", orphan, exc_info=True)
+
                 chosen = {}
                 entries = await asyncio.to_thread(
                     enumerate_pro_controller2,
                     reason,
                     None,
-                    False,
+                    # Manual scans opt into the unfiltered enumerate + its one-time
+                    # "Nintendo HID devices present/none found" diagnostic. Some hidapi
+                    # builds/states return nothing from the VID/PID-filtered call, which
+                    # previously made a failed manual scan completely silent. One-shot on a
+                    # user action only -- the auto path is unchanged.
+                    manual_requested,
                 )
                 for entry in entries:
                     key = _device_key(entry)
                     if key and key not in chosen:
                         chosen[key] = entry
+                if manual_requested:
+                    logger.info(
+                        "Manual wired scan: found=%d known=%d connecting=%d free_slots=%d",
+                        len(chosen), len(known), len(connecting),
+                        sum(1 for c in VIRTUAL_CONTROLLERS if c is None))
                 if chosen:
                     _cancel_arrival_retry(candidate_path)
                 elif (candidate_path and "device_arrival" in reason
@@ -1647,14 +1756,14 @@ async def run_usb_hid_discovery(quit_event):
                 for key, entry in chosen.items():
                     if key in known or key in connecting:
                         continue
-                    connecting.add(key)
+                    connecting[key] = time.monotonic()
                     asyncio.create_task(_add(entry, key))
                 if removal_requested or manual_requested:
                     for key in list(known):
                         if key not in chosen:
                             controller = known.get(key)
                             if controller is not None:
-                                await _remove(controller, key)
+                                asyncio.create_task(_remove(controller, key))
             except Exception:
                 logger.exception("Wired USB discovery scan error")
     finally:
