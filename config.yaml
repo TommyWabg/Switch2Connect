@@ -607,6 +607,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -627,6 +628,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -684,6 +686,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -704,6 +707,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -1248,6 +1252,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -1268,6 +1273,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -1325,6 +1331,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -1345,6 +1352,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -1444,6 +1452,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -1464,6 +1473,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -1521,6 +1531,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -1541,6 +1552,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -1641,6 +1653,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -1661,6 +1674,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -1718,6 +1732,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -1738,6 +1753,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -1843,6 +1859,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -1863,6 +1880,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -1920,6 +1938,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -1940,6 +1959,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -2038,6 +2058,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -2058,6 +2079,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -2115,6 +2137,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -2135,6 +2158,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -2235,6 +2259,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -2255,6 +2280,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -2312,6 +2338,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -2332,6 +2359,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -2589,6 +2617,7 @@ profiles:
               left_click:
               - L
               middle_click: []
+              raw_input: false
               right_click:
               - ZL
               sensitivity: 4.0
@@ -2609,6 +2638,7 @@ profiles:
               left_click:
               - R
               middle_click: []
+              raw_input: false
               right_click:
               - ZR
               sensitivity: 4.0
@@ -2666,6 +2696,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -2686,6 +2717,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -3725,6 +3757,49 @@ profiles:
         gl_mapping: Default
         gr_mapping: Default
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -3779,6 +3854,7 @@ profiles:
             left_click:
             - L
             middle_click: []
+            raw_input: false
             right_click:
             - ZL
             sensitivity: 4.0
@@ -3799,6 +3875,7 @@ profiles:
             left_click:
             - R
             middle_click: []
+            raw_input: false
             right_click:
             - ZR
             sensitivity: 4.0
@@ -4135,20 +4212,20 @@ stick_r_bias:
 - 0.0
 sw2_zero_command_pacing: true
 ui_scale: 1.0
-usbip_sim_mode: PS5
+usbip_sim_mode: Switch1
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_ps5: 10
 vibration_strength_switch: 5
 vibration_strength_xbox: 5
 vigembus_installed: true
-vigembus_sim_mode: Xbox360
+vigembus_sim_mode: PS4
 virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1255
-window_y: 62
+window_x: 1227
+window_y: 66
 winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5
