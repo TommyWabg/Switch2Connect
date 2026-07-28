@@ -18,7 +18,7 @@
 
 ## Quick Start
 
-1. Download the latest version of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.7.exe)**.
+1. Download the [latest version](https://github.com/TommyWabg/Switch2Connect/releases/latest/) of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.7.exe)**.
 2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
 3. Once the installation completes, the setup window will close automatically, and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
