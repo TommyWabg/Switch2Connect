@@ -1507,6 +1507,12 @@ class ESP32S3Controller(Controller):
             self.polling_task.cancel()
         if hasattr(self, "interp_thread") and self.interp_thread.is_alive():
             self.interp_thread.join(timeout=0.5)
+        # This class overrides Controller.disconnect() entirely, and a bridged Joy-Con
+        # can hold an IR Mouse Raw Input device, so release it here too.
+        try:
+            self._release_raw_input_device()
+        except Exception:
+            logger.exception("Failed to release the Raw Input virtual mouse")
         if self.client:
             try:
                 if self._owns_client:

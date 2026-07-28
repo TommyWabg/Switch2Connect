@@ -92,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.6"
+APP_VERSION = "v1.7"
 
 def _set_current_thread_priority(level):
     try:
@@ -760,12 +760,21 @@ class PowerListener:
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
 class WiredDeviceChangeListener:
+    """Watches for wired Pro Controller arrival/removal, and for Bluetooth radios.
+
+    Both live on one hidden window: RegisterDeviceNotificationW can be called more than
+    once for the same hwnd, and the two interfaces are told apart in _wndproc. The radio
+    notification lets the wireless route sit idle until a radio actually appears instead
+    of retrying on a timer.
+    """
+
     WM_DEVICECHANGE = 0x0219
     DBT_DEVICEARRIVAL = 0x8000
     DBT_DEVICEREMOVECOMPLETE = 0x8004
     DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
     DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
     HID_INTERFACE_GUID = "{4D1E55B2-F16F-11CF-88CB-001111000030}"
+    BLUETOOTH_RADIO_GUID = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}"
 
     def __init__(self, event_queue):
         self.event_queue = event_queue
@@ -774,6 +783,7 @@ class WiredDeviceChangeListener:
         self._stop_event = threading.Event()
         self._class_name = f"Switch2WiredDeviceChangeWindow_{id(self)}"
         self.notification_handle = None
+        self.bluetooth_notification_handle = None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -816,16 +826,38 @@ class WiredDeviceChangeListener:
             if not self.notification_handle:
                 raise ctypes.WinError(ctypes.get_last_error())
             logger.info("Wired HID device notification registered.")
+
+            # Second registration on the same window for Bluetooth radios.
+            try:
+                radio_filter = DEV_BROADCAST_DEVICEINTERFACE_W()
+                radio_filter.dbcc_size = ctypes.sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)
+                radio_filter.dbcc_devicetype = self.DBT_DEVTYP_DEVICEINTERFACE
+                radio_filter.dbcc_classguid = GUID.from_string(self.BLUETOOTH_RADIO_GUID)
+                self.bluetooth_notification_handle = ctypes.windll.user32.RegisterDeviceNotificationW(
+                    self.hwnd,
+                    ctypes.byref(radio_filter),
+                    self.DEVICE_NOTIFY_WINDOW_HANDLE,
+                )
+                if self.bluetooth_notification_handle:
+                    logger.info("Bluetooth radio device notification registered.")
+                else:
+                    logger.warning("Bluetooth radio notification could not be registered; "
+                                   "the wireless route will fall back to its periodic check.")
+            except Exception as e:
+                logger.warning("Bluetooth radio notification setup failed: %s", e)
+
             win32gui.PumpMessages()
         except Exception as e:
             logger.error("Wired device change listener failed: %s", e)
         finally:
-            if self.notification_handle:
-                try:
-                    ctypes.windll.user32.UnregisterDeviceNotification(self.notification_handle)
-                except Exception:
-                    pass
-                self.notification_handle = None
+            for attr in ("notification_handle", "bluetooth_notification_handle"):
+                handle = getattr(self, attr, None)
+                if handle:
+                    try:
+                        ctypes.windll.user32.UnregisterDeviceNotification(handle)
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
             self.hwnd = None
             try:
                 win32gui.UnregisterClass(self._class_name, hinstance)
@@ -853,6 +885,19 @@ class WiredDeviceChangeListener:
             if reason and "VID_057E&PID_2069" in target_path:
                 try:
                     self.event_queue.put_nowait({
+                        "kind": "wired",
+                        "reason": reason,
+                        "path": path,
+                        "timestamp": time.time(),
+                    })
+                except Exception:
+                    pass
+            elif reason and self.BLUETOOTH_RADIO_GUID.strip("{}") in target_path:
+                # A Bluetooth radio came or went. The wireless route is parked waiting for
+                # exactly this instead of retrying an adapter that is not there.
+                try:
+                    self.event_queue.put_nowait({
+                        "kind": "bluetooth_radio",
                         "reason": reason,
                         "path": path,
                         "timestamp": time.time(),
@@ -4967,8 +5012,16 @@ class ControllerWindow:
                 conn_status = "Ready"
                 status_color = "#55CC55"
             else:
-                conn_status = "Disconnect"
-                status_color = "#888888"
+                # No Bluetooth radio (or it was switched off): the app keeps running in
+                # wired-only mode, so report the USB route rather than a bare "Disconnect"
+                # that made it look like nothing could connect at all.
+                conn_method = "USB"
+                if getattr(self, 'wired_pro2_detected', False):
+                    conn_status = "USB Connected"
+                    status_color = "#55CC55"
+                else:
+                    conn_status = "Pending USB Connection"
+                    status_color = "#888888"
 
         self.header_label.config(
             text=f"Connecting Via: {conn_method}  |  Status: {conn_status}",
@@ -10647,6 +10700,45 @@ bg_color=panel_bg, widths=[8, 10])
         self.joycon_ir_mouse_popup_anchor = anchor_widget
         popup.joycon_ir_context = (side, profile_name, category, mapping_scope)
         settings = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope)["ir_mouse"]
+
+        # Raw Input toggle, styled after the wired Pro Controller's "Auto Scan: On/Off".
+        # Packed into the popup itself (not the two-column content grid) and before
+        # _joycon_ir_popup_layout packs `content`, so it spans the popup's full width
+        # inside the existing padding and sits at the very top.
+        raw_input_frame = tk.Frame(popup, bg=button_gray)
+        raw_input_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(8 * scaling_factor)))
+
+        def raw_input_enabled():
+            # Deliberately the unscoped getter: raw_input is one value per side that
+            # Mode Shift / In-app Gyro layers do not override, because toggling it
+            # creates or destroys a real virtual HID mouse device.
+            return bool(CONFIG.get_joycon_ir_sensor_settings(
+                side, profile_name, category)["ir_mouse"].get("raw_input", False))
+
+        def refresh_raw_input_button():
+            raw_input_btn.config(text=f"Raw Input: {'On' if raw_input_enabled() else 'Off'}")
+
+        def toggle_raw_input():
+            CONFIG.set_joycon_ir_mouse_setting(side, "raw_input", not raw_input_enabled(),
+                                               profile_name, category)
+            CONFIG.save_config()
+            refresh_raw_input_button()
+
+        raw_input_btn = tk.Button(
+            raw_input_frame,
+            text="",
+            bg=button_gray,
+            fg=text_color,
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 11, "bold")),
+            command=toggle_raw_input,
+        )
+        raw_input_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+        refresh_raw_input_button()
+        Tooltip(raw_input_btn, lambda: "Send IR Mouse movement through a virtual HID mouse\n"
+                                       "so games that read Raw Input can see it.")
+
         create_row, finalize, control_font, control_width, _control_height = self._joycon_ir_popup_layout(popup)
         sensitivity_cell = create_row("Sensitivity:")
         sensitivity = tk.Scale(sensitivity_cell, from_=1, to=10, resolution=.2, orient=tk.HORIZONTAL,
@@ -11400,22 +11492,36 @@ bg_color=panel_bg, widths=[8, 10])
     def poll_wired_device_events(self):
         if getattr(self, 'is_quitting', False):
             return
-        latest = None
+        # Keep the latest of each kind: the queue now carries wired-controller events and
+        # Bluetooth-radio events, and collapsing to a single "latest" would let one kind
+        # swallow the other.
+        latest = {}
         try:
             q = getattr(self, "wired_device_event_queue", None)
             if q is not None:
                 while True:
                     try:
-                        latest = q.get_nowait()
+                        event = q.get_nowait()
                     except queue.Empty:
                         break
+                    latest[event.get("kind", "wired")] = event
         except Exception:
-            latest = None
-        if latest:
+            latest = {}
+
+        wired_event = latest.get("wired")
+        if wired_event:
             self._schedule_wired_device_change_rescan(
-                latest.get("reason", "device_arrival"),
-                latest.get("path"),
+                wired_event.get("reason", "device_arrival"),
+                wired_event.get("path"),
             )
+
+        if latest.get("bluetooth_radio"):
+            try:
+                from discoverer import notify_bluetooth_radio_changed
+                notify_bluetooth_radio_changed()
+            except Exception:
+                logger.debug("Bluetooth radio change notification failed", exc_info=True)
+
         try:
             self.root.after(250, self.poll_wired_device_events)
         except Exception:
@@ -12898,6 +13004,14 @@ bg_color=panel_bg, widths=[8, 10])
             for controller in getattr(vc, "controllers", []) or []
         )
         self.update_driver_buttons_visibility()
+        # Refresh the header here too. In wired-only mode it reads wired_pro2_detected, and
+        # its other callers are the button-layout rebuild and the 5 s ESP32 status poll --
+        # neither of which fires when a wired pad connects, so the status would otherwise sit
+        # on "Pending USB Connection" for up to 5 seconds after the controller is ready.
+        try:
+            self.update_header_status()
+        except Exception:
+            logger.debug("Header status refresh failed", exc_info=True)
         
         if hasattr(self, 'djg_dominant_var'):
             djg_dominant = getattr(CONFIG, "djg_dominant_side", "Right")

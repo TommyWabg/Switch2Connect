@@ -51,6 +51,82 @@ def decodes(data: bytes):
 
 _CACHED_LOCAL_MAC_VALUE = None
 
+# Bluetooth radio (HCI) device interface. Present exactly when Windows has a Bluetooth
+# radio enumerated -- built in or on a dongle.
+GUID_BTHPORT_DEVICE_INTERFACE = "{0850302A-B344-4FDA-9BE9-90576B8D46F0}"
+
+
+def bluetooth_radio_present() -> bool:
+    """True when Windows currently has a Bluetooth radio device.
+
+    ``get_local_mac_value()`` below raises "No more data is available"
+    (ERROR_NO_MORE_ITEMS) both when there is no radio at all and when the Bluetooth stack
+    simply has not finished starting yet, which are very different situations: the first
+    should never be retried, the second always should. Asking PnP directly tells the two
+    apart, so a machine with no dongle stops retrying immediately while a machine whose
+    radio is still warming up at boot keeps its retries.
+
+    Returns True on any unexpected failure -- callers then fall back to their retry loop,
+    which is the safe direction to be wrong in.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import uuid
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("InterfaceClassGuid", GUID),
+                ("Flags", wintypes.DWORD),
+                ("Reserved", ctypes.c_void_p),
+            ]
+
+        value = uuid.UUID(GUID_BTHPORT_DEVICE_INTERFACE.strip("{}"))
+        guid = GUID(value.time_low, value.time_mid, value.time_hi_version,
+                    (ctypes.c_ubyte * 8)(*value.bytes[8:]))
+
+        DIGCF_PRESENT = 0x00000002
+        DIGCF_DEVICEINTERFACE = 0x00000010
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+        setupapi.SetupDiGetClassDevsW.argtypes = [
+            ctypes.POINTER(GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD
+        ]
+        setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+        setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID), wintypes.DWORD,
+            ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)
+        ]
+        setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+        setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+
+        info_set = setupapi.SetupDiGetClassDevsW(
+            ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+        if info_set == INVALID_HANDLE_VALUE:
+            return True
+        try:
+            iface = SP_DEVICE_INTERFACE_DATA()
+            iface.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
+            return bool(setupapi.SetupDiEnumDeviceInterfaces(
+                info_set, None, ctypes.byref(guid), 0, ctypes.byref(iface)))
+        finally:
+            setupapi.SetupDiDestroyDeviceInfoList(info_set)
+    except Exception:
+        return True
+
+
 def convert_mac_string_to_value(mac: str):
     # Handle colons, dashes, and spaces robustly and convert to integer
     cleaned = mac.replace(":", "").replace("-", "").strip()

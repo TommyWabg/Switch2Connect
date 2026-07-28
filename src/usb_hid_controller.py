@@ -98,6 +98,15 @@ USB_SELECT_COMMON_REPORT_COMMAND = bytes([0x03, 0x91, 0x00, 0x0A, 0x00, 0x04,
 _hid_import_warned = False
 _pyusb_import_warned = False
 _native_winusb_warned = False
+_winusb_binding_warned = False
+# True once a client's read loop is streaming input. While set, SET_CONFIGURATION on the
+# composite device is off limits: it resets every endpoint, including the interface 0 pipe
+# we are in the middle of reading. Only that one call is gated -- writing commands to the
+# interface-1 bulk endpoint stays available, because _delayed_reinit() needs it to re-apply
+# the startup commands after connect. See _ensure_configuration().
+_usb_input_streaming = threading.Event()
+_usb_streaming_lock = threading.Lock()
+_usb_streaming_refs = 0
 
 
 def _import_hid():
@@ -171,12 +180,14 @@ def _guid_from_string(value: str):
 
 
 def _pro2_winusb_interface_guids() -> list[str]:
+    global _winusb_binding_warned
     try:
         import winreg
     except Exception:
         return []
 
     guids: list[str] = []
+    services_seen: list[str] = []
     base_path = r"SYSTEM\CurrentControlSet\Enum\USB\VID_057E&PID_2069&MI_01"
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_path) as base_key:
@@ -192,6 +203,7 @@ def _pro2_winusb_interface_guids() -> list[str]:
                 try:
                     with winreg.OpenKey(base_key, instance) as instance_key:
                         service = str(winreg.QueryValueEx(instance_key, "Service")[0]).upper()
+                    services_seen.append(service or "(none)")
                     if service != "WINUSB":
                         continue
                     with winreg.OpenKey(base_key, instance + r"\Device Parameters") as params_key:
@@ -208,6 +220,23 @@ def _pro2_winusb_interface_guids() -> list[str]:
                         guids.append(candidate)
     except OSError:
         pass
+
+    if not guids and not _winusb_binding_warned:
+        _winusb_binding_warned = True
+        # Informational only. The native WinUSB route is one of three ways to reach the
+        # vendor command endpoint; pyusb and the HID output-report fallback are tried next,
+        # and initialize() reports which one actually won. Drawing a "less reliable"
+        # conclusion here was wrong -- it fired even when pyusb went on to work fine.
+        if any(s == "WINUSB" for s in services_seen):
+            reason = ("bound to WinUSB but no DeviceInterfaceGUIDs registered, so it has "
+                      "no device interface to open")
+        elif services_seen:
+            reason = f"not bound to WinUSB (services found: {services_seen})"
+        else:
+            reason = "not present in the registry"
+        logger.info(
+            "Wired USB: native WinUSB route unavailable for interface 1 (MI_01) -- %s. "
+            "Falling back to pyusb, then to HID output reports.", reason)
     return guids
 
 
@@ -414,6 +443,33 @@ def _write_startup_reports_native_winusb() -> bool:
     ))
 
 
+def _ensure_configuration(dev) -> None:
+    """Set the USB configuration only when the device does not already have one.
+
+    Calling set_configuration() unconditionally is destructive here: interface 0 of this
+    composite device is bound to HIDClass and is the interface we stream input from, and a
+    SET_CONFIGURATION resets every endpoint on the device. Doing that repeatedly (the
+    rumble fallback used to, every 0.5 s) tears down the input stream over and over.
+
+    This is the only libusb operation that is unsafe mid-stream, so it is the only one
+    gated on _usb_input_streaming. Writing to the interface-1 bulk endpoint is fine and
+    must stay available -- _delayed_reinit() depends on it to re-apply the startup
+    commands a second after connect.
+    """
+    try:
+        if dev.get_active_configuration() is not None:
+            return
+    except Exception:
+        pass
+    if _usb_input_streaming.is_set():
+        logger.debug("Wired USB: skipping set_configuration while input is streaming")
+        return
+    try:
+        dev.set_configuration()
+    except Exception:
+        logger.debug("Wired USB set_configuration failed", exc_info=True)
+
+
 def send_pro_controller2_usb_command(command: bytes) -> bool:
     if _write_commands_native_winusb((bytes(command),)):
         return True
@@ -427,10 +483,7 @@ def send_pro_controller2_usb_command(command: bytes) -> bool:
         dev = usb_core.find(idVendor=NINTENDO_VENDOR_ID, idProduct=PRO_CONTROLLER2_PID, backend=backend)
         if dev is None:
             return False
-        try:
-            dev.set_configuration()
-        except Exception:
-            pass
+        _ensure_configuration(dev)
         try:
             usb_util.claim_interface(dev, USB_COMMAND_INTERFACE)
             claimed = True
@@ -454,14 +507,20 @@ def send_pro_controller2_usb_command(command: bytes) -> bool:
                 pass
 
 
-def initialize_pro_controller2_usb_reports() -> bool:
-    """Send the startup commands required before a Pro Controller 2 streams USB input."""
+def initialize_pro_controller2_usb_reports() -> str:
+    """Send the startup commands required before a Pro Controller 2 streams USB input.
+
+    Returns the transport that delivered them -- "native_winusb", "pyusb", or "" when none
+    did. Truthiness matches the old bool return, and the name lets the caller re-apply the
+    commands later over the same route instead of blindly retrying one that cannot work on
+    this machine.
+    """
     if _write_startup_reports_native_winusb():
-        return True
+        return "native_winusb"
 
     usb_core, usb_util, backend = _import_pyusb()
     if usb_core is None or usb_util is None:
-        return False
+        return ""
 
     dev = None
     claimed = False
@@ -469,12 +528,9 @@ def initialize_pro_controller2_usb_reports() -> bool:
         dev = usb_core.find(idVendor=NINTENDO_VENDOR_ID, idProduct=PRO_CONTROLLER2_PID, backend=backend)
         if dev is None:
             logger.debug("Wired USB init: Pro Controller 2 USB device not found")
-            return False
+            return ""
 
-        try:
-            dev.set_configuration()
-        except Exception:
-            pass
+        _ensure_configuration(dev)
 
         try:
             usb_util.claim_interface(dev, USB_COMMAND_INTERFACE)
@@ -511,10 +567,10 @@ def initialize_pro_controller2_usb_reports() -> bool:
 
         logger.info("Wired USB Pro Controller 2 startup commands sent on endpoint 0x%02x",
                     endpoint_out)
-        return True
+        return "pyusb"
     except Exception as e:
         logger.warning("Wired USB Pro Controller 2 startup commands failed: %s", e)
-        return False
+        return ""
     finally:
         if dev is not None:
             if claimed:
@@ -780,6 +836,7 @@ class _UsbHidClient:
         self._hid_rumble_ok = False         # a hid output write has succeeded at least once
         self._hid_rumble_fail_streak = 0
         self._last_bulk_fallback = 0.0
+        self._connected_at = time.time()
         self._timer_res_raised = False
         self._last_rumble_write_warn = 0.0
         # Audio-haptic rate gate: the controller sets this True whenever the emulated
@@ -805,6 +862,10 @@ class _UsbHidClient:
         self._last_recover = 0.0
         self._recover_attempts = 0
         self._io_pause = threading.Event()   # set while recovering; read loop stands down
+        # _reopen() is called from both the read thread and the rumble writer. Without this
+        # lock the two race on _recover_attempts and can burn the whole retry budget inside
+        # a single backoff window.
+        self._recover_lock = threading.Lock()
         self.on_disconnect_callback = None
         self._disconnect_notified = False
 
@@ -824,6 +885,9 @@ class _UsbHidClient:
     # Healthy input for this long after a recovery refunds the retry budget, so a
     # session that glitches once an hour keeps recovering instead of running out.
     _RECOVER_SETTLE = 10.0
+    # How long after connect the Bulk/WinUSB rumble fallback stays eligible. It exists to
+    # probe which transport this pad accepts, so it only needs the opening seconds.
+    _BULK_FALLBACK_WINDOW = 3.0
 
     def _reopen(self):
         """Close and re-open the HID handle in place. True when input can resume.
@@ -832,6 +896,17 @@ class _UsbHidClient:
         rumble loops down while the handle is swapped, and `_write_lock` is held so
         no writer is inside `dev.write()` when the handle goes away.
         """
+        # Serialised so a concurrent fault on the other worker cannot consume a second
+        # attempt while this one is still in its backoff sleep. The budget itself is
+        # unchanged (_MAX_RECOVER_ATTEMPTS stays 3).
+        if not self._recover_lock.acquire(blocking=False):
+            return False
+        try:
+            return self._reopen_locked()
+        finally:
+            self._recover_lock.release()
+
+    def _reopen_locked(self):
         if self._read_stop.is_set():
             return False
         if self._recover_attempts >= self._MAX_RECOVER_ATTEMPTS:
@@ -1046,8 +1121,15 @@ class _UsbHidClient:
         # accepted a hid report (init-time transport probe). Once hid writes have
         # succeeded, a failure is a stall to be healed by reopen -- not a reason to
         # hammer set_configuration() on interface 1 (which makes recovery impossible).
+        #
+        # Also bounded in time. _hid_rumble_ok never flipping true used to mean this ran
+        # every 0.5 s for the whole session; on a machine without the WinUSB binding that
+        # is an endless stream of libusb round-trips against the composite device. It is a
+        # transport probe, so a few seconds after connect is all it is good for.
         now = time.time()
-        if not self._hid_rumble_ok and now - self._last_bulk_fallback >= 0.5:
+        if (not self._hid_rumble_ok
+                and now - self._connected_at <= self._BULK_FALLBACK_WINDOW
+                and now - self._last_bulk_fallback >= 0.5):
             self._last_bulk_fallback = now
             self.write_rumble_command(data)
             return
@@ -1084,7 +1166,12 @@ class _UsbHidClient:
                 self._last_usb_sample_refresh = now
 
     def write_output_report(self, data, report_id=OUTPUT_REPORT_ID_PRO2):
-        self.open()
+        # Never re-open here. This used to call open(), so a writer that outlived
+        # disconnect()'s bounded join could resurrect the HID handle after teardown --
+        # leaking it, and letting _ensure_rumble_thread() spin up a fresh writer against
+        # a controller the discoverer had already dropped.
+        if self.dev is None or self._read_stop.is_set():
+            return 0
         is_audio = getattr(self, 'is_audio_haptic_active', False)
         payload = _pro2_usb_output_body(data, is_audio_active=is_audio)
         report = bytes([report_id]) + payload
@@ -1110,7 +1197,10 @@ class _UsbHidClient:
         return written
 
     def write_command_report(self, command: bytes):
-        self.open()
+        # Same rule as write_output_report(): the handle is opened by open()/initialize(),
+        # never lazily resurrected from a worker thread.
+        if self.dev is None or self._read_stop.is_set():
+            return 0
         report = bytes([OUTPUT_REPORT_ID_PRO2]) + bytes(command).ljust(PRO2_OUTPUT_REPORT_BODY_SIZE, b"\x00")
         with self._write_lock:
             try:
@@ -1128,7 +1218,13 @@ class _UsbHidClient:
                 USB_ENABLE_FEATURES_COMMAND,
                 USB_SELECT_COMMON_REPORT_COMMAND,
             ):
-                self.write_command_report(command)
+                # Report the real outcome: this result now selects _init_transport, and
+                # claiming success for writes the handle rejected would make _delayed_reinit
+                # keep re-sending over a route that does not work.
+                if self.write_command_report(command) <= 0:
+                    logger.warning(
+                        "Wired USB HID startup fallback: command 0x%02x rejected", command[0])
+                    return False
                 time.sleep(0.02)
             logger.info("Wired USB Pro Controller 2 startup commands sent via HID output report fallback")
             return True
@@ -1144,6 +1240,23 @@ class _UsbHidClient:
         self._read_thread.start()
 
     def _read_loop(self):
+        # Marks the composite device as off limits to the libusb command path for as long
+        # as we are reading interface 0. Reference-counted so a second wired pad does not
+        # clear the flag when the first one's loop exits.
+        with _usb_streaming_lock:
+            global _usb_streaming_refs
+            _usb_streaming_refs += 1
+            _usb_input_streaming.set()
+        try:
+            self._read_loop_inner()
+        finally:
+            with _usb_streaming_lock:
+                _usb_streaming_refs -= 1
+                if _usb_streaming_refs <= 0:
+                    _usb_streaming_refs = 0
+                    _usb_input_streaming.clear()
+
+    def _read_loop_inner(self):
         while not self._read_stop.is_set():
             if self._io_pause.is_set():
                 time.sleep(0.01)
@@ -1248,6 +1361,16 @@ class _UsbHidClient:
         self.is_connected = False
         self._rumble_stop.set()
         self._rumble_wake.set()
+        # Drop the handle here rather than waiting for disconnect(). The transport is
+        # already dead, and holding an open handle to it across the rescan only gives the
+        # driver stack another reason to keep the device in a half-torn-down state.
+        with self._write_lock:
+            if self.dev is not None:
+                try:
+                    self.dev.close()
+                except Exception:
+                    logger.debug("Wired USB HID close on disconnect notify failed", exc_info=True)
+                self.dev = None
         callback = self.on_disconnect_callback
         if callback is None:
             return
@@ -1261,12 +1384,14 @@ class _UsbHidClient:
         self._disconnect_notified = True
         self._rumble_stop.set()
         self._rumble_wake.set()
+        # Joins go to a worker thread so the discoverer's event loop stays responsive
+        # during teardown (see USBHidController.disconnect).
         if self._rumble_thread and self._rumble_thread.is_alive():
-            self._rumble_thread.join(timeout=0.5)
+            await asyncio.to_thread(self._rumble_thread.join, 0.5)
         self._rumble_thread = None
         self._set_timer_resolution(False)
         if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=0.5)
+            await asyncio.to_thread(self._read_thread.join, 0.5)
         self._read_thread = None
         if self.dev is not None:
             try:
@@ -1469,9 +1594,23 @@ class USBHidController(Controller):
         output reports stay disabled after connect."""
         self._loop = asyncio.get_running_loop()
         self.client.open()
-        winusb_ok = await asyncio.to_thread(initialize_pro_controller2_usb_reports)
-        if not winusb_ok:
-            await asyncio.to_thread(self.client.send_startup_reports_hid)
+        # Runs before the read thread starts, so the pyusb route is still allowed here.
+        transport = await asyncio.to_thread(initialize_pro_controller2_usb_reports)
+        if not transport:
+            if await asyncio.to_thread(self.client.send_startup_reports_hid):
+                transport = "hid_fallback"
+        self._init_transport = transport or "none"
+        if self._init_transport in ("hid_fallback", "none"):
+            # Only now is "the vendor command endpoint is unreachable" actually true --
+            # every route has been tried and none of them worked.
+            logger.warning(
+                "Wired USB init transport = %s (%s): the vendor command endpoint could not "
+                "be reached by any route, so the controller may be less stable. Installing "
+                "the WinUSB driver for interface 1 (MI_01) is recommended.",
+                self._init_transport, self.device.address)
+        else:
+            logger.info("Wired USB init transport = %s (%s)",
+                        self._init_transport, self.device.address)
 
         ensure_wired_controller_calibration_alias(self)
         gyro_cal_data = get_calibration_entry(getattr(CONFIG, "calibration_data", {}) or {}, self)
@@ -1512,13 +1651,35 @@ class USBHidController(Controller):
         self._reinit_task = asyncio.create_task(self._delayed_reinit())
 
     async def _delayed_reinit(self):
+        # Re-apply over whichever route actually worked at init. This used to always call
+        # initialize_pro_controller2_usb_reports(), which on a machine without the WinUSB
+        # binding is two silent no-ops -- the pad never received its feature-enable and
+        # only ever worked after an app restart.
+        transport = getattr(self, "_init_transport", "none")
+        if transport == "none":
+            logger.warning(
+                "Wired USB re-init skipped (%s): no working command transport",
+                self.device.address)
+            return
         try:
             for delay in (0.8, 1.8):
                 await asyncio.sleep(delay)
-                if not self.interp_running:
+                if not self.interp_running or self.client is None:
                     return
-                await asyncio.to_thread(initialize_pro_controller2_usb_reports)
-            logger.info("Wired USB Pro Controller 2 startup commands re-applied (%s)", self.device.address)
+                if transport == "hid_fallback":
+                    ok = await asyncio.to_thread(self.client.send_startup_reports_hid)
+                else:
+                    ok = await asyncio.to_thread(initialize_pro_controller2_usb_reports)
+                if not ok:
+                    # Do not claim success we did not verify: this re-init is what makes
+                    # battery reporting and the rumble settings take effect, so a silent
+                    # failure here used to look identical to a working connect.
+                    logger.warning(
+                        "Wired USB re-init via %s did not complete (%s); battery reporting "
+                        "or rumble may be unavailable", transport, self.device.address)
+                    return
+            logger.info("Wired USB Pro Controller 2 startup commands re-applied via %s (%s)",
+                        transport, self.device.address)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1530,8 +1691,14 @@ class USBHidController(Controller):
         task = getattr(self, "_reinit_task", None)
         if task is not None:
             task.cancel()
+        # This class overrides Controller.disconnect() entirely, so the base class never
+        # gets to stop the threads it starts in __init__. Do it here.
+        self._stop_worker_threads()
+        # Off the event loop: these are blocking joins, and the discoverer's wired watcher
+        # runs on this same loop. Blocking it here left WIRED_RESCAN_EVENT unserviced, so
+        # pressing manual scan during a teardown appeared to do nothing.
         if hasattr(self, "interp_thread") and self.interp_thread.is_alive():
-            self.interp_thread.join(timeout=0.5)
+            await asyncio.to_thread(self.interp_thread.join, 0.5)
         if self.client:
             try:
                 await self.client.disconnect()

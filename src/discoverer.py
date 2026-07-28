@@ -55,6 +55,17 @@ WIRED_RESCAN_EVENT = None
 WIRED_RESCAN_REQUESTS = []
 WIRED_RESCAN_LOCK = threading.Lock()
 
+# Ceilings for the wired add/remove path. These only bound how long a *stuck* operation
+# can block; they add no background work. Without them a single hung driver or libusb
+# call leaves the device key in `connecting` forever, and every later scan -- including
+# a manual one -- skips that device until the app is restarted.
+ADD_INITIALIZE_TIMEOUT = 8.0
+ADD_SETUP_TIMEOUT = 8.0
+DISCONNECT_TIMEOUT = 5.0
+# A `connecting` entry older than this is a task that died without running its `finally`
+# (or is wedged past every ceiling above). Swept from the watcher's existing idle tick.
+CONNECTING_STALE_TIMEOUT = 15.0
+
 def request_wired_rescan(reason: str = "manual_refresh", candidate_path=None, manual: bool = False):
     """Request one wired Pro Controller discovery pass from any thread."""
     global WIRED_RESCAN_EVENT
@@ -163,6 +174,57 @@ _SYSTEM_BT_AVAILABLE = True
 def is_system_bluetooth_available() -> bool:
     return _SYSTEM_BT_AVAILABLE
 
+
+# Set by the GUI's device-change listener when a Bluetooth radio arrives or is removed.
+# The wireless route waits on this instead of retrying on a timer, so a machine with no
+# radio costs nothing until one actually appears.
+BLUETOOTH_RADIO_EVENT = None
+
+
+def notify_bluetooth_radio_changed():
+    """Wake the wireless route after a Bluetooth radio arrived or was removed.
+
+    Safe to call from any thread -- mirrors request_wired_rescan() above.
+    """
+    loop = DISCOVERER_LOOP
+    event = BLUETOOTH_RADIO_EVENT
+    if loop and event and loop.is_running():
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            pass
+
+
+async def _wait_for_bluetooth_radio(quit_event) -> bool:
+    """Block until a Bluetooth radio change is signalled. False when the app is quitting.
+
+    Also re-checks on a slow timer as a backstop: toggling Bluetooth off/on in Windows
+    Settings does not reliably raise a radio device-interface arrival, so an event-only
+    wait could miss it. 30 s is far too coarse to cost anything, and this only runs while
+    there is no usable radio.
+    """
+    from utils import bluetooth_radio_present
+    RADIO_PROBE_INTERVAL = 30.0
+    last_probe = time.monotonic()
+    while not quit_event.is_set():
+        try:
+            # quit_event is a threading.Event and cannot be awaited, so wake up often
+            # enough to notice it. This is shutdown latency, not the probe interval --
+            # waiting the full 30 s here made quitting take up to half a minute.
+            await asyncio.wait_for(BLUETOOTH_RADIO_EVENT.wait(), timeout=1.0)
+            BLUETOOTH_RADIO_EVENT.clear()
+            await asyncio.sleep(1.0)   # let the stack settle after the arrival
+            return not quit_event.is_set()
+        except asyncio.TimeoutError:
+            now = time.monotonic()
+            if now - last_probe >= RADIO_PROBE_INTERVAL:
+                last_probe = now
+                if await asyncio.to_thread(bluetooth_radio_present):
+                    logger.info("Bluetooth radio detected by periodic check.")
+                    return not quit_event.is_set()
+    return False
+
+
 async def auto_disconnect_checker(quit_event):
     logger.info("Auto disconnect checker task started.")
     while not quit_event.is_set():
@@ -170,7 +232,7 @@ async def auto_disconnect_checker(quit_event):
             await asyncio.sleep(1.0)
             if not getattr(CONFIG, "auto_disconnect_enabled", False):
                 continue
-            
+
             days = getattr(CONFIG, "auto_disconnect_days", 0)
             hours = getattr(CONFIG, "auto_disconnect_hours", 0)
             minutes = getattr(CONFIG, "auto_disconnect_minutes", 0)
@@ -206,9 +268,17 @@ async def auto_disconnect_checker(quit_event):
         except Exception as e:
             logger.error(f"Error in auto_disconnect_checker: {e}")
 
-async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
-    global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, DISCONNECT_CALLBACK, _CURRENTLY_DISCOVERING
-    global GLOBAL_LOCK, CONNECTION_LOCK, _SYSTEM_BT_AVAILABLE
+async def run_discovery_session(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
+    """Own the wired and wireless discovery routes as two independent tasks.
+
+    The wired watcher used to be created by (and torn down with) run_discovery(). That
+    coupling meant any way the wireless route ended -- a return, an exception, or simply
+    giving up on an absent Bluetooth adapter -- also cancelled the wired watcher and
+    disconnected wired controllers that were working perfectly well. Ownership lives here
+    instead, so the wired route survives whatever the wireless route does.
+    """
+    global VIRTUAL_CONTROLLERS, UPDATE_CALLBACK, DISCOVERER_LOOP, _CURRENTLY_DISCOVERING
+    global GLOBAL_LOCK, CONNECTION_LOCK, BLUETOOTH_RADIO_EVENT
 
     with DISCOVERY_LOCK:
         if _CURRENTLY_DISCOVERING:
@@ -218,13 +288,14 @@ async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridg
 
     usb_hid_task = None
     try:
+        # These must exist before either route starts: run_usb_hid_discovery() uses
+        # GLOBAL_LOCK and UPDATE_CALLBACK from its very first scan.
         UPDATE_CALLBACK = update_controllers_threadsafe
         DISCOVERER_LOOP = asyncio.get_running_loop()
-    
         GLOBAL_LOCK = asyncio.Lock()
         CONNECTION_LOCK = asyncio.Lock()
-        connected_mac_addresses: list[str] = []
-    
+        BLUETOOTH_RADIO_EVENT = asyncio.Event()
+
         logger.info("Discovery starting: Performing initial cleanup of stale controllers...")
         for i, vc in enumerate(VIRTUAL_CONTROLLERS):
             if vc is not None:
@@ -234,21 +305,64 @@ async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridg
                 except Exception as e:
                     logger.error(f"Error in initial cleanup of controller {i}: {e}")
                 VIRTUAL_CONTROLLERS[i] = None
-            
+
         # Detach all possible USBIP ports to clear stale attachments
         try:
             from virtual_controller import detach_all_usbip_devices
             detach_all_usbip_devices()
         except Exception as e:
             logger.error(f"Error in initial USBIP port cleanup: {e}")
-    
+
         if UPDATE_CALLBACK:
             UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
 
-        # Wired USB controllers (e.g. Pro Controller 2) run on an independent transport,
-        # so watch for them concurrently with whichever BLE route is chosen below.
+        # Wired USB controllers (e.g. Pro Controller 2) run on an independent transport.
         usb_hid_task = asyncio.create_task(run_usb_hid_discovery(quit_event))
 
+        try:
+            await run_discovery(quit_event, startup_bridge_context)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A wireless-route failure must never take the wired route with it.
+            logger.exception("Wireless discovery route failed; wired route continues")
+            while not quit_event.is_set():
+                await asyncio.sleep(0.5)
+    finally:
+        if usb_hid_task is not None:
+            usb_hid_task.cancel()
+            try:
+                await usb_hid_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("USB HID discovery task teardown error", exc_info=True)
+        with DISCOVERY_LOCK:
+            _CURRENTLY_DISCOVERING = False
+        logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery loop exited. Starting session cleanup...")
+        # Use a copy to avoid issues if the list is modified during iteration
+        vcs_to_disconnect = [vc for vc in VIRTUAL_CONTROLLERS if vc is not None]
+        if vcs_to_disconnect:
+            # CRITICAL: We now use is_suspending=False even during suspend
+            # to ensure the ViGEmBus handles are closed cleanly.
+            # Our "Triple Protection" in gui.py handles the wake-prevention.
+            await asyncio.gather(*[vc.disconnect(is_suspending=False) for vc in vcs_to_disconnect])
+        logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery session cleanup complete.")
+        # Allow WinRT background events (like services_changed_handler) to clear out before closing the loop
+        await asyncio.sleep(0.5)
+
+
+async def run_discovery(quit_event, startup_bridge_context=None):
+    """The wireless route: ESP32-S3 bridge if present, otherwise system Bluetooth.
+
+    Owns neither the wired watcher nor the session-wide cleanup -- see
+    run_discovery_session() above.
+    """
+    global VIRTUAL_CONTROLLERS, DISCONNECT_CALLBACK, _SYSTEM_BT_AVAILABLE
+
+    connected_mac_addresses: list[str] = []
+
+    try:
         try:
             import usb_serial_bridge as _usb_serial_bridge_mod
             from usb_serial_bridge import (
@@ -1142,38 +1256,68 @@ async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridg
         host_mac_value = None
         logger.info("Controller connection route: system bluetooth")
         
-        # Robust retry loop to wait for Windows Bluetooth service and BLE stack to initialize (critical for startup)
-        bluetooth_initialized = False
-        retries = 15
-        for attempt in range(retries):
-            if quit_event.is_set():
-                logger.info("Quit event set during Bluetooth initialization. Aborting discovery.")
-                with DISCOVERY_LOCK:
-                    _CURRENTLY_DISCOVERING = False
-                return
-        
-            try:
-                from utils import get_local_mac_value
-                host_mac_value = get_local_mac_value()
-            
-                # Test scanner initialization to verify WinRT stack is ready
-                scanner = BleakScanner()
-            
-                bluetooth_initialized = True
-                logger.info(f"Bluetooth adapter and stack initialized successfully. Host MAC: {host_mac_value}")
-                break
-            except Exception as e:
-                logger.warning(f"Waiting for Bluetooth adapter/stack initialization (attempt {attempt + 1}/{retries}): {e}")
-                await asyncio.sleep(2.0)
+        from utils import get_local_mac_value, bluetooth_radio_present
 
-        if not bluetooth_initialized:
-            logger.error("Bluetooth adapter/stack failed to initialize after multiple attempts. Discovery aborted.")
-            with DISCOVERY_LOCK:
-                _CURRENTLY_DISCOVERING = False
-            return
-
-        # Start auto disconnect checker task
+        # Runs for every wireless state below, including while waiting for a radio, so
+        # auto-disconnect keeps working for wired controllers on a machine with no radio.
         checker_task = asyncio.create_task(auto_disconnect_checker(quit_event))
+
+        bluetooth_initialized = False
+        while not quit_event.is_set() and not bluetooth_initialized:
+            # Ask PnP whether a radio exists at all. get_local_mac_value() raises the same
+            # "No more data is available" for "no radio" and for "stack still starting",
+            # and retrying the former 15 times only delayed the wired route's status by
+            # 30 seconds while never being able to succeed.
+            if not await asyncio.to_thread(bluetooth_radio_present):
+                _SYSTEM_BT_AVAILABLE = False
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                logger.info(
+                    "No Bluetooth radio present; skipping the BLE route. Wired controllers "
+                    "are unaffected. Waiting for a radio to appear.")
+                if not await _wait_for_bluetooth_radio(quit_event):
+                    return
+                continue
+
+            # A radio exists, so the stack may just still be warming up (this is normal
+            # right after boot) -- that is what these retries are for.
+            retries = 15
+            for attempt in range(retries):
+                if quit_event.is_set():
+                    logger.info("Quit event set during Bluetooth initialization.")
+                    return
+                try:
+                    # PyBluez's read_local_bdaddr() is a blocking call; keep it off the
+                    # shared event loop so it cannot stall the wired route.
+                    host_mac_value = await asyncio.to_thread(get_local_mac_value)
+                    # Test scanner initialization to verify WinRT stack is ready. Left on
+                    # the loop thread deliberately: WinRT objects are apartment-bound.
+                    scanner = BleakScanner()
+                    bluetooth_initialized = True
+                    logger.info(f"Bluetooth adapter and stack initialized successfully. Host MAC: {host_mac_value}")
+                    break
+                except Exception as e:
+                    # Flip the flag on the first failure, not after all the retries, so the
+                    # GUI header switches to the wired/USB view straight away.
+                    _SYSTEM_BT_AVAILABLE = False
+                    if attempt == 0 and UPDATE_CALLBACK is not None:
+                        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                    logger.warning(f"Waiting for Bluetooth adapter/stack initialization (attempt {attempt + 1}/{retries}): {e}")
+                    if not await asyncio.to_thread(bluetooth_radio_present):
+                        logger.info("Bluetooth radio went away while initializing; stopping retries.")
+                        break
+                    await asyncio.sleep(2.0)
+
+            if not bluetooth_initialized:
+                logger.error(
+                    "Bluetooth adapter/stack did not initialize. Wired controllers are "
+                    "unaffected. Waiting for the Bluetooth radio to change before retrying.")
+                _SYSTEM_BT_AVAILABLE = False
+                if not await _wait_for_bluetooth_radio(quit_event):
+                    return
+
+        if quit_event.is_set():
+            return
         pending_connections_count = 0
 
         async def start_all_pending_virtual_usb():
@@ -1352,30 +1496,26 @@ async def run_discovery(update_controllers_threadsafe, quit_event, startup_bridg
                 raise
             except Exception as e:
                 _SYSTEM_BT_AVAILABLE = False
+                if UPDATE_CALLBACK is not None:
+                    UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                # If the radio is simply gone (dongle unplugged mid-session) there is
+                # nothing to retry against, so wait for it to come back instead of logging
+                # an error every 2 seconds for the rest of the session.
+                if not await asyncio.to_thread(bluetooth_radio_present):
+                    logger.info(
+                        "Bluetooth radio removed; pausing the BLE route until one returns. "
+                        "Wired controllers are unaffected.")
+                    if not await _wait_for_bluetooth_radio(quit_event):
+                        return
+                    continue
                 logger.error(f"Bluetooth scanner error: {e}. Retrying in 2 seconds...")
                 await asyncio.sleep(2.0)
     finally:
-        if usb_hid_task is not None:
-            usb_hid_task.cancel()
-            try:
-                await usb_hid_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.debug("USB HID discovery task teardown error", exc_info=True)
-        with DISCOVERY_LOCK:
-            _CURRENTLY_DISCOVERING = False
-        logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery loop exited. Starting session cleanup...")
-        # Use a copy to avoid issues if the list is modified during iteration
-        vcs_to_disconnect = [vc for vc in VIRTUAL_CONTROLLERS if vc is not None]
-        if vcs_to_disconnect:
-            # CRITICAL: We now use is_suspending=False even during suspend
-            # to ensure the ViGEmBus handles are closed cleanly.
-            # Our "Triple Protection" in gui.py handles the wake-prevention.
-            await asyncio.gather(*[vc.disconnect(is_suspending=False) for vc in vcs_to_disconnect])
-        logger.info(f"[{time.strftime('%H:%M:%S')}] Discovery session cleanup complete.")
-        # Allow WinRT background events (like services_changed_handler) to clear out before closing the loop
-        await asyncio.sleep(0.5)
+        # Wireless-route cleanup only. Cancelling the wired watcher and disconnecting the
+        # controllers belongs to run_discovery_session(), which owns them -- doing it here
+        # is what used to kill working wired pads whenever this route ended.
+        _SYSTEM_BT_AVAILABLE = False
+        logger.info(f"[{time.strftime('%H:%M:%S')}] Wireless discovery route exited.")
 
 async def run_usb_hid_discovery(quit_event):
     """Concurrent watcher for wired USB Pro Controller 2 devices.
@@ -1401,7 +1541,10 @@ async def run_usb_hid_discovery(quit_event):
     logger.info("Wired USB watcher started (event-driven, VID 057E/PID 2069).")
 
     known: dict = {}          # device key -> USBHidController
-    connecting: set = set()
+    # device key -> time.monotonic() when the _add task started. Timestamped (rather than a
+    # plain set) so a task that wedged or died without unwinding can be swept, instead of
+    # blocking that key from ever being re-added.
+    connecting: dict = {}
     removing: set = set()
     arrival_retry_tasks: dict = {}
     # Every physical HID instance we've added to the HidHide blacklist. Entries persist
@@ -1500,7 +1643,11 @@ async def run_usb_hid_discovery(quit_event):
                         UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
                     await update_all_player_leds()
             try:
-                await controller.disconnect()
+                # Bounded: disconnect() joins the interpolation, rumble and read threads and
+                # closes the HID handle. A wedged join must not pin this task forever.
+                await asyncio.wait_for(controller.disconnect(), timeout=DISCONNECT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Wired USB controller disconnect timed out (%s)", key)
             except Exception:
                 pass
         finally:
@@ -1523,6 +1670,13 @@ async def run_usb_hid_discovery(quit_event):
     async def _add(entry, key):
         controller = None
         instance_id = None
+        # Slot this call claimed in VIRTUAL_CONTROLLERS. Tracked so the failure path can
+        # hand it back: a claimed-but-never-finished slot is invisible to every cleanup
+        # path (the controller never reaches `known`, so neither _remove() nor the
+        # dead-transport sweep can ever see it) and would be lost until the app restarts.
+        # Four of those and the "no free player slot" branch below rejects every
+        # subsequent scan -- including manual ones.
+        claimed_vc = None
         try:
             # Hide the physical HID first (whitelists our own process so we keep access).
             instance_id = hidhide.hid_path_to_instance_id(entry.get("path"))
@@ -1543,12 +1697,19 @@ async def run_usb_hid_discovery(quit_event):
                 await _remove(c, _k, request_rescan=True)
             controller.disconnected_callback = _on_disc
 
-            await controller.initialize()
+            # Bounded: initialize() reaches pyusb/WinUSB, which can block indefinitely on a
+            # wedged device. Without a ceiling this task never finishes, `key` stays in
+            # `connecting` forever and every later scan skips the pad.
+            await asyncio.wait_for(controller.initialize(), timeout=ADD_INITIALIZE_TIMEOUT)
 
             async with GLOBAL_LOCK:
                 slot_index = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS) if c is None), None)
                 if slot_index is None:
-                    logger.warning("Wired USB pad connected but no free player slot.")
+                    logger.warning(
+                        "Wired USB pad connected but no free player slot. Slots: %s",
+                        [None if c is None else
+                         f"{getattr(c, 'mode', '?')}/{len(getattr(c, 'controllers', []))}"
+                         for c in VIRTUAL_CONTROLLERS])
                     await controller.disconnect()
                     if instance_id:
                         hidhide.unhide_device(instance_id)
@@ -1556,23 +1717,55 @@ async def run_usb_hid_discovery(quit_event):
                     return
                 vc = VirtualController(slot_index + 1, [controller], _on_disc, setup_usb=False)
                 VIRTUAL_CONTROLLERS[slot_index] = vc
+                claimed_vc = vc
                 await vc.init_added_controller(controller)
                 reorder_controllers()
                 if UPDATE_CALLBACK is not None:
                     UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
                 await update_all_player_leds()
 
-            await asyncio.to_thread(vc.setup_virtual_device)
+            # Bounded for the same reason: WinUHid creation takes VIRTUAL_DEVICE_CREATION_LOCK
+            # and the driver call can hang, and setup_virtual_device() also raises outright when
+            # the neutral readiness probe is rejected.
+            await asyncio.wait_for(
+                asyncio.to_thread(vc.setup_virtual_device), timeout=ADD_SETUP_TIMEOUT)
             async def _connection_haptics(c_ref=controller):
                 await c_ref.trigger_connection_haptics()
             asyncio.create_task(_connection_haptics())
             known[key] = controller
             logger.info("Wired USB Pro Controller 2 added (%s)", controller.device.address)
-        except Exception:
-            logger.exception("Failed to add wired USB controller")
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                logger.warning("Timed out adding wired USB controller (%s); releasing slot", key)
+            else:
+                logger.exception("Failed to add wired USB controller")
+            # Hand the player slot back. Skipping this strands a half-built VirtualController
+            # in VIRTUAL_CONTROLLERS that nothing else can ever reap, permanently shrinking
+            # the pool until the app is restarted.
+            if claimed_vc is not None:
+                try:
+                    async with GLOBAL_LOCK:
+                        # Located by identity, not by the index we claimed:
+                        # reorder_controllers() compacts and re-indexes the list, so the vc
+                        # may well have moved since.
+                        current = next((i for i, c in enumerate(VIRTUAL_CONTROLLERS)
+                                        if c is claimed_vc), None)
+                        if current is not None:
+                            try:
+                                await claimed_vc.remove_controller(controller)
+                            except Exception:
+                                logger.debug("Slot rollback remove_controller failed", exc_info=True)
+                            VIRTUAL_CONTROLLERS[current] = None
+                            logger.info("Released player slot %d after failed wired add", current + 1)
+                        if not (IS_SHUTTING_DOWN or _IS_SUSPENDING):
+                            reorder_controllers()
+                            if UPDATE_CALLBACK is not None:
+                                UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+                except Exception:
+                    logger.exception("Failed to release player slot after wired USB add error")
             if controller is not None:
                 try:
-                    await controller.disconnect()
+                    await asyncio.wait_for(controller.disconnect(), timeout=DISCONNECT_TIMEOUT)
                 except Exception:
                     pass
             if instance_id:
@@ -1582,7 +1775,7 @@ async def run_usb_hid_discovery(quit_event):
                 except Exception:
                     pass
         finally:
-            connecting.discard(key)
+            connecting.pop(key, None)
 
     try:
         while not quit_event.is_set():
@@ -1593,10 +1786,25 @@ async def run_usb_hid_discovery(quit_event):
                     if not getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
                         for retry_path in list(arrival_retry_tasks):
                             _cancel_arrival_retry(retry_path)
+                    # Reap `connecting` entries whose _add task never unwound. Piggybacks on
+                    # this existing idle tick, so it costs no extra wakeups.
+                    now_mono = time.monotonic()
+                    for stale_key, started in list(connecting.items()):
+                        if now_mono - started > CONNECTING_STALE_TIMEOUT:
+                            connecting.pop(stale_key, None)
+                            logger.warning(
+                                "Wired USB add for %s never completed after %.0fs; "
+                                "clearing so it can be retried", stale_key,
+                                now_mono - started)
                     for key, controller in list(known.items()):
                         if _controller_transport_dead(controller):
                             logger.info("Wired USB controller transport ended; removing stale controller (%s)", getattr(controller.device, "address", key))
-                            await _remove(controller, key, request_rescan=True)
+                            # Fire-and-forget: _remove() tears down WinUHid/USBIP and joins
+                            # worker threads, which can take seconds. Awaiting it here would
+                            # stall this loop and leave WIRED_RESCAN_EVENT unserviced -- which
+                            # is exactly why pressing manual scan appeared to do nothing.
+                            # `removing` already de-duplicates concurrent calls.
+                            asyncio.create_task(_remove(controller, key, request_rescan=True))
                     continue
                 WIRED_RESCAN_EVENT.clear()
                 await asyncio.sleep(0.5)
@@ -1628,17 +1836,47 @@ async def run_usb_hid_discovery(quit_event):
                             "HidHide application-list configuration could not be verified; "
                             "the wired controller may not be visible to this process."
                         )
+                if manual_requested:
+                    # A manual scan is the user's explicit "get it back" action, so make it a
+                    # best-effort recovery rather than a plain repeat of the auto path.
+                    # Re-assert HidHide for instances whose controller is gone: unhide, then
+                    # hide again on re-add. Leaving an orphaned instance blacklisted keeps it
+                    # invisible, and hidapi's enumerate opens every device and silently skips
+                    # the ones it cannot open -- so the pad vanishes from the scan entirely.
+                    # This is what an app restart does in its teardown, and it is why only a
+                    # restart used to bring the controller back.
+                    orphaned = [i for i in hidden_instances
+                                if not any(getattr(c, "_hidhide_instance_id", None) == i
+                                           for c in known.values())]
+                    for orphan in orphaned:
+                        try:
+                            await asyncio.to_thread(hidhide.unhide_device, orphan)
+                            hidden_instances.discard(orphan)
+                            logger.info("Manual scan: released orphaned HidHide instance %s", orphan)
+                        except Exception:
+                            logger.debug("Manual scan unhide failed for %s", orphan, exc_info=True)
+
                 chosen = {}
                 entries = await asyncio.to_thread(
                     enumerate_pro_controller2,
                     reason,
                     None,
-                    False,
+                    # Manual scans opt into the unfiltered enumerate + its one-time
+                    # "Nintendo HID devices present/none found" diagnostic. Some hidapi
+                    # builds/states return nothing from the VID/PID-filtered call, which
+                    # previously made a failed manual scan completely silent. One-shot on a
+                    # user action only -- the auto path is unchanged.
+                    manual_requested,
                 )
                 for entry in entries:
                     key = _device_key(entry)
                     if key and key not in chosen:
                         chosen[key] = entry
+                if manual_requested:
+                    logger.info(
+                        "Manual wired scan: found=%d known=%d connecting=%d free_slots=%d",
+                        len(chosen), len(known), len(connecting),
+                        sum(1 for c in VIRTUAL_CONTROLLERS if c is None))
                 if chosen:
                     _cancel_arrival_retry(candidate_path)
                 elif (candidate_path and "device_arrival" in reason
@@ -1647,14 +1885,14 @@ async def run_usb_hid_discovery(quit_event):
                 for key, entry in chosen.items():
                     if key in known or key in connecting:
                         continue
-                    connecting.add(key)
+                    connecting[key] = time.monotonic()
                     asyncio.create_task(_add(entry, key))
                 if removal_requested or manual_requested:
                     for key in list(known):
                         if key not in chosen:
                             controller = known.get(key)
                             if controller is not None:
-                                await _remove(controller, key)
+                                asyncio.create_task(_remove(controller, key))
             except Exception:
                 logger.exception("Wired USB discovery scan error")
     finally:
@@ -1674,7 +1912,7 @@ async def run_usb_hid_discovery(quit_event):
 
 
 def start_discoverer(update_controllers_threadsafe, quit_event, startup_bridge_context=None):
-    asyncio.run(run_discovery(update_controllers_threadsafe, quit_event, startup_bridge_context))
+    asyncio.run(run_discovery_session(update_controllers_threadsafe, quit_event, startup_bridge_context))
 
 def reorder_controllers():
     global VIRTUAL_CONTROLLERS
@@ -1743,7 +1981,16 @@ def emergency_cleanup():
         reset_vigem_bus()
     except Exception as e:
         logger.debug(f"Reset bus in emergency_cleanup failed: {e}")
-        
+
+    # force_close() bypasses Controller.disconnect(), so the IR Mouse Raw Input
+    # devices would otherwise outlive their owners here.
+    try:
+        import raw_input_mouse
+        raw_input_mouse.shutdown()
+    except Exception as e:
+        logger.debug(f"Raw Input mouse shutdown in emergency_cleanup failed: {e}")
+
+
     if UPDATE_CALLBACK:
         UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
 

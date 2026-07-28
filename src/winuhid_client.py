@@ -21,6 +21,7 @@ import ctypes
 import os
 import sys
 import logging
+import threading
 import time
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
@@ -465,6 +466,24 @@ def setup_prototypes():
     _winuhid_devs.WinUHidXOneDestroy.argtypes = [ctypes.c_void_p]
     _winuhid_devs.WinUHidXOneDestroy.restype = None
 
+    # Mouse (emulates a Microsoft Precision Mouse unless the preset info overrides
+    # the identifiers). Used by the Joy-Con IR Mouse "Raw Input" mode so that games
+    # reading WM_INPUT see a real HID mouse instead of injected mouse_event calls.
+    _winuhid_devs.WinUHidMouseCreate.argtypes = [ctypes.POINTER(WINUHID_PRESET_DEVICE_INFO)]
+    _winuhid_devs.WinUHidMouseCreate.restype = ctypes.c_void_p
+
+    _winuhid_devs.WinUHidMouseReportMotion.argtypes = [ctypes.c_void_p, ctypes.c_short, ctypes.c_short]
+    _winuhid_devs.WinUHidMouseReportMotion.restype = ctypes.c_bool
+
+    _winuhid_devs.WinUHidMouseReportButton.argtypes = [ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_bool]
+    _winuhid_devs.WinUHidMouseReportButton.restype = ctypes.c_bool
+
+    _winuhid_devs.WinUHidMouseReportScroll.argtypes = [ctypes.c_void_p, ctypes.c_short, ctypes.c_bool]
+    _winuhid_devs.WinUHidMouseReportScroll.restype = ctypes.c_bool
+
+    _winuhid_devs.WinUHidMouseDestroy.argtypes = [ctypes.c_void_p]
+    _winuhid_devs.WinUHidMouseDestroy.restype = None
+
 setup_prototypes()
 
 
@@ -791,6 +810,100 @@ class VX360Gamepad:
 
     def __del__(self):
         self.close()
+
+
+class VMouse:
+    """A virtual HID mouse backed by WinUHidDevs.dll.
+
+    Unlike win32api.mouse_event, reports submitted here travel the real HID stack,
+    so applications that read the mouse through Raw Input (WM_INPUT) see them.
+
+    Every method is a no-op when the DLL is missing or device creation failed, so
+    callers can hold one unconditionally and fall back on `device is None`.
+    """
+
+    # WinUHidMouseReportButton takes a *zero-based* index even though the WUHM_BUTTON_*
+    # constants in WinUHidMouse.h are 1-based: the implementation does
+    # `Mouse->Buttons |= 1 << ButtonIndex` and rejects ButtonIndex >= 5.
+    BTN_LEFT = 0
+    BTN_RIGHT = 1
+    BTN_MIDDLE = 2
+    BTN_X1 = 3
+    BTN_X2 = 4
+
+    # Logical min/max of the X/Y fields in the mouse report descriptor.
+    _DELTA_LIMIT = 32767
+
+    def __init__(self, vendor_id=0, product_id=0, version=0, instance_id=None):
+        self.device = None
+        # Motion is submitted from the interpolation thread while buttons and scroll
+        # are submitted from the BLE notification thread; they share one handle.
+        self._lock = threading.Lock()
+        if _winuhid_devs is None:
+            logger.error("Cannot create WinUHid virtual mouse: WinUHidDevs DLL not loaded")
+            return
+        info = WINUHID_PRESET_DEVICE_INFO()
+        # PopulateDeviceInfo requires a vendor id whenever a product id is given, and
+        # a product id whenever a version is given. Leaving all three at 0 keeps the
+        # DLL's built-in identifiers. HardwareIDs is left NULL on purpose: it must be
+        # a REG_MULTI_SZ and c_wchar_p truncates at the first embedded null.
+        info.VendorID = vendor_id
+        info.ProductID = product_id
+        info.VersionNumber = version
+        info.InstanceID = instance_id
+        info.HardwareIDs = None
+        device = _winuhid_devs.WinUHidMouseCreate(ctypes.byref(info))
+        if not device:
+            logger.error(
+                "Failed to create WinUHid virtual mouse (VID %04x PID %04x): error %s",
+                vendor_id, product_id, ctypes.GetLastError())
+            return
+        self.device = device
+
+    def report_motion(self, dx, dy):
+        if not self.device or _winuhid_devs is None:
+            return False
+        limit = self._DELTA_LIMIT
+        dx = max(-limit, min(limit, int(dx)))
+        dy = max(-limit, min(limit, int(dy)))
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid_devs.WinUHidMouseReportMotion(self.device, dx, dy))
+
+    def report_button(self, button_index, down):
+        if not self.device or _winuhid_devs is None:
+            return False
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid_devs.WinUHidMouseReportButton(self.device, int(button_index), bool(down)))
+
+    def report_scroll(self, value, horizontal=False):
+        """Scroll in units of 1/120th of a detent - the same scale as WHEEL_DELTA."""
+        if not self.device or _winuhid_devs is None:
+            return False
+        limit = self._DELTA_LIMIT
+        value = max(-limit, min(limit, int(value)))
+        if value == 0:
+            return True
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid_devs.WinUHidMouseReportScroll(self.device, value, bool(horizontal)))
+
+    def close(self):
+        with self._lock:
+            device = getattr(self, 'device', None)
+            self.device = None
+        if device and _winuhid_devs:
+            _winuhid_devs.WinUHidMouseDestroy(device)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 

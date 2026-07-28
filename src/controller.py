@@ -51,6 +51,7 @@ from utils import (
     trigger_switch_profile
 )
 import utils
+import raw_input_mouse
 
 # Non-blocking logging: every thread's logger call only enqueues a record (O(1), no
 # I/O), and a dedicated listener thread does the actual console write.  A synchronous
@@ -1284,6 +1285,14 @@ class Controller:
         self.interp_task = None
         self._interp_wake_event = threading.Event()
         self.virtual_controller = None
+
+        # IR Mouse "Raw Input" mode: when enabled for this Joy-Con's side, motion,
+        # clicks and scroll are submitted through a virtual HID mouse instead of
+        # win32api.mouse_event, so games reading Raw Input (WM_INPUT) receive them.
+        self._raw_mouse = None
+        self._raw_mouse_side = None
+        self._raw_mouse_generation = -1
+        self._raw_mouse_buttons = (False, False, False)
         
         self.is_calibrating = False
         self.calibration_end_time = 0
@@ -2033,12 +2042,14 @@ class Controller:
         device = await BleakScanner.find_device_by_address(mac_address)
         return await cls.create_from_device(device)
         
-    async def disconnect(self):
-        if not getattr(self, 'interp_running', False) and not self.client:
-            return
-            
-        logger.info(f"Controller {self.device.address}: Suspending interpolation...")
-        self.interp_running = False
+    def _stop_worker_threads(self):
+        """Stop the always-on background threads started in __init__.
+
+        Kept separate from disconnect() so subclasses that override disconnect() (the wired
+        USB pad does) can still shut these down. Missing this leaks one ~666 Hz rumble
+        scheduler thread per connect/disconnect cycle, which is why repeated reconnects got
+        progressively slower and more failure-prone.
+        """
         self._rumble_scheduler_running = False
         self._poke_rumble_scheduler()
         if hasattr(self, '_rumble_scheduler_thread') and self._rumble_scheduler_thread.is_alive():
@@ -2053,12 +2064,28 @@ class Controller:
         sender_thread = self._audio_haptic_sender_thread
         if sender_thread and sender_thread.is_alive():
             sender_thread.join(timeout=0.25)
-        
+
+    async def disconnect(self):
+        if not getattr(self, 'interp_running', False) and not self.client:
+            return
+
+        logger.info(f"Controller {self.device.address}: Suspending interpolation...")
+        self.interp_running = False
+        self._stop_worker_threads()
+
         # Join the interpolation thread if it exists and is running
         if hasattr(self, 'interp_thread') and self.interp_thread.is_alive():
             logger.info(f"Controller {self.device.address}: Joining interpolation thread...")
             self.interp_thread.join(timeout=0.5)
-            
+
+        # Only safe once the interpolation thread (the sole caller of
+        # _sync_raw_input_device) has stopped, so it cannot re-acquire behind us.
+        try:
+            self._release_raw_input_device()
+        except Exception:
+            logger.exception("Failed to release the Raw Input virtual mouse")
+
+
         if self.client:
             if self.client.is_connected:
                 logger.info(f"Controller {self.device.address}: Disconnecting Bluetooth...")
@@ -4474,10 +4501,14 @@ class Controller:
                 prev_rb = self.previous_mouse_state.rb if getattr(self, 'previous_mouse_state', None) is not None else False
 
                 # Inject mouse clicks immediately
-                mx, my = win32api.GetCursorPos()
-                press_or_release_mouse_button(lb, prev_lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                press_or_release_mouse_button(mb, prev_mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                press_or_release_mouse_button(rb, prev_rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+                raw_mouse = self._raw_mouse
+                if raw_mouse is not None:
+                    self._report_raw_mouse_buttons(raw_mouse, lb, mb, rb)
+                else:
+                    mx, my = win32api.GetCursorPos()
+                    press_or_release_mouse_button(lb, prev_lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                    press_or_release_mouse_button(mb, prev_mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                    press_or_release_mouse_button(rb, prev_rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
 
                 # Scroll wheel handling
                 if self.is_joycon_right():
@@ -4486,8 +4517,14 @@ class Controller:
                     scroll_value = inputData.left_stick[1]
 
                 if abs(scroll_value) > 0.2:
-                    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, int(scroll_value * 60 * mouse_config.scroll_sensitivity), 0)
-                            
+                    # WinUHidMouseReportScroll counts in 1/120ths of a detent, the same
+                    # scale as WHEEL_DELTA, so the magnitude carries over unchanged.
+                    scroll_amount = int(scroll_value * 60 * mouse_config.scroll_sensitivity)
+                    if raw_mouse is not None:
+                        raw_mouse.report_scroll(scroll_amount)
+                    else:
+                        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, scroll_amount, 0)
+
                 self.previous_mouse_state = MouseState(x, y, lb, mb, rb, ir_active)
             else:
                 self.jc_mouse_active = False
@@ -4495,10 +4532,14 @@ class Controller:
                 self.jc_target_vy = 0.0
                 # Exited IR Mouse Mode: release any pressed mouse buttons instantly
                 if getattr(self, 'previous_mouse_state', None) is not None:
-                    mx, my = win32api.GetCursorPos()
-                    press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                    press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                    press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+                    raw_mouse = self._raw_mouse
+                    if raw_mouse is not None:
+                        self._report_raw_mouse_buttons(raw_mouse, False, False, False)
+                    else:
+                        mx, my = win32api.GetCursorPos()
+                        press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                        press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                        press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
                 self.previous_mouse_state = None
         else:
             self.jc_mouse_active = False
@@ -4506,11 +4547,31 @@ class Controller:
             self.jc_target_vy = 0.0
             # If mouse mode is disabled or it's not a Joycon, make sure any pressed mouse button is released!
             if getattr(self, 'previous_mouse_state', None) is not None:
-                mx, my = win32api.GetCursorPos()
-                press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+                raw_mouse = self._raw_mouse
+                if raw_mouse is not None:
+                    self._report_raw_mouse_buttons(raw_mouse, False, False, False)
+                else:
+                    mx, my = win32api.GetCursorPos()
+                    press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                    press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                    press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
             self.previous_mouse_state = None
+
+    def _report_raw_mouse_buttons(self, raw_mouse, lb, mb, rb):
+        """Edge-detect the three IR Mouse buttons onto the virtual HID mouse.
+
+        previous_mouse_state cannot be used for this: it is cleared on every exit
+        from IR Mouse mode and is not updated when Raw Input is toggled mid-press,
+        so the virtual device tracks its own latched state.
+        """
+        prev_lb, prev_mb, prev_rb = self._raw_mouse_buttons
+        if lb != prev_lb:
+            raw_mouse.report_button(raw_mouse.BTN_LEFT, lb)
+        if mb != prev_mb:
+            raw_mouse.report_button(raw_mouse.BTN_MIDDLE, mb)
+        if rb != prev_rb:
+            raw_mouse.report_button(raw_mouse.BTN_RIGHT, rb)
+        self._raw_mouse_buttons = (lb, mb, rb)
 
     # How long a matched In-App Gyro modifier button keeps counting as "pressed" after it
     # is physically released (Trigger Dampening / Trigger Deadzone release-latch).
@@ -5656,9 +5717,82 @@ class Controller:
             if flags:
                 win32api.mouse_event(flags, 0, 0, mouse_data, 0)
 
+    def _sync_raw_input_device(self):
+        """Create or destroy this Joy-Con's Raw Input virtual mouse to match settings.
+
+        Deliberately reads the *base* IR settings rather than the scope-resolved ones:
+        raw_input is a single per-side switch, so engaging a Mode Shift layer must not
+        make Windows re-enumerate the HID device mid-game.
+
+        Cheap to call every loop iteration - it returns immediately unless the config
+        generation moved, mirroring the _get_ir_sensor_snapshot caching pattern.
+        """
+        generation = int(getattr(CONFIG, "settings_generation", 0))
+        if generation == self._raw_mouse_generation:
+            return
+        self._raw_mouse_generation = generation
+
+        wanted_side = None
+        # disconnect() releases the device after joining this thread, but the join has
+        # a timeout - never re-acquire once teardown has begun.
+        if self.interp_running and self.is_joycon():
+            side = "left" if self.is_joycon_left() else "right"
+            try:
+                enabled = bool(self._get_ir_sensor_snapshot(side)["base"]["ir_mouse"].get("raw_input", False))
+            except Exception:
+                enabled = False
+            if enabled:
+                wanted_side = side
+
+        if wanted_side == self._raw_mouse_side:
+            return
+
+        # The output sink is about to change under a possibly-held click.
+        # _release_raw_input_device lifts anything latched on the virtual device;
+        # this lifts anything latched on the legacy mouse_event path, which the raw
+        # branch of simulate_mouse would otherwise never get to release.
+        prev = getattr(self, 'previous_mouse_state', None)
+        if prev is not None and self._raw_mouse is None and (prev.lb or prev.mb or prev.rb):
+            mx, my = win32api.GetCursorPos()
+            press_or_release_mouse_button(False, prev.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+            press_or_release_mouse_button(False, prev.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+            press_or_release_mouse_button(False, prev.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+            self.previous_mouse_state = None
+
+        self._release_raw_input_device()
+        if wanted_side is not None:
+            mouse = raw_input_mouse.acquire(wanted_side)
+            if mouse is not None:
+                self._raw_mouse = mouse
+                self._raw_mouse_side = wanted_side
+
+    def _release_raw_input_device(self):
+        """Release this controller's reference to the shared per-side virtual mouse."""
+        side = self._raw_mouse_side
+        mouse = self._raw_mouse
+        if mouse is not None:
+            # The device is shared, so leaving a button latched down would strand it
+            # for whoever else holds a reference.
+            lb, mb, rb = self._raw_mouse_buttons
+            if lb:
+                mouse.report_button(mouse.BTN_LEFT, False)
+            if mb:
+                mouse.report_button(mouse.BTN_MIDDLE, False)
+            if rb:
+                mouse.report_button(mouse.BTN_RIGHT, False)
+        self._raw_mouse_buttons = (False, False, False)
+        self._raw_mouse = None
+        self._raw_mouse_side = None
+        if side is not None:
+            raw_input_mouse.release(side)
+
     def _interpolation_thread_loop(self):
         last_time = time.perf_counter()
         while self.interp_running:
+            # Kept above the activity check: the idle branch below continues the loop,
+            # so syncing inside it would never create the device until the IR mouse
+            # first became active.
+            self._sync_raw_input_device()
             if self.client and self.client.is_connected and (self.gyro_mouse_enabled or getattr(self, 'jc_mouse_active', False) or getattr(self, 'joystick_mouse_active', False)):
                 self._interp_wake_event.clear()
                 if getattr(self, 'is_calibrating', False) or getattr(self, 'is_joystick_calibrating', False):
@@ -5688,7 +5822,15 @@ class Controller:
                 self.interp_residual_y = total_dy - move_y
 
                 if move_x != 0 or move_y != 0:
-                    win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, move_x, move_y, 0, 0)
+                    # In Raw Input mode the whole combined delta goes through the
+                    # virtual HID mouse, gyro contribution included: interp_residual_x/y
+                    # is a single accumulator, and splitting it across two output sinks
+                    # would produce jitter. Both paths drive the same system cursor.
+                    raw_mouse = self._raw_mouse
+                    if raw_mouse is not None:
+                        raw_mouse.report_motion(move_x, move_y)
+                    else:
+                        win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, move_x, move_y, 0, 0)
             else:
                 last_time = time.perf_counter()
                 self._interp_wake_event.wait(0.02)

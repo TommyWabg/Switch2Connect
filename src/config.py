@@ -230,11 +230,17 @@ IR_SENSOR_IN_APP_GYRO_DEFAULTS = {
     "dampening_effect_after_released_ms": 200,
 }
 IR_SENSOR_DEFAULTS = {
+    # NOTE: raw_input is deliberately a single per-side value read from the base layer
+    # only (see Config.get_joycon_ir_sensor_settings). It is never resolved per mapping
+    # scope: flipping it creates or destroys a real virtual HID mouse device, and doing
+    # that every time a Mode Shift layer engages would make Windows re-enumerate the
+    # device mid-game. It still lives under ir_mouse so the existing setter whitelist
+    # and normalization apply to it.
     "left": {"function": "Default", "activate_threshold": 1,
-             "ir_mouse": {"sensitivity": 4.0, "left_click": ["L"], "right_click": ["ZL"], "middle_click": []},
+             "ir_mouse": {"sensitivity": 4.0, "raw_input": False, "left_click": ["L"], "right_click": ["ZL"], "middle_click": []},
              "in_app_gyro": IR_SENSOR_IN_APP_GYRO_DEFAULTS.copy()},
     "right": {"function": "Default", "activate_threshold": 1,
-              "ir_mouse": {"sensitivity": 4.0, "left_click": ["R"], "right_click": ["ZR"], "middle_click": []},
+              "ir_mouse": {"sensitivity": 4.0, "raw_input": False, "left_click": ["R"], "right_click": ["ZR"], "middle_click": []},
               "in_app_gyro": IR_SENSOR_IN_APP_GYRO_DEFAULTS.copy()},
 }
 
@@ -1130,6 +1136,13 @@ class Config:
         elif _sens > 10.0:
             _sens = 10.0
         values["ir_mouse"]["sensitivity"] = _sens
+        # raw_input drives virtual-HID-device creation, so a stray value from a
+        # hand-edited config must not reach the hot path as a truthy non-bool.
+        # bool("false") is True, so strings are resolved by name rather than truthiness.
+        _raw_input = values["ir_mouse"].get("raw_input", False)
+        if isinstance(_raw_input, str):
+            _raw_input = _raw_input.strip().lower() in ("true", "1", "yes", "on")
+        values["ir_mouse"]["raw_input"] = bool(_raw_input)
         for click_key in ("left_click", "right_click", "middle_click"):
             values["ir_mouse"][click_key] = normalize_ir_mouse_switch_inputs(values["ir_mouse"].get(click_key))
         if not isinstance(values.get("in_app_gyro"), dict):
