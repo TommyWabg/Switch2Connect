@@ -11,7 +11,7 @@
   <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
 </p>
 <p align="Center">
-  <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/README.md#microsoft-store-version">
+  <a href="https://github.com/TommyWabg/Switch2Connect#microsoft-store-version">
     <img width="150" alt="Get_it_from_Microsoft_Badge-01" src="https://github.com/user-attachments/assets/19016267-e0e0-428c-aa07-7878a10db9e8" alt="Microsoft Store">
   </a>
 </p>
