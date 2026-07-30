@@ -63,13 +63,13 @@ To use WinUHid Driver Mode or IR Mouse Raw Input Mode, please install the **Full
 
 #### Get Started With Microsoft Store Version
 
-1. Download and install Switch 2 Connect from **[Microsoft Store](https://apps.microsoft.好com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS)**.
+1. Download and install Switch 2 Connect from **[Microsoft Store](https://apps.microsoft.com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS)**.
 2. Launch the app and follow the in-app setup instructions. Approve the administrator UAC prompt if Windows asks to install a supported driver.
 3. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
 4. Use the settings panel at the bottom of the app to configure the available driver mode, controller layout, gyro sensitivity, and custom button mappings.
 
 <p align="Center">
-  <a href="https://apps.microsoft.好com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS">
+  <a href="https://apps.microsoft.com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS">
     <img width="150" alt="Get_it_from_Microsoft_Badge-01" src="https://github.com/user-attachments/assets/19016267-e0e0-428c-aa07-7878a10db9e8" alt="Microsoft Store">
   </a>
 </p>
