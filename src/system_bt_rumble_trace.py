@@ -18,8 +18,8 @@ import time
 from pathlib import Path
 
 
-DEFAULT_TRACE_PATH = "logs/system_bt_rumble_trace.jsonl"
-NO_RUMBLE_TRACE_PATH = "logs/system_bt_rumble_trace_no_rumble.jsonl"
+DEFAULT_TRACE_PATH = "logs/system_bt_rumble_trace.txt"
+NO_RUMBLE_TRACE_PATH = "logs/system_bt_rumble_trace_no_rumble.txt"
 DEFAULT_QUEUE_SIZE = 65536
 
 

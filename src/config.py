@@ -33,8 +33,8 @@ DJG_DOMINANT_SIDES = ("Left", "Right", "None")
 # System Bluetooth + WinUHid PS5 rumble diagnostic log names.  Keep the two
 # destinations separate so a dry-run capture can never be mistaken for a real
 # rumble write capture during analysis.
-SYSTEM_BT_RUMBLE_TRACE_PATH = "logs/system_bt_rumble_trace.jsonl"
-SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH = "logs/system_bt_rumble_trace_no_rumble.jsonl"
+SYSTEM_BT_RUMBLE_TRACE_PATH = "logs/system_bt_rumble_trace.txt"
+SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH = "logs/system_bt_rumble_trace_no_rumble.txt"
 
 
 def normalize_djg_settings(mode, dominant_side):
