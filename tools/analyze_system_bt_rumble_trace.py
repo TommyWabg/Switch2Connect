@@ -1,7 +1,7 @@
 """Summarise a controller rumble/input trace produced by the app.
 
 Usage:
-    python tools/analyze_system_bt_rumble_trace.py logs/system_bt_rumble_trace.jsonl
+    python tools/analyze_system_bt_rumble_trace.py logs/system_bt_rumble_trace.txt
 """
 
 from __future__ import annotations
