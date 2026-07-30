@@ -48,6 +48,15 @@ _devices = {}
 _failed_sides = set()
 
 
+def _is_packaged_build():
+    try:
+        from utils import is_packaged
+        return bool(is_packaged())
+    except Exception:
+        # If package detection itself fails, preserve the standalone behaviour.
+        return False
+
+
 def acquire(side):
     """Return the shared virtual mouse for `side`, creating it if needed.
 
@@ -57,6 +66,17 @@ def acquire(side):
 
     Every successful call must be paired with exactly one release(side).
     """
+    # Raw Input is a WinUHid-backed feature.  The MSIX package may use it only
+    # when the user has separately installed a healthy WinUHid stack.  Keep this
+    # live capability guard at the device boundary so a stale config or profile
+    # cannot create a virtual HID device when the driver is absent.
+    if _is_packaged_build():
+        try:
+            from config import packaged_winuhid_available
+            if not packaged_winuhid_available():
+                return None
+        except Exception:
+            return None
     if side not in _SIDE_IDS:
         return None
     with _lock:

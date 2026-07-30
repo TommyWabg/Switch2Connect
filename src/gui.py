@@ -53,7 +53,8 @@ from discoverer import (
     request_wired_rescan,
     set_wired_auto_scan_enabled,
 )
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, SYSTEM_BT_RUMBLE_TRACE_PATH, SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH, packaged_winuhid_available, refresh_packaged_winuhid_capability
+from system_bt_rumble_trace import get_trace_log_directory
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -92,7 +93,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.7"
+APP_VERSION = "v1.7.1"
 
 def _set_current_thread_priority(level):
     try:
@@ -3586,17 +3587,16 @@ class ControllerWindow:
                 (("ViGEmBus is partially installed and cannot start.\n\n"
                  f"{status.describe()}\n\nDo you want to clean it up and reinstall it now?\n")
                  if partial else
-                 "ViGEmBus driver is not installed.\n\nDo you want to download and install it now?\n") +
+                 ("ViGEmBus driver is not installed.\n\nDo you want to "
+                  + ("install" if utils.is_packaged() else "download and install")
+                  + " it now?\n")) +
                 "(Requires administrator privileges.)"
             )
 
             if answer:
                 if partial and not self.run_vigembus_uninstall():
                     return False
-                installed = self.download_and_install_driver(
-                    "ViGEmBus",
-                    verify_vigembus_ready,
-                    show_success_msg=True)
+                installed = self.install_vigembus_driver(show_success_msg=True)
                 if installed:
                     CONFIG.vigembus_installed = True
                     if save:
@@ -3615,6 +3615,14 @@ class ControllerWindow:
             "ViGEmBus files and device are present, but the runtime bus connection failed.\n\n"
             f"{status.describe()}\n\nUse Repair ViGEmBus Driver to cleanly reinstall it."
         )
+        if utils.is_packaged():
+            # WinUHid is not shipped by the Store build.  Do not silently switch
+            # to a driver that the package deliberately cannot install.
+            CONFIG.vigembus_installed = False
+            if save:
+                CONFIG.save_config()
+            self.update_driver_button()
+            return False
         CONFIG.driver_type = "WinUHid"
         CONFIG.simulation_mode = CONFIG.winuhid_sim_mode
         CONFIG.vigembus_installed = False
@@ -3626,6 +3634,20 @@ class ControllerWindow:
         return False
 
     def check_driver_installation(self, save=True):
+        # MSIX may consume a separately installed WinUHid, but it never installs
+        # or repairs one.  Refresh the live capability silently before choosing
+        # a driver so a stale config/profile cannot re-enable unavailable paths.
+        if utils.is_packaged():
+            previous = bool(getattr(CONFIG, "driver_installed", False))
+            available = bool(refresh_packaged_winuhid_capability())
+            CONFIG.driver_installed = available
+            if save and previous != available:
+                CONFIG.save_config()
+            if not available and getattr(CONFIG, "driver_type", "WinUHid") == "WinUHid":
+                CONFIG.driver_type = "ViGEmBus"
+                CONFIG.simulation_mode = getattr(CONFIG, "vigembus_sim_mode", "Xbox360")
+                if save:
+                    CONFIG.save_config()
         # If driver type is USBIP, check USBIP driver instead
         if getattr(CONFIG, "driver_type", "") == "USBIP":
             usbip_status = get_usbip_status()
@@ -3760,34 +3782,96 @@ class ControllerWindow:
         except Exception:
             return "Uninstaller log was not available."
 
+    def install_vigembus_driver(self, show_success_msg=True):
+        """Install ViGEmBus. The packaged build installs from the bundled vgamepad
+        ViGEmBus MSI (no download); the standalone .exe build downloads the official
+        installer (unchanged). Returns True once ViGEmBus is verified working."""
+        if utils.is_packaged():
+            return self.run_vigembus_install(show_success_msg=show_success_msg)
+        return self.download_and_install_driver("ViGEmBus", verify_vigembus_ready, show_success_msg)
+
+    def run_vigembus_install(self, show_success_msg=True):
+        """Install ViGEmBus from the ViGEmBus MSI bundled inside the package (vgamepad),
+        elevated and silent — no network access. Used by the MSIX/packaged build."""
+        import os, glob
+        # Locate the bundled ViGEmBusSetup MSI (vgamepad ships it under win/vigem/install).
+        roots = []
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            roots.append(base)
+        roots.append(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import vgamepad
+            roots.append(os.path.dirname(os.path.abspath(vgamepad.__file__)))
+        except Exception:
+            pass
+        msi = None
+        for root in roots:
+            hits = glob.glob(os.path.join(root, "vgamepad", "win", "vigem", "install", "x64", "ViGEmBusSetup_x64.msi"))
+            hits += glob.glob(os.path.join(root, "**", "ViGEmBusSetup_x64.msi"), recursive=True)
+            if hits:
+                msi = hits[0]
+                break
+        if not msi or not os.path.exists(msi):
+            self.show_centered_message("Error", "Could not find the bundled ViGEmBus installer. Please verify the application files.")
+            return False
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Install ViGEmBus Driver")
+        progress_win.resizable(False, False)
+        progress_win.config(bg="#1E1E1E")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        self.center_window_on_root(progress_win, int(450 * scaling_factor), int(130 * scaling_factor))
+        tk.Label(progress_win, text="Installing ViGEmBus driver...\nPlease authorize the UAC prompt if asked.",
+                 fg="white", bg="#1E1E1E", font=scale_font(("Arial", 11, "bold"))).pack(pady=int(40 * scaling_factor))
+
+        hProcess = self._launch_elevated("msiexec.exe", f'/i "{msi}" /qn /norestart', progress_win=progress_win)
+        if not hProcess:
+            progress_win.grab_release()
+            progress_win.destroy()
+            self.show_centered_message("Error", "ViGEmBus install was cancelled or failed to start (UAC prompt declined).")
+            return False
+
+        def check_process():
+            if hProcess and ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0) == WAIT_TIMEOUT:
+                progress_win.after(200, check_process)
+                return
+            if hProcess:
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+            progress_win.grab_release()
+            progress_win.destroy()
+        progress_win.after(200, check_process)
+        self.root.wait_window(progress_win)
+
+        invalidate_driver_status_cache("vigembus")
+        ok = verify_vigembus_ready()
+        if ok:
+            if show_success_msg:
+                self.show_centered_message("Success", "ViGEmBus driver installed successfully.")
+        else:
+            self.show_centered_message(
+                "Error",
+                "ViGEmBus installation was not completed. A system restart may be required; please try again if the issue persists.")
+        return ok
+
     def download_and_install_driver(self, driver_key, verify_fn, show_success_msg=True):
         """Download a driver installer and run it silently with UAC elevation.
 
-        Used for ViGEmBus one-click install (both builds) and, in the MSIX-packaged
-        build, for WinUHid / USBIP / HidHide (which are not shipped inside the
-        package). Returns True if verify_fn() reports the driver installed afterwards.
+        Standalone .exe build only: used for the ViGEmBus one-click install (the
+        packaged build installs ViGEmBus from the bundled MSI instead, and all other
+        drivers are installed from bundled files in both builds).
+        Returns True if verify_fn() reports the driver installed afterwards.
         """
         return self._download_and_run_driver_action(driver_key, verify_fn, "install", show_success_msg)
 
-    def download_and_uninstall_driver(self, driver_key, verify_fn, show_success_msg=True):
-        """MSIX-packaged counterpart to the bundled uninstall scripts.
-
-        Downloads the driver's self-contained uninstall .ps1 from the project GitHub
-        and runs it elevated. verify_fn() must return True once the driver is GONE.
-        """
-        return self._download_and_run_driver_action(driver_key, verify_fn, "uninstall", show_success_msg)
-
     def _download_and_run_driver_action(self, driver_key, verify_fn, action, show_success_msg=True):
-        """Shared core for packaged install/uninstall: download file(s) then run
-        elevated with a progress dialog. action is "install" or "uninstall".
-        verify_fn() returns True for the desired end-state (installed / removed).
-        """
-        from driver_install_helper import (
-            DRIVER_SPECS, UNINSTALL_SPECS, make_download_dir, download_spec_files,
-        )
+        """Download ViGEmBus's installer and run it silently with UAC elevation, with a
+        progress dialog. Standalone .exe build only (the packaged build never downloads).
+        verify_fn() returns True once ViGEmBus is installed."""
+        from driver_install_helper import DRIVER_SPECS, make_download_dir, download_spec_files
 
-        specs = DRIVER_SPECS if action == "install" else UNINSTALL_SPECS
-        spec = specs.get(driver_key)
+        spec = DRIVER_SPECS.get(driver_key)
         if spec is None:
             self.show_centered_message("Error", f"Unknown driver: {driver_key}")
             return False
@@ -3941,22 +4025,14 @@ class ControllerWindow:
         return action_ok
 
     def run_driver_install(self, show_success_msg=True):
-        # In the MSIX-packaged build the driver files are not shipped inside the
-        # package; download and install WinUHid from the project GitHub instead.
         if utils.is_packaged():
-            def winuhid_ready():
-                invalidate_driver_status_cache("winuhid")
-                status = get_winuhid_status()
-                return (status.installed or status.unknown) and verify_winuhid_runtime()
-
-            installed = self.download_and_install_driver(
-                "WinUHid", winuhid_ready, show_success_msg)
-            if installed:
-                CONFIG.driver_installed = True
-                CONFIG.save_config()
-            self.update_driver_button()
-            return installed
-
+            self.show_centered_message(
+                "Unavailable",
+                "WinUHid Driver Mode is not available in the Microsoft Store version."
+            )
+            return False
+        # Drivers are bundled in the package (both builds); install from the local
+        # files below — never downloaded (Store policy 10.2.10.1 / 10.1.5).
         import sys
         import os
         from tkinter import messagebox
@@ -4056,18 +4132,9 @@ class ControllerWindow:
         return bool(locals().get('driver_installed_ok', False))
 
     def run_driver_uninstall(self):
-        # In the MSIX-packaged build the uninstall script is not shipped inside the
-        # package; download it from the project GitHub and run it elevated.
-        if utils.is_packaged():
-            removed = self.download_and_uninstall_driver(
-                "WinUHid",
-                lambda: removal_verified(get_winuhid_status(), verify_winuhid_runtime))
-            if removed:
-                CONFIG.driver_installed = False
-                CONFIG.save_config()
-            self.update_driver_button()
-            return removed
-
+        # MSIX may remove an externally installed WinUHid, but it must never
+        # install or repair one.  The uninstall script is bundled locally so
+        # this path does not download or acquire software at runtime.
         import sys
         import os
         from tkinter import messagebox
@@ -4145,6 +4212,14 @@ class ControllerWindow:
                 if driver_removed_ok:
                     CONFIG.driver_installed = False
                     CONFIG.save_config()
+                    if utils.is_packaged():
+                        refresh_packaged_winuhid_capability()
+                        # A removed active WinUHid cannot keep virtual devices
+                        # alive.  Move the current profile back to ViGEmBus;
+                        # the normal driver-change path performs its readiness
+                        # check and recreates the virtual controller safely.
+                        if getattr(CONFIG, "driver_type", "") == "WinUHid":
+                            self.update_driver_type_setting("ViGEmBus")
                     self.show_centered_message("Success", "WinUHid driver uninstalled successfully.")
                 else:
                     uninstall_log = self._read_winuhid_uninstall_log()
@@ -4185,17 +4260,7 @@ class ControllerWindow:
         self.discoverer_thread.start()
 
     def run_vigembus_uninstall(self):
-        # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
-        if utils.is_packaged():
-            removed = self.download_and_uninstall_driver(
-                "ViGEmBus",
-                lambda: removal_verified(get_vigembus_status(), verify_vigembus_runtime))
-            if removed:
-                CONFIG.vigembus_installed = False
-                CONFIG.save_config()
-            self.update_driver_button()
-            return removed
-
+        # Uninstall from the bundled script (both builds); nothing downloaded.
         import sys
         import os
         from tkinter import messagebox
@@ -4304,19 +4369,13 @@ class ControllerWindow:
                     f"{vigem_status.describe()}\n\n(Requires administrator privileges.)"
                 ):
                     if self.run_vigembus_uninstall():
-                        installed = self.download_and_install_driver(
-                            "ViGEmBus",
-                            verify_vigembus_ready,
-                            show_success_msg=True)
+                        installed = self.install_vigembus_driver(show_success_msg=True)
                         if installed:
                             CONFIG.vigembus_installed = True
                             CONFIG.save_config()
                         self.update_driver_button()
             else:
-                installed = self.download_and_install_driver(
-                    "ViGEmBus",
-                    verify_vigembus_ready,
-                    show_success_msg=True)
+                installed = self.install_vigembus_driver(show_success_msg=True)
                 if installed:
                     CONFIG.vigembus_installed = True
                     CONFIG.save_config()
@@ -4354,11 +4413,15 @@ class ControllerWindow:
         
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
         
-        # Pack the active driver button
+        # Pack the active driver button.  MSIX exposes WinUHid's uninstall
+        # operation only when a healthy external copy is present; installation
+        # remains an external Manager responsibility.
         if driver_type == "USBIP":
             if hasattr(self, 'usbip_frame'):
                 self.usbip_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
-        else:
+        elif not (utils.is_packaged()
+                  and driver_type == "WinUHid"
+                  and not packaged_winuhid_available()):
             if hasattr(self, 'driver_frame'):
                 self.driver_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
@@ -4405,6 +4468,52 @@ class ControllerWindow:
         return (
             self.root.winfo_rootx() + self.root.winfo_width() // 2,
             self.root.winfo_rooty(),
+        )
+
+    def _open_debug_log_location(self):
+        """Open the application's debug-log directory in Windows Explorer."""
+        log_dir = get_trace_log_directory()
+        try:
+            # The directory may not exist until the first log is written. Creating it
+            # here makes the button useful immediately after installation as well.
+            os.makedirs(log_dir, exist_ok=True)
+            if os.name == "nt" and hasattr(os, "startfile"):
+                os.startfile(log_dir)
+            else:
+                # Keep the helper harmless if the GUI is started on another OS.
+                webbrowser.open("file://" + os.path.realpath(log_dir))
+        except Exception as exc:
+            logger.exception("Failed to open debug log directory %s", log_dir)
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Open Debug Log File Location",
+                f"Unable to open the debug log directory:\n{log_dir}\n\n{exc}",
+                parent=self.root,
+            )
+
+    def _toggle_rumble_trace_mode(self):
+        """Toggle real Bluetooth rumble writes and persist the matching log path."""
+        dry_run = not bool(getattr(CONFIG, "system_bt_rumble_trace_dry_run", False))
+        CONFIG.system_bt_rumble_trace_dry_run = dry_run
+        CONFIG.system_bt_rumble_trace_path = (
+            SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH
+            if dry_run
+            else SYSTEM_BT_RUMBLE_TRACE_PATH
+        )
+        CONFIG.save_config()
+        self._update_rumble_button()
+
+    def _update_rumble_button(self):
+        button = getattr(self, "rumble_button", None)
+        if button is None:
+            return
+        rumble_on = not bool(getattr(CONFIG, "system_bt_rumble_trace_dry_run", False))
+        button.config(
+            text=f"Rumble: {'On' if rumble_on else 'Off'}",
+            bg=highlight_color if rumble_on else button_gray,
+            fg="#000000" if rumble_on else "#FFFFFF",
+            activebackground=highlight_color,
+            activeforeground="#000000",
         )
 
     def _open_kofi_window(self):
@@ -5117,19 +5226,7 @@ class ControllerWindow:
                 self.run_usbip_install()
 
     def run_usbip_install(self, show_success_msg=True):
-        # In the MSIX-packaged build, download the USBIP driver from the project
-        # GitHub instead of running a bundled installer.
-        if utils.is_packaged():
-            def usbip_installed():
-                invalidate_driver_status_cache("usbip")
-                status = get_usbip_status()
-                # An undeterminable state falls back to the executable, which is
-                # what the rest of the app actually invokes.
-                return status.installed or (
-                    status.unknown and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
-            self.download_and_install_driver("USBIP", usbip_installed, show_success_msg)
-            return
-
+        # Install USBIP from the bundled installer (both builds); nothing downloaded.
         import sys
         import os
         from tkinter import messagebox
@@ -5296,13 +5393,7 @@ class ControllerWindow:
         return False, status
 
     def run_usbip_uninstall(self):
-        # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
-        # The script handles both the Program Files uninstaller and manual cleanup.
-        if utils.is_packaged():
-            def usbip_removed():
-                return self._usbip_removal_verified()[0]
-            return bool(self.download_and_uninstall_driver("USBIP", usbip_removed))
-
+        # Uninstall from the bundled uninstaller/script (both builds); nothing downloaded.
         import sys
         import os
         from tkinter import messagebox
@@ -5598,6 +5689,48 @@ class ControllerWindow:
             anchor=tk.W,
         )
         self.version_label.pack(side=tk.LEFT, padx=(int(12 * scaling_factor), 0), fill=tk.Y)
+
+        self.debug_log_button = tk.Button(
+            self.header_frame,
+            text="Open Debug Log File Location",
+            command=self._open_debug_log_location,
+            font=scale_font(("Arial", 8, "bold")),
+            bg=button_gray,
+            fg="#FFFFFF",
+            activebackground=highlight_color,
+            activeforeground="#000000",
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=0,
+            padx=int(5 * scaling_factor),
+            pady=0,
+            cursor="hand2",
+        )
+        self.debug_log_button.pack(
+            side=tk.LEFT,
+            padx=(int(8 * scaling_factor), 0),
+            pady=int(2 * scaling_factor),
+            fill=tk.Y,
+        )
+
+        self.rumble_button = tk.Button(
+            self.header_frame,
+            command=self._toggle_rumble_trace_mode,
+            font=scale_font(("Arial", 8, "bold")),
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=0,
+            padx=int(5 * scaling_factor),
+            pady=0,
+            cursor="hand2",
+        )
+        self.rumble_button.pack(
+            side=tk.LEFT,
+            padx=(int(4 * scaling_factor), 0),
+            pady=int(2 * scaling_factor),
+            fill=tk.Y,
+        )
+        self._update_rumble_button()
 
         self.header_label = tk.Label(
             self.header_frame,
@@ -9768,7 +9901,16 @@ bg_color=panel_bg, widths=[8, 10])
         
         # Driver Switch
         tk.Label(row_global, text="Driver:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(int(10 * scaling_factor), int(2 * scaling_factor)))
-        self.driver_switch = ToggleSwitch(row_global, ["WinUHid", "ViGEmBus", "USBIP"], ["WinUHid", "ViGEmBus", "USBIP"], getattr(CONFIG, "driver_type", "WinUHid"), self.update_driver_type_setting, background_color)
+        # MSIX can expose WinUHid only when a healthy copy was installed
+        # separately.  It never bundles or installs the driver itself.
+        _winuhid_available = packaged_winuhid_available()
+        _driver_opts = (["WinUHid", "ViGEmBus", "USBIP"]
+                        if (not utils.is_packaged() or _winuhid_available)
+                        else ["ViGEmBus", "USBIP"])
+        _driver_current = getattr(CONFIG, "driver_type", "WinUHid")
+        if _driver_current not in _driver_opts:
+            _driver_current = _driver_opts[0]
+        self.driver_switch = ToggleSwitch(row_global, _driver_opts, _driver_opts, _driver_current, self.update_driver_type_setting, background_color)
         self.driver_switch.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         
         # Emu Mode
@@ -10705,39 +10847,42 @@ bg_color=panel_bg, widths=[8, 10])
         # Packed into the popup itself (not the two-column content grid) and before
         # _joycon_ir_popup_layout packs `content`, so it spans the popup's full width
         # inside the existing padding and sits at the very top.
-        raw_input_frame = tk.Frame(popup, bg=button_gray)
-        raw_input_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(8 * scaling_factor)))
+        # "Raw Input" routes IR mouse motion through a WinUHid virtual HID mouse.
+        # It is available in MSIX only when a healthy external WinUHid exists.
+        if not utils.is_packaged() or packaged_winuhid_available():
+            raw_input_frame = tk.Frame(popup, bg=button_gray)
+            raw_input_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(8 * scaling_factor)))
 
-        def raw_input_enabled():
-            # Deliberately the unscoped getter: raw_input is one value per side that
-            # Mode Shift / In-app Gyro layers do not override, because toggling it
-            # creates or destroys a real virtual HID mouse device.
-            return bool(CONFIG.get_joycon_ir_sensor_settings(
-                side, profile_name, category)["ir_mouse"].get("raw_input", False))
+            def raw_input_enabled():
+                # Deliberately the unscoped getter: raw_input is one value per side that
+                # Mode Shift / In-app Gyro layers do not override, because toggling it
+                # creates or destroys a real virtual HID mouse device.
+                return bool(CONFIG.get_joycon_ir_sensor_settings(
+                    side, profile_name, category)["ir_mouse"].get("raw_input", False))
 
-        def refresh_raw_input_button():
-            raw_input_btn.config(text=f"Raw Input: {'On' if raw_input_enabled() else 'Off'}")
+            def refresh_raw_input_button():
+                raw_input_btn.config(text=f"Raw Input: {'On' if raw_input_enabled() else 'Off'}")
 
-        def toggle_raw_input():
-            CONFIG.set_joycon_ir_mouse_setting(side, "raw_input", not raw_input_enabled(),
-                                               profile_name, category)
-            CONFIG.save_config()
+            def toggle_raw_input():
+                CONFIG.set_joycon_ir_mouse_setting(side, "raw_input", not raw_input_enabled(),
+                                                   profile_name, category)
+                CONFIG.save_config()
+                refresh_raw_input_button()
+
+            raw_input_btn = tk.Button(
+                raw_input_frame,
+                text="",
+                bg=button_gray,
+                fg=text_color,
+                bd=0,
+                relief=tk.FLAT,
+                font=scale_font(("Arial", 11, "bold")),
+                command=toggle_raw_input,
+            )
+            raw_input_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
             refresh_raw_input_button()
-
-        raw_input_btn = tk.Button(
-            raw_input_frame,
-            text="",
-            bg=button_gray,
-            fg=text_color,
-            bd=0,
-            relief=tk.FLAT,
-            font=scale_font(("Arial", 11, "bold")),
-            command=toggle_raw_input,
-        )
-        raw_input_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
-        refresh_raw_input_button()
-        Tooltip(raw_input_btn, lambda: "Send IR Mouse movement through a virtual HID mouse\n"
-                                       "so games that read Raw Input can see it.")
+            Tooltip(raw_input_btn, lambda: "Send IR Mouse movement through a virtual HID mouse\n"
+                                           "so games that read Raw Input can see it.")
 
         create_row, finalize, control_font, control_width, _control_height = self._joycon_ir_popup_layout(popup)
         sensitivity_cell = create_row("Sensitivity:")
@@ -10842,6 +10987,10 @@ bg_color=panel_bg, widths=[8, 10])
 
     def update_driver_type_setting(self, val):
         self.close_joystick_custom_popup()
+        # Redirect a saved/manual WinUHid selection only when the external driver
+        # is actually unavailable.  MSIX never installs it from inside the app.
+        if utils.is_packaged() and not packaged_winuhid_available() and val == "WinUHid":
+            val = "ViGEmBus"
         # 1. 霈??(Removed load_config to prevent async save race condition)
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
@@ -12004,31 +12153,7 @@ bg_color=panel_bg, widths=[8, 10])
         return exit_code[0]
 
     def run_hidhide_install(self, prompt_restart=True):
-        # In the MSIX-packaged build, download HidHide from the project GitHub
-        # instead of running the bundled installer script.
-        if utils.is_packaged():
-            def hidhide_installed():
-                invalidate_driver_status_cache("hidhide")
-                status = get_hidhide_status()
-                # An undeterminable status defers to the service registration,
-                # which is what the driver actually needs to load.
-                return status.installed or (
-                    status.unknown and hidhide_service_state() is True)
-            ok = self.download_and_install_driver("HidHide", hidhide_installed, show_success_msg=True)
-            self._sync_hidhide_installed()
-            self.update_driver_buttons_visibility()
-            if ok and prompt_restart and self.ask_centered_yes_no(
-                "Restart Required",
-                "A restart is required to finish HidHide setup and hide the physical "
-                "controller.\n\nRestart now?",
-            ):
-                try:
-                    import subprocess
-                    subprocess.Popen(["shutdown", "/r", "/t", "0"])
-                except Exception:
-                    pass
-            return ok
-
+        # Install HidHide from the bundled installer script (both builds); nothing downloaded.
         code = self._run_hidhide_script("install_hidhide.ps1", "Installing HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return False  # cancelled / could not start
@@ -12061,35 +12186,7 @@ bg_color=panel_bg, widths=[8, 10])
         return bool(ok or code in (0, 3010))
 
     def run_hidhide_uninstall(self):
-        # MSIX-packaged build: download the uninstall script from GitHub, run elevated.
-        # HidHide's driver unloads only on reboot, so success is reported as "started".
-        if utils.is_packaged():
-            # The cleanup script verifies the service and Driver Store package;
-            # the .sys file itself may remain locked until the requested reboot.
-            removed = self.download_and_uninstall_driver(
-                "HidHide",
-                lambda: hidhide_service_state() is False,
-                show_success_msg=False,
-            )
-            if not removed:
-                return  # download/UAC/script/verification failure was already reported
-            self._sync_hidhide_installed()
-            self.update_driver_buttons_visibility()
-            self.show_centered_message(
-                "Success",
-                "HidHide removal started. A restart is required to complete the uninstall.",
-            )
-            if self.ask_centered_yes_no(
-                "Restart Required",
-                "A restart is required to finish removing HidHide.\n\nRestart now?",
-            ):
-                try:
-                    import subprocess
-                    subprocess.Popen(["shutdown", "/r", "/t", "0"])
-                except Exception as e:
-                    self.show_centered_message("Error", f"Could not restart automatically: {e}\nPlease restart manually.")
-            return True
-
+        # Uninstall from the bundled script (both builds); nothing downloaded.
         code = self._run_hidhide_script("uninstall_hidhide.ps1", "Uninstalling HidHide...\nPlease authorize the UAC prompt if asked.")
         if code is None:
             return  # cancelled / could not start
@@ -12731,6 +12828,10 @@ bg_color=panel_bg, widths=[8, 10])
         if not new_driver:
             new_driver = getattr(CONFIG, "driver_type", "WinUHid")
             CONFIG.profiles[new_profile_name]["driver_type"] = new_driver
+        # A WinUHid profile maps to ViGEmBus only when MSIX cannot observe an
+        # externally installed healthy WinUHid stack.
+        if utils.is_packaged() and not packaged_winuhid_available() and new_driver == "WinUHid":
+            new_driver = "ViGEmBus"
             
         new_emu = CONFIG.profiles[new_profile_name].get("simulation_mode")
         if not new_emu:

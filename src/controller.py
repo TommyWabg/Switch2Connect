@@ -32,6 +32,7 @@ import time
 import threading
 import functools
 import math
+import zlib
 import imufusion
 import numpy as np
 import os
@@ -42,6 +43,12 @@ try:
 except Exception:
     pass
 from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
+from system_bt_rumble_trace import (
+    trace_event as _system_bt_trace_event,
+    dry_run_enabled as _system_bt_trace_dry_run_enabled,
+    interval_override_ms as _system_bt_trace_interval_override_ms,
+    maybe_trace_lock_marker as _system_bt_trace_lock_marker,
+)
 from utils import (
     apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
@@ -1250,6 +1257,8 @@ class Controller:
         self._audio_haptic_sender_stop = False
         self._audio_haptic_sender_thread = None
         self._rumble_scheduler_event = threading.Event()
+        self._rumble_trace_pending_lock = threading.Lock()
+        self._rumble_trace_pending_futures = set()
         self._rumble_scheduler_running = True
         self._rumble_scheduler_thread = threading.Thread(
             target=self._rumble_scheduler_loop,
@@ -2176,9 +2185,21 @@ class Controller:
         Semantics are identical: set _rumble_task_running, send, clear flag.
         """
         self._rumble_task_running = True
+        _system_bt_trace_event(
+            "RUMBLE_COROUTINE_STARTED",
+            controller=self,
+            lf_amp=int(getattr(v1, "lf_amp", 0)),
+            hf_amp=int(getattr(v1, "hf_amp", 0)),
+        )
+        started_ns = time.perf_counter_ns()
         try:
             await self.set_vibration(v1, v2, v3)
         finally:
+            _system_bt_trace_event(
+                "RUMBLE_COROUTINE_FINISHED",
+                controller=self,
+                duration_ns=time.perf_counter_ns() - started_ns,
+            )
             self._rumble_task_running = False
 
 
@@ -2427,6 +2448,22 @@ class Controller:
             return
         self.last_rumble_time = current_time
 
+        # Optional diagnostic pacing override.  The default is disabled, so
+        # this cannot alter normal behaviour unless explicitly requested for an
+        # A/B trace run.
+        interval_ms = _system_bt_trace_interval_override_ms(
+            virtual_controller=vc)
+        if interval_ms is not None:
+            last_bt_send = getattr(self, "_system_bt_trace_last_send_rt", 0.0)
+            if current_time - last_bt_send < interval_ms / 1000.0:
+                _system_bt_trace_event(
+                    "RUMBLE_SCHED_DECISION",
+                    controller=self,
+                    decision="rate_limited",
+                    interval_ms=interval_ms,
+                )
+                return
+
         # Cache for diagnostics and cheap non-critical checks.  The ESP32 routing
         # decision re-checks the live timestamp at the send point to close the
         # first-PCM-packet race.
@@ -2467,7 +2504,40 @@ class Controller:
         def dispatch_rumble_task(coro):
             loop = getattr(vc, 'loop', None)
             if loop and not loop.is_closed():
-                asyncio.run_coroutine_threadsafe(coro, loop)
+                queued_ns = time.perf_counter_ns()
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+                with self._rumble_trace_pending_lock:
+                    self._rumble_trace_pending_futures.add(future)
+                    pending_count = len(self._rumble_trace_pending_futures)
+                    if pending_count > getattr(self, "_rumble_trace_pending_high_watermark", 0):
+                        self._rumble_trace_pending_high_watermark = pending_count
+
+                _system_bt_trace_event(
+                    "RUMBLE_COROUTINE_QUEUED",
+                    controller=self,
+                    pending_count=pending_count,
+                    pending_high_watermark=getattr(self, "_rumble_trace_pending_high_watermark", pending_count),
+                )
+
+                def _rumble_future_done(done_future):
+                    with self._rumble_trace_pending_lock:
+                        self._rumble_trace_pending_futures.discard(done_future)
+                        remaining = len(self._rumble_trace_pending_futures)
+                    try:
+                        exc = done_future.exception()
+                        error = type(exc).__name__ if exc is not None else None
+                    except Exception as exc:
+                        error = type(exc).__name__
+                    _system_bt_trace_event(
+                        "RUMBLE_FUTURE_DONE",
+                        controller=self,
+                        pending_count=remaining,
+                        error=error,
+                        queued_to_done_ns=time.perf_counter_ns() - queued_ns,
+                    )
+
+                future.add_done_callback(_rumble_future_done)
+                self._system_bt_trace_last_send_rt = current_time
                 return True
             return False
 
@@ -2952,8 +3022,45 @@ class Controller:
                         self.vibration_packet_id += 1
                         return
 
-            await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+            write_started_ns = time.perf_counter_ns()
+            _system_bt_trace_event(
+                "BT_RUMBLE_WRITE_START",
+                controller=self,
+                uuid=str(uuid_to_use),
+                payload_len=len(payload),
+                packet_id=int(self.vibration_packet_id),
+            )
+            if _system_bt_trace_dry_run_enabled(controller=self):
+                _system_bt_trace_event(
+                    "BT_RUMBLE_WRITE_END",
+                    controller=self,
+                    uuid=str(uuid_to_use),
+                    payload_len=len(payload),
+                    packet_id=int(self.vibration_packet_id),
+                    duration_ns=time.perf_counter_ns() - write_started_ns,
+                    dry_run=True,
+                    success=True,
+                )
+            else:
+                await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+                _system_bt_trace_event(
+                    "BT_RUMBLE_WRITE_END",
+                    controller=self,
+                    uuid=str(uuid_to_use),
+                    payload_len=len(payload),
+                    packet_id=int(self.vibration_packet_id),
+                    duration_ns=time.perf_counter_ns() - write_started_ns,
+                    dry_run=False,
+                    success=True,
+                )
         except Exception as e:
+            _system_bt_trace_event(
+                "BT_RUMBLE_WRITE_ERROR",
+                controller=self,
+                error=type(e).__name__,
+                duration_ns=(time.perf_counter_ns() - write_started_ns)
+                if "write_started_ns" in locals() else None,
+            )
             logger.debug(f"Vibration write failed: {e}")
             
         self.vibration_packet_id += 1
@@ -3055,7 +3162,21 @@ class Controller:
 
     async def enable_input_notify_callback(self):
         def input_report_callback(sender, data):
+            input_started_ns = time.perf_counter_ns()
+            _system_bt_trace_event(
+                "BT_INPUT_NOTIFY_ENTER",
+                controller=self,
+                report_len=len(data) if data is not None else 0,
+            )
+            _system_bt_trace_lock_marker(controller=self)
             if getattr(self, 'suspended', False) or getattr(self, '_is_suspending', False):
+                _system_bt_trace_event(
+                    "BT_INPUT_NOTIFY_EXIT",
+                    controller=self,
+                    duration_ns=time.perf_counter_ns() - input_started_ns,
+                    accepted=False,
+                    reason="suspended",
+                )
                 return
 
             # Debug log for the first few packets to see what's being sent on wake
@@ -3068,6 +3189,42 @@ class Controller:
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
             inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
 
+            # Capture physical control freshness before mappings, profile logic,
+            # or gyro transforms mutate the decoded input object.  The protocol
+            # timestamp and raw-report CRC are retained separately: the former
+            # identifies controller report progression, while the latter helps
+            # detect repeated BLE payloads.
+            self._system_bt_trace_report_seq = getattr(self, "_system_bt_trace_report_seq", 0) + 1
+            raw_left = tuple(getattr(inputData, "raw_left_stick", inputData.left_stick))
+            raw_right = tuple(getattr(inputData, "raw_right_stick", inputData.right_stick))
+            raw_buttons = int(inputData.buttons)
+            physical_key = (raw_buttons, raw_left, raw_right,
+                            int(getattr(inputData, "left_trigger_raw", 0)),
+                            int(getattr(inputData, "right_trigger_raw", 0)))
+            now_ns = time.perf_counter_ns()
+            changed = physical_key != getattr(self, "_system_bt_trace_last_physical_key", None)
+            if changed:
+                self._system_bt_trace_last_physical_key = physical_key
+                self._system_bt_trace_last_physical_change_ns = now_ns
+            last_change_ns = getattr(self, "_system_bt_trace_last_physical_change_ns", now_ns)
+            inputData._system_bt_trace_seq = self._system_bt_trace_report_seq
+            inputData._system_bt_trace_raw_crc32 = f"{zlib.crc32(bytes(data)) & 0xffffffff:08x}"
+            inputData._system_bt_trace_raw_buttons = raw_buttons
+            inputData._system_bt_trace_state_changed = bool(changed)
+            inputData._system_bt_trace_state_age_ms = (now_ns - last_change_ns) / 1_000_000.0
+            _system_bt_trace_event(
+                "BT_INPUT_STATE",
+                controller=self,
+                physical_seq=self._system_bt_trace_report_seq,
+                protocol_time=int(getattr(inputData, "time", 0)),
+                raw_crc32=inputData._system_bt_trace_raw_crc32,
+                raw_buttons=raw_buttons,
+                raw_left_stick=raw_left,
+                raw_right_stick=raw_right,
+                state_changed=bool(changed),
+                state_age_ms=inputData._system_bt_trace_state_age_ms,
+            )
+
             # Connection settle gate: right after (re)connection the controller can
             # emit transient/garbage frames (or the wake button is still held), which
             # would otherwise be forwarded as real input the instant we start
@@ -3079,6 +3236,13 @@ class Controller:
                 if phys_buttons == 0 or time.time() >= getattr(self, '_input_settle_deadline', 0):
                     self._input_settled = True
                 else:
+                    _system_bt_trace_event(
+                        "BT_INPUT_NOTIFY_EXIT",
+                        controller=self,
+                        duration_ns=time.perf_counter_ns() - input_started_ns,
+                        accepted=False,
+                        reason="connection_settle",
+                    )
                     return
 
             self.last_input_data = inputData
@@ -3207,6 +3371,13 @@ class Controller:
                     pass
                 if self.input_report_callback is not None:
                     self.input_report_callback(inputData, self)
+                _system_bt_trace_event(
+                    "BT_INPUT_NOTIFY_EXIT",
+                    controller=self,
+                    duration_ns=time.perf_counter_ns() - input_started_ns,
+                    accepted=False,
+                    reason="profile_selection",
+                )
                 return
             elif getattr(self, "_ps_was_active", False):
                 self._ps_was_active = False
@@ -4173,6 +4344,13 @@ class Controller:
 
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
+
+            _system_bt_trace_event(
+                "BT_INPUT_NOTIFY_EXIT",
+                controller=self,
+                duration_ns=time.perf_counter_ns() - input_started_ns,
+                accepted=True,
+            )
 
             self._poke_rumble_scheduler()
 
@@ -5735,7 +5913,7 @@ class Controller:
         wanted_side = None
         # disconnect() releases the device after joining this thread, but the join has
         # a timeout - never re-acquire once teardown has begun.
-        if self.interp_running and self.is_joycon():
+        if (not utils.is_packaged()) and self.interp_running and self.is_joycon():
             side = "left" if self.is_joycon_left() else "right"
             try:
                 enabled = bool(self._get_ir_sensor_snapshot(side)["base"]["ir_mouse"].get("raw_input", False))

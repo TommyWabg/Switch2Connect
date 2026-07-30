@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 DJG_MODES = ("Switch Dominant Side", "Switch Gyro Side", "Single Side Toggle")
 DJG_DOMINANT_SIDES = ("Left", "Right", "None")
 
+# System Bluetooth + WinUHid PS5 rumble diagnostic log names.  Keep the two
+# destinations separate so a dry-run capture can never be mistaken for a real
+# rumble write capture during analysis.
+SYSTEM_BT_RUMBLE_TRACE_PATH = "logs/system_bt_rumble_trace.jsonl"
+SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH = "logs/system_bt_rumble_trace_no_rumble.jsonl"
+
 
 def normalize_djg_settings(mode, dominant_side):
     """Normalize current DJG settings and migrate the removed Direct Merge mode."""
@@ -478,6 +484,51 @@ class MouseConfig:
         self.joycon_l_buttons = MouseButtonConfig(buttons_config.get("left_joycon", {}), default_left="L", default_right="ZL")
         self.joycon_r_buttons = MouseButtonConfig(buttons_config.get("right_joycon", {}), default_left="R", default_right="ZR")
 
+_PACKAGED_CACHE = None
+_PACKAGED_WINUHID_CACHE = None
+def _packaged_build():
+    """True when running from the MSIX/Store package (drivers differ there)."""
+    global _PACKAGED_CACHE
+    if _PACKAGED_CACHE is None:
+        try:
+            from utils import is_packaged
+            _PACKAGED_CACHE = bool(is_packaged())
+        except Exception:
+            _PACKAGED_CACHE = False
+    return _PACKAGED_CACHE
+
+
+def packaged_winuhid_available(refresh=False):
+    """Return whether an MSIX installation may use a pre-installed WinUHid.
+
+    The Store package never installs the driver.  It may use one that the user
+    installed separately, but only after the live driver stack is observed as
+    healthy.  Keep this probe cached because it invokes Windows device queries;
+    callers that need to notice an external install/uninstall can request a
+    refresh at a controlled UI boundary.
+    """
+    global _PACKAGED_WINUHID_CACHE
+    if not _packaged_build():
+        return True
+    if _PACKAGED_WINUHID_CACHE is None or refresh:
+        try:
+            import driver_install_helper as _driver_helper
+            if refresh:
+                _PACKAGED_WINUHID_CACHE = bool(_driver_helper.refresh_winuhid_usable())
+            else:
+                _PACKAGED_WINUHID_CACHE = bool(_driver_helper.is_winuhid_usable(use_cache=True))
+        except Exception as exc:
+            logger.debug("WinUHid capability probe failed: %s", exc)
+            _PACKAGED_WINUHID_CACHE = False
+    return bool(_PACKAGED_WINUHID_CACHE)
+
+
+def refresh_packaged_winuhid_capability():
+    """Re-probe the external WinUHid capability and persist its UI cache."""
+    global _PACKAGED_WINUHID_CACHE
+    _PACKAGED_WINUHID_CACHE = packaged_winuhid_available(refresh=True)
+    return _PACKAGED_WINUHID_CACHE
+
 def get_app_root():
     if hasattr(sys, '_MEIPASS'):
         return sys._MEIPASS
@@ -722,6 +773,11 @@ class Config:
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
         self.driver_installed = config.get("driver_installed", False)
+        if _packaged_build():
+            # The persisted value is not trusted as a capability grant.  Refresh
+            # it from the live system so a separately installed WinUHid can
+            # unlock the Store build without any installation prompt.
+            self.driver_installed = packaged_winuhid_available(refresh=True)
         # Wired USB Pro Controller 2 support + auto-hide of its physical HID via HidHide.
         self.wired_auto_scan_enabled = config.get(
             "wired_auto_scan_enabled",
@@ -742,6 +798,10 @@ class Config:
         self.driver_type = config.get("driver_type", "WinUHid")
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
+        # The MSIX/Store build may use WinUHid only when a healthy copy was
+        # installed separately; it never installs one itself.
+        if _packaged_build() and self.driver_type == "WinUHid" and not packaged_winuhid_available():
+            self.driver_type = "ViGEmBus"
         # Connection-speed changes are independently reversible.  These defaults
         # enable the ready-driven path while keeping the former waits/pacing as a
         # per-flag fallback for model or adapter regressions.
@@ -752,6 +812,19 @@ class Config:
         self.controller_fast_cache_entries = config.get("controller_fast_cache_entries", {}) or {}
         self.winrt_cached_services = config.get("winrt_cached_services", True)
         self.winrt_skip_pro2_unsupported_init_0101 = config.get("winrt_skip_pro2_unsupported_init_0101", True)
+        # Diagnostics for the System Bluetooth rumble investigation.  Older
+        # config files do not contain this key, so tracing defaults to enabled
+        # for this diagnostic build while an explicit false is still respected.
+        self.system_bt_rumble_trace_dry_run = bool(config.get("system_bt_rumble_trace_dry_run", False))
+        # Keep the filename coupled to the mode, including when an older config
+        # still contains the previous single-path value.
+        self.system_bt_rumble_trace_path = (
+            SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH
+            if self.system_bt_rumble_trace_dry_run
+            else SYSTEM_BT_RUMBLE_TRACE_PATH
+        )
+        self.system_bt_rumble_trace_enabled = bool(config.get("system_bt_rumble_trace_enabled", True))
+        self.system_bt_rumble_interval_ms = config.get("system_bt_rumble_interval_ms", None)
         
         self.simulation_mode = config.get("simulation_mode", "PS5")
         if self.simulation_mode == "Switch 2 Pro":
@@ -1142,7 +1215,9 @@ class Config:
         _raw_input = values["ir_mouse"].get("raw_input", False)
         if isinstance(_raw_input, str):
             _raw_input = _raw_input.strip().lower() in ("true", "1", "yes", "on")
-        values["ir_mouse"]["raw_input"] = bool(_raw_input)
+        # IR Mouse "Raw Input" creates a WinUHid virtual mouse.  In MSIX it is
+        # available only when the separately installed driver is healthy.
+        values["ir_mouse"]["raw_input"] = bool(_raw_input) and packaged_winuhid_available()
         for click_key in ("left_click", "right_click", "middle_click"):
             values["ir_mouse"][click_key] = normalize_ir_mouse_switch_inputs(values["ir_mouse"].get(click_key))
         if not isinstance(values.get("in_app_gyro"), dict):
@@ -1239,6 +1314,10 @@ class Config:
         values = self.get_joycon_ir_sensor_settings(side, profile_name, category)
         if key not in IR_SENSOR_DEFAULTS["left"]["ir_mouse"]:
             return
+        # Keep the live capability invariant at the mutation boundary as well
+        # as during config-load normalization.
+        if key == "raw_input" and not packaged_winuhid_available():
+            value = False
         if key in ("left_click", "right_click", "middle_click"):
             value = normalize_ir_mouse_switch_inputs(value)
         values["ir_mouse"][key] = value
@@ -1248,6 +1327,8 @@ class Config:
         values = self.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, scope)
         if key not in IR_SENSOR_DEFAULTS["left"]["ir_mouse"]:
             return
+        if key == "raw_input" and not packaged_winuhid_available():
+            value = False
         if key in ("left_click", "right_click", "middle_click"):
             value = normalize_ir_mouse_switch_inputs(value)
         values["ir_mouse"][key] = value
@@ -1703,6 +1784,10 @@ class Config:
             'controller_fast_cache_entries': self.controller_fast_cache_entries,
             'winrt_cached_services': self.winrt_cached_services,
             'winrt_skip_pro2_unsupported_init_0101': self.winrt_skip_pro2_unsupported_init_0101,
+            'system_bt_rumble_trace_enabled': self.system_bt_rumble_trace_enabled,
+            'system_bt_rumble_trace_path': self.system_bt_rumble_trace_path,
+            'system_bt_rumble_trace_dry_run': self.system_bt_rumble_trace_dry_run,
+            'system_bt_rumble_interval_ms': self.system_bt_rumble_interval_ms,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
             'usbip_sim_mode': self.usbip_sim_mode,

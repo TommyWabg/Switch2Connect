@@ -51,6 +51,7 @@ from controller import (Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         USBIP_PS5_CONCURRENT_RUMBLE_TEST)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
+from system_bt_rumble_trace import trace_event as _system_bt_trace_event
 from usbip_server import USBIPServer
 from audio_endpoint_guard import DualSenseAudioEndpointGuard
 from utils import USBIPAllocator
@@ -1423,6 +1424,12 @@ class VirtualController:
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
+        _system_bt_trace_event(
+            "WINUHID_RUMBLE_CALLBACK",
+            virtual_controller=self,
+            large_motor=int(large_motor),
+            small_motor=int(small_motor),
+        )
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading
@@ -1433,6 +1440,13 @@ class VirtualController:
     def _vibration_callback_internal(self, client, target, large_motor, small_motor, led_number, user_data):
         import math
         import discoverer
+
+        _system_bt_trace_event(
+            "VIRTUAL_RUMBLE_CALLBACK",
+            virtual_controller=self,
+            large_motor=int(large_motor),
+            small_motor=int(small_motor),
+        )
 
         lf_val = int(800 * large_motor / 256)
         hf_val = int(800 * small_motor / 256)
@@ -2543,6 +2557,15 @@ class VirtualController:
                 inputData.gyroscope = (0.0, 0.0, 0.0)
                 inputData.accelerometer = (0.0, 0.0, 0.0)
 
+            virtual_submit_started_ns = time.perf_counter_ns()
+            _system_bt_trace_event(
+                "VIRTUAL_INPUT_SUBMIT_START",
+                virtual_controller=self,
+                controller=controller,
+                buttons=int(buttons),
+                physical_seq=getattr(inputData, "_system_bt_trace_seq", None),
+                physical_state_age_ms=getattr(inputData, "_system_bt_trace_state_age_ms", None),
+            )
             if self.mode == "PS4":
                 submitted = self.update_as_ps4(inputData, buttons, controller)
             elif self.mode == "PS5":
@@ -2558,6 +2581,13 @@ class VirtualController:
                     submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
             else:
                 submitted = self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
+            _system_bt_trace_event(
+                "VIRTUAL_INPUT_SUBMIT_END",
+                virtual_controller=self,
+                controller=controller,
+                duration_ns=time.perf_counter_ns() - virtual_submit_started_ns,
+                success=bool(submitted),
+            )
             
             # Record raw buttons for shared click logic in next report
             controller._last_raw_buttons = current_buttons
@@ -3056,11 +3086,38 @@ class VirtualController:
             self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS4")
 
     def update_as_ps5(self, inputData: ControllerInputData, buttons: int, controller: Controller):
+        submit_started_ns = time.perf_counter_ns()
+        _system_bt_trace_event(
+            "WINUHID_INPUT_SUBMIT_START",
+            virtual_controller=self,
+            controller=controller,
+            buttons=int(buttons),
+            physical_seq=getattr(inputData, "_system_bt_trace_seq", None),
+            physical_raw_crc32=getattr(inputData, "_system_bt_trace_raw_crc32", None),
+            physical_state_changed=getattr(inputData, "_system_bt_trace_state_changed", None),
+            physical_state_age_ms=getattr(inputData, "_system_bt_trace_state_age_ms", None),
+            physical_raw_buttons=int(getattr(inputData, "_system_bt_trace_raw_buttons", getattr(inputData, "buttons", 0))),
+            physical_raw_left_stick=getattr(inputData, "raw_left_stick", None),
+            physical_raw_right_stick=getattr(inputData, "raw_right_stick", None),
+            mapped_left_stick=tuple(inputData.left_stick),
+            mapped_right_stick=tuple(inputData.right_stick),
+        )
+        submitted = False
         with self.state_lock:
             if self.vg_controller is None:
-                return
-            self._update_as_ps5_locked(inputData, buttons, controller)
-            self.vg_controller.update()
+                submitted = False
+            else:
+                self._update_as_ps5_locked(inputData, buttons, controller)
+                result = self.vg_controller.update()
+                submitted = result is not False
+        _system_bt_trace_event(
+            "WINUHID_INPUT_SUBMIT_END",
+            virtual_controller=self,
+            controller=controller,
+            duration_ns=time.perf_counter_ns() - submit_started_ns,
+            success=submitted,
+        )
+        return submitted
 
     def _update_as_ps5_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         self._update_ps_controller_locked(inputData, buttons, controller, self.vg_controller.report, mode="PS5")
