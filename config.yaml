@@ -4213,8 +4213,8 @@ stick_r_bias:
 sw2_zero_command_pacing: true
 system_bt_rumble_interval_ms: null
 system_bt_rumble_trace_dry_run: false
-system_bt_rumble_trace_enabled: true
-system_bt_rumble_trace_path: logs/system_bt_rumble_trace.txt
+system_bt_rumble_trace_enabled: false
+system_bt_rumble_trace_path: logs/system_bt_rumble_trace.jsonl
 ui_scale: 1.0
 usbip_sim_mode: Switch1
 vibration_frequency: 10
@@ -4228,7 +4228,7 @@ virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1232
+window_x: 3753
 window_y: 58
 winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
