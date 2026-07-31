@@ -53,8 +53,7 @@ from discoverer import (
     request_wired_rescan,
     set_wired_auto_scan_enabled,
 )
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, SYSTEM_BT_RUMBLE_TRACE_PATH, SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH, packaged_winuhid_available, refresh_packaged_winuhid_capability
-from system_bt_rumble_trace import get_trace_log_directory
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, packaged_winuhid_available, refresh_packaged_winuhid_capability
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -93,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.7.1"
+APP_VERSION = "v1.7.2"
 
 def _set_current_thread_priority(level):
     try:
@@ -4470,52 +4469,6 @@ class ControllerWindow:
             self.root.winfo_rooty(),
         )
 
-    def _open_debug_log_location(self):
-        """Open the application's debug-log directory in Windows Explorer."""
-        log_dir = get_trace_log_directory()
-        try:
-            # The directory may not exist until the first log is written. Creating it
-            # here makes the button useful immediately after installation as well.
-            os.makedirs(log_dir, exist_ok=True)
-            if os.name == "nt" and hasattr(os, "startfile"):
-                os.startfile(log_dir)
-            else:
-                # Keep the helper harmless if the GUI is started on another OS.
-                webbrowser.open("file://" + os.path.realpath(log_dir))
-        except Exception as exc:
-            logger.exception("Failed to open debug log directory %s", log_dir)
-            from tkinter import messagebox
-            messagebox.showerror(
-                "Open Debug Log File Location",
-                f"Unable to open the debug log directory:\n{log_dir}\n\n{exc}",
-                parent=self.root,
-            )
-
-    def _toggle_rumble_trace_mode(self):
-        """Toggle real Bluetooth rumble writes and persist the matching log path."""
-        dry_run = not bool(getattr(CONFIG, "system_bt_rumble_trace_dry_run", False))
-        CONFIG.system_bt_rumble_trace_dry_run = dry_run
-        CONFIG.system_bt_rumble_trace_path = (
-            SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH
-            if dry_run
-            else SYSTEM_BT_RUMBLE_TRACE_PATH
-        )
-        CONFIG.save_config()
-        self._update_rumble_button()
-
-    def _update_rumble_button(self):
-        button = getattr(self, "rumble_button", None)
-        if button is None:
-            return
-        rumble_on = not bool(getattr(CONFIG, "system_bt_rumble_trace_dry_run", False))
-        button.config(
-            text=f"Rumble: {'On' if rumble_on else 'Off'}",
-            bg=highlight_color if rumble_on else button_gray,
-            fg="#000000" if rumble_on else "#FFFFFF",
-            activebackground=highlight_color,
-            activeforeground="#000000",
-        )
-
     def _open_kofi_window(self):
         """Toggle the Ko-fi donation popup.
 
@@ -5689,48 +5642,6 @@ class ControllerWindow:
             anchor=tk.W,
         )
         self.version_label.pack(side=tk.LEFT, padx=(int(12 * scaling_factor), 0), fill=tk.Y)
-
-        self.debug_log_button = tk.Button(
-            self.header_frame,
-            text="Open Debug Log File Location",
-            command=self._open_debug_log_location,
-            font=scale_font(("Arial", 8, "bold")),
-            bg=button_gray,
-            fg="#FFFFFF",
-            activebackground=highlight_color,
-            activeforeground="#000000",
-            bd=0,
-            relief=tk.FLAT,
-            highlightthickness=0,
-            padx=int(5 * scaling_factor),
-            pady=0,
-            cursor="hand2",
-        )
-        self.debug_log_button.pack(
-            side=tk.LEFT,
-            padx=(int(8 * scaling_factor), 0),
-            pady=int(2 * scaling_factor),
-            fill=tk.Y,
-        )
-
-        self.rumble_button = tk.Button(
-            self.header_frame,
-            command=self._toggle_rumble_trace_mode,
-            font=scale_font(("Arial", 8, "bold")),
-            bd=0,
-            relief=tk.FLAT,
-            highlightthickness=0,
-            padx=int(5 * scaling_factor),
-            pady=0,
-            cursor="hand2",
-        )
-        self.rumble_button.pack(
-            side=tk.LEFT,
-            padx=(int(4 * scaling_factor), 0),
-            pady=int(2 * scaling_factor),
-            fill=tk.Y,
-        )
-        self._update_rumble_button()
 
         self.header_label = tk.Label(
             self.header_frame,

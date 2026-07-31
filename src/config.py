@@ -30,13 +30,6 @@ logger = logging.getLogger(__name__)
 DJG_MODES = ("Switch Dominant Side", "Switch Gyro Side", "Single Side Toggle")
 DJG_DOMINANT_SIDES = ("Left", "Right", "None")
 
-# System Bluetooth + WinUHid PS5 rumble diagnostic log names.  Keep the two
-# destinations separate so a dry-run capture can never be mistaken for a real
-# rumble write capture during analysis.
-SYSTEM_BT_RUMBLE_TRACE_PATH = "logs/system_bt_rumble_trace.txt"
-SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH = "logs/system_bt_rumble_trace_no_rumble.txt"
-
-
 def normalize_djg_settings(mode, dominant_side):
     """Normalize current DJG settings and migrate the removed Direct Merge mode."""
     if mode == "Direct Merge":
@@ -812,20 +805,6 @@ class Config:
         self.controller_fast_cache_entries = config.get("controller_fast_cache_entries", {}) or {}
         self.winrt_cached_services = config.get("winrt_cached_services", True)
         self.winrt_skip_pro2_unsupported_init_0101 = config.get("winrt_skip_pro2_unsupported_init_0101", True)
-        # Diagnostics for the System Bluetooth rumble investigation.  Older
-        # config files do not contain this key, so tracing defaults to enabled
-        # for this diagnostic build while an explicit false is still respected.
-        self.system_bt_rumble_trace_dry_run = bool(config.get("system_bt_rumble_trace_dry_run", False))
-        # Keep the filename coupled to the mode, including when an older config
-        # still contains the previous single-path value.
-        self.system_bt_rumble_trace_path = (
-            SYSTEM_BT_RUMBLE_TRACE_NO_RUMBLE_PATH
-            if self.system_bt_rumble_trace_dry_run
-            else SYSTEM_BT_RUMBLE_TRACE_PATH
-        )
-        self.system_bt_rumble_trace_enabled = bool(config.get("system_bt_rumble_trace_enabled", True))
-        self.system_bt_rumble_interval_ms = config.get("system_bt_rumble_interval_ms", None)
-        
         self.simulation_mode = config.get("simulation_mode", "PS5")
         if self.simulation_mode == "Switch 2 Pro":
             self.simulation_mode = "Switch2"
@@ -1784,10 +1763,6 @@ class Config:
             'controller_fast_cache_entries': self.controller_fast_cache_entries,
             'winrt_cached_services': self.winrt_cached_services,
             'winrt_skip_pro2_unsupported_init_0101': self.winrt_skip_pro2_unsupported_init_0101,
-            'system_bt_rumble_trace_enabled': self.system_bt_rumble_trace_enabled,
-            'system_bt_rumble_trace_path': self.system_bt_rumble_trace_path,
-            'system_bt_rumble_trace_dry_run': self.system_bt_rumble_trace_dry_run,
-            'system_bt_rumble_interval_ms': self.system_bt_rumble_interval_ms,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
             'usbip_sim_mode': self.usbip_sim_mode,
