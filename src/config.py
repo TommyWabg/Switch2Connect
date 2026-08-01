@@ -805,6 +805,11 @@ class Config:
         self.controller_fast_cache_entries = config.get("controller_fast_cache_entries", {}) or {}
         self.winrt_cached_services = config.get("winrt_cached_services", True)
         self.winrt_skip_pro2_unsupported_init_0101 = config.get("winrt_skip_pro2_unsupported_init_0101", True)
+        # Paces System Bluetooth rumble writes so they cannot occupy every BLE
+        # connection event and crowd out the controller's input notifications.
+        # Off by default: it trades rumble refresh rate for input headroom, and
+        # only helps adapters whose stack does not apply its own backpressure.
+        self.system_bt_rumble_pacing = bool(config.get("system_bt_rumble_pacing", False))
         self.simulation_mode = config.get("simulation_mode", "PS5")
         if self.simulation_mode == "Switch 2 Pro":
             self.simulation_mode = "Switch2"
@@ -1763,6 +1768,7 @@ class Config:
             'controller_fast_cache_entries': self.controller_fast_cache_entries,
             'winrt_cached_services': self.winrt_cached_services,
             'winrt_skip_pro2_unsupported_init_0101': self.winrt_skip_pro2_unsupported_init_0101,
+            'system_bt_rumble_pacing': self.system_bt_rumble_pacing,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
             'usbip_sim_mode': self.usbip_sim_mode,

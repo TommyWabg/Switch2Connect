@@ -35,10 +35,26 @@ import math
 import imufusion
 import numpy as np
 import os
+import sys
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
+# Temporary hardware diagnostics for comparing a Joy-Con in the magnetic grip
+# with normal IR Mouse use. Enabled by default for the measurement build; set
+# SWITCH2_IR_DIAGNOSTICS=0 before launch to silence it.
+_IR_SENSOR_DIAGNOSTICS = os.environ.get('SWITCH2_IR_DIAGNOSTICS', '1') != '0'
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+except Exception:
+    pass
+# The virtual-pad drivers call back into Python from their own native threads
+# (see winuhid_client._rumble_handler), and those callbacks must take the GIL
+# before they can return. At the 5 ms default a callback thread can be made to
+# wait through several scheduling quanta while it still holds driver state,
+# which shows up as input stalling during rumble. usbip_dualsense_server.py
+# already lowers this for the same reason; the GUI process hosts WinUHid and
+# needs it just as much.
+try:
+    sys.setswitchinterval(0.001)
 except Exception:
     pass
 from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
@@ -52,6 +68,10 @@ from utils import (
 )
 import utils
 import raw_input_mouse
+from ir_mouse_activation import (
+    IR_MOUSE_FREE_SECONDS, IR_MOUSE_VERIFY_BINS,
+    IrMouseActivationState, advance_ir_mouse_activation,
+)
 
 # Non-blocking logging: every thread's logger call only enqueues a record (O(1), no
 # I/O), and a dedicated listener thread does the actual console write.  A synchronous
@@ -105,6 +125,13 @@ BT_RUMBLE_WRITE_SLOW_WARN = 0.05
 # Seconds between slow-write warnings, so a degraded link reports the problem
 # without the logging itself adding load to an already-struggling session.
 BT_RUMBLE_WRITE_WARN_INTERVAL = 5.0
+# Minimum spacing between System-Bluetooth rumble writes when pacing is enabled.
+# One command already carries 3 frames spanning about this long, so holding to it
+# costs no haptic coverage while freeing BLE connection events for input.
+BT_RUMBLE_MIN_INTERVAL = 0.015
+# Seconds between rumble write-rate reports. Logged in both paced and unpaced mode
+# so the two can be compared directly from a user's terminal output.
+BT_RUMBLE_RATE_LOG_INTERVAL = 1.0
 
 # Controller identification info
 NINTENDO_VENDOR_ID = 0x057e
@@ -1294,6 +1321,14 @@ class Controller:
         self.jc_target_vx = 0.0
         self.jc_target_vy = 0.0    
         self.jc_mouse_active = False
+        # IR Mouse alone uses a timed gate: during its initial free window it
+        # follows per-report displacement, then motion-only verification must
+        # succeed before it latches. Other IR functions use _ir_sensor_active*
+        # directly.
+        self._ir_mouse_activation_state = IrMouseActivationState()
+        self._ir_diag_previous_coords = None
+        self._ir_diag_last_log_time = 0.0
+        self._ir_diag_last_signature = None
         self.current_vx = 0.0
         self.current_vy = 0.0
         self.interp_residual_x = 0.0
@@ -2172,12 +2207,26 @@ class Controller:
 
     def _bridge_rumble_due(self):
         """Rate-gate continuous rumble for the ESP32-S3 bridge to the BLE connection
-        interval (~7.5ms). Non-bridge (WinRT) controllers always return True because
-        the OS BLE stack already paces their writes. Each command carries 3 frames
-        that cover the interval, so pacing here keeps low latency without flooding the
-        firmware's per-interval BLE write (which caused merge-mode rumble stutter)."""
+        interval (~7.5ms). Each command carries 3 frames that cover the interval, so
+        pacing here keeps low latency without flooding the firmware's per-interval BLE
+        write (which caused merge-mode rumble stutter).
+
+        System Bluetooth is unpaced by default, on the assumption that the OS BLE stack
+        applies its own backpressure. That assumption is adapter-dependent: where it does
+        not hold, writes are merely queued and occupy the connection events the
+        controller's input notifications also need, which shows up as input freezing for
+        the duration of a rumble. system_bt_rumble_pacing gates those writes to the span
+        of haptic data each command already carries, leaving airtime for input. It is
+        opt-in because it trades rumble refresh rate for that headroom.
+        """
         if not getattr(self, 'is_esp32s3_bridge', False):
-            return True
+            if not getattr(CONFIG, 'system_bt_rumble_pacing', False):
+                return True
+            now_rt = time.perf_counter()
+            if (now_rt - getattr(self, '_last_bt_rumble_send_rt', 0.0)) >= BT_RUMBLE_MIN_INTERVAL:
+                self._last_bt_rumble_send_rt = now_rt
+                return True
+            return False
         now_rt = time.perf_counter()
         if (now_rt - getattr(self, '_last_rumble_send_rt', 0.0)) >= 0.0075:
             self._last_rumble_send_rt = now_rt
@@ -2213,6 +2262,30 @@ class Controller:
         # had already reserved, reopening the pile-up this guard exists to stop.
         future.add_done_callback(lambda _f: self._end_rumble_dispatch())
         return True
+
+    def _count_rumble_write(self):
+        """Report how many rumble writes actually reach the link, once per second.
+
+        This is the number that separates a saturated link from a blocked driver: an
+        unpaced session can issue more writes per second than the BLE connection
+        interval has events for, leaving none spare for input notifications. Logged
+        in both paced and unpaced mode so the two can be compared side by side.
+        """
+        now = time.perf_counter()
+        self._rumble_write_count = getattr(self, '_rumble_write_count', 0) + 1
+        window_start = getattr(self, '_rumble_write_window_start', 0.0)
+        if window_start == 0.0:
+            self._rumble_write_window_start = now
+            return
+        elapsed = now - window_start
+        if elapsed >= BT_RUMBLE_RATE_LOG_INTERVAL:
+            logger.info(
+                "Rumble writes: %.0f/s on %s (pacing=%s)",
+                self._rumble_write_count / elapsed,
+                getattr(self.device, 'address', 'unknown'),
+                "on" if getattr(CONFIG, 'system_bt_rumble_pacing', False) else "off")
+            self._rumble_write_count = 0
+            self._rumble_write_window_start = now
 
     def _warn_slow_rumble_write(self, elapsed, timed_out=False):
         """Report a backing-up BLE write queue, at most once every few seconds.
@@ -3020,6 +3093,7 @@ class Controller:
             # the send slot open. Rumble is re-sent on the next scheduler tick, so a
             # dropped frame is inaudible while a stalled one freezes the controls.
             write_started = time.perf_counter()
+            self._count_rumble_write()
             await asyncio.wait_for(
                 self.client.write_gatt_char(uuid_to_use, payload, response=False),
                 timeout=BT_RUMBLE_WRITE_TIMEOUT)
@@ -3205,6 +3279,10 @@ class Controller:
 
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
                 self.simulate_mouse(inputData)
+            else:
+                # Calibration suppresses simulate_mouse entirely, so explicitly
+                # tear down both activation stages and any held mouse buttons.
+                self._deactivate_ir_mouse(reset_activation=True)
 
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False) and not getattr(self, 'is_joystick_calibrating', False):
@@ -4520,10 +4598,26 @@ class Controller:
             self._ir_sensor_active_scoped = False
             self._ir_sensor_active = False
         if ir_mouse_enabled and self.is_joycon():
-            # Check if mouse coordinate data is valid to mark the controller as active IR mouse
-            _IR_THRESHOLD_MAP = {1: (1000, 4000), 2: (1500, 5000), 3: (3000, 10000)}
-            _ir_dist, _ir_rough = _IR_THRESHOLD_MAP.get(ir_settings.get("activate_threshold", 1), (1000, 4000))
-            ir_active = self._ir_sensor_active
+            # During the initial free window, displacement controls IR Mouse
+            # report-by-report. Afterward, temporal and spatial motion evidence
+            # must pass verification; Grip jitter remains unlatched.
+            self._ir_mouse_activation_state, activation_origin, verification_event = advance_ir_mouse_activation(
+                self._ir_sensor_active,
+                inputData.mouse_coords,
+                time.perf_counter(),
+                getattr(self, "_ir_mouse_activation_state", IrMouseActivationState()),
+            )
+            if verification_event is not None:
+                self._log_ir_verification(side, verification_event)
+            ir_active = self._ir_mouse_activation_state.mode_active
+
+            if activation_origin is not None:
+                # Seed the normal delta path with the armed coordinate so the
+                # movement that confirms stage two is emitted immediately.
+                self.previous_mouse_state = MouseState(
+                    activation_origin[0], activation_origin[1],
+                    False, False, False, True,
+                )
 
             if ir_active:
                 self.jc_mouse_active = True 
@@ -4602,35 +4696,101 @@ class Controller:
 
                 self.previous_mouse_state = MouseState(x, y, lb, mb, rb, ir_active)
             else:
-                self.jc_mouse_active = False
-                self.jc_target_vx = 0.0
-                self.jc_target_vy = 0.0
-                # Exited IR Mouse Mode: release any pressed mouse buttons instantly
-                if getattr(self, 'previous_mouse_state', None) is not None:
-                    raw_mouse = self._raw_mouse
-                    if raw_mouse is not None:
-                        self._report_raw_mouse_buttons(raw_mouse, False, False, False)
-                    else:
-                        mx, my = win32api.GetCursorPos()
-                        press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                        press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                        press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
-                self.previous_mouse_state = None
+                # Keep the latest stage-one coordinate while stopping output;
+                # the next displaced report can immediately re-enter stage two.
+                self._deactivate_ir_mouse(reset_activation=False)
         else:
-            self.jc_mouse_active = False
-            self.jc_target_vx = 0.0
-            self.jc_target_vy = 0.0
-            # If mouse mode is disabled or it's not a Joycon, make sure any pressed mouse button is released!
-            if getattr(self, 'previous_mouse_state', None) is not None:
-                raw_mouse = self._raw_mouse
-                if raw_mouse is not None:
-                    self._report_raw_mouse_buttons(raw_mouse, False, False, False)
-                else:
-                    mx, my = win32api.GetCursorPos()
-                    press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                    press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                    press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
-            self.previous_mouse_state = None
+            self._deactivate_ir_mouse(reset_activation=True)
+
+        if self.is_joycon():
+            self._log_ir_sensor_diagnostics(inputData, side, ir_mouse_enabled)
+
+    def _log_ir_sensor_diagnostics(self, inputData, side, ir_mouse_enabled):
+        """Log moving IR samples only while the activation threshold is met."""
+        if not _IR_SENSOR_DIAGNOSTICS:
+            return
+
+        now = time.perf_counter()
+        coords = (int(inputData.mouse_coords[0]), int(inputData.mouse_coords[1]))
+        previous = getattr(self, "_ir_diag_previous_coords", None)
+        if previous is None:
+            dx = dy = 0
+        else:
+            dx = signed_looping_difference_16bit(previous[0], coords[0])
+            dy = signed_looping_difference_16bit(previous[1], coords[1])
+        self._ir_diag_previous_coords = coords
+
+        state = getattr(self, "_ir_mouse_activation_state", IrMouseActivationState())
+        threshold_active = bool(getattr(self, "_ir_sensor_active", False))
+        moving = dx != 0 or dy != 0
+        if not threshold_active or not moving:
+            return
+
+        if state.latched:
+            phase = "latched"
+            started = state.threshold_since if state.threshold_since is not None else now
+            elapsed_ms = int(max(0.0, now - started) * 1000)
+        else:
+            started = state.threshold_since if state.threshold_since is not None else now
+            elapsed_ms = int(max(0.0, now - started) * 1000)
+            phase = "free" if elapsed_ms < int(IR_MOUSE_FREE_SECONDS * 1000) else "verifying"
+
+        signature = (threshold_active, bool(state.mode_active), bool(state.latched), phase)
+        last_time = getattr(self, "_ir_diag_last_log_time", 0.0)
+        last_signature = getattr(self, "_ir_diag_last_signature", None)
+        if signature != last_signature or now - last_time >= 0.100:
+            logger.info(
+                "[IR-DIAG] side=%s function=%s phase=%s elapsed_ms=%d "
+                "threshold=%d mouse=%d latched=%d distance=%d roughness=%d "
+                "x=%d y=%d dx=%d dy=%d moving=%d",
+                side,
+                "IR Mouse" if ir_mouse_enabled else "Other",
+                phase,
+                elapsed_ms,
+                int(threshold_active),
+                int(bool(state.mode_active)),
+                int(bool(state.latched)),
+                int(inputData.mouse_distance),
+                int(inputData.mouse_roughness),
+                coords[0],
+                coords[1],
+                dx,
+                dy,
+                int(moving),
+            )
+            self._ir_diag_last_log_time = now
+            self._ir_diag_last_signature = signature
+
+    def _log_ir_verification(self, side, event):
+        """Log one motion-only summary for each completed verification window."""
+        if not _IR_SENSOR_DIAGNOSTICS:
+            return
+        logger.info(
+            "[IR-VERIFY] side=%s result=%s reason=%s samples=%d moving=%d "
+            "bins=%d/%d path=%d span_x=%d span_y=%d max_delta=%d streak=%d",
+            side, event.result, event.reason, event.samples, event.moving_samples,
+            event.active_bins, IR_MOUSE_VERIFY_BINS, event.path, event.span_x, event.span_y,
+            event.max_delta, event.streak,
+        )
+
+    def _deactivate_ir_mouse(self, reset_activation=False):
+        """Stop IR Mouse output and release every latched mouse button."""
+        if reset_activation:
+            self._ir_mouse_activation_state = IrMouseActivationState()
+        self.jc_mouse_active = False
+        self.jc_target_vx = 0.0
+        self.jc_target_vy = 0.0
+        previous = getattr(self, 'previous_mouse_state', None)
+        if previous is not None:
+            raw_mouse = self._raw_mouse
+            if raw_mouse is not None:
+                self._report_raw_mouse_buttons(raw_mouse, False, False, False)
+            else:
+                mx, my = win32api.GetCursorPos()
+                press_or_release_mouse_button(False, previous.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                press_or_release_mouse_button(False, previous.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                press_or_release_mouse_button(False, previous.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+        self.previous_mouse_state = None
 
     def _report_raw_mouse_buttons(self, raw_mouse, lb, mb, rb):
         """Edge-detect the three IR Mouse buttons onto the virtual HID mouse.

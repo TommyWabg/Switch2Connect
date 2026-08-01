@@ -291,6 +291,12 @@ def detach_all_usbip_devices():
 
 RUMBLE_WRITE_INTERVAL = 0.0166
 SWITCH_RUMBLE_TIMEOUT = 0.150
+# A Joy-Con reports about every 11-15 ms, so a submit taking this long has already
+# cost the game a frame of input and points at the virtual pad driver blocking.
+SUBMIT_SLOW_WARN_MS = 10.0
+# Seconds between submit warnings, so a struggling session reports the problem
+# without the logging itself adding to the load.
+SUBMIT_WARN_INTERVAL = 5.0
 AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE = 5
 # DualSense 0x02 output-report bytes masked out of the traditional-rumble stop
 # signature: motors [3],[4] plus valid_flag0/1 [1],[2] and valid_flag2 [39].
@@ -467,6 +473,25 @@ class VirtualController:
         
         self.state_lock = threading.RLock()
         self._disconnect_lock = asyncio.Lock()
+
+        # Input submits run on a dedicated thread. The virtual-pad drivers submit
+        # input with a blocking native call, and it used to run inline on the Bleak
+        # notification callback -- i.e. on the shared DISCOVERER_LOOP. While the
+        # driver was busy delivering rumble output reports that call could block,
+        # which stalled notification delivery for every controller and left input
+        # frozen at its last value until the rumble stopped. Producers now only
+        # leave the newest frame in a slot and return.
+        self._submit_lock = threading.Lock()
+        self._submit_pending = None      # (inputData, buttons, controller, buttonsConfig)
+        self._submit_sticky_buttons = 0  # presses from frames superseded before submit
+        self._submit_wake = threading.Event()
+        self._submit_stop = False
+        self._submit_thread = None
+        self._submit_fail_count = 0
+        self._last_submit_fail_warn = 0.0
+        self._last_slow_submit_warn = 0.0
+        self._rumble_cb_count = 0
+        self._rumble_cb_window_start = 0.0
         
         # Adaptive Trigger State Tracking (for Weapon mode recoil kicks)
         self.trigger_r_prev_force = 0
@@ -857,8 +882,123 @@ class VirtualController:
                 inputData.gyroscope = fused_gyro
                 inputData.accelerometer = fused_accel
 
+    def _count_rumble_callback(self):
+        """Report how fast the game is driving rumble, once per second while active.
+
+        This runs inside the driver's native callback, which holds the GIL for its
+        duration, so the rate is also a measure of how often that thread competes
+        with input processing. Kept to a counter plus one log per second.
+        """
+        now = time.perf_counter()
+        self._rumble_cb_count += 1
+        if self._rumble_cb_window_start == 0.0:
+            self._rumble_cb_window_start = now
+            return
+        elapsed = now - self._rumble_cb_window_start
+        if elapsed >= 1.0:
+            logger.info("Rumble callbacks: %.0f/s (mode=%s driver=%s)",
+                        self._rumble_cb_count / elapsed, self.mode, self.driver_type)
+            self._rumble_cb_count = 0
+            self._rumble_cb_window_start = now
+
+    def _publish_input_submit(self, inputData, buttons, controller, buttonsConfig):
+        """Hand the newest input frame to the submit thread and return immediately."""
+        with self._submit_lock:
+            if self._submit_pending is not None:
+                # The previous frame never reached the driver. Carry its presses
+                # forward so a button tapped and released between two submits is
+                # still delivered once, instead of vanishing.
+                self._submit_sticky_buttons |= self._submit_pending[1]
+            self._submit_pending = (inputData, buttons, controller, buttonsConfig)
+        if self._submit_thread is None or not self._submit_thread.is_alive():
+            self._start_submit_thread()
+        self._submit_wake.set()
+
+    def _start_submit_thread(self):
+        with self._submit_lock:
+            if self._submit_thread is not None and self._submit_thread.is_alive():
+                return
+            self._submit_stop = False
+            self._submit_thread = threading.Thread(
+                target=self._input_submit_loop, daemon=True, name="VirtualInputSubmit")
+            self._submit_thread.start()
+
+    def _stop_submit_thread(self):
+        self._submit_stop = True
+        self._submit_wake.set()
+        thread = self._submit_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+        self._submit_thread = None
+        with self._submit_lock:
+            self._submit_pending = None
+            self._submit_sticky_buttons = 0
+
+    def _input_submit_loop(self):
+        while not self._submit_stop:
+            self._submit_wake.wait(timeout=0.05)
+            self._submit_wake.clear()
+            while not self._submit_stop:
+                with self._submit_lock:
+                    pending = self._submit_pending
+                    sticky = self._submit_sticky_buttons
+                    self._submit_pending = None
+                    self._submit_sticky_buttons = 0
+                if pending is None:
+                    break
+                inputData, buttons, controller, buttonsConfig = pending
+                try:
+                    self._run_input_submit(
+                        inputData, buttons | sticky, controller, buttonsConfig)
+                except Exception:
+                    logger.exception("Virtual input submit failed")
+
+    def _run_input_submit(self, inputData, buttons, controller, buttonsConfig):
+        started_ns = time.perf_counter_ns()
+        submitted = False
+        if self.mode == "PS4":
+            submitted = self.update_as_ps4(inputData, buttons, controller)
+        elif self.mode == "PS5":
+            submitted = self.update_as_ps5(inputData, buttons, controller)
+        elif self.mode == "Switch2":
+            submitted = self.update_as_switch2_pro(inputData, buttons, controller)
+        elif self.mode == "Switch1":
+            if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
+                submitted = self.update_as_switch1_pro(inputData, buttons, controller)
+            elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
+                submitted = self.update_as_switch1_joycon_l(inputData, buttons, controller)
+            elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
+                submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
+        else:
+            submitted = self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
+
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        now = time.perf_counter()
+        # A submit this slow means the driver held us up; on the old inline path
+        # that time was taken straight out of input delivery.
+        if elapsed_ms >= SUBMIT_SLOW_WARN_MS and now - self._last_slow_submit_warn >= SUBMIT_WARN_INTERVAL:
+            self._last_slow_submit_warn = now
+            logger.warning(
+                "Virtual controller submit took %.1f ms (mode=%s driver=%s) -- "
+                "the virtual pad driver is blocking input updates",
+                elapsed_ms, self.mode, self.driver_type)
+        if submitted:
+            self._submit_fail_count = 0
+        else:
+            # Previously discarded in full: update_as_* returned False and every
+            # caller ignored it, so dropped input frames were invisible.
+            self._submit_fail_count += 1
+            if now - self._last_submit_fail_warn >= SUBMIT_WARN_INTERVAL:
+                self._last_submit_fail_warn = now
+                logger.warning(
+                    "Virtual controller rejected %d input update(s) (mode=%s driver=%s) -- "
+                    "input is being dropped before it reaches the game",
+                    self._submit_fail_count, self.mode, self.driver_type)
+        return submitted
+
     def cleanup_vg_controller(self):
         self._suppress_usbip_reconnect = True
+        self._stop_submit_thread()
         self._stop_dualsense_audio_guard()
         for suffix in ('', '_l', '_r', '_pro'):
             port_attr = f'server_port{suffix}' if suffix else 'server_port'
@@ -1423,6 +1563,7 @@ class VirtualController:
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
+        self._count_rumble_callback()
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading
@@ -2087,7 +2228,6 @@ class VirtualController:
         def input_report_callback(inputData: ControllerInputData, controller: Controller):
             if self.vg_controller is None:
                 return False
-            submitted = False
             controllers = getattr(self, "_controllers_tuple", None)
             if controllers is None or len(controllers) != len(self.controllers):
                 self._refresh_controller_cache()
@@ -2543,25 +2683,14 @@ class VirtualController:
                 inputData.gyroscope = (0.0, 0.0, 0.0)
                 inputData.accelerometer = (0.0, 0.0, 0.0)
 
-            if self.mode == "PS4":
-                submitted = self.update_as_ps4(inputData, buttons, controller)
-            elif self.mode == "PS5":
-                submitted = self.update_as_ps5(inputData, buttons, controller)
-            elif self.mode == "Switch2":
-                submitted = self.update_as_switch2_pro(inputData, buttons, controller)
-            elif self.mode == "Switch1":
-                if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
-                    submitted = self.update_as_switch1_pro(inputData, buttons, controller)
-                elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
-                    submitted = self.update_as_switch1_joycon_l(inputData, buttons, controller)
-                elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
-                    submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
-            else:
-                submitted = self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
+            # Hand off to the submit thread rather than calling into the virtual pad
+            # driver here: this runs on the Bleak notification thread, and a blocking
+            # driver call would delay the next input report for every controller.
+            self._publish_input_submit(inputData, buttons, controller, buttonsConfig)
 
             # Record raw buttons for shared click logic in next report
             controller._last_raw_buttons = current_buttons
-            return bool(submitted)
+            return True
 
         def wrapped_callback(inputData: ControllerInputData, controller: Controller):
             with self.state_lock:

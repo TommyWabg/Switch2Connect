@@ -92,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.7.2"
+APP_VERSION = "v1.7.3"
 
 def _set_current_thread_priority(level):
     try:
@@ -4469,6 +4469,30 @@ class ControllerWindow:
             self.root.winfo_rooty(),
         )
 
+    def _toggle_rumble_pacing(self):
+        """Toggle System Bluetooth rumble pacing and persist the choice.
+
+        Takes effect on the next rumble scheduler tick because _bridge_rumble_due
+        reads CONFIG live, so it can be flipped mid-game to compare directly.
+        """
+        CONFIG.system_bt_rumble_pacing = not bool(
+            getattr(CONFIG, "system_bt_rumble_pacing", False))
+        CONFIG.save_config()
+        self._update_pacing_button()
+
+    def _update_pacing_button(self):
+        button = getattr(self, "rumble_pacing_button", None)
+        if button is None:
+            return
+        pacing_on = bool(getattr(CONFIG, "system_bt_rumble_pacing", False))
+        button.config(
+            text=f"Rumble Pacing: {'On' if pacing_on else 'Off'}",
+            bg=highlight_color if pacing_on else button_gray,
+            fg="#000000" if pacing_on else "#FFFFFF",
+            activebackground=highlight_color,
+            activeforeground="#000000",
+        )
+
     def _open_kofi_window(self):
         """Toggle the Ko-fi donation popup.
 
@@ -5642,6 +5666,25 @@ class ControllerWindow:
             anchor=tk.W,
         )
         self.version_label.pack(side=tk.LEFT, padx=(int(12 * scaling_factor), 0), fill=tk.Y)
+
+        self.rumble_pacing_button = tk.Button(
+            self.header_frame,
+            command=self._toggle_rumble_pacing,
+            font=scale_font(("Arial", 8, "bold")),
+            bd=0,
+            relief=tk.FLAT,
+            highlightthickness=0,
+            padx=int(5 * scaling_factor),
+            pady=0,
+            cursor="hand2",
+        )
+        self.rumble_pacing_button.pack(
+            side=tk.LEFT,
+            padx=(int(8 * scaling_factor), 0),
+            pady=int(2 * scaling_factor),
+            fill=tk.Y,
+        )
+        self._update_pacing_button()
 
         self.header_label = tk.Label(
             self.header_frame,
