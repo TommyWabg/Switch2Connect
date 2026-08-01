@@ -4212,6 +4212,7 @@ stick_r_bias:
 - 0.0
 sw2_zero_command_pacing: true
 system_bt_rumble_interval_ms: null
+system_bt_rumble_pacing: false
 system_bt_rumble_trace_dry_run: false
 system_bt_rumble_trace_enabled: false
 system_bt_rumble_trace_path: logs/system_bt_rumble_trace.jsonl
@@ -4223,13 +4224,13 @@ vibration_strength_ps5: 10
 vibration_strength_switch: 5
 vibration_strength_xbox: 5
 vigembus_installed: true
-vigembus_sim_mode: PS4
+vigembus_sim_mode: Xbox360
 virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 3753
-window_y: 58
+window_x: 1229
+window_y: 64
 winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5
