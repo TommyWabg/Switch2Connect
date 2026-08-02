@@ -186,7 +186,7 @@ controller_fast_cache_entries:
       - 1191
       - 1176
     stick_secondary: null
-driver_installed: true
+driver_installed: false
 driver_type: WinUHid
 gc_l_click_mapping: Default
 gc_r_click_mapping: Default
