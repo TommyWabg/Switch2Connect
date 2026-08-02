@@ -6,15 +6,16 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# This module centralizes the download sources and silent-install commands for
-# the external drivers the app relies on. It is used by:
-#   * ViGEmBus one-click install (both the standalone .exe build and MSIX build).
-#   * The MSIX-packaged build, which cannot ship driver installers inside the
-#     package, so it downloads them from the project GitHub drivers folder
-#     (and ViGEmBus from nefarius' official release) and installs them at runtime.
+# This module provides:
+#   * Robust driver-state detection (WinUHid / ViGEmBus / USBIP / HidHide).
+#   * The single remaining download path: the standalone .exe build's ViGEmBus
+#     installer (nefarius' official release).
 #
-# The standalone .exe build still installs WinUHid / USBIP / HIDHide from the
-# bundled files; only ViGEmBus is routed through here for both builds.
+# NOTE ON PACKAGING POLICY: the MSIX/Store build NEVER downloads anything. All
+# drivers are bundled inside the package and installed from those local files at
+# runtime (Store policy 10.2.10.1 / 10.1.5 forbid an app downloading executables).
+# The packaged build installs ViGEmBus from the bundled vgamepad MSI. Only the
+# standalone .exe build downloads ViGEmBus (see DRIVER_SPECS below).
 
 import os
 import re
@@ -25,20 +26,12 @@ import time
 import urllib.request
 from dataclasses import dataclass
 
-# Raw base for files hosted in the project's own drivers/ folder on GitHub.
-GITHUB_DRIVERS_RAW = "https://raw.githubusercontent.com/TommyWabg/Switch2Connect/main/drivers"
-
-# ViGEmBus is not in the project repo; use nefarius' official signed release.
+# ViGEmBus is not in the project repo. The standalone .exe build downloads nefarius'
+# official signed release. (The packaged/MSIX build installs ViGEmBus from the bundled
+# vgamepad MSI instead and never downloads — all other drivers install from bundled files.)
 VIGEMBUS_URL = (
     "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/"
     "ViGEmBus_1.22.0_x64_x86_arm64.exe"
-)
-
-# The usbip-win2 installer is not committed to the project drivers/ folder; use
-# the upstream vadimgrn/usbip-win2 official release asset.
-USBIP_EXE_URL = (
-    "https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.7.7/"
-    "USBip-0.9.7.7-x64.exe"
 )
 
 
@@ -669,6 +662,23 @@ def get_winuhid_status(pnputil_runner=None, registry_checker=None, cfgmgr=None,
     return status
 
 
+def is_winuhid_usable(use_cache=True):
+    """Return True only when the complete WinUHid stack is currently usable.
+
+    This is intentionally based on the observed device, Driver Store package,
+    and WUDF registration rather than the persisted ``driver_installed`` flag.
+    The flag is a convenience cache for the application UI; it is never a
+    capability grant by itself.
+    """
+    return bool(get_winuhid_status(use_cache=use_cache).installed)
+
+
+def refresh_winuhid_usable():
+    """Re-probe WinUHid after an external install/uninstall operation."""
+    invalidate_driver_status_cache("winuhid")
+    return is_winuhid_usable(use_cache=False)
+
+
 @dataclass(frozen=True)
 class ViGEmBusStatus:
     state: str
@@ -1150,67 +1160,15 @@ def get_hidhide_status(pnputil_runner=None, registry_query=None, cfgmgr=None,
     return status
 
 
-def _gh(name):
-    return f"{GITHUB_DRIVERS_RAW}/{name}"
-
-
+# Only ViGEmBus is ever downloaded, and only by the standalone .exe build. All other
+# drivers (WinUHid / USBIP / HidHide) install from files bundled in the package, and
+# the packaged/MSIX build installs ViGEmBus from the bundled vgamepad MSI — so nothing
+# is fetched from the internet there. Uninstall is always run from bundled scripts.
 DRIVER_SPECS = {
     "ViGEmBus": DriverSpec(
         "ViGEmBus",
         files=[(VIGEMBUS_URL, "ViGEmBus_1.22.0_x64_x86_arm64.exe")],
         run=("exe", "ViGEmBus_1.22.0_x64_x86_arm64.exe", "/quiet /norestart"),
-    ),
-    "WinUHid": DriverSpec(
-        "WinUHid",
-        files=[
-            (_gh("install_driver.ps1"), "install_driver.ps1"),
-            (_gh("WinUHidDriver.inf"), "WinUHidDriver.inf"),
-            (_gh("WinUHidDriver.dll"), "WinUHidDriver.dll"),
-            (_gh("WinUHidDriver.cer"), "WinUHidDriver.cer"),
-            (_gh("winuhiddriver.cat"), "winuhiddriver.cat"),
-        ],
-        run=("ps1", "install_driver.ps1"),
-    ),
-    "USBIP": DriverSpec(
-        "USBIP",
-        files=[
-            (_gh("install_usbip.ps1"), "install_usbip.ps1"),
-            (USBIP_EXE_URL, "USBip-0.9.7.7-x64.exe"),
-        ],
-        run=("ps1", "install_usbip.ps1"),
-    ),
-    "HidHide": DriverSpec(
-        "HidHide",
-        files=[(_gh("hidhide/HidHide_x64.exe"), "HidHide_x64.exe")],
-        run=("exe", "HidHide_x64.exe", "/quiet /norestart"),
-    ),
-}
-
-
-# Uninstall scripts hosted in the project drivers/ folder. Each is self-contained
-# (pnputil / certutil / registry / the driver's own uninstaller under Program Files)
-# and references no bundled binary, so the packaged build just downloads the single
-# .ps1 and runs it elevated. Mirrors DRIVER_SPECS but for removal.
-UNINSTALL_SPECS = {
-    "WinUHid": DriverSpec(
-        "WinUHid",
-        files=[(_gh("uninstall_driver.ps1"), "uninstall_driver.ps1")],
-        run=("ps1", "uninstall_driver.ps1"),
-    ),
-    "ViGEmBus": DriverSpec(
-        "ViGEmBus",
-        files=[(_gh("uninstall_vigembus.ps1"), "uninstall_vigembus.ps1")],
-        run=("ps1", "uninstall_vigembus.ps1"),
-    ),
-    "USBIP": DriverSpec(
-        "USBIP",
-        files=[(_gh("uninstall_usbip.ps1"), "uninstall_usbip.ps1")],
-        run=("ps1", "uninstall_usbip.ps1"),
-    ),
-    "HidHide": DriverSpec(
-        "HidHide",
-        files=[(_gh("hidhide/uninstall_hidhide.ps1"), "uninstall_hidhide.ps1")],
-        run=("ps1", "uninstall_hidhide.ps1"),
     ),
 }
 

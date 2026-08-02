@@ -37,6 +37,13 @@ _ENTRY_POINTS = (
     "CM_Get_Device_ID_ListW",
     "CM_Locate_DevNodeW",
     "CM_Get_DevNode_Registry_PropertyW",
+    # Device-tree walking, used to correlate the interfaces of one composite USB
+    # device. Present since Windows 2000, like the rest of this list.
+    "CM_Get_Parent",
+    "CM_Get_Child",
+    "CM_Get_Sibling",
+    "CM_Get_Device_IDW",
+    "CM_Get_Device_ID_Size",
 )
 
 _library = None
@@ -190,6 +197,72 @@ def service_of(instance_id):
     if node is None:
         return [] if _lib() is not None else None
     return _registry_property(node, CM_DRP_SERVICE)
+
+
+def _device_id_of_node(node):
+    """The instance id string of an already-located devnode, or None."""
+    lib = _lib()
+    if lib is None or node is None:
+        return None
+    try:
+        size = wintypes.ULONG(0)
+        # Reports a length in characters, excluding the terminating NUL.
+        if lib.CM_Get_Device_ID_Size(ctypes.byref(size), node, 0) != CR_SUCCESS:
+            return None
+        buffer = ctypes.create_unicode_buffer(size.value + 1)
+        if lib.CM_Get_Device_IDW(node, buffer, size.value + 1, 0) != CR_SUCCESS:
+            return None
+        return buffer.value or None
+    except Exception:
+        return None
+
+
+def _related_node(node, entry_point):
+    lib = _lib()
+    if lib is None or node is None:
+        return None
+    try:
+        related = wintypes.DWORD()
+        if getattr(lib, entry_point)(ctypes.byref(related), node, 0) != CR_SUCCESS:
+            return None
+        return related
+    except Exception:
+        return None
+
+
+def parent_instance_id(instance_id):
+    """The instance id of a node's parent, or None.
+
+    A USB HID interface's parent chain is
+    ``HID\\...`` -> ``USB\\VID_x&PID_y&MI_00\\...`` -> ``USB\\VID_x&PID_y\\...``,
+    so two hops from a HID node reach the composite device that owns every
+    interface of one physical controller.
+    """
+    return _device_id_of_node(_related_node(_locate(instance_id), "CM_Get_Parent"))
+
+
+def child_instance_ids(instance_id):
+    """Instance ids of a node's immediate children, in enumeration order.
+
+    Returns None when the query failed, [] when the node genuinely has none.
+    """
+    node = _locate(instance_id)
+    if node is None:
+        return [] if _lib() is not None else None
+    child = _related_node(node, "CM_Get_Child")
+    if child is None:
+        return []
+    found = []
+    # A bounded walk: a corrupt sibling ring must not spin forever, and no real
+    # composite device has anywhere near this many interfaces.
+    for _ in range(64):
+        child_id = _device_id_of_node(child)
+        if child_id:
+            found.append(child_id)
+        child = _related_node(child, "CM_Get_Sibling")
+        if child is None:
+            break
+    return found
 
 
 def instances_by_hardware_id(wanted_hardware_ids, enumerator="ROOT"):

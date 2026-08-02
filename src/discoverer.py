@@ -1533,12 +1533,14 @@ async def run_usb_hid_discovery(quit_event):
             WIRED_RESCAN_EVENT.set()
 
     try:
-        from usb_hid_controller import USBHidController, enumerate_pro_controller2
+        from usb_hid_controller import (
+            USBHidController, enumerate_wired_controllers, WIRED_USB_PIDS)
         import hidhide
     except Exception as e:
         logger.info("Wired USB support unavailable (missing hidapi?): %s", e)
         return
-    logger.info("Wired USB watcher started (event-driven, VID 057E/PID 2069).")
+    logger.info("Wired USB watcher started (event-driven, VID 057E, PIDs %s).",
+                ", ".join(f"{pid:04X}" for pid in WIRED_USB_PIDS))
 
     known: dict = {}          # device key -> USBHidController
     # device key -> time.monotonic() when the _add task started. Timestamped (rather than a
@@ -1733,7 +1735,11 @@ async def run_usb_hid_discovery(quit_event):
                 await c_ref.trigger_connection_haptics()
             asyncio.create_task(_connection_haptics())
             known[key] = controller
-            logger.info("Wired USB Pro Controller 2 added (%s)", controller.device.address)
+            logger.info("Wired USB %s added (%s)",
+                        CONTROLER_NAMES.get(
+                            getattr(controller.controller_info, "product_id", 0),
+                            "controller"),
+                        controller.device.address)
         except Exception as exc:
             if isinstance(exc, asyncio.TimeoutError):
                 logger.warning("Timed out adding wired USB controller (%s); releasing slot", key)
@@ -1858,7 +1864,7 @@ async def run_usb_hid_discovery(quit_event):
 
                 chosen = {}
                 entries = await asyncio.to_thread(
-                    enumerate_pro_controller2,
+                    enumerate_wired_controllers,
                     reason,
                     None,
                     # Manual scans opt into the unfiltered enumerate + its one-time

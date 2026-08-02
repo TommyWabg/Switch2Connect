@@ -35,10 +35,26 @@ import math
 import imufusion
 import numpy as np
 import os
+import sys
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
+# Temporary hardware diagnostics for comparing a Joy-Con in the magnetic grip
+# with normal IR Mouse use. Enabled by default for the measurement build; set
+# SWITCH2_IR_DIAGNOSTICS=0 before launch to silence it.
+_IR_SENSOR_DIAGNOSTICS = os.environ.get('SWITCH2_IR_DIAGNOSTICS', '1') != '0'
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
+except Exception:
+    pass
+# The virtual-pad drivers call back into Python from their own native threads
+# (see winuhid_client._rumble_handler), and those callbacks must take the GIL
+# before they can return. At the 5 ms default a callback thread can be made to
+# wait through several scheduling quanta while it still holds driver state,
+# which shows up as input stalling during rumble. usbip_dualsense_server.py
+# already lowers this for the same reason; the GUI process hosts WinUHid and
+# needs it just as much.
+try:
+    sys.setswitchinterval(0.001)
 except Exception:
     pass
 from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
@@ -52,6 +68,10 @@ from utils import (
 )
 import utils
 import raw_input_mouse
+from ir_mouse_activation import (
+    IR_MOUSE_FREE_SECONDS, IR_MOUSE_VERIFY_BINS,
+    IrMouseActivationState, advance_ir_mouse_activation,
+)
 
 # Non-blocking logging: every thread's logger call only enqueues a record (O(1), no
 # I/O), and a dedicated listener thread does the actual console write.  A synchronous
@@ -81,6 +101,99 @@ _atexit.register(_log_listener.stop)
 logging.getLogger("bleak").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# --- IMU raw-scale measurement probe -----------------------------------------
+# Diagnostic only, off unless S2_IMU_SCALE_PROBE is set in the environment:
+#   set S2_IMU_SCALE_PROBE=rest   -> accelerometer LSB/g
+#   set S2_IMU_SCALE_PROBE=gyro   -> gyroscope LSB/dps
+# Exists because the codebase currently holds three mutually contradictory
+# assumptions about the accelerometer scale (16384 LSB/g in the fusion path,
+# 4096 in the Cemuhook path, 8192 implied by the DualSense calibration report).
+# At most one can be right; this measures which.
+_IMU_SCALE_PROBE_MODE = (os.environ.get("S2_IMU_SCALE_PROBE") or "").strip().lower()
+# Candidate full-scale ranges for a 16-bit accelerometer.
+_IMU_ACCEL_CANDIDATES = ((4096, "+-8g"), (8192, "+-4g"), (16384, "+-2g"))
+_IMU_PROBE_LOG_INTERVAL = 1.0   # seconds between report lines
+_IMU_PROBE_REST_WINDOW = 3.0    # seconds of samples averaged in 'rest' mode
+_IMU_PROBE_BIAS_SECONDS = 2.0   # 'gyro' mode: still-hold before integration starts
+_IMU_PROBE_REFERENCE_ROTATION = 360.0   # degrees the operator is asked to rotate
+
+# --- Sensor scale: single source of truth -------------------------------------
+# All values below were measured with the probe above, not assumed.
+#
+# Accelerometer: 4096 LSB/g (+-8g full scale) on BOTH families -- measured
+# |a| = 4104 on a Pro 2 and 4090 on a Joy-Con 2 R while resting flat.
+S2_ACCEL_LSB_PER_G = 4096.0
+# Gyroscope, both confirmed by integrating a known 360 deg rotation on each axis:
+# - Pro Controller: ST standard +-2000 dps (70 mdps/LSB -> 1000/70 = 14.285714 LSB/dps)
+#   measured 14.111 / 14.325 / 14.266 (Z/Y/X), mean 14.234
+# - Joy-Cons: Nintendo standard +-2000 dps (0.06103 dps/LSB -> 16.384 LSB/dps)
+#   measured 16.213 / 16.418 / 16.372 (Z/Y/X), mean 16.334
+S2_GYRO_LSB_PER_DPS_PRO = 14.285714
+S2_GYRO_LSB_PER_DPS_JOYCON = 16.384
+
+# What the emulated Sony device tells the host its int16 motion fields mean, keyed by
+# (driver_type, mode).  Two candidate scales exist in the wild, both from real
+# calibration feature reports:
+#     16.384 LSB/dps + 8192 LSB/g   (gyro/acc +-8192,  speed 500 -> 0.061035 dps/LSB)
+#     20.000 LSB/dps + 10000 LSB/g  (gyro/acc +-10000, speed 500 -> 0.050000 dps/LSB)
+#
+# DO NOT re-derive this table by reading the calibration reports in
+# WinUHid-main/WinUHidDevs/WinUHidPS4.cpp / WinUHidPS5.cpp.  That was tried and gave the
+# wrong answer, because those files say what is *advertised*, not what SDL does with it.
+# Every value below is MEASURED end-to-end instead:
+#
+#   gyro  -- rotate the physical controller exactly 360 deg, read the angle the virtual
+#            pad reports.  accel -- rest it flat and still, read the magnitude a tester
+#            shows in m/s2 (9.8 means that row is correct).
+#
+#     backend/mode   gyro: 360deg ->   implied   | accel: rest ->  implied
+#     USBIP   PS5    360 deg           16.384    | 9.8 m/s2         8192
+#     ViGEm   PS4    435-450 deg       16.271    | 10  m/s2         8000
+#     WinUHid PS4    450-460 deg       15.824    | 8.0 m/s2        10000
+#     WinUHid PS5    300 deg           19.661    | 9.8 m/s2        10000
+#
+# Pro 2 and Joy-Con 2 gave identical accel readings on every backend, as expected: the
+# target is a property of the host's assumption, not of the controller.
+#
+# ViGEmBus PS4's 8000 is the odd one out.  It was measured, not guessed: with the target
+# at 8192 that row read 10 m/s2 on both controllers across two sessions while every other
+# row read 9.8, and 8000 is the only round value that reproduces it (8192 -> 10.06).
+# The mechanism is unexplained -- ViGEmBus serves the DS4 calibration from its own kernel
+# driver (Ds4Pdo.cpp), whose source is not vendored here, so it could not be checked.
+#
+# The self-consistent model behind the rest of the numbers, for whoever extends this:
+#   - WinUHid advertises +-10000 in BOTH modes; USBIP advertises +-8192.
+#   - SDL's DS5 driver derives accel AND gyro from the advertised values.
+#   - SDL's DS4 driver derives accel from them but its gyro path effectively IGNORES
+#     them, which is why both PS4 backends land on 16.384 despite advertising
+#     different calibration.
+DS_MOTION_TARGET = {
+    #                          accel LSB/g, gyro LSB/dps
+    ("USBIP",     "PS5"):      (8192.0,  16.384),
+    ("ViGEmBus",  "PS4"):      (8000.0,  16.384),
+    ("WinUHid",   "PS4"):      (10000.0, 16.384),
+    ("WinUHid",   "PS5"):      (10000.0, 20.0),
+}
+# Used when driver_type is unknown; the 16.384 set is what three of four backends want.
+DS_MOTION_TARGET_DEFAULT = (8192.0, 16.384)
+
+
+def s2_gyro_lsb_per_dps(controller):
+    """Native gyroscope scale of this controller, in LSB per degree/second."""
+    return S2_GYRO_LSB_PER_DPS_PRO if controller.is_pro_controller() else S2_GYRO_LSB_PER_DPS_JOYCON
+
+
+def ds_motion_scale(controller, driver_type, mode):
+    """(accel, gyro) multipliers converting native LSBs into DS4/DualSense LSBs.
+
+    Without these the host under-reports motion: a physical 360 deg rotation came
+    back as 300 deg on WinUHid PS5 and the accelerometer read ~4 m/s2 instead of
+    9.8 on every backend.
+    """
+    ds_accel, ds_gyro = DS_MOTION_TARGET.get((driver_type, mode), DS_MOTION_TARGET_DEFAULT)
+    return (ds_accel / S2_ACCEL_LSB_PER_G,
+            ds_gyro / s2_gyro_lsb_per_dps(controller))
+
 def _set_current_thread_priority(level):
     try:
         if os.name == "nt":
@@ -92,6 +205,26 @@ JOYCON2_LEFT_PID = 0x2067
 
 USBIP_AUDIO_HAPTIC_RUMBLE_INTERVAL = 0.0166
 USBIP_PS5_CONCURRENT_RUMBLE_TEST = True
+
+# Ceiling on a single System-Bluetooth rumble GATT write. The scheduler offers a
+# frame every ~7 ms, so anything still outstanding after this has already missed
+# several frames and is stalling input delivery on the shared loop rather than
+# producing useful haptics.
+BT_RUMBLE_WRITE_TIMEOUT = 0.1
+# Healthy links complete a rumble write in 11-38 ms; sustained times above this
+# mean the BLE write queue is backing up, which is what precedes an input freeze.
+# Kept under the timeout above so a degraded-but-completing write still reports.
+BT_RUMBLE_WRITE_SLOW_WARN = 0.05
+# Seconds between slow-write warnings, so a degraded link reports the problem
+# without the logging itself adding load to an already-struggling session.
+BT_RUMBLE_WRITE_WARN_INTERVAL = 5.0
+# Minimum spacing between System-Bluetooth rumble writes when pacing is enabled.
+# One command already carries 3 frames spanning about this long, so holding to it
+# costs no haptic coverage while freeing BLE connection events for input.
+BT_RUMBLE_MIN_INTERVAL = 0.015
+# Seconds between rumble write-rate reports. Logged in both paced and unpaced mode
+# so the two can be compared directly from a user's terminal output.
+BT_RUMBLE_RATE_LOG_INTERVAL = 1.0
 
 # Controller identification info
 NINTENDO_VENDOR_ID = 0x057e
@@ -121,7 +254,7 @@ CONTROLER_NAMES = {
     JOYCON2_RIGHT_PID: "Joy-con 2 (Right)",
     JOYCON2_LEFT_PID: "Joy-con 2 (Left)",
     PRO_CONTROLLER2_PID: "Pro Controller 2",
-    NSO_GAMECUBE_CONTROLLER_PID: "NSO Gamecube Controller",
+    NSO_GAMECUBE_CONTROLLER_PID: "NSO GameCube Controller",
     PRO_CONTROLLER_PID: "Pro Controller",
     JOYCON_L_PID: "Joy-con (Left)",
     JOYCON_R_PID: "Joy-con (Right)"
@@ -1250,6 +1383,9 @@ class Controller:
         self._audio_haptic_sender_stop = False
         self._audio_haptic_sender_thread = None
         self._rumble_scheduler_event = threading.Event()
+        self._rumble_inflight_lock = threading.Lock()
+        self._rumble_task_running = False
+        self._last_slow_rumble_write_warn = 0.0
         self._rumble_scheduler_running = True
         self._rumble_scheduler_thread = threading.Thread(
             target=self._rumble_scheduler_loop,
@@ -1278,6 +1414,14 @@ class Controller:
         self.jc_target_vx = 0.0
         self.jc_target_vy = 0.0    
         self.jc_mouse_active = False
+        # IR Mouse alone uses a timed gate: during its initial free window it
+        # follows per-report displacement, then motion-only verification must
+        # succeed before it latches. Other IR functions use _ir_sensor_active*
+        # directly.
+        self._ir_mouse_activation_state = IrMouseActivationState()
+        self._ir_diag_previous_coords = None
+        self._ir_diag_last_log_time = 0.0
+        self._ir_diag_last_signature = None
         self.current_vx = 0.0
         self.current_vy = 0.0
         self.interp_residual_x = 0.0
@@ -2155,31 +2299,122 @@ class Controller:
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
     def _bridge_rumble_due(self):
-        """Rate-gate continuous rumble for the ESP32-S3 bridge to the BLE connection
-        interval (~7.5ms). Non-bridge (WinRT) controllers always return True because
-        the OS BLE stack already paces their writes. Each command carries 3 frames
-        that cover the interval, so pacing here keeps low latency without flooding the
-        firmware's per-interval BLE write (which caused merge-mode rumble stutter)."""
+        """Rate-gate continuous rumble to the BLE connection interval.
+
+        Each command carries 3 frames covering the interval, so gating to it costs no
+        haptic coverage. The ESP32-S3 bridge uses ~7.5ms, which keeps latency low without
+        flooding the firmware's per-interval BLE write (that caused merge-mode stutter).
+
+        System Bluetooth is gated to BT_RUMBLE_MIN_INTERVAL. It used to be unpaced, on the
+        assumption that the OS BLE stack applies its own backpressure -- adapter-dependent
+        behaviour that, where it does not hold, lets rumble writes occupy the connection
+        events the controller's input notifications also need, which surfaces as input
+        freezing for exactly as long as a rumble lasts. The two transports keep separate
+        timestamps so neither can gate the other.
+        """
         if not getattr(self, 'is_esp32s3_bridge', False):
-            return True
+            now_rt = time.perf_counter()
+            if (now_rt - getattr(self, '_last_bt_rumble_send_rt', 0.0)) >= BT_RUMBLE_MIN_INTERVAL:
+                self._last_bt_rumble_send_rt = now_rt
+                return True
+            return False
         now_rt = time.perf_counter()
         if (now_rt - getattr(self, '_last_rumble_send_rt', 0.0)) >= 0.0075:
             self._last_rumble_send_rt = now_rt
             return True
         return False
 
+    def _dispatch_rumble_coro(self, loop, coro):
+        """Queue one rumble send, reserving the single in-flight slot first.
+
+        The reservation has to happen here, on the scheduler thread, rather than
+        inside the worker coroutine. The scheduler re-checks every ~7 ms while a
+        dispatched coroutine only marks itself once the event loop starts it, so
+        under BLE backpressure that gap let the scheduler keep dispatching against
+        a stale "idle" reading. Captured traces show that runaway reaching 194
+        concurrent write_gatt_char calls (148 on one controller), at which point
+        the WinRT write backlog took 1-2 s to drain and starved input notification
+        delivery on the same link -- the reported freeze. Healthy sessions never
+        exceed one in flight per controller.
+
+        Returns True when the coroutine was handed to the loop.
+        """
+        if loop is None or loop.is_closed() or not self._begin_rumble_dispatch():
+            coro.close()
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            self._end_rumble_dispatch()
+            coro.close()
+            return False
+        # Released here rather than in the worker's own finally: releasing in both
+        # places would let the previous send's completion clear a slot the next one
+        # had already reserved, reopening the pile-up this guard exists to stop.
+        future.add_done_callback(lambda _f: self._end_rumble_dispatch())
+        return True
+
+    def _count_rumble_write(self):
+        """Report how many rumble writes actually reach the link, once per second.
+
+        This is the number that separates a saturated link from a blocked driver: issuing
+        more writes per second than the BLE connection interval has events for leaves none
+        spare for input notifications. It is the only such measurement available from a
+        user's terminal output.
+        """
+        now = time.perf_counter()
+        self._rumble_write_count = getattr(self, '_rumble_write_count', 0) + 1
+        window_start = getattr(self, '_rumble_write_window_start', 0.0)
+        if window_start == 0.0:
+            self._rumble_write_window_start = now
+            return
+        elapsed = now - window_start
+        if elapsed >= BT_RUMBLE_RATE_LOG_INTERVAL:
+            logger.info(
+                "Rumble writes: %.0f/s on %s",
+                self._rumble_write_count / elapsed,
+                getattr(self.device, 'address', 'unknown'))
+            self._rumble_write_count = 0
+            self._rumble_write_window_start = now
+
+    def _warn_slow_rumble_write(self, elapsed, timed_out=False):
+        """Report a backing-up BLE write queue, at most once every few seconds.
+
+        Write latency is the signal that separates a healthy session from a frozen
+        one: captured traces show 11-38 ms per write when input is fine and over a
+        second once the queue runs away. Note this is only visible on a build with a
+        console attached (Switch2Connect_v1.7_log.spec); the shipped spec sets
+        console=False, where there is no stderr to write to.
+        """
+        now = time.perf_counter()
+        if now - getattr(self, '_last_slow_rumble_write_warn', 0.0) < BT_RUMBLE_WRITE_WARN_INTERVAL:
+            return
+        self._last_slow_rumble_write_warn = now
+        logger.warning(
+            "Bluetooth rumble write %s after %.0f ms on %s -- the BLE write queue is "
+            "backing up and input delivery may stutter",
+            "timed out" if timed_out else "was slow",
+            elapsed * 1000, getattr(self.device, 'address', 'unknown'))
+
+    def _begin_rumble_dispatch(self):
+        with self._rumble_inflight_lock:
+            if self._rumble_task_running:
+                return False
+            self._rumble_task_running = True
+            return True
+
+    def _end_rumble_dispatch(self):
+        with self._rumble_inflight_lock:
+            self._rumble_task_running = False
+
     async def _simple_rumble_send_worker(self, v1, v2, v3):
         """Single-shot rumble send worker (non-audio-haptic path).
 
         Promoted from the per-tick inline `safe_send_single` closure so that no
-        coroutine *function* object is created on every input report.
-        Semantics are identical: set _rumble_task_running, send, clear flag.
+        coroutine *function* object is created on every input report. The
+        in-flight slot is owned by _dispatch_rumble_coro, not by this coroutine.
         """
-        self._rumble_task_running = True
-        try:
-            await self.set_vibration(v1, v2, v3)
-        finally:
-            self._rumble_task_running = False
+        await self.set_vibration(v1, v2, v3)
 
 
     def _audio_haptic_send_worker_thread(self):
@@ -2291,51 +2526,46 @@ class Controller:
     ):
         """Stereo (non-audio-haptic) rumble send worker.
 
-        Promoted from the per-tick inline `safe_send` closure.
-        Semantics are identical: set _rumble_task_running, send, clear flag.
+        Promoted from the per-tick inline `safe_send` closure. The in-flight slot
+        is owned by _dispatch_rumble_coro, not by this coroutine.
         """
-        self._rumble_task_running = True
-        try:
-            if self.is_pro_controller():
-                await self.set_vibration(
-                    v1_l, v2_l, v3_l, False,
-                    v1_r, v2_r, v3_r,
-                    trigger_overlay=(t1_l, t2_l, t3_l),
-                    trigger_overlay_r=(t1_r, t2_r, t3_r))
-            elif self.is_joycon_left():
-                await self.set_vibration(
-                    v1_l, v2_l, v3_l,
-                    trigger_overlay=(t1_l, t2_l, t3_l))
-            else:
-                await self.set_vibration(
-                    v1_r, v2_r, v3_r,
-                    trigger_overlay=(t1_r, t2_r, t3_r))
-        finally:
-            self._rumble_task_running = False
+        if self.is_pro_controller():
+            await self.set_vibration(
+                v1_l, v2_l, v3_l, False,
+                v1_r, v2_r, v3_r,
+                trigger_overlay=(t1_l, t2_l, t3_l),
+                trigger_overlay_r=(t1_r, t2_r, t3_r))
+        elif self.is_joycon_left():
+            await self.set_vibration(
+                v1_l, v2_l, v3_l,
+                trigger_overlay=(t1_l, t2_l, t3_l))
+        else:
+            await self.set_vibration(
+                v1_r, v2_r, v3_r,
+                trigger_overlay=(t1_r, t2_r, t3_r))
 
     async def _xbox_impulse_rumble_send_worker(
         self, v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
         i1_l, i2_l, i3_l, i1_r, i2_r, i3_r
     ):
-        """Sends ordinary mono rumble plus final, side-specific Xbox impulse HF."""
-        self._rumble_task_running = True
-        try:
-            if self.is_pro_controller():
-                await self.set_vibration(
-                    v1_l, v2_l, v3_l, False,
-                    v1_r, v2_r, v3_r,
-                    impulse_overlay=(i1_l, i2_l, i3_l),
-                    impulse_overlay_r=(i1_r, i2_r, i3_r))
-            elif self.is_joycon_left():
-                await self.set_vibration(
-                    v1_l, v2_l, v3_l,
-                    impulse_overlay=(i1_l, i2_l, i3_l))
-            else:
-                await self.set_vibration(
-                    v1_r, v2_r, v3_r,
-                    impulse_overlay=(i1_r, i2_r, i3_r))
-        finally:
-            self._rumble_task_running = False
+        """Sends ordinary mono rumble plus final, side-specific Xbox impulse HF.
+
+        The in-flight slot is owned by _dispatch_rumble_coro, not by this coroutine.
+        """
+        if self.is_pro_controller():
+            await self.set_vibration(
+                v1_l, v2_l, v3_l, False,
+                v1_r, v2_r, v3_r,
+                impulse_overlay=(i1_l, i2_l, i3_l),
+                impulse_overlay_r=(i1_r, i2_r, i3_r))
+        elif self.is_joycon_left():
+            await self.set_vibration(
+                v1_l, v2_l, v3_l,
+                impulse_overlay=(i1_l, i2_l, i3_l))
+        else:
+            await self.set_vibration(
+                v1_r, v2_r, v3_r,
+                impulse_overlay=(i1_r, i2_r, i3_r))
 
     def _poke_rumble_scheduler(self):
         try:
@@ -2404,11 +2634,11 @@ class Controller:
             should_send = self._bridge_rumble_due()
         if should_send:
             loop = getattr(vc, 'loop', None)
-            if loop and not loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
+            if self._dispatch_rumble_coro(
+                    loop,
                     self._xbox_impulse_rumble_send_worker(
                         v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
-                        i1_l, i2_l, i3_l, i1_r, i2_r, i3_r), loop)
+                        i1_l, i2_l, i3_l, i1_r, i2_r, i3_r)):
                 self._last_xbox_impulse_sequence_sent_l = state['sequence_l']
                 self._last_xbox_impulse_sequence_sent_r = state['sequence_r']
                 self._last_xbox_impulse_stop_sequence_sent_l = state['stop_sequence_l']
@@ -2465,11 +2695,7 @@ class Controller:
             return
 
         def dispatch_rumble_task(coro):
-            loop = getattr(vc, 'loop', None)
-            if loop and not loop.is_closed():
-                asyncio.run_coroutine_threadsafe(coro, loop)
-                return True
-            return False
+            return self._dispatch_rumble_coro(getattr(vc, 'loop', None), coro)
 
         if not use_dualsense_stereo:
             v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
@@ -2952,10 +3178,23 @@ class Controller:
                         self.vibration_packet_id += 1
                         return
 
-            await self.client.write_gatt_char(uuid_to_use, payload, response=False)
+            # Backstop for the in-flight guard in _dispatch_rumble_coro: if a write
+            # ever does back up in the WinRT stack, abandon it rather than let it hold
+            # the send slot open. Rumble is re-sent on the next scheduler tick, so a
+            # dropped frame is inaudible while a stalled one freezes the controls.
+            write_started = time.perf_counter()
+            self._count_rumble_write()
+            await asyncio.wait_for(
+                self.client.write_gatt_char(uuid_to_use, payload, response=False),
+                timeout=BT_RUMBLE_WRITE_TIMEOUT)
+            elapsed = time.perf_counter() - write_started
+            if elapsed >= BT_RUMBLE_WRITE_SLOW_WARN:
+                self._warn_slow_rumble_write(elapsed)
+        except asyncio.TimeoutError:
+            self._warn_slow_rumble_write(BT_RUMBLE_WRITE_TIMEOUT, timed_out=True)
         except Exception as e:
             logger.debug(f"Vibration write failed: {e}")
-            
+
         self.vibration_packet_id += 1
 
     async def set_leds(self, player_number: int, reversed=False):
@@ -3130,6 +3369,10 @@ class Controller:
 
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
                 self.simulate_mouse(inputData)
+            else:
+                # Calibration suppresses simulate_mouse entirely, so explicitly
+                # tear down both activation stages and any held mouse buttons.
+                self._deactivate_ir_mouse(reset_activation=True)
 
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False) and not getattr(self, 'is_joystick_calibrating', False):
@@ -3152,6 +3395,10 @@ class Controller:
                 ax, ay, az = inputData.accelerometer
                 self.true_accel = (ax, ay, az)
                 mx, my, mz = inputData.magnometer
+                # Raw, pre-bias values and the fusion dt, so the probe measures the
+                # sensor and cannot disagree with the fusion path about timing.
+                if _IMU_SCALE_PROBE_MODE:
+                    self._imu_scale_probe(inputData.accelerometer, (raw_gx, raw_gy, raw_gz), dt)
                 self._mahony_update(gyro_x, gyro_y, gyro_z, ax, ay, az, mx, my, mz, dt)
 
             btn_states = {
@@ -4332,6 +4579,119 @@ class Controller:
         self._ir_sensor_snapshot_generation = generation
         return snap
 
+    def _imu_family(self):
+        """Short label for the sensor-scale branch this controller falls under."""
+        if self.is_pro_controller():
+            return "pro"
+        if self.is_joycon_left():
+            return "joycon-L"
+        if self.is_joycon_right():
+            return "joycon-R"
+        return "other"
+
+    def _imu_scale_probe(self, accel, gyro, dt):
+        """Measure the controller's true accelerometer/gyroscope LSB scale.
+
+        Fed the raw report values *before* bias subtraction or fusion, so it
+        characterises the sensor rather than the filter.  Reports to the console
+        logger; enabled only via the S2_IMU_SCALE_PROBE environment variable.
+        """
+        if not _IMU_SCALE_PROBE_MODE:
+            return
+        try:
+            st = self._imu_probe_state
+        except AttributeError:
+            st = self._imu_probe_state = {
+                "start": time.perf_counter(), "last_log": 0.0,
+                "samples": [], "integral": [0.0, 0.0, 0.0],
+                "bias": None, "bias_acc": [0.0, 0.0, 0.0], "bias_n": 0,
+                "announced": False,
+            }
+            logger.info("IMU-PROBE mode=%s family=%s -- diagnostic build, not for release",
+                        _IMU_SCALE_PROBE_MODE, self._imu_family())
+
+        now = time.perf_counter()
+        elapsed = now - st["start"]
+        due = (now - st["last_log"]) >= _IMU_PROBE_LOG_INTERVAL
+
+        if _IMU_SCALE_PROBE_MODE == "rest":
+            st["samples"].append((now, float(accel[0]), float(accel[1]), float(accel[2])))
+            cutoff = now - _IMU_PROBE_REST_WINDOW
+            while st["samples"] and st["samples"][0][0] < cutoff:
+                st["samples"].pop(0)
+            if not due or len(st["samples"]) < 10:
+                return
+            st["last_log"] = now
+
+            n = len(st["samples"])
+            mx = sum(s[1] for s in st["samples"]) / n
+            my = sum(s[2] for s in st["samples"]) / n
+            mz = sum(s[3] for s in st["samples"]) / n
+            mags = [math.sqrt(s[1] * s[1] + s[2] * s[2] + s[3] * s[3]) for s in st["samples"]]
+            mean_mag = sum(mags) / n
+            var = sum((m - mean_mag) ** 2 for m in mags) / n
+            sd = math.sqrt(var)
+
+            # A large spread means the controller was moving; the sample is then
+            # meaningless for scale determination and must not be trusted.
+            still = sd < (mean_mag * 0.005)
+            ratios = " ".join("%d->%.4f" % (c, mean_mag / c) for c, _ in _IMU_ACCEL_CANDIDATES)
+            best, best_label = min(_IMU_ACCEL_CANDIDATES,
+                                   key=lambda c: abs(mean_mag / c[0] - 1.0))
+            off_by = abs(mean_mag / best - 1.0)
+            verdict = ("nearest=%d (%s)" % (best, best_label) if off_by < 0.05
+                       else "NO CANDIDATE MATCHES (closest %d, off by %.1f%%) "
+                            "-- re-check the parsing offsets before trusting this" % (best, off_by * 100))
+            logger.info(
+                "IMU-PROBE[rest] %s n=%d mean=(%.1f, %.1f, %.1f) |a|=%.1f sd=%.2f %s | %s | ratio %s",
+                self._imu_family(), n, mx, my, mz, mean_mag, sd,
+                "STILL" if still else "*** MOVING - DISCARD ***", verdict, ratios)
+            return
+
+        if _IMU_SCALE_PROBE_MODE != "gyro":
+            return
+
+        if st["bias"] is None:
+            # Resting bias must be removed first: over a slow rotation an
+            # unsubtracted bias integrates into a large angle error.
+            st["bias_acc"][0] += float(gyro[0])
+            st["bias_acc"][1] += float(gyro[1])
+            st["bias_acc"][2] += float(gyro[2])
+            st["bias_n"] += 1
+            if elapsed < _IMU_PROBE_BIAS_SECONDS:
+                if due:
+                    st["last_log"] = now
+                    logger.info("IMU-PROBE[gyro] %s HOLD STILL - measuring bias (%.1fs left)",
+                                self._imu_family(), _IMU_PROBE_BIAS_SECONDS - elapsed)
+                return
+            if st["bias_n"] < 10:
+                return
+            st["bias"] = tuple(v / st["bias_n"] for v in st["bias_acc"])
+            logger.info("IMU-PROBE[gyro] %s bias locked = (%.2f, %.2f, %.2f) LSB -- "
+                        "now rotate the controller through exactly %.0f degrees about ONE axis, then stop",
+                        self._imu_family(), st["bias"][0], st["bias"][1], st["bias"][2],
+                        _IMU_PROBE_REFERENCE_ROTATION)
+            st["last_log"] = now
+            return
+
+        bias = st["bias"]
+        for i in range(3):
+            st["integral"][i] += (float(gyro[i]) - bias[i]) * dt
+        if not due:
+            return
+        st["last_log"] = now
+
+        ix, iy, iz = st["integral"]
+        # sum(raw * dt) accumulated over a known rotation gives LSB/dps directly.
+        lsb_per_dps = [v / _IMU_PROBE_REFERENCE_ROTATION for v in (ix, iy, iz)]
+        claimed = 14.285714 if self.is_pro_controller() else 16.384
+        ratios = " ".join("%.4f" % (v / claimed) for v in lsb_per_dps)
+        logger.info(
+            "IMU-PROBE[gyro] %s t=%.1fs sum(LSB*s)=(%.1f, %.1f, %.1f) | "
+            "LSB/dps@%.0fdeg=(%.3f, %.3f, %.3f) | claimed=%.6f ratio=(%s)",
+            self._imu_family(), elapsed, ix, iy, iz, _IMU_PROBE_REFERENCE_ROTATION,
+            lsb_per_dps[0], lsb_per_dps[1], lsb_per_dps[2], claimed, ratios)
+
     def _mahony_update(self, gx, gy, gz, ax, ay, az, mx, my, mz, dt):
         cfg = self._get_gyro_config_snapshot()
         current_mode = cfg["gyro_mode"]
@@ -4344,8 +4704,12 @@ class Controller:
         gx_dps = (gx / GYRO_SCALE) - math.degrees(self.gyro_bias_integral[0])
         gy_dps = (gy / GYRO_SCALE) - math.degrees(self.gyro_bias_integral[1])
         gz_dps = (gz / GYRO_SCALE) - math.degrees(self.gyro_bias_integral[2])
-        
-        # Accelerometer to g unit
+
+        # Accelerometer to g unit.
+        # DO NOT "correct" 16384.0 to the measured 4096 LSB/g.  The sensor really is
+        # +-8g at 4096 (see S2_ACCEL_LSB_PER_G), but this whole In-App Gyro path is
+        # tuned around 16384 and changing it wrecked the controls -- see the note on
+        # G_REF below.  The constant is load-bearing, not a bug to fix.
         ax_g = ax / 16384.0
         ay_g = ay / 16384.0
         az_g = az / 16384.0
@@ -4391,6 +4755,13 @@ class Controller:
         # OR when the controller is accelerating/decelerating (accel_err_total >= 150 LSB).
         # Any dynamic compensation is performed strictly during steady, non-accelerating movement states.
         raw_mag = math.sqrt(ax*ax + ay*ay + az*az)
+        # DO NOT "correct" this to the measured 4096 LSB/g.  It looks like a 4x bug --
+        # raw_mag is really ~4096 at rest, so accel_err_total sits near 12288 and the
+        # guard below can never be true, leaving this branch and the desk auto-calibration
+        # at :5203 permanently dead.  That dead state is what the In-App Gyro path was
+        # tuned against.  Setting G_REF to 4096 activates both loops for the first time,
+        # on thresholds that have never been exercised, and it made the controls extremely
+        # erratic on device.  Tried, reverted; leave it.
         G_REF = 16384.0
         accel_err_total = abs(raw_mag - G_REF)
         gyro_mag = math.sqrt(gx**2 + gy**2 + gz**2)
@@ -4445,10 +4816,26 @@ class Controller:
             self._ir_sensor_active_scoped = False
             self._ir_sensor_active = False
         if ir_mouse_enabled and self.is_joycon():
-            # Check if mouse coordinate data is valid to mark the controller as active IR mouse
-            _IR_THRESHOLD_MAP = {1: (1000, 4000), 2: (1500, 5000), 3: (3000, 10000)}
-            _ir_dist, _ir_rough = _IR_THRESHOLD_MAP.get(ir_settings.get("activate_threshold", 1), (1000, 4000))
-            ir_active = self._ir_sensor_active
+            # During the initial free window, displacement controls IR Mouse
+            # report-by-report. Afterward, temporal and spatial motion evidence
+            # must pass verification; Grip jitter remains unlatched.
+            self._ir_mouse_activation_state, activation_origin, verification_event = advance_ir_mouse_activation(
+                self._ir_sensor_active,
+                inputData.mouse_coords,
+                time.perf_counter(),
+                getattr(self, "_ir_mouse_activation_state", IrMouseActivationState()),
+            )
+            if verification_event is not None:
+                self._log_ir_verification(side, verification_event)
+            ir_active = self._ir_mouse_activation_state.mode_active
+
+            if activation_origin is not None:
+                # Seed the normal delta path with the armed coordinate so the
+                # movement that confirms stage two is emitted immediately.
+                self.previous_mouse_state = MouseState(
+                    activation_origin[0], activation_origin[1],
+                    False, False, False, True,
+                )
 
             if ir_active:
                 self.jc_mouse_active = True 
@@ -4527,35 +4914,101 @@ class Controller:
 
                 self.previous_mouse_state = MouseState(x, y, lb, mb, rb, ir_active)
             else:
-                self.jc_mouse_active = False
-                self.jc_target_vx = 0.0
-                self.jc_target_vy = 0.0
-                # Exited IR Mouse Mode: release any pressed mouse buttons instantly
-                if getattr(self, 'previous_mouse_state', None) is not None:
-                    raw_mouse = self._raw_mouse
-                    if raw_mouse is not None:
-                        self._report_raw_mouse_buttons(raw_mouse, False, False, False)
-                    else:
-                        mx, my = win32api.GetCursorPos()
-                        press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                        press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                        press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
-                self.previous_mouse_state = None
+                # Keep the latest stage-one coordinate while stopping output;
+                # the next displaced report can immediately re-enter stage two.
+                self._deactivate_ir_mouse(reset_activation=False)
         else:
-            self.jc_mouse_active = False
-            self.jc_target_vx = 0.0
-            self.jc_target_vy = 0.0
-            # If mouse mode is disabled or it's not a Joycon, make sure any pressed mouse button is released!
-            if getattr(self, 'previous_mouse_state', None) is not None:
-                raw_mouse = self._raw_mouse
-                if raw_mouse is not None:
-                    self._report_raw_mouse_buttons(raw_mouse, False, False, False)
-                else:
-                    mx, my = win32api.GetCursorPos()
-                    press_or_release_mouse_button(False, self.previous_mouse_state.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-                    press_or_release_mouse_button(False, self.previous_mouse_state.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-                    press_or_release_mouse_button(False, self.previous_mouse_state.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
-            self.previous_mouse_state = None
+            self._deactivate_ir_mouse(reset_activation=True)
+
+        if self.is_joycon():
+            self._log_ir_sensor_diagnostics(inputData, side, ir_mouse_enabled)
+
+    def _log_ir_sensor_diagnostics(self, inputData, side, ir_mouse_enabled):
+        """Log moving IR samples only while the activation threshold is met."""
+        if not _IR_SENSOR_DIAGNOSTICS:
+            return
+
+        now = time.perf_counter()
+        coords = (int(inputData.mouse_coords[0]), int(inputData.mouse_coords[1]))
+        previous = getattr(self, "_ir_diag_previous_coords", None)
+        if previous is None:
+            dx = dy = 0
+        else:
+            dx = signed_looping_difference_16bit(previous[0], coords[0])
+            dy = signed_looping_difference_16bit(previous[1], coords[1])
+        self._ir_diag_previous_coords = coords
+
+        state = getattr(self, "_ir_mouse_activation_state", IrMouseActivationState())
+        threshold_active = bool(getattr(self, "_ir_sensor_active", False))
+        moving = dx != 0 or dy != 0
+        if not threshold_active or not moving:
+            return
+
+        if state.latched:
+            phase = "latched"
+            started = state.threshold_since if state.threshold_since is not None else now
+            elapsed_ms = int(max(0.0, now - started) * 1000)
+        else:
+            started = state.threshold_since if state.threshold_since is not None else now
+            elapsed_ms = int(max(0.0, now - started) * 1000)
+            phase = "free" if elapsed_ms < int(IR_MOUSE_FREE_SECONDS * 1000) else "verifying"
+
+        signature = (threshold_active, bool(state.mode_active), bool(state.latched), phase)
+        last_time = getattr(self, "_ir_diag_last_log_time", 0.0)
+        last_signature = getattr(self, "_ir_diag_last_signature", None)
+        if signature != last_signature or now - last_time >= 0.100:
+            logger.info(
+                "[IR-DIAG] side=%s function=%s phase=%s elapsed_ms=%d "
+                "threshold=%d mouse=%d latched=%d distance=%d roughness=%d "
+                "x=%d y=%d dx=%d dy=%d moving=%d",
+                side,
+                "IR Mouse" if ir_mouse_enabled else "Other",
+                phase,
+                elapsed_ms,
+                int(threshold_active),
+                int(bool(state.mode_active)),
+                int(bool(state.latched)),
+                int(inputData.mouse_distance),
+                int(inputData.mouse_roughness),
+                coords[0],
+                coords[1],
+                dx,
+                dy,
+                int(moving),
+            )
+            self._ir_diag_last_log_time = now
+            self._ir_diag_last_signature = signature
+
+    def _log_ir_verification(self, side, event):
+        """Log one motion-only summary for each completed verification window."""
+        if not _IR_SENSOR_DIAGNOSTICS:
+            return
+        logger.info(
+            "[IR-VERIFY] side=%s result=%s reason=%s samples=%d moving=%d "
+            "bins=%d/%d path=%d span_x=%d span_y=%d max_delta=%d streak=%d",
+            side, event.result, event.reason, event.samples, event.moving_samples,
+            event.active_bins, IR_MOUSE_VERIFY_BINS, event.path, event.span_x, event.span_y,
+            event.max_delta, event.streak,
+        )
+
+    def _deactivate_ir_mouse(self, reset_activation=False):
+        """Stop IR Mouse output and release every latched mouse button."""
+        if reset_activation:
+            self._ir_mouse_activation_state = IrMouseActivationState()
+        self.jc_mouse_active = False
+        self.jc_target_vx = 0.0
+        self.jc_target_vy = 0.0
+        previous = getattr(self, 'previous_mouse_state', None)
+        if previous is not None:
+            raw_mouse = self._raw_mouse
+            if raw_mouse is not None:
+                self._report_raw_mouse_buttons(raw_mouse, False, False, False)
+            else:
+                mx, my = win32api.GetCursorPos()
+                press_or_release_mouse_button(False, previous.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
+                press_or_release_mouse_button(False, previous.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
+                press_or_release_mouse_button(False, previous.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
+        self.previous_mouse_state = None
 
     def _report_raw_mouse_buttons(self, raw_mouse, lb, mb, rb):
         """Edge-detect the three IR Mouse buttons onto the virtual HID mouse.
@@ -4750,6 +5203,7 @@ class Controller:
         # It is allowed to slowly run (alpha = 0.001) ONLY when the controller is placed
         # absolutely still on a flat desk surface (moving_env < 0.05).
         accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
+        # Load-bearing at 16384.0 -- see the note on G_REF in _mahony_update.
         accel_err = abs(accel_mag - 16384.0)
         gyro_sub_mag = math.sqrt((raw_gx - bx)**2 + (raw_gy - by)**2 + (raw_gz - bz)**2)
         moving_env = getattr(self, 'gyro_moving_envelope', 0.0)
@@ -5735,7 +6189,7 @@ class Controller:
         wanted_side = None
         # disconnect() releases the device after joining this thread, but the join has
         # a timeout - never re-acquire once teardown has begun.
-        if self.interp_running and self.is_joycon():
+        if (not utils.is_packaged()) and self.interp_running and self.is_joycon():
             side = "left" if self.is_joycon_left() else "right"
             try:
                 enabled = bool(self._get_ir_sensor_snapshot(side)["base"]["ir_mouse"].get("raw_input", False))

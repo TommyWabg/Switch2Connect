@@ -1903,7 +1903,16 @@ class USBIPDualSenseServer(USBIPServer):
             report_id = value & 0xFF
             if report_type == 3: # Feature Report
                 if report_id == 0x05:
-                    # Calibration Data: Prevent Division By Zero in SDL2 / Sony SDK
+                    # Calibration Data.  These values are LOAD-BEARING, not filler:
+                    # SDL and the Sony SDK derive the motion scale from them as
+                    #   gyro dps/LSB = (speed_plus + speed_minus) / (gyro_plus - gyro_minus)
+                    #                = 1000 / 16384 = 0.061035
+                    #   accel LSB/g  = (acc_plus - acc_minus) / 2 = 8192
+                    # virtual_controller.py converts the native Switch 2 LSBs into exactly
+                    # this scale via controller.DS_MOTION_TARGET["PS5"], which must be kept
+                    # in lockstep with the numbers below.  These also match what
+                    # WinUHid-main/WinUHidDevs/WinUHidPS5.cpp serves, so the USBIP and
+                    # WinUHid backends present an identical device to the host.
                     calib = bytearray(max(41, length))
                     calib[0] = 0x05
                     # Format: 3 biases, 6 gyro plus/minus, 2 gyro speed plus/minus, 6 acc plus/minus (all little-endian shorts)

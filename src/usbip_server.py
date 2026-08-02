@@ -1415,8 +1415,28 @@ class USBIPJoyConServer(USBIPServer):
         if 0x6000 <= addr < 0x6100:
             spi_memory = [0xFF] * 0x100
             
-            # 0x6020: IMU calibration
-            imu_calib = [0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
+            # 0x6020: IMU calibration -- accel origin[3], accel coeff[3],
+            #                            gyro origin[3],  gyro coeff[3]  (all int16 LE)
+            #
+            # THE Z ACCEL ORIGIN MUST STAY POSITIVE.  Measured on a Pro Controller:
+            #
+            #   origins (-45, -43, +341)  original   motion control stable
+            #   origins ( 0,   0,    0)              motion control badly unstable
+            #   origins (-45, -43,  -40)             motion control badly unstable
+            #   origins (-45, -43,  +40)  current    <- keeps the sign, shrinks the error
+            #
+            # Note X and Y are negative in the original and have always been stable, so
+            # negative origins are not the problem in general -- it is the Z sign
+            # specifically.  Joy-Con was unaffected throughout; this is Pro-specific and
+            # the mechanism (accel-only bytes destabilising the GYRO) is not understood.
+            #
+            # Why it is worth touching at all: a host derives the accel scale per axis as
+            # (coeff - origin) / 4, so +341 makes it compute 4010.75 LSB/g instead of the
+            # ~4096 the sensor actually uses.  Measured by resting the controller in each
+            # orientation: X up 9.8, Y up 9.8, Z up (stick facing up) 10.0.  Gravity does
+            # not depend on orientation, so that 2% is ours.  +40 keeps Z positive while
+            # bringing the derived scale to 4086 (0.2% off instead of 2.1%).
+            imu_calib = [0xD3, 0xFF, 0xD5, 0xFF, 0x28, 0x00, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
                          0x19, 0x00, 0xDD, 0xFF, 0xDC, 0xFF, 0x3B, 0x34, 0x3B, 0x34, 0x3B, 0x34]
             spi_memory[0x20:0x20+len(imu_calib)] = imu_calib
 
