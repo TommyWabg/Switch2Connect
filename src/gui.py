@@ -92,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.9"
+APP_VERSION = "v1.9_Test"
 
 def _set_current_thread_priority(level):
     try:
@@ -5657,6 +5657,24 @@ class ControllerWindow:
             anchor=tk.W,
         )
         self.version_label.pack(side=tk.LEFT, padx=(int(12 * scaling_factor), 0), fill=tk.Y)
+
+        self.zadig_driver_button = tk.Button(
+            self.header_frame,
+            text="Zadig Driver: Off",
+            fg="#FFFFFF",
+            bg="#7A2E2E",
+            activeforeground="#FFFFFF",
+            activebackground="#944040",
+            disabledforeground="#888888",
+            bd=0,
+            relief=tk.FLAT,
+            font=scale_font(("Arial", 8, "bold")),
+            padx=int(6 * scaling_factor),
+            command=self.toggle_zadig_driver_route,
+        )
+        self.zadig_driver_button.pack(
+            side=tk.LEFT, padx=(int(8 * scaling_factor), 0), pady=int(2 * scaling_factor))
+        self.refresh_zadig_driver_button()
 
         self.header_label = tk.Label(
             self.header_frame,
@@ -11833,6 +11851,93 @@ bg_color=panel_bg, widths=[8, 10])
         return result["install"]
 
 
+    def _wired_gamecube_usb_controllers(self):
+        controllers = []
+        for vc in getattr(self, "current_controllers", []) or []:
+            if vc is None:
+                continue
+            for controller in getattr(vc, "controllers", []) or []:
+                if (controller is not None
+                        and controller.__class__.__name__ == "USBHidController"
+                        and getattr(controller, "usb_product_id", None)
+                        == NSO_GAMECUBE_CONTROLLER_PID):
+                    controllers.append(controller)
+        return controllers
+
+    def refresh_zadig_driver_button(self):
+        button = getattr(self, "zadig_driver_button", None)
+        if button is None:
+            return
+        controllers = self._wired_gamecube_usb_controllers()
+        active = bool(controllers) and all(
+            bool(getattr(controller, "zadig_driver_active", False))
+            for controller in controllers)
+        busy = bool(getattr(self, "_zadig_route_toggle_in_progress", False))
+        if busy:
+            button.config(text="Zadig Driver: Checking...", state=tk.DISABLED,
+                          bg=button_gray, activebackground=button_gray)
+        elif active:
+            button.config(text="Zadig Driver: On", state=tk.NORMAL,
+                          bg="#2E7D32", activebackground="#3D9142")
+        else:
+            button.config(text="Zadig Driver: Off",
+                          state=(tk.NORMAL if controllers else tk.DISABLED),
+                          bg="#7A2E2E", activebackground="#944040")
+
+    def toggle_zadig_driver_route(self):
+        if getattr(self, "_zadig_route_toggle_in_progress", False):
+            return
+        controllers = self._wired_gamecube_usb_controllers()
+        if not controllers:
+            self.refresh_zadig_driver_button()
+            return
+        currently_active = all(
+            bool(getattr(controller, "zadig_driver_active", False))
+            for controller in controllers)
+        target = not currently_active
+        self._zadig_route_toggle_in_progress = True
+        self.refresh_zadig_driver_button()
+
+        def worker():
+            enabled = []
+            success = True
+            for controller in controllers:
+                try:
+                    result = bool(controller.set_zadig_driver_enabled(target))
+                except Exception:
+                    logger.exception("Failed to switch NSO GameCube USB rumble route")
+                    result = False
+                if target and result:
+                    enabled.append(controller)
+                if target and not result:
+                    success = False
+            if target and not success:
+                # Keep a multi-controller toggle truthful and atomic: never leave only
+                # some pads on interface 1 while the single header button says Off.
+                for controller in enabled:
+                    try:
+                        controller.set_zadig_driver_enabled(False)
+                    except Exception:
+                        logger.debug("Could not roll back GameCube interface-1 route",
+                                     exc_info=True)
+
+            def apply():
+                self._zadig_route_toggle_in_progress = False
+                self.refresh_zadig_driver_button()
+                if target and not success:
+                    self.show_centered_message(
+                        "Zadig Driver Unavailable",
+                        "Interface 1 could not be opened. Install the WinUSB driver for "
+                        "NSO GameCube Controller Interface 1 with Zadig, reconnect the "
+                        "controller, and try again. Interface 0 remains active.")
+
+            try:
+                self.root.after(0, apply)
+            except Exception:
+                self._zadig_route_toggle_in_progress = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_wired_usb_driver_button(self):
         # WinUSB is auto-installed by the controller's MS OS descriptor, so the only
         # optional driver here is HidHide. If it's not installed, prompt to install it
@@ -13042,6 +13147,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.wired_pro2_detected = detected
         self.wired_controller_pids = sorted(wired_pids)
         self.update_driver_buttons_visibility()
+        self.refresh_zadig_driver_button()
         # Refresh the header here too. In wired-only mode it reads wired_pro2_detected, and
         # its other callers are the button-layout rebuild and the 5 s ESP32 status poll --
         # neither of which fires when a wired pad connects, so the status would otherwise sit
@@ -13349,6 +13455,7 @@ bg_color=panel_bg, widths=[8, 10])
                 self.wired_controller_pids = sorted(wired_pids)
                 self._hidhide_installed_cached = hh_installed
                 self.update_driver_buttons_visibility()
+                self.refresh_zadig_driver_button()
 
                 # Auto-prompt HidHide install on first detection while it's absent.
                 if (detected and not hh_installed

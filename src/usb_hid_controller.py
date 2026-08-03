@@ -1295,6 +1295,10 @@ class _UsbHidClient:
         # Kept separate from the command/input transports so one route working is
         # never mistaken for all of them working.
         self.rumble_transport = "none"
+        # User-selected GameCube diagnostic route. False means the normal HID
+        # interface-0 output report; True is set only after interface 1 has accepted
+        # the startup sequence through WinUSB/libusb.
+        self.zadig_rumble_enabled = False
         # Set by USBHidController.initialize() to the route that actually delivered the
         # startup commands. That is the only evidence we have that the vendor endpoint
         # is reachable, and it is what decides where GameCube rumble goes.
@@ -1583,6 +1587,25 @@ class _UsbHidClient:
         # single slot and let a dedicated writer thread touch the wire.
         del response
         self._submit_rumble_write(uuid, data)
+
+    def set_gamecube_bulk_rumble_enabled(self, enabled: bool) -> bool:
+        """Select the live GameCube rumble route after interface 1 was verified."""
+        if not self.is_gamecube:
+            return False
+        enabled = bool(enabled)
+        if enabled and not self.bulk_rumble_available():
+            self.zadig_rumble_enabled = False
+            return False
+        if not enabled and self.zadig_rumble_enabled and self._last_usb_rumble_active:
+            # Do not leave the motor latched on when changing transports.
+            stop = bytes([0x0A, 0x91, 0x00, 0x02, 0x00, 0x04,
+                          0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            self.write_rumble_command(stop)
+        self.zadig_rumble_enabled = enabled
+        self._last_usb_rumble_command = None
+        self._last_usb_rumble_active = None
+        self.rumble_transport = "bulk" if enabled else "hid_output"
+        return self.zadig_rumble_enabled
 
     def _record_rumble_submit(self, payload, overwritten):
         if self._rumble_trace is None:
@@ -2095,6 +2118,20 @@ class _UsbHidClient:
         return self.command_transport in ("native_winusb", "pyusb")
 
     def _write_rumble_frame(self, data):
+        # The header toggle is an explicit A/B test for the NSO GameCube pad.  Do not
+        # touch HID first while it is on: hidapi can report a successful queue operation
+        # even when the motor does not react, which would prevent a real interface-1 test.
+        if self.is_gamecube and self.zadig_rumble_enabled:
+            if self.write_rumble_command(data):
+                return
+            # The displayed state must follow the live route. If interface 1 disappears
+            # (driver removal, replug or I/O failure), fall back safely to HID now and let
+            # the GUI's state refresh turn the button back Off.
+            self.zadig_rumble_enabled = False
+            self.rumble_transport = "none"
+            logger.warning(
+                "Wired USB GameCube interface-1 rumble failed; falling back to HID interface 0")
+
         t0 = time.perf_counter()
         previous_wire_start = self._rumble_trace_last_wire_start
         previous_wire_active = self._rumble_trace_last_wire_active
@@ -2210,15 +2247,20 @@ class _UsbHidClient:
         if self.is_gamecube:
             # Already a complete USB vibration command; just push it over the vendor
             # bulk endpoint, deduplicated the same way as the Pro Controller 2 path.
-            if data != self._last_usb_rumble_command or (
-                    active and now - self._last_usb_rumble_refresh >= 0.1):
+            should_send = (data != self._last_usb_rumble_command or
+                           (active and now - self._last_usb_rumble_refresh >= 0.1))
+            if should_send:
                 if send_pro_controller2_usb_command(bytes(data), self.product_id,
-                                                    self.transport, require_unique=True):
+                                                     self.transport, require_unique=True):
                     self.rumble_transport = "bulk"
                     self._last_usb_rumble_active = active
                     self._last_usb_rumble_refresh = now
                     self._last_usb_rumble_command = bytes(data)
-            return
+                    return True
+                return False
+            # A deduplicated command still means the selected interface-1 route is live;
+            # its last accepted motor state remains in effect.
+            return True
         command = _pro2_usb_vibration_command(data)
         if command == self._last_usb_rumble_command and (not active or now - self._last_usb_rumble_refresh < 0.1):
             raw_sent = False
@@ -2236,6 +2278,7 @@ class _UsbHidClient:
             if send_pro_controller2_usb_command(sample_command):
                 self._last_usb_sample_command = sample_command
                 self._last_usb_sample_refresh = now
+        return bool(raw_sent)
 
     def write_output_report(self, data, report_id=None, raw_body=False):
         # Never re-open here. This used to call open(), so a writer that outlived
@@ -2681,6 +2724,47 @@ class USBHidController(Controller):
         self._loop = None
         self._disconnect_notified = False
         self.client.on_disconnect_callback = self._on_usb_hid_disconnected
+
+    @property
+    def zadig_driver_active(self) -> bool:
+        """Whether this pad is currently routing rumble through interface 1."""
+        return bool(
+            self.usb_product_id == NSO_GAMECUBE_CONTROLLER_PID
+            and self.client is not None
+            and self.client.zadig_rumble_enabled
+            and self.client.bulk_rumble_available()
+        )
+
+    def set_zadig_driver_enabled(self, enabled: bool) -> bool:
+        """Switch GameCube rumble between HID interface 0 and bulk interface 1.
+
+        Enabling is transactional: refresh the PnP association and send the startup
+        sequence over interface 1 first. The UI may show On only if that write succeeds.
+        """
+        if self.usb_product_id != NSO_GAMECUBE_CONTROLLER_PID or self.client is None:
+            return False
+        if not enabled:
+            self.client.set_gamecube_bulk_rumble_enabled(False)
+            return False
+
+        refreshed = resolve_command_transport(self.hid_path, self.usb_product_id)
+        route = initialize_pro_controller2_usb_reports(self.usb_product_id, refreshed)
+        if route not in ("native_winusb", "pyusb"):
+            self.client.set_gamecube_bulk_rumble_enabled(False)
+            logger.warning(
+                "Wired USB GameCube interface 1 could not be opened; Zadig route remains Off")
+            return False
+
+        self.usb_transport = refreshed
+        self.client.transport = refreshed
+        self._init_transport = route
+        self.command_transport = route
+        self.client.command_transport = route
+        active = self.client.set_gamecube_bulk_rumble_enabled(True)
+        if active:
+            logger.info(
+                "Wired USB GameCube rumble route switched to interface 1 via %s", route)
+        return active
 
     # --- Output reports are restricted for the wired pad ---
     # Command/feature/LED output reports can stop the default 0x05 input stream on
