@@ -1,11 +1,11 @@
 # Switch 2 Connect
 ### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
- <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.8.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
+ <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.9.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
 <p align="center">
   <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
-  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.8.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.9.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
   <br>
   <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
@@ -30,7 +30,7 @@
 * Auto-update supported.
 
 #### Cons
-* No in-app installer for WinUHid driver. WinUHid must be installed separately using [WinUHid_Manager.exe](https://github.com/TommyWabg/Switch2Connect/releases/download/v1.8_MicrosoftStore/WinUHid_Manager.exe).
+* No in-app installer for WinUHid driver. WinUHid must be installed separately using [WinUHid_Manager.exe](https://github.com/TommyWabg/Switch2Connect/releases/download/v1.9_MicrosoftStore/WinUHid_Manager.exe).
 *  New updates would take up to 3 days to be reviewed and distributed.
 
 #### Important WinUHid Notice
@@ -47,7 +47,7 @@ If WinUHid is not installed or the installation is incomplete:
 #### Get Started With Microsoft Store Version
 
 1. Download and install Switch 2 Connect from **[Microsoft Store](https://apps.microsoft.com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS)**.
-2. If you want to access WinUHid-related features, download **[WinUHid_Manager.exe](https://github.com/TommyWabg/Switch2Connect/releases/download/v1.8_MicrosoftStore/WinUHid_Manager.exe)** to install or repair WinUHid driver.
+2. If you want to access WinUHid-related features, download **[WinUHid_Manager.exe](https://github.com/TommyWabg/Switch2Connect/releases/download/v1.9_MicrosoftStore/WinUHid_Manager.exe)** to install or repair WinUHid driver.
 3. Launch the app and follow the in-app setup instructions. Approve the administrator UAC prompt if Windows asks to install a supported driver.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
 5. Use the settings panel at the bottom of the app to configure the available driver mode, controller layout, gyro sensitivity, and custom button mappings.
