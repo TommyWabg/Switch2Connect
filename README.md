@@ -23,56 +23,67 @@
 
 ## Choose a Version And Get Started
 
-### Full Version
-#### Pros
-* Complete feature set, including WinUHid Driver Mode and IR Mouse Raw Input Mode.
-* Direct access to the latest release.
+**Microsoft Store Version**
 
-#### Cons
-* Not signed, so Windows Defender or other antivirus software may show an untrusted-download or flag the app as malware.
-
-  ***Note:** All releases after v1.8 are submitted to [Microsoft Security Intelligence](https://www.microsoft.com/en-us/wdsi/filesubmission) for review and removal of false-positive detections. These requests are typically processed within one to two days after a new version is published.*
-
-* No auto-update support.
-
-#### Get Started With Full Version
-1. Download the [latest version](https://github.com/TommyWabg/Switch2Connect/releases/latest/) of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.8.exe)**.
-2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
-3. Once the installation completes, the setup window will close automatically, and the main application will launch.
-4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
-5. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
+**GitHub Version**
 
 ##
 
-### Microsoft Store Version 
+### Microsoft Store Version
 
 #### Pros
 * Store-delivered signing helps prevent Windows Defender or other antivirus software from flagging the app as malware or an untrusted download.
 * Auto-update supported.
 
 #### Cons
-*  WinUHid is not included, so WinUHid Driver Mode and IR Mouse Raw Input Mode are unavailable.
+* No in-app installer for WinUHid driver. WinUHid must be installed separately using [WinUHid_Manager.exe](https://github.com/TommyWabg/Switch2Connect/releases/download/v1.8_MicrosoftStore/WinUHid_Manager.exe).
 *  New updates would take up to 3 days to be reviewed and distributed.
 
-#### Important Notice
-The Microsoft Store version **DOES NOT** include WinUHid driver.
-WinUHid Driver Mode and IR Mouse Raw Input Mode are therefore unavailable in this version.
-This limitation is required to comply with Microsoft Store packaging and driver-distribution policies; it is not a hardware or controller compatibility problem.
-
-To use WinUHid Driver Mode or IR Mouse Raw Input Mode, please install the **Full Version**.
+#### Important WinUHid Notice
+The Microsoft Store package **does not include or install the WinUHid driver** to comply with Microsoft Store packaging and driver-distribution policies. It is not a controller or hardware compatibility problem.
+However, the Microsoft Store Version can detect and use a healthy WinUHid installation that was installed separately.
+If WinUHid is not installed or the installation is incomplete:
+* WinUHid Driver Mode will remain unavailable.
+* IR Mouse Raw Input Mode will remain unavailable.
+* The related controls may remain hidden.
+* The Store app will not display a WinUHid installation prompt.
 
 #### Get Started With Microsoft Store Version
 
 1. Download and install Switch 2 Connect from **[Microsoft Store](https://apps.microsoft.com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS)**.
-2. Launch the app and follow the in-app setup instructions. Approve the administrator UAC prompt if Windows asks to install a supported driver.
-3. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
-4. Use the settings panel at the bottom of the app to configure the available driver mode, controller layout, gyro sensitivity, and custom button mappings.
+2. If you want to access WinUHid-related features, download **[WinUHid_Manager.exe](https://github.com/TommyWabg/Switch2Connect/releases/download/v1.8_MicrosoftStore/WinUHid_Manager.exe)** to install or repair WinUHid driver.
+3. Launch the app and follow the in-app setup instructions. Approve the administrator UAC prompt if Windows asks to install a supported driver.
+4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
+5. Use the settings panel at the bottom of the app to configure the available driver mode, controller layout, gyro sensitivity, and custom button mappings.
 
 <p align="Center">
   <a href="https://apps.microsoft.com/store/detail/9N6VDZ4GWHH1?cid=DevShareMCLPCS">
     <img width="150" alt="Get_it_from_Microsoft_Badge-01" src="https://github.com/user-attachments/assets/19016267-e0e0-428c-aa07-7878a10db9e8" alt="Microsoft Store">
   </a>
 </p>
+
+##
+
+### GitHub Version
+#### Pros
+* Complete feature set with built-in WinUHid detection and installation guidance.
+* Direct access to the latest release.
+
+#### Cons
+* Not signed, so Windows Defender or other antivirus software may show an untrusted-download or flag the app as malware.
+
+  ***Note:** All releases after v1.7 are submitted to [Microsoft Security Intelligence](https://www.microsoft.com/en-us/wdsi/filesubmission) for review and removal of false-positive detections. These requests are typically processed within one to two days after a new version is published.*
+
+* No auto-update support.
+
+#### Get Started With GitHub Version
+1. Download the [latest version](https://github.com/TommyWabg/Switch2Connect/releases/latest/) of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.7.exe)**.
+2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
+3. Once the installation completes, the setup window will close automatically, and the main application will launch.
+4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
+6. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
+
+##
 
 ## Feature Descriptions
 
