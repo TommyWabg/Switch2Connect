@@ -92,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.8"
+APP_VERSION = "v1.9"
 
 def _set_current_thread_priority(level):
     try:
@@ -380,41 +380,12 @@ def wired_controller_label(product_ids, sentence=False):
     return f"Wired {name}"
 
 
-def is_pro2_winusb_bound(product_id=0x2069):
-    """True when a wired pad's vendor interface (MI_01) is bound to WinUSB.
-
-    On Windows 8+ the controller's own MS OS descriptor makes Windows auto-install
-    WinUSB, so this is normally always True and needs no user action. It is used only
-    as an internal safety-net signal (to warn if activation might fail); there is no
-    WinUSB install/uninstall UI. Uses a fast registry read (no PowerShell subprocess).
-    """
-    try:
-        import winreg
-    except Exception:
-        return False
-    base = (r"SYSTEM\CurrentControlSet\Enum\USB"
-            "\\" + f"VID_057E&PID_{product_id:04X}&MI_01")
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as key:
-            index = 0
-            while True:
-                try:
-                    instance = winreg.EnumKey(key, index)
-                    index += 1
-                except OSError:
-                    break
-                if "SWITCH2EMU" in instance.upper():
-                    continue
-                try:
-                    with winreg.OpenKey(key, instance) as inst_key:
-                        service = str(winreg.QueryValueEx(inst_key, "Service")[0]).upper()
-                    if service == "WINUSB":
-                        return True
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return False
+# No WinUSB status helper lives here any more. Nintendo's pads advertise the
+# MS_COMP_WINUSB compatible id, so Windows binds its own inbox winusb.inf with no
+# user action, and nothing in the UI depends on that binding: input works through
+# the HID interface, and so does rumble (the console itself drives GameCube
+# vibration as HID output report 0x03). usb_hid_controller.winusb_binding_state()
+# remains as the single implementation, used for the connection diagnostics log.
 
 logger = logging.getLogger(__name__)
 
@@ -2267,7 +2238,6 @@ class ControllerWindow:
         self._hidhide_installed_cached = False
         self._wired_pro2_refresh_running = False
         self._wired_pro2_prompt_shown = False
-        self._winusb_warn_shown = False
         self.wired_device_event_queue = queue.Queue()
         self.wired_device_listener = WiredDeviceChangeListener(self.wired_device_event_queue)
         self._wired_device_change_after_id = None
@@ -11862,6 +11832,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.wait_window(dialog)
         return result["install"]
 
+
     def on_wired_usb_driver_button(self):
         # WinUSB is auto-installed by the controller's MS OS descriptor, so the only
         # optional driver here is HidHide. If it's not installed, prompt to install it
@@ -13340,10 +13311,12 @@ bg_color=panel_bg, widths=[8, 10])
             self.root.after(5000, self.start_esp32s3_refresh_timer)
 
     def refresh_wired_pro2_status_async(self):
-        """Poll for a wired controller, then update the HidHide button. WinUSB is
-        auto-installed by the controller (MS OS descriptor), so it isn't managed here —
-        we only keep an internal check as a safety-net warning. When a pad is present and
-        HidHide is absent, prompt to install HidHide once per session."""
+        """Poll for a wired controller, then update the HidHide button.
+
+        WinUSB is not checked or managed here at all: the pads advertise the
+        MS_COMP_WINUSB compatible id so Windows binds it unaided, and no feature
+        depends on that binding anyway. When a pad is present and HidHide is absent,
+        prompt to install HidHide once per session."""
         if getattr(self, '_wired_pro2_refresh_running', False) or getattr(self, 'is_quitting', False):
             return
         self._wired_pro2_refresh_running = True
@@ -13363,18 +13336,12 @@ bg_color=panel_bg, widths=[8, 10])
                     if is_usb_hid:
                         wired_pids.add(getattr(controller, "usb_product_id", 0x2069))
             hh_installed = False
-            winusb_bound = True
             if detected:
                 state = hidhide_service_state()
                 # Undetermined keeps the last known answer instead of flickering
                 # the button to "Install HidHide" on a transient read failure.
                 hh_installed = (self._hidhide_installed_cached if state is None
                                 else state)
-            if wired_pids:
-                # Safety-net only: WinUSB should be auto-bound. If it isn't, activation
-                # (input) will fail, so we warn the user once. Checked per connected pad,
-                # since Pro Controller 2 and NSO GameCube have separate registry keys.
-                winusb_bound = all(is_pro2_winusb_bound(pid) for pid in wired_pids)
 
             def apply():
                 self._wired_pro2_refresh_running = False
@@ -13382,21 +13349,6 @@ bg_color=panel_bg, widths=[8, 10])
                 self.wired_controller_pids = sorted(wired_pids)
                 self._hidhide_installed_cached = hh_installed
                 self.update_driver_buttons_visibility()
-
-                # Safety net: pad present but its vendor interface is not bound to
-                # WinUSB. This is a capability downgrade, not a dead controller --
-                # the pad keeps streaming its power-on report, which still gives
-                # buttons, sticks and analog triggers. Say that rather than implying
-                # nothing works.
-                if detected and not winusb_bound and not getattr(self, '_winusb_warn_shown', False):
-                    self._winusb_warn_shown = True
-                    self.show_centered_message(
-                        "Wired Controller",
-                        "Windows hasn't finished setting up the wired controller's "
-                        "vendor interface. Buttons, sticks and analog triggers still "
-                        "work; motion and USB rumble are unavailable until it does. "
-                        "Unplug and reconnect the controller to retry.",
-                    )
 
                 # Auto-prompt HidHide install on first detection while it's absent.
                 if (detected and not hh_installed
@@ -13407,9 +13359,8 @@ bg_color=panel_bg, widths=[8, 10])
                         self.run_hidhide_install(prompt_restart=True)
 
                 if not detected:
-                    # Allow the prompts again next time a pad is (re)connected.
+                    # Allow the prompt again next time a pad is (re)connected.
                     self._wired_pro2_prompt_shown = False
-                    self._winusb_warn_shown = False
 
             try:
                 self.root.after(0, apply)

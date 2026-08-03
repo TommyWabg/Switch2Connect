@@ -1564,7 +1564,6 @@ class VirtualController:
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
-        self._count_rumble_callback()
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading

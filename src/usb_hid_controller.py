@@ -43,9 +43,15 @@ tried in order: native WinUSB, pyusb/libusb, then HID output reports on interfac
 If all three fail the pad never leaves its power-on input mode.  That degrades
 rather than dies: the GameCube path re-encodes the power-on report (0x05) into the
 same layout its native report (0x0A) produces, so buttons, sticks and both analog
-triggers keep working; motion and USB rumble do not.  ``input_transport`` says which
+triggers keep working; only motion data is lost.  ``input_transport`` says which
 mode is actually live, and it is set from the report id that arrived -- never
 inferred from a command write having succeeded.
+
+Rumble needs none of that.  The official console drives GameCube vibration over the
+ordinary HID interrupt OUT endpoint as output report 0x03 (confirmed from a
+wire-level capture of the console itself), exactly as it drives the Pro Controller 2
+with report 0x02 -- so vibration works on the HID interface alone, with no
+vendor-interface driver.
 
 GameCube notes: the NSO GameCube Controller speaks the very same command framing and
 differs only in (a) its input report id (0x0A instead of 0x09), (b) its output report
@@ -60,6 +66,8 @@ import threading
 import time
 import asyncio
 import os
+import json
+from collections import deque
 
 from config import CONFIG
 from controller import (
@@ -81,6 +89,10 @@ from controller import (
 from usb_serial_bridge import MockService, MockCharacteristic, DEFAULT_STICK_CALIBRATION
 
 logger = logging.getLogger(__name__)
+
+_usb_rumble_trace_dump_lock = threading.Lock()
+_USB_RUMBLE_TRACE_FIELDS = (
+    "time", "event", "value0", "value1", "value2", "value3")
 
 # SW2 GATT service UUID (used only so initialize()'s SW2-detection branch runs).
 SW2_SERVICE_UUID = "ab7de9be-89fe-49ad-828f-118f09df7fd0"
@@ -549,6 +561,85 @@ class UsbCommandTransport:
         return f"unbound(hid={self.hid_instance_id or '?'})"
 
 
+def winusb_binding_state(product_id: int) -> dict:
+    """What driver, if any, Windows bound to this pad's vendor interface (MI_01).
+
+    Returns a dict with:
+      ``state``      -- "bound" | "unbound" | "absent" | "unknown"
+      ``service``    -- the bound service name, e.g. "WINUSB"
+      ``ms_comp``    -- True when the device reports the MS_COMP_WINUSB compatible id
+      ``has_guids``  -- whether DeviceInterfaceGUIDs is registered
+
+    ``has_guids`` is reported for diagnostics only and must NOT be used to decide
+    whether WinUSB works: Windows' inbox winusb.inf registers no interface GUIDs, so
+    a perfectly bound MS_COMP_WINUSB device has none. libusb reaches the interface
+    anyway, through the composite device.
+
+    ``ms_comp`` is the useful signal when nothing is bound: a device that advertises
+    MS_COMP_WINUSB will be bound automatically once Windows finishes installing, so
+    "unbound + ms_comp" means "wait or replug", while "unbound + no ms_comp" means
+    the binding will never happen on its own.
+    """
+    result = {"state": "unknown", "service": None, "ms_comp": False,
+              "has_guids": False, "instances": 0}
+    if os.name != "nt":
+        return result
+    try:
+        import winreg
+    except Exception:
+        return result
+
+    base = (r"SYSTEM\CurrentControlSet\Enum\USB"
+            "\\" + f"VID_{NINTENDO_VENDOR_ID:04X}&PID_{product_id:04X}&MI_01")
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as key:
+            index = 0
+            while True:
+                try:
+                    instance = winreg.EnumKey(key, index)
+                    index += 1
+                except OSError:
+                    break
+                if "SWITCH2EMU" in instance.upper():
+                    continue
+                result["instances"] += 1
+                try:
+                    with winreg.OpenKey(key, instance) as inst_key:
+                        try:
+                            service = str(winreg.QueryValueEx(inst_key, "Service")[0])
+                        except OSError:
+                            service = ""
+                        try:
+                            compat = winreg.QueryValueEx(inst_key, "CompatibleIDs")[0]
+                        except OSError:
+                            compat = []
+                except OSError:
+                    continue
+                if service:
+                    result["service"] = service
+                if any("MS_COMP_WINUSB" in str(c).upper() for c in (compat or ())):
+                    result["ms_comp"] = True
+                try:
+                    with winreg.OpenKey(key, instance + r"\Device Parameters") as params:
+                        winreg.QueryValueEx(params, "DeviceInterfaceGUIDs")
+                    result["has_guids"] = True
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        result["state"] = "absent"
+        return result
+    except OSError:
+        return result
+
+    if not result["instances"]:
+        result["state"] = "absent"
+    elif (result["service"] or "").upper() == "WINUSB":
+        result["state"] = "bound"
+    else:
+        result["state"] = "unbound"
+    return result
+
+
 def _instance_id_to_path_fragment(instance_id: str) -> str:
     r"""``USB\VID_057E&PID_2073&MI_01\7&abc&0&0001`` -> ``usb#vid_057e&…#7&abc&0&0001``.
 
@@ -927,6 +1018,38 @@ def _gc_rumble_payload_is_active(data: bytes) -> bool:
     return len(payload) > 8 and payload[8] != 0x00
 
 
+# The four "GameCube Rumble Data" bytes of output report 0x03, taken verbatim from the
+# official console capture (reference/switch2_controller_research-master/captures/usb/
+# rumble-procon-gccon.pcapng.gz, a wire-level LINKTYPE_USB_2_0 recording).
+#
+# Every rumble report the console sent to the GameCube pad went to the HID interrupt
+# OUT endpoint 0x01 as report 0x03 -- never to the vendor bulk endpoint. hid_reports.md
+# documents the field only as "packed rumble data"; these are the observed values:
+#
+#     03 50 02 00 00     03 61 00 01 00     03 5b 00 00 00   <- last one, motor stops
+#     03 55 02 00 00     03 63 00 01 00
+#     03 5a 02 00 00     03 66 00 01 00
+#                        03 68 00 01 00
+#
+# Byte 0's low nibble increments strictly across the capture (0,1,3,5,6,8,a,b), i.e. a
+# packet counter -- the same construction the Pro Controller 2 uses for its own report
+# (0x50 + packet id), which is independently confirmed in the same capture. The high
+# nibble and bytes 1-2 carry the rumble state: two non-zero states were exercised, and
+# all-zero is the stop the console sent at the end of the test.
+GC_RUMBLE_STATE_OFF = (0x50, 0x00, 0x00, 0x00)
+GC_RUMBLE_STATE_ON = (0x60, 0x00, 0x01, 0x00)
+# The other non-zero state the console used. Kept documented so it can be swapped in
+# with a one-line change if hardware testing shows it is the stronger/correct one.
+GC_RUMBLE_STATE_ALT = (0x50, 0x02, 0x00, 0x00)
+
+
+def _gc_native_rumble_body(active: bool, counter: int) -> bytes:
+    """Body of GameCube output report 0x03: 4 rumble bytes, then padding."""
+    base, b1, b2, b3 = GC_RUMBLE_STATE_ON if active else GC_RUMBLE_STATE_OFF
+    body = bytes([base | (counter & 0x0F), b1, b2, b3])
+    return body.ljust(PRO2_OUTPUT_REPORT_BODY_SIZE, b"\x00")
+
+
 def _pro2_rumble_payload_is_active(data: bytes) -> bool:
     payload = bytes(data)
     if len(payload) < 17 or payload[0] != 0x00:
@@ -942,6 +1065,18 @@ def _pro2_rumble_payload_is_active(data: bytes) -> bool:
         return False
 
     return segment_active(payload[1:17]) or segment_active(payload[17:33])
+
+
+def _pro2_zero_rumble_payload(data: bytes) -> bytes:
+    """Build a neutral Pro 2 frame from an accepted 0x02 rumble body."""
+    payload = bytearray(data)
+    if len(payload) < 33 or payload[0] != 0x00:
+        return bytes(len(payload))
+    for segment_start in (1, 17):
+        packet_id = ((payload[segment_start] & 0x0F) + 1) & 0x0F
+        payload[segment_start] = 0x50 | packet_id
+        payload[segment_start + 1:segment_start + 16] = b"\x00" * 15
+    return bytes(payload)
 
 
 _gc_common_report_warned = False
@@ -1029,6 +1164,40 @@ def _gc_translate_common_report(data) -> bytes | None:
     return bytes(out)
 
 
+def _translate_pro2_usb_report(data) -> bytes | None:
+    """v1.7 Pro Controller 2 input translator with no product dispatch."""
+    if not data:
+        return None
+    report_id = data[0]
+
+    if report_id == REPORT_ID_COMMON:
+        body = bytes(data[1:])
+        if len(body) < 60:
+            body = body.ljust(64, b"\x00")
+        return body
+
+    if report_id == REPORT_ID_PRO2:
+        if len(data) < 12:
+            return None
+        buf = bytearray(64)
+        buf[0] = data[1]
+        buttons = _pro2_buttons_to_u32(data[3], data[4], data[5])
+        buf[4] = buttons & 0xFF
+        buf[5] = (buttons >> 8) & 0xFF
+        buf[6] = (buttons >> 16) & 0xFF
+        buf[7] = (buttons >> 24) & 0xFF
+        buf[10:13] = bytes(data[6:9])
+        buf[13:16] = bytes(data[9:12])
+        power = data[2]
+        level = min((power >> 2) & 0x0F, 9)
+        volt_mv = 3100 + level * 110
+        buf[31] = volt_mv & 0xFF
+        buf[32] = (volt_mv >> 8) & 0xFF
+        return bytes(buf)
+
+    return None
+
+
 def translate_usb_report(data, product_id: int = PRO_CONTROLLER2_PID) -> bytes | None:
     """Translate a raw USB HID input report into the internal buffer layout that
     ``ControllerInputData`` expects for this ``product_id``.
@@ -1066,49 +1235,12 @@ def translate_usb_report(data, product_id: int = PRO_CONTROLLER2_PID) -> bytes |
                 logger.warning(
                     "Wired USB NSO GameCube Controller is streaming the common report "
                     "0x05: the USB init commands did not reach the pad. Falling back to "
-                    "translated input -- buttons, sticks and analog triggers work, "
-                    "motion and USB rumble do not.")
+                    "translated input -- buttons, sticks, analog triggers and rumble "
+                    "work; motion data does not.")
             return _gc_translate_common_report(data)
         return None
 
-    if report_id == REPORT_ID_COMMON:
-        # Report 0x05 payload is already exactly the layout the parser wants — just
-        # drop the report-id byte. Short reads used to be zero-padded up to 64; that
-        # turned a malformed read into a report claiming both sticks were held hard
-        # bottom-left (raw 0 is an extreme, not the centre), so they are dropped.
-        if len(data) < USB_INPUT_REPORT_SIZE:
-            return None
-        return bytes(data[1:])
-
-    if report_id == REPORT_ID_PRO2:
-        # Report 0x09 (Pro Controller 2 default): data[0]=report id, then body
-        # Counter[0]->data[1], Power[1]->data[2], Buttons[2:5]->data[3:6],
-        # LStick[5:8]->data[6:9], RStick[8:11]->data[9:12]. Motion is an
-        # undocumented packed format, so gyro/accel are left zeroed.
-        if len(data) < USB_INPUT_REPORT_SIZE:
-            return None
-        buf = bytearray(64)
-        buf[0] = data[1]                      # counter (low byte)
-        buttons = _pro2_buttons_to_u32(data[3], data[4], data[5])
-        buf[4] = buttons & 0xFF
-        buf[5] = (buttons >> 8) & 0xFF
-        buf[6] = (buttons >> 16) & 0xFF
-        buf[7] = (buttons >> 24) & 0xFF
-        buf[10:13] = bytes(data[6:9])         # left stick (packed 12-bit)
-        buf[13:16] = bytes(data[9:12])        # right stick (packed 12-bit)
-        # Battery: report 0x09 has no voltage field, only a Power-Info byte
-        # (bits [2:5] = level 0-9). Synthesize a Li-ion-ish voltage into the
-        # [31:33] field ControllerInputData reads, so the battery icon is correct
-        # even when the pad streams 0x09 instead of 0x05.
-        power = data[2]
-        level = min((power >> 2) & 0x0F, 9)
-        volt_mv = 3100 + level * 110          # ~3.10V (empty) .. ~4.09V (full)
-        buf[31] = volt_mv & 0xFF
-        buf[32] = (volt_mv >> 8) & 0xFF
-        return bytes(buf)
-
-    # Anything else: not an input report for this pad.
-    return None
+    return _translate_pro2_usb_report(data)
 
 
 def _pro2_buttons_to_u32(b0: int, b1: int, b2: int) -> int:
@@ -1163,6 +1295,27 @@ class _UsbHidClient:
         # Kept separate from the command/input transports so one route working is
         # never mistaken for all of them working.
         self.rumble_transport = "none"
+        # Set by USBHidController.initialize() to the route that actually delivered the
+        # startup commands. That is the only evidence we have that the vendor endpoint
+        # is reachable, and it is what decides where GameCube rumble goes.
+        self.command_transport = "none"
+        # Resolve product-specific hot paths once. Pro Controller 2 then executes
+        # the same branch-free translator/activity/output route as v1.7; GameCube
+        # keeps its protocol-specific implementation without taxing every Pro frame.
+        if self.is_gamecube:
+            self._translate_input_report = self._translate_gamecube_input_report
+            self._rumble_payload_is_active = _gc_rumble_payload_is_active
+            self._accept_rumble_write = self._accept_gamecube_rumble_write
+            self._write_primary_rumble_frame = self._write_gamecube_primary_rumble_frame
+            self._submit_rumble_write = self._submit_gamecube_rumble_write
+            self._rumble_write_loop = self._gamecube_rumble_write_loop
+        else:
+            self._translate_input_report = _translate_pro2_usb_report
+            self._rumble_payload_is_active = _pro2_rumble_payload_is_active
+            self._accept_rumble_write = self._accept_pro2_rumble_write
+            self._write_primary_rumble_frame = self._write_pro2_primary_rumble_frame
+            self._submit_rumble_write = self._submit_pro2_rumble_write_v17
+            self._rumble_write_loop = self._pro2_rumble_write_loop_v17
         self.dev = None
         self.is_connected = False
         if self.is_gamecube:
@@ -1197,6 +1350,70 @@ class _UsbHidClient:
         self._rumble_wake = threading.Event()
         self._rumble_stop = threading.Event()
         self._rumble_thread = None
+        self._rumble_high_priority_enabled = os.environ.get(
+            "SWITCH2_USB_RUMBLE_HIGH_PRIORITY", "1").lower() in (
+                "1", "true", "yes", "on")
+        self._rumble_thread_priority_applied = False
+        # Wired Pro rumble frames contain only ~15 ms of samples. Keep replaying the
+        # latest active frame across short producer/asyncio stalls, but bound the hold
+        # so a lost stop command can never leave a motor running indefinitely.
+        self._rumble_sustain_enabled = not self.is_gamecube
+        try:
+            sustain_ms = float(os.environ.get("SWITCH2_USB_RUMBLE_SUSTAIN_MS", "120"))
+        except (TypeError, ValueError):
+            sustain_ms = 120.0
+        self._rumble_sustain_seconds = max(0.030, min(0.250, sustain_ms / 1000.0))
+        self._rumble_sustain_frame = None
+        self._rumble_sustain_deadline = 0.0
+        self._rumble_sustain_repeat_count = 0
+        self._rumble_sustain_timeout_count = 0
+        self._rumble_pending_stop_submitted_at = 0.0
+        # Pro-only persistent playout state. GameCube's bound submit/writer methods
+        # never read or mutate these fields.
+        try:
+            pro_hold_ms = float(os.environ.get(
+                "SWITCH2_USB_PRO_RUMBLE_HOLD_MS", "120"))
+        except (TypeError, ValueError):
+            pro_hold_ms = 120.0
+        self._pro_hold_seconds = max(0.030, min(0.250, pro_hold_ms / 1000.0))
+        self._pro_latest_active_frame = None
+        self._pro_pending_active_frame = None
+        self._pro_pending_stop_frame = None
+        self._pro_active_hold_deadline = 0.0
+        self._pro_submit_sequence = 0
+        self._pro_stop_sequence = 0
+        self._pro_replay_count = 0
+        self._pro_real_stop_count = 0
+        self._pro_timeout_stop_count = 0
+        self._pro_stale_active_drop_count = 0
+        self._pro_timer_create_error = 0
+        self._pro_timer_set_error = 0
+        self._rumble_trace_writer_late_count = 0
+        self._rumble_trace_writer_late_max_ms = 0.0
+        self._rumble_trace_producer_frame_count = 0
+        self._rumble_trace_sustain_wire_count = 0
+        self._rumble_trace_stop_latency_max_ms = 0.0
+        trace_enabled = os.environ.get("SWITCH2_USB_RUMBLE_TRACE", "0").lower() in (
+            "1", "true", "yes", "on")
+        try:
+            trace_size = max(128, min(
+                16384, int(os.environ.get("SWITCH2_USB_RUMBLE_TRACE_SIZE", "4096"))))
+        except (TypeError, ValueError):
+            trace_size = 4096
+        try:
+            self._rumble_trace_gap_seconds = max(0.015, float(
+                os.environ.get("SWITCH2_USB_RUMBLE_TRACE_GAP_MS", "25")) / 1000.0)
+        except (TypeError, ValueError):
+            self._rumble_trace_gap_seconds = 0.025
+        self._rumble_trace = deque(maxlen=trace_size) if trace_enabled else None
+        self._rumble_trace_path = os.environ.get(
+            "SWITCH2_USB_RUMBLE_TRACE_PATH", "logs/usb_rumble_trace.jsonl")
+        self._rumble_trace_last_wire_start = 0.0
+        self._rumble_trace_last_wire_active = False
+        self._rumble_trace_gap_count = 0
+        self._rumble_trace_first_gap_snapshot = None
+        self._rumble_trace_submit_count = 0
+        self._rumble_trace_overwrite_count = 0
         self._hid_rumble_ok = False         # a hid output write has succeeded at least once
         self._hid_rumble_fail_streak = 0
         self._last_bulk_fallback = 0.0
@@ -1303,6 +1520,12 @@ class _UsbHidClient:
             # comes back.
             with self._rumble_slot_lock:
                 self._rumble_slot = None
+                self._rumble_sustain_frame = None
+                self._rumble_sustain_deadline = 0.0
+                self._pro_latest_active_frame = None
+                self._pro_pending_active_frame = None
+                self._pro_pending_stop_frame = None
+                self._pro_active_hold_deadline = 0.0
             self._inactive_run = 0
             self._stall_streak = 0
             # Restart the staleness clock, otherwise the watchdog fires again
@@ -1359,21 +1582,54 @@ class _UsbHidClient:
         # controllers' rumble + input). So we only stash the latest payload in a
         # single slot and let a dedicated writer thread touch the wire.
         del response
-        payload = bytes(data)
-        if self.is_gamecube:
-            # GameCube rumble is not an HD-rumble output report but the on/off vibration
-            # command, which set_vibration writes to the SW2 command characteristic.
-            if str(uuid).lower() != COMMAND_WRITE_UUID.lower():
-                return
-            payload = _gc_usb_rumble_command(payload)
-            if payload is None:
-                return
-        elif str(uuid).lower() != VIBRATION_WRITE_PRO_CONTROLLER_UUID.lower():
+        self._submit_rumble_write(uuid, data)
+
+    def _record_rumble_submit(self, payload, overwritten):
+        if self._rumble_trace is None:
+            return
+        self._rumble_trace_submit_count += 1
+        if overwritten:
+            self._rumble_trace_overwrite_count += 1
+        self._trace_rumble_event(
+            "submit", int(overwritten), len(payload),
+            payload[1] if len(payload) > 1 else -1,
+            self._rumble_trace_submit_count)
+
+    def _submit_pro2_rumble_write_v17(self, uuid, data):
+        """v1.7-style latest-state Pro producer (no replay or stop barrier)."""
+        payload = self._accept_pro2_rumble_write(uuid, data)
+        if payload is None:
             return
         with self._rumble_slot_lock:
+            overwritten = self._rumble_slot is not None
             self._rumble_slot = payload
+        self._record_rumble_submit(payload, overwritten)
         self._ensure_rumble_thread()
         self._rumble_wake.set()
+
+    def _submit_gamecube_rumble_write(self, uuid, data):
+        """GameCube-only command conversion and latest on/off slot."""
+        payload = self._accept_gamecube_rumble_write(uuid, data)
+        if payload is None:
+            return
+        with self._rumble_slot_lock:
+            overwritten = self._rumble_slot is not None
+            self._rumble_slot = payload
+        self._record_rumble_submit(payload, overwritten)
+        self._ensure_rumble_thread()
+        self._rumble_wake.set()
+
+    @staticmethod
+    def _accept_pro2_rumble_write(uuid, data):
+        if str(uuid).lower() != VIBRATION_WRITE_PRO_CONTROLLER_UUID.lower():
+            return None
+        return bytes(data)
+
+    @staticmethod
+    def _accept_gamecube_rumble_write(uuid, data):
+        if str(uuid).lower() != COMMAND_WRITE_UUID.lower():
+            return None
+        return _gc_usb_rumble_command(bytes(data))
 
     def _ensure_rumble_thread(self):
         if self._rumble_thread and self._rumble_thread.is_alive():
@@ -1400,17 +1656,316 @@ class _UsbHidClient:
         except Exception as e:
             logger.debug("timeBeginPeriod/timeEndPeriod failed: %s", e)
 
-    def _rumble_write_loop(self):
+    def _set_rumble_thread_priority(self) -> None:
+        """Raise only the current USB writer thread to ABOVE_NORMAL on Windows.
+
+        This deliberately does not alter process priority and never uses
+        TIME_CRITICAL. Thread priority dies with the writer thread, so no global
+        restoration is required during disconnect.
+        """
+        enabled = self._rumble_high_priority_enabled
+        if not enabled or os.name != "nt":
+            self._trace_rumble_event(
+                "thread_priority", int(enabled), 0, 0, 0)
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentThread.argtypes = []
+            kernel32.GetCurrentThread.restype = wintypes.HANDLE
+            kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+            kernel32.SetThreadPriority.restype = wintypes.BOOL
+            thread_handle = kernel32.GetCurrentThread()
+            # THREAD_PRIORITY_ABOVE_NORMAL = 1. Pseudo handles returned by
+            # GetCurrentThread are valid for SetThreadPriority in this process.
+            applied = bool(kernel32.SetThreadPriority(thread_handle, 1))
+            self._rumble_thread_priority_applied = applied
+            error_code = 0 if applied else int(kernel32.GetLastError())
+            self._trace_rumble_event(
+                "thread_priority", 1, int(applied), 1, error_code)
+            if not applied:
+                logger.warning(
+                    "Could not raise USB rumble writer thread priority (error %d)",
+                    error_code)
+        except Exception:
+            self._trace_rumble_event("thread_priority", 1, 0, 1, -1)
+            logger.debug(
+                "Could not raise USB rumble writer thread priority",
+                exc_info=True)
+
+    def _create_pro_waitable_timer(self):
+        """Create one Pro-writer-owned Windows high-resolution timer handle."""
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create = kernel32.CreateWaitableTimerExW
+            create.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR,
+                               wintypes.DWORD, wintypes.DWORD]
+            create.restype = wintypes.HANDLE
+            set_timer = kernel32.SetWaitableTimerEx
+            set_timer.argtypes = [wintypes.HANDLE,
+                                  ctypes.POINTER(ctypes.c_longlong),
+                                  wintypes.LONG, wintypes.LPVOID,
+                                  wintypes.LPVOID, wintypes.LPVOID,
+                                  wintypes.ULONG]
+            set_timer.restype = wintypes.BOOL
+            wait = kernel32.WaitForSingleObject
+            wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            wait.restype = wintypes.DWORD
+            close = kernel32.CloseHandle
+            close.argtypes = [wintypes.HANDLE]
+            close.restype = wintypes.BOOL
+
+            # CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2. Retry without the flag
+            # on Windows builds that predate high-resolution waitable timers.
+            handle = create(None, None, 0x2, 0x1F0003)
+            high_resolution = 1
+            if not handle:
+                first_error = ctypes.get_last_error()
+                handle = create(None, None, 0, 0x1F0003)
+                high_resolution = 0
+                if not handle:
+                    self._pro_timer_create_error = ctypes.get_last_error() or first_error
+                    self._trace_rumble_event(
+                        "pro_timer_create", 0, 0,
+                        self._pro_timer_create_error, 0)
+                    return None
+            self._pro_timer_api = (set_timer, wait, close, ctypes)
+            self._trace_rumble_event(
+                "pro_timer_create", 1, high_resolution, 0, 0)
+            return handle
+        except Exception:
+            self._pro_timer_create_error = -1
+            self._trace_rumble_event("pro_timer_create", 0, 0, -1, 0)
+            logger.debug("Could not create Pro rumble waitable timer", exc_info=True)
+            return None
+
+    def _wait_for_pro_deadline(self, timer_handle, wait_seconds):
+        """Wait until a relative Pro playout deadline; True when native timer worked."""
+        wait_seconds = max(0.0, float(wait_seconds))
+        if timer_handle is None:
+            if wait_seconds > 0.002:
+                time.sleep(wait_seconds - 0.002)
+            deadline = time.perf_counter() + min(wait_seconds, 0.002)
+            while time.perf_counter() < deadline:
+                pass
+            return False
+        try:
+            set_timer, wait, _close, ctypes = self._pro_timer_api
+            due = ctypes.c_longlong(-max(1, int(wait_seconds * 10_000_000)))
+            if not set_timer(timer_handle, ctypes.byref(due), 0,
+                             None, None, None, 0):
+                self._pro_timer_set_error = ctypes.get_last_error()
+                self._trace_rumble_event(
+                    "pro_timer_arm", wait_seconds * 1000.0,
+                    0, self._pro_timer_set_error, 0)
+                time.sleep(wait_seconds)
+                return False
+            self._trace_rumble_event(
+                "pro_timer_arm", wait_seconds * 1000.0, 1, 0, 0)
+            wait_result = int(wait(timer_handle,
+                                   max(1, int(wait_seconds * 1000.0) + 20)))
+            self._trace_rumble_event(
+                "pro_timer_wake", wait_seconds * 1000.0,
+                wait_result, 0, 0)
+            return wait_result == 0
+        except Exception:
+            self._pro_timer_set_error = -1
+            time.sleep(wait_seconds)
+            return False
+
+    def _close_pro_waitable_timer(self, timer_handle):
+        if timer_handle is None:
+            return
+        try:
+            self._pro_timer_api[2](timer_handle)
+        except Exception:
+            logger.debug("Could not close Pro rumble waitable timer", exc_info=True)
+
+    def _trace_rumble_event(self, event, value0=0, value1=0, value2=0, value3=0):
+        """Append one fixed-size record; never performs I/O on a rumble hot path."""
+        trace = self._rumble_trace
+        if trace is not None:
+            trace.append((time.perf_counter(), event, value0, value1, value2, value3))
+
+    def _dump_rumble_trace(self, reason):
+        """Flush the bounded in-memory trace after worker shutdown or disconnect."""
+        trace = self._rumble_trace
+        if trace is None:
+            return
+        current = list(trace)
+        first_gap = self._rumble_trace_first_gap_snapshot
+        payload = {
+            "type": "usb_rumble_trace",
+            "reason": reason,
+            "wall_time": time.time(),
+            "product_id": self.product_id,
+            "fields": _USB_RUMBLE_TRACE_FIELDS,
+            "submit_count": self._rumble_trace_submit_count,
+            "overwrite_count": self._rumble_trace_overwrite_count,
+            "gap_count": self._rumble_trace_gap_count,
+            "gap_threshold_ms": self._rumble_trace_gap_seconds * 1000.0,
+            "sustain_ms": self._rumble_sustain_seconds * 1000.0,
+            "sustain_repeat_count": self._rumble_sustain_repeat_count,
+            "sustain_timeout_count": self._rumble_sustain_timeout_count,
+            "writer_late_count": self._rumble_trace_writer_late_count,
+            "writer_late_max_ms": self._rumble_trace_writer_late_max_ms,
+            "producer_frame_count": self._rumble_trace_producer_frame_count,
+            "sustain_wire_count": self._rumble_trace_sustain_wire_count,
+            "stop_latency_max_ms": self._rumble_trace_stop_latency_max_ms,
+            "pro_hold_ms": self._pro_hold_seconds * 1000.0,
+            "pro_replay_count": self._pro_replay_count,
+            "pro_real_stop_count": self._pro_real_stop_count,
+            "pro_timeout_stop_count": self._pro_timeout_stop_count,
+            "pro_stale_active_drop_count": self._pro_stale_active_drop_count,
+            "pro_timer_create_error": self._pro_timer_create_error,
+            "pro_timer_set_error": self._pro_timer_set_error,
+            "first_gap_snapshot": first_gap,
+            "events": current,
+        }
+        path = os.path.abspath(self._rumble_trace_path)
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with _usb_rumble_trace_dump_lock:
+                with open(path, "a", encoding="utf-8") as stream:
+                    stream.write(line)
+            logger.info(
+                "USB rumble trace dumped: %s (%d events, %d gaps, %d overwrites)",
+                path, len(current), self._rumble_trace_gap_count,
+                self._rumble_trace_overwrite_count)
+        except Exception:
+            logger.exception("Failed to dump USB rumble trace to %s", path)
+
+    def _pro2_rumble_write_loop_v17(self):
+        """v1.7-style Pro writer: producer-driven latest frame, no replay."""
+        SILENCE_KEEP = 3
+        last_write = 0.0
+        while not self._rumble_stop.is_set():
+            self._rumble_wake.wait(0.5)
+            if self._rumble_stop.is_set():
+                break
+            self._rumble_wake.clear()
+            if self._io_pause.is_set():
+                time.sleep(0.01)
+                continue
+            with self._rumble_slot_lock:
+                data = self._rumble_slot
+                self._rumble_slot = None
+            if data is None:
+                continue
+
+            interval = 0.015
+            if time.perf_counter() < self._congested_until:
+                interval = max(interval, self._congest_interval)
+            target_time = last_write + interval
+            now = time.perf_counter()
+            if now < target_time:
+                sleep_amount = target_time - now
+                if sleep_amount > 0.002:
+                    time.sleep(sleep_amount - 0.002)
+                while time.perf_counter() < target_time:
+                    pass
+
+            active = _pro2_rumble_payload_is_active(data)
+            if active:
+                self._inactive_run = 0
+            else:
+                self._inactive_run += 1
+                if self._inactive_run > SILENCE_KEEP:
+                    self._trace_rumble_event("silence_drop", self._inactive_run)
+                    continue
+
+            self._rumble_trace_producer_frame_count += 1
+            self._trace_rumble_event(
+                "pro_producer_frame", self._rumble_trace_producer_frame_count,
+                int(active), 0, 0)
+            last_write = time.perf_counter()
+            self._write_rumble_frame(data)
+
+    def _gamecube_rumble_write_loop(self):
+        """GameCube-only on/off writer; never executes for PID 0x2069."""
+        SILENCE_KEEP = 3
+        last_write = 0.0
+        while not self._rumble_stop.is_set():
+            self._rumble_wake.wait(0.5)
+            if self._rumble_stop.is_set():
+                break
+            self._rumble_wake.clear()
+            if self._io_pause.is_set():
+                time.sleep(0.01)
+                continue
+            with self._rumble_slot_lock:
+                data = self._rumble_slot
+                self._rumble_slot = None
+            if data is None:
+                continue
+
+            target_time = last_write + 0.015
+            now = time.perf_counter()
+            if now < target_time:
+                sleep_amount = target_time - now
+                if sleep_amount > 0.002:
+                    time.sleep(sleep_amount - 0.002)
+                while time.perf_counter() < target_time:
+                    pass
+            active = _gc_rumble_payload_is_active(data)
+            if active:
+                self._inactive_run = 0
+            else:
+                self._inactive_run += 1
+                if self._inactive_run > SILENCE_KEEP:
+                    continue
+            self._rumble_trace_producer_frame_count += 1
+            self._trace_rumble_event(
+                "gc_producer_frame", self._rumble_trace_producer_frame_count,
+                int(active), 0, 0)
+            last_write = time.perf_counter()
+            self._write_rumble_frame(data)
+
+    def _experimental_deadline_rumble_write_loop(self):
         # Minimum spacing between wire writes. HD rumble frames carry 3x5 ms of
         # We dynamically adjust the interval:
         # - 15ms (66Hz) for traditional vibration (safe, proven)
         # - 25ms (40Hz) for audio haptics (prevents USB buffer overrun from dense payloads)
         # The interval is evaluated per frame based on the Controller state.
         # After this many consecutive inactive frames, stop re-sending silence.
+        self._set_rumble_thread_priority()
         SILENCE_KEEP = 3
         last_write = 0.0
         while not self._rumble_stop.is_set():
-            self._rumble_wake.wait(0.5)
+            wait_started = time.perf_counter()
+            with self._rumble_slot_lock:
+                sustaining = self._rumble_sustain_frame is not None
+            interval = 0.015
+            if wait_started < self._congested_until:
+                interval = max(interval, self._congest_interval)
+            target_time = last_write + interval if last_write else 0.0
+            # Wait against an absolute wire-start deadline. The old fixed 15 ms
+            # wait began after dev.write() returned, adding every 2-7 ms USB write
+            # to the cadence. Leave the last 2 ms to the existing precision spin.
+            if sustaining and target_time:
+                wait_timeout = max(0.0, target_time - wait_started - 0.002)
+            else:
+                wait_timeout = 0.5
+            self._rumble_wake.wait(wait_timeout)
+            woke_at = time.perf_counter()
+            wake_signaled = int(self._rumble_wake.is_set())
+            self._trace_rumble_event(
+                "wake", (woke_at - wait_started) * 1000.0,
+                wake_signaled, 0, 0)
+            if sustaining and target_time:
+                actual_wait_ms = (woke_at - wait_started) * 1000.0
+                self._trace_rumble_event(
+                    "deadline_wait", wait_timeout * 1000.0,
+                    actual_wait_ms, wake_signaled,
+                    max(0.0, target_time - woke_at) * 1000.0)
             if self._rumble_stop.is_set():
                 break
             self._rumble_wake.clear()
@@ -1423,10 +1978,29 @@ class _UsbHidClient:
             with self._rumble_slot_lock:
                 data = self._rumble_slot
                 self._rumble_slot = None
+                frame_source = "producer" if data is not None else None
+                if data is None and self._rumble_sustain_frame is not None:
+                    now = time.perf_counter()
+                    if now < self._rumble_sustain_deadline:
+                        data = self._rumble_sustain_frame
+                        frame_source = "sustain"
+                        self._rumble_sustain_repeat_count += 1
+                        self._trace_rumble_event(
+                            "sustain_repeat", self._rumble_sustain_repeat_count,
+                            max(0.0, self._rumble_sustain_deadline - now) * 1000.0,
+                            0, 0)
+                    else:
+                        data = _pro2_zero_rumble_payload(self._rumble_sustain_frame)
+                        frame_source = "timeout"
+                        self._rumble_sustain_frame = None
+                        self._rumble_sustain_deadline = 0.0
+                        self._rumble_sustain_timeout_count += 1
+                        self._trace_rumble_event(
+                            "sustain_timeout", self._rumble_sustain_timeout_count,
+                            self._rumble_sustain_seconds * 1000.0, 0, 0)
             if data is None:
+                self._trace_rumble_event("slot_empty")
                 continue
-
-            interval = 0.015
 
             if time.perf_counter() < self._congested_until:
                 interval = max(interval, self._congest_interval)
@@ -1435,12 +2009,27 @@ class _UsbHidClient:
             target_time = last_write + interval
             if now < target_time:
                 sleep_amount = target_time - now
+                self._trace_rumble_event(
+                    "pace", interval * 1000.0, sleep_amount * 1000.0,
+                    max(0.0, self._congested_until - now) * 1000.0, 0)
                 if sleep_amount > 0.002:
                     # Sleep most of the way, leaving 2ms for spin-wait accuracy
                     time.sleep(sleep_amount - 0.002)
                 # Spin-wait the remaining time to guarantee strict interval
                 while time.perf_counter() < target_time:
                     pass
+            # A stop submitted while this frame was being paced must preempt a
+            # locally-held sustain replay; otherwise one stale active frame can be
+            # emitted just before the queued stop and extend stop latency by 15 ms.
+            if self._rumble_payload_is_active(data):
+                with self._rumble_slot_lock:
+                    pending = self._rumble_slot
+                    if (pending is not None and
+                            not self._rumble_payload_is_active(pending)):
+                        data = pending
+                        frame_source = "producer"
+                        self._rumble_slot = None
+                        self._trace_rumble_event("priority_stop")
             # Silence suppression: keep the motor definitively stopped by sending a
             # few zero frames, then stop touching the wire until real motion returns.
             if self._rumble_payload_is_active(data):
@@ -1448,45 +2037,93 @@ class _UsbHidClient:
             else:
                 self._inactive_run += 1
                 if self._inactive_run > SILENCE_KEEP:
+                    self._trace_rumble_event("silence_drop", self._inactive_run)
                     continue
 
+            active = self._rumble_payload_is_active(data)
+            if frame_source == "sustain":
+                self._rumble_trace_sustain_wire_count += 1
+                self._trace_rumble_event(
+                    "sustain_frame", self._rumble_trace_sustain_wire_count)
+            elif frame_source == "timeout":
+                self._trace_rumble_event("timeout_zero")
+            else:
+                self._rumble_trace_producer_frame_count += 1
+                self._trace_rumble_event(
+                    "producer_frame", self._rumble_trace_producer_frame_count,
+                    int(active), 0, 0)
+            if not active and self._rumble_pending_stop_submitted_at:
+                stop_latency_ms = ((time.perf_counter() -
+                                    self._rumble_pending_stop_submitted_at) * 1000.0)
+                self._rumble_trace_stop_latency_max_ms = max(
+                    self._rumble_trace_stop_latency_max_ms, stop_latency_ms)
+                self._rumble_pending_stop_submitted_at = 0.0
+                self._trace_rumble_event("stop_wire", stop_latency_ms)
+
+            # Rebase after a late wake. We send only the latest frame once and make
+            # the actual wire start the next cadence anchor; no catch-up burst.
             last_write = time.perf_counter()
+            deadline_late_ms = ((last_write - target_time) * 1000.0
+                                if target_time else 0.0)
+            if sustaining and deadline_late_ms > 0.5:
+                self._rumble_trace_writer_late_count += 1
+                self._rumble_trace_writer_late_max_ms = max(
+                    self._rumble_trace_writer_late_max_ms, deadline_late_ms)
+                self._trace_rumble_event(
+                    "writer_late", deadline_late_ms,
+                    self._rumble_trace_writer_late_count,
+                    wait_timeout * 1000.0, wake_signaled)
+                self._trace_rumble_event(
+                    "deadline_rebase", deadline_late_ms,
+                    interval * 1000.0, 0, 0)
             self._write_rumble_frame(data)
 
-    def _rumble_payload_is_active(self, data) -> bool:
-        if self.is_gamecube:
-            return _gc_rumble_payload_is_active(data)
-        return _pro2_rumble_payload_is_active(data)
+    def bulk_rumble_available(self) -> bool:
+        """True when the vendor command endpoint demonstrably works for this pad.
+
+        The right signal is which route actually delivered the startup commands, not
+        whether a WinUSB device-interface path could be resolved. Windows' inbox
+        winusb.inf registers no ``DeviceInterfaceGUIDs`` (verified on a real
+        MS_COMP_WINUSB-bound Pro Controller 2), so ``transport.is_bound`` is False on
+        perfectly working machines -- gating rumble on it meant the GameCube bulk path
+        never ran even once. libusb does not need those GUIDs; it reaches interface 1
+        through the composite device.
+
+        ``is_bound`` keeps its own meaning (this transport addresses one specific pad)
+        and is still what stops rumble crossing between two same-PID controllers.
+        """
+        return self.command_transport in ("native_winusb", "pyusb")
 
     def _write_rumble_frame(self, data):
-        if self.is_gamecube and self.transport is not None and self.transport.is_bound:
-            # The vendor bulk endpoint is the GameCube's real rumble path (it is what
-            # the reference pairing app uses, and what the console uses). Prefer it
-            # whenever it is bound to this pad, rather than trusting a HID output
-            # write whose success only proves the OS accepted the bytes -- the HID
-            # interface may be input-only, in which case the write "succeeds" forever
-            # while the motor never moves.
-            if send_pro_controller2_usb_command(data, self.product_id,
-                                                self.transport, require_unique=True):
-                self.rumble_transport = "bulk"
-                self._stall_streak = 0
-                self._recover_attempts = 0
-                return
-            logger.debug("Wired USB GameCube bulk rumble write failed; trying HID output")
-
         t0 = time.perf_counter()
+        previous_wire_start = self._rumble_trace_last_wire_start
+        previous_wire_active = self._rumble_trace_last_wire_active
+        wire_gap = t0 - previous_wire_start if previous_wire_start else 0.0
+        self._rumble_trace_last_wire_start = t0
         written = None
         try:
-            if self.is_gamecube:
-                # An on/off command, not HD rumble frames: it goes out as a command
-                # report (no _pro2_usb_output_body, whose amplitude limiting and
-                # left/right frame layout are meaningless here).
-                written = self.write_command_report(data)
-            else:
-                written = self.write_output_report(data, OUTPUT_REPORT_ID_PRO2)
+            written = self._write_primary_rumble_frame(data)
         except Exception:
             logger.debug("Wired USB HID output rumble write failed", exc_info=True)
         elapsed = time.perf_counter() - t0
+        if self._rumble_trace is not None:
+            active = int(self._rumble_payload_is_active(data))
+            self._rumble_trace_last_wire_active = bool(active)
+            self._trace_rumble_event(
+                "wire", wire_gap * 1000.0, elapsed * 1000.0,
+                written if written is not None else -1, active)
+            if (previous_wire_start and previous_wire_active and active and
+                    wire_gap >= self._rumble_trace_gap_seconds):
+                self._rumble_trace_gap_count += 1
+                self._trace_rumble_event(
+                    "gap", wire_gap * 1000.0, elapsed * 1000.0,
+                    self._rumble_trace_gap_count, active)
+                if self._rumble_trace_first_gap_snapshot is None:
+                    self._rumble_trace_first_gap_snapshot = list(self._rumble_trace)
+                    logger.warning(
+                        "USB rumble wire gap %.1f ms captured; trace will flush to %s "
+                        "when the controller disconnects",
+                        wire_gap * 1000.0, self._rumble_trace_path)
         if elapsed > 1.0:
             now = time.time()
             if now - getattr(self, '_last_rumble_write_warn', 0.0) >= 1.0:
@@ -1504,9 +2141,15 @@ class _UsbHidClient:
         if elapsed > 0.040:
             self._congest_interval = min(0.1, max(0.030, elapsed))
             self._congested_until = time.perf_counter() + 0.5
+            self._trace_rumble_event(
+                "congestion", elapsed * 1000.0,
+                self._congest_interval * 1000.0, 500.0, 0)
 
         # hidapi's device.write() returns the byte count on success and -1 on failure.
         if written is not None and written > 0:
+            # NOTE: for the GameCube this only means the OS queued the report. Whether
+            # For the GameCube this is the same route the console itself uses, so a
+            # successful write is as good a signal as the protocol offers.
             self.rumble_transport = "hid_output"
             self._hid_rumble_ok = True
             self._hid_rumble_fail_streak = 0
@@ -1527,9 +2170,15 @@ class _UsbHidClient:
         # is an endless stream of libusb round-trips against the composite device. It is a
         # transport probe, so a few seconds after connect is all it is good for.
         now = time.time()
-        if (not self._hid_rumble_ok
-                and now - self._connected_at <= self._BULK_FALLBACK_WINDOW
-                and now - self._last_bulk_fallback >= 0.5):
+        # The GameCube keeps the bulk route as a real fallback rather than an
+        # init-time probe: report 0x03 is its primary path, but if those writes are
+        # being rejected the vendor endpoint is the only way left to reach the motor.
+        # Still rate-limited, just not retired after three seconds.
+        gc_bulk = (self.is_gamecube and self.bulk_rumble_available()
+                   and now - self._last_bulk_fallback >= 0.5)
+        if gc_bulk or (not self._hid_rumble_ok
+                       and now - self._connected_at <= self._BULK_FALLBACK_WINDOW
+                       and now - self._last_bulk_fallback >= 0.5):
             self._last_bulk_fallback = now
             self.write_rumble_command(data)
             return
@@ -1543,6 +2192,17 @@ class _UsbHidClient:
                 self._stall_streak)
             self._stall_streak = 0
             self._reopen()
+
+    def _write_pro2_primary_rumble_frame(self, data):
+        """v1.7 Pro Controller 2 HID OUT path, with no GameCube dispatch."""
+        return self._write_pro2_output_report(data)
+
+    def _write_gamecube_primary_rumble_frame(self, data):
+        self._gc_rumble_counter = (getattr(self, "_gc_rumble_counter", 0) + 1) & 0x0F
+        body = _gc_native_rumble_body(
+            self._rumble_payload_is_active(data), self._gc_rumble_counter)
+        return self.write_output_report(
+            body, OUTPUT_REPORT_ID_GAMECUBE, raw_body=True)
 
     def write_rumble_command(self, data):
         active = self._rumble_payload_is_active(data)
@@ -1577,7 +2237,7 @@ class _UsbHidClient:
                 self._last_usb_sample_command = sample_command
                 self._last_usb_sample_refresh = now
 
-    def write_output_report(self, data, report_id=None):
+    def write_output_report(self, data, report_id=None, raw_body=False):
         # Never re-open here. This used to call open(), so a writer that outlived
         # disconnect()'s bounded join could resurrect the HID handle after teardown --
         # leaking it, and letting _ensure_rumble_thread() spin up a fresh writer against
@@ -1586,8 +2246,14 @@ class _UsbHidClient:
             return 0
         if report_id is None:
             report_id = _output_report_id(self.product_id)
-        is_audio = getattr(self, 'is_audio_haptic_active', False)
-        payload = _pro2_usb_output_body(data, is_audio_active=is_audio)
+        if raw_body:
+            # Already in the device's own output-report layout. _pro2_usb_output_body
+            # would reinterpret it as HD rumble frames and "limit" amplitudes that
+            # aren't there.
+            payload = bytes(data).ljust(PRO2_OUTPUT_REPORT_BODY_SIZE, b"\x00")
+        else:
+            is_audio = getattr(self, 'is_audio_haptic_active', False)
+            payload = _pro2_usb_output_body(data, is_audio_active=is_audio)
         report = bytes([report_id]) + payload
             
         with self._write_lock:
@@ -1608,6 +2274,32 @@ class _UsbHidClient:
             if len(self._blackbox_history) > 32:
                 self._blackbox_history.pop(0)
             
+        return written
+
+    def _write_pro2_output_report(self, data):
+        """Exact v1.7 Pro Controller 2 output-report construction fast path."""
+        if self.dev is None or self._read_stop.is_set():
+            return 0
+        is_audio = getattr(self, 'is_audio_haptic_active', False)
+        payload = _pro2_usb_output_body(data, is_audio_active=is_audio)
+        report = bytes([OUTPUT_REPORT_ID_PRO2]) + payload
+
+        with self._write_lock:
+            try:
+                t0 = time.perf_counter()
+                written = self.dev.write(report)
+            except TypeError:
+                t0 = time.perf_counter()
+                written = self.dev.write(list(report))
+
+        if not getattr(self, "_blackbox_frozen", False):
+            if not hasattr(self, "_blackbox_history"):
+                self._blackbox_history = []
+            elapsed = time.perf_counter() - t0
+            self._blackbox_history.append(
+                (time.time(), written, elapsed * 1000, report.hex()))
+            if len(self._blackbox_history) > 32:
+                self._blackbox_history.pop(0)
         return written
 
     def write_command_report(self, command: bytes):
@@ -1665,6 +2357,12 @@ class _UsbHidClient:
                 if _usb_streaming_refs <= 0:
                     _usb_streaming_refs = 0
                     _usb_input_streaming.clear()
+
+    def _translate_gamecube_input_report(self, data):
+        """GameCube-only input state tracking and translation."""
+        if data:
+            self.last_input_report_id = data[0]
+        return translate_usb_report(data, NSO_GAMECUBE_CONTROLLER_PID)
 
     def _read_loop_inner(self):
         while not self._read_stop.is_set():
@@ -1741,8 +2439,7 @@ class _UsbHidClient:
 
             report_id = data[0]
             if report_id in INPUT_REPORT_IDS:
-                self.last_input_report_id = report_id
-                translated = translate_usb_report(data, self.product_id)
+                translated = self._translate_input_report(data)
                 if translated is None:
                     continue
                 cb = self._notify.get(INPUT_REPORT_UUID.lower())
@@ -1800,6 +2497,9 @@ class _UsbHidClient:
         if self._rumble_thread and self._rumble_thread.is_alive():
             await asyncio.to_thread(self._rumble_thread.join, 0.5)
         self._rumble_thread = None
+        self._trace_rumble_event("disconnect", self._rumble_trace_gap_count,
+                                 self._rumble_trace_overwrite_count, 0, 0)
+        self._dump_rumble_trace("disconnect")
         self._set_timer_resolution(False)
         if self._read_thread and self._read_thread.is_alive():
             await asyncio.to_thread(self._read_thread.join, 0.5)
@@ -2048,6 +2748,8 @@ class USBHidController(Controller):
                 transport = "hid_fallback"
         self._init_transport = transport or "none"
         self.command_transport = self._init_transport
+        # The rumble writer lives on the client, so it needs the same answer.
+        self.client.command_transport = self._init_transport
         if self._init_transport == "none":
             # Every route has been tried and none of them worked. Input is not
             # necessarily lost: the pad keeps streaming its power-on report, which the
@@ -2055,7 +2757,8 @@ class USBHidController(Controller):
             logger.warning(
                 "Wired USB command transport = none (%s): the vendor command endpoint "
                 "could not be reached by any route. The pad will stay in its power-on "
-                "input mode; motion and USB rumble will be unavailable.",
+                "input mode; motion data will be unavailable. Rumble is unaffected -- "
+                "it goes out on the HID interface.",
                 self.device.address)
         else:
             logger.info("Wired USB command transport = %s (%s)",
@@ -2135,9 +2838,10 @@ class USBHidController(Controller):
         succeeded but nothing vibrated" are otherwise indistinguishable in a log.
         """
         transport = self.usb_transport
+        binding = winusb_binding_state(self.usb_product_id)
         logger.info(
             "Wired USB diagnostics (%s): pad=%s hid_path=%s hid_instance=%s "
-            "mi01_instance=%s winusb_paths=%d transport=%s command=%s input=%s rumble=%s",
+            "mi01_instance=%s winusb_paths=%d transport=%s",
             self.device.address,
             _device_label(self.usb_product_id),
             self.hid_path,
@@ -2145,9 +2849,17 @@ class USBHidController(Controller):
             getattr(transport, "mi01_instance_id", None),
             len(getattr(transport, "winusb_paths", []) or []),
             transport.describe() if transport is not None else "none",
+        )
+        logger.info(
+            "Wired USB diagnostics (%s): mi01_state=%s mi01_service=%s "
+            "ms_comp_winusb=%s iface_guids=%s | command=%s input=%s rumble=%s bulk_ok=%s",
+            self.device.address,
+            binding["state"], binding["service"], binding["ms_comp"],
+            binding["has_guids"],
             self.command_transport,
             self.input_transport,
             getattr(self.client, "rumble_transport", "none") if self.client else "none",
+            self.client.bulk_rumble_available() if self.client else False,
         )
 
     async def _delayed_reinit(self):
@@ -2166,15 +2878,19 @@ class USBHidController(Controller):
                 await asyncio.sleep(delay)
                 if not self.interp_running or self.client is None:
                     return
-                # Only re-send while the pad has NOT actually switched. Once the
-                # expected report id is arriving, the commands demonstrably took, and
-                # re-sending them just adds endpoint traffic and reset risk.
+                # Deliberately unconditional. An earlier version skipped this once the
+                # expected report id was arriving, on the theory that the commands had
+                # demonstrably taken -- but the report id only proves the *report
+                # selection* command landed (0x03/0x0A). It says nothing about the
+                # feature-enable pair (0x0C/0x02 + 0x0C/0x04, mask 0x27) whose bit 5 is
+                # rumble, and that is precisely what the first startup pass tends to
+                # miss. Skipping here silently killed wired Pro Controller 2 rumble and
+                # battery reporting, because the pad streams report 0x05 within
+                # milliseconds and the re-send never happened.
+                #
+                # The observation below is kept for diagnostics only; it must not gate
+                # the re-send. The commands are idempotent.
                 self._refresh_input_transport()
-                if self.input_transport != "none" and not self.is_input_fallback:
-                    logger.info(
-                        "Wired USB re-init not needed (%s): pad is streaming report "
-                        "0x%02X", self.device.address, self.expected_input_report_id)
-                    return
                 if transport == "hid_fallback":
                     ok = await asyncio.to_thread(self.client.send_startup_reports_hid)
                 else:
@@ -2186,8 +2902,9 @@ class USBHidController(Controller):
                     # battery reporting and the rumble settings take effect, so a silent
                     # failure here used to look identical to a working connect.
                     logger.warning(
-                        "Wired USB re-init via %s did not complete (%s); battery reporting "
-                        "or rumble may be unavailable", transport, self.device.address)
+                        "Wired USB re-init via %s did not complete (%s); battery "
+                        "reporting or motion may be unavailable",
+                        transport, self.device.address)
                     return
             # Give the pad a moment to act on the last batch, then report what it is
             # actually doing rather than what we hoped it would do.
@@ -2197,7 +2914,7 @@ class USBHidController(Controller):
                 logger.warning(
                     "Wired USB %s is still streaming %s after re-init (%s), not the "
                     "expected report 0x%02X; running on translated input -- buttons, "
-                    "sticks and analog triggers work, motion and USB rumble do not.",
+                    "sticks, analog triggers and rumble work; motion data does not.",
                     _device_label(self.usb_product_id), self.input_transport,
                     self.device.address, self.expected_input_report_id)
             else:

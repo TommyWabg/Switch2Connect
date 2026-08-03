@@ -35,7 +35,6 @@ import math
 import imufusion
 import numpy as np
 import os
-import sys
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 # Temporary hardware diagnostics for comparing a Joy-Con in the magnetic grip
 # with normal IR Mouse use. Enabled by default for the measurement build; set
@@ -44,17 +43,6 @@ _IR_SENSOR_DIAGNOSTICS = os.environ.get('SWITCH2_IR_DIAGNOSTICS', '1') != '0'
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
-except Exception:
-    pass
-# The virtual-pad drivers call back into Python from their own native threads
-# (see winuhid_client._rumble_handler), and those callbacks must take the GIL
-# before they can return. At the 5 ms default a callback thread can be made to
-# wait through several scheduling quanta while it still holds driver state,
-# which shows up as input stalling during rumble. usbip_dualsense_server.py
-# already lowers this for the same reason; the GUI process hosts WinUHid and
-# needs it just as much.
-try:
-    sys.setswitchinterval(0.001)
 except Exception:
     pass
 from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
@@ -2298,48 +2286,70 @@ class Controller:
                 
         await self.write_command(COMMAND_FEATURE, SUBCOMMAND_FEATURE_ENABLE, feature_flags.to_bytes().ljust(4, b'\0'))
 
-    def _bridge_rumble_due(self):
-        """Rate-gate continuous rumble to the BLE connection interval.
+    def _uses_bt_rumble_pacing(self):
+        """Return whether this controller needs the System-Bluetooth rumble gate.
 
-        Each command carries 3 frames covering the interval, so gating to it costs no
-        haptic coverage. The ESP32-S3 bridge uses ~7.5ms, which keeps latency low without
-        flooding the firmware's per-interval BLE write (that caused merge-mode stutter).
-
-        System Bluetooth is gated to BT_RUMBLE_MIN_INTERVAL. It used to be unpaced, on the
-        assumption that the OS BLE stack applies its own backpressure -- adapter-dependent
-        behaviour that, where it does not hold, lets rumble writes occupy the connection
-        events the controller's input notifications also need, which surfaces as input
-        freezing for exactly as long as a rumble lasts. The two transports keep separate
-        timestamps so neither can gate the other.
+        The gate exists for merged Joy-Con pairs, whose two controllers share a
+        constrained Bluetooth budget. ESP32 bridges have their own 7.5 ms cadence,
+        wired USB is paced by _UsbHidClient, and a single Bluetooth controller does
+        not need this additional layer.
         """
-        if not getattr(self, 'is_esp32s3_bridge', False):
+        if getattr(self, 'is_esp32s3_bridge', False):
+            return False
+        if getattr(self, 'is_wired_usb', False):
+            return False
+        return bool(getattr(self, 'is_merged', False))
+
+    def _uses_system_bt_single_flight(self):
+        """Reserve one rumble-write slot for every System Bluetooth device."""
+        if getattr(self, 'is_esp32s3_bridge', False):
+            return False
+        if getattr(self, 'is_wired_usb', False):
+            return False
+        return True
+
+    def _bridge_rumble_due(self):
+        """Rate-gate only transports that require their own rumble cadence.
+
+        The ESP32-S3 bridge keeps its existing ~7.5 ms gate. Merged Joy-Con pairs
+        using System Bluetooth use BT_RUMBLE_MIN_INTERVAL so rumble writes do not
+        starve input notifications. All other transports retain their native pacing.
+        Separate timestamps ensure the bridge and Bluetooth gates cannot interfere.
+        """
+        if getattr(self, 'is_esp32s3_bridge', False):
+            now_rt = time.perf_counter()
+            if (now_rt - getattr(self, '_last_rumble_send_rt', 0.0)) >= 0.0075:
+                self._last_rumble_send_rt = now_rt
+                return True
+            return False
+        if self._uses_bt_rumble_pacing():
             now_rt = time.perf_counter()
             if (now_rt - getattr(self, '_last_bt_rumble_send_rt', 0.0)) >= BT_RUMBLE_MIN_INTERVAL:
                 self._last_bt_rumble_send_rt = now_rt
                 return True
             return False
-        now_rt = time.perf_counter()
-        if (now_rt - getattr(self, '_last_rumble_send_rt', 0.0)) >= 0.0075:
-            self._last_rumble_send_rt = now_rt
-            return True
-        return False
+        return True
 
     def _dispatch_rumble_coro(self, loop, coro):
-        """Queue one rumble send, reserving the single in-flight slot first.
+        """Queue a rumble send with transport-appropriate in-flight semantics.
 
-        The reservation has to happen here, on the scheduler thread, rather than
-        inside the worker coroutine. The scheduler re-checks every ~7 ms while a
-        dispatched coroutine only marks itself once the event loop starts it, so
-        under BLE backpressure that gap let the scheduler keep dispatching against
-        a stale "idle" reading. Captured traces show that runaway reaching 194
-        concurrent write_gatt_char calls (148 on one controller), at which point
-        the WinRT write backlog took 1-2 s to drain and starved input notification
-        delivery on the same link -- the reported freeze. Healthy sessions never
-        exceed one in flight per controller.
-
-        Returns True when the coroutine was handed to the loop.
+        Every System-Bluetooth controller reserves its slot on the scheduler
+        thread. ESP32-S3 and wired USB retain direct submission and their existing
+        worker-owned running flag. This changes ownership only, not pacing.
         """
-        if loop is None or loop.is_closed() or not self._begin_rumble_dispatch():
+        if loop is None or loop.is_closed():
+            coro.close()
+            return False
+
+        if not self._uses_system_bt_single_flight():
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+            except Exception:
+                coro.close()
+                return False
+            return True
+
+        if not self._begin_rumble_dispatch():
             coro.close()
             return False
         try:
@@ -2411,10 +2421,18 @@ class Controller:
         """Single-shot rumble send worker (non-audio-haptic path).
 
         Promoted from the per-tick inline `safe_send_single` closure so that no
-        coroutine *function* object is created on every input report. The
-        in-flight slot is owned by _dispatch_rumble_coro, not by this coroutine.
+        coroutine *function* object is created on every input report. System
+        Bluetooth owns its slot in _dispatch_rumble_coro; every other transport
+        retains its worker-owned running flag.
         """
-        await self.set_vibration(v1, v2, v3)
+        if self._uses_system_bt_single_flight():
+            await self.set_vibration(v1, v2, v3)
+            return
+        self._rumble_task_running = True
+        try:
+            await self.set_vibration(v1, v2, v3)
+        finally:
+            self._rumble_task_running = False
 
 
     def _audio_haptic_send_worker_thread(self):
@@ -2526,46 +2544,57 @@ class Controller:
     ):
         """Stereo (non-audio-haptic) rumble send worker.
 
-        Promoted from the per-tick inline `safe_send` closure. The in-flight slot
-        is owned by _dispatch_rumble_coro, not by this coroutine.
+        Non-System-Bluetooth transports retain their worker-owned running flag.
+        System Bluetooth already owns the slot in _dispatch_rumble_coro.
         """
-        if self.is_pro_controller():
-            await self.set_vibration(
-                v1_l, v2_l, v3_l, False,
-                v1_r, v2_r, v3_r,
-                trigger_overlay=(t1_l, t2_l, t3_l),
-                trigger_overlay_r=(t1_r, t2_r, t3_r))
-        elif self.is_joycon_left():
-            await self.set_vibration(
-                v1_l, v2_l, v3_l,
-                trigger_overlay=(t1_l, t2_l, t3_l))
-        else:
-            await self.set_vibration(
-                v1_r, v2_r, v3_r,
-                trigger_overlay=(t1_r, t2_r, t3_r))
+        reserved = self._uses_system_bt_single_flight()
+        if not reserved:
+            self._rumble_task_running = True
+        try:
+            if self.is_pro_controller():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l, False,
+                    v1_r, v2_r, v3_r,
+                    trigger_overlay=(t1_l, t2_l, t3_l),
+                    trigger_overlay_r=(t1_r, t2_r, t3_r))
+            elif self.is_joycon_left():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l,
+                    trigger_overlay=(t1_l, t2_l, t3_l))
+            else:
+                await self.set_vibration(
+                    v1_r, v2_r, v3_r,
+                    trigger_overlay=(t1_r, t2_r, t3_r))
+        finally:
+            if not reserved:
+                self._rumble_task_running = False
 
     async def _xbox_impulse_rumble_send_worker(
         self, v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
         i1_l, i2_l, i3_l, i1_r, i2_r, i3_r
     ):
-        """Sends ordinary mono rumble plus final, side-specific Xbox impulse HF.
-
-        The in-flight slot is owned by _dispatch_rumble_coro, not by this coroutine.
-        """
-        if self.is_pro_controller():
-            await self.set_vibration(
-                v1_l, v2_l, v3_l, False,
-                v1_r, v2_r, v3_r,
-                impulse_overlay=(i1_l, i2_l, i3_l),
-                impulse_overlay_r=(i1_r, i2_r, i3_r))
-        elif self.is_joycon_left():
-            await self.set_vibration(
-                v1_l, v2_l, v3_l,
-                impulse_overlay=(i1_l, i2_l, i3_l))
-        else:
-            await self.set_vibration(
-                v1_r, v2_r, v3_r,
-                impulse_overlay=(i1_r, i2_r, i3_r))
+        """Sends ordinary mono rumble plus final, side-specific Xbox impulse HF."""
+        reserved = self._uses_system_bt_single_flight()
+        if not reserved:
+            self._rumble_task_running = True
+        try:
+            if self.is_pro_controller():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l, False,
+                    v1_r, v2_r, v3_r,
+                    impulse_overlay=(i1_l, i2_l, i3_l),
+                    impulse_overlay_r=(i1_r, i2_r, i3_r))
+            elif self.is_joycon_left():
+                await self.set_vibration(
+                    v1_l, v2_l, v3_l,
+                    impulse_overlay=(i1_l, i2_l, i3_l))
+            else:
+                await self.set_vibration(
+                    v1_r, v2_r, v3_r,
+                    impulse_overlay=(i1_r, i2_r, i3_r))
+        finally:
+            if not reserved:
+                self._rumble_task_running = False
 
     def _poke_rumble_scheduler(self):
         try:
@@ -3178,20 +3207,25 @@ class Controller:
                         self.vibration_packet_id += 1
                         return
 
-            # Backstop for the in-flight guard in _dispatch_rumble_coro: if a write
-            # ever does back up in the WinRT stack, abandon it rather than let it hold
-            # the send slot open. Rumble is re-sent on the next scheduler tick, so a
-            # dropped frame is inaudible while a stalled one freezes the controls.
-            write_started = time.perf_counter()
-            self._count_rumble_write()
-            await asyncio.wait_for(
-                self.client.write_gatt_char(uuid_to_use, payload, response=False),
-                timeout=BT_RUMBLE_WRITE_TIMEOUT)
-            elapsed = time.perf_counter() - write_started
-            if elapsed >= BT_RUMBLE_WRITE_SLOW_WARN:
-                self._warn_slow_rumble_write(elapsed)
-        except asyncio.TimeoutError:
-            self._warn_slow_rumble_write(BT_RUMBLE_WRITE_TIMEOUT, timed_out=True)
+            if self._uses_bt_rumble_pacing():
+                # Backstop only for merged Joy-Con on System Bluetooth. Those two
+                # links share the event budget and a stalled write can freeze input.
+                write_started = time.perf_counter()
+                self._count_rumble_write()
+                try:
+                    await asyncio.wait_for(
+                        self.client.write_gatt_char(uuid_to_use, payload, response=False),
+                        timeout=BT_RUMBLE_WRITE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    self._warn_slow_rumble_write(BT_RUMBLE_WRITE_TIMEOUT, timed_out=True)
+                else:
+                    elapsed = time.perf_counter() - write_started
+                    if elapsed >= BT_RUMBLE_WRITE_SLOW_WARN:
+                        self._warn_slow_rumble_write(elapsed)
+            else:
+                # Exact v1.7 transport semantics: let the native Bluetooth/USB
+                # implementation complete the write without an upper-layer timeout.
+                await self.client.write_gatt_char(uuid_to_use, payload, response=False)
         except Exception as e:
             logger.debug(f"Vibration write failed: {e}")
 
