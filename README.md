@@ -23,9 +23,9 @@
 
 ## Choose a Version And Get Started
 
-**Microsoft Store Version**
+**[Microsoft Store Version](https://github.com/TommyWabg/Switch2Connect#microsoft-store-version)**
 
-**GitHub Version**
+**[GitHub Version](https://github.com/TommyWabg/Switch2Connect#github-version)**
 
 ##
 
