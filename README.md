@@ -41,11 +41,13 @@
 
 #### Important WinUHid Notice
 The Microsoft Store package **does not include or install the WinUHid driver** to comply with Microsoft Store packaging and driver-distribution policies. It is not a controller or hardware compatibility problem.
+
 However, the Microsoft Store Version can detect and use a healthy WinUHid installation that was installed separately.
+
 If WinUHid is not installed or the installation is incomplete:
 * WinUHid Driver Mode will remain unavailable.
 * IR Mouse Raw Input Mode will remain unavailable.
-* The related controls may remain hidden.
+* The related controls will remain hidden.
 * The Store app will not display a WinUHid installation prompt.
 
 #### Get Started With Microsoft Store Version
