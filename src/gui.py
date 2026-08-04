@@ -92,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v1.9"
+APP_VERSION = "v2.0"
 
 def _set_current_thread_priority(level):
     try:
@@ -382,10 +382,10 @@ def wired_controller_label(product_ids, sentence=False):
 
 # No WinUSB status helper lives here any more. Nintendo's pads advertise the
 # MS_COMP_WINUSB compatible id, so Windows binds its own inbox winusb.inf with no
-# user action, and nothing in the UI depends on that binding: input works through
-# the HID interface, and so does rumble (the console itself drives GameCube
-# vibration as HID output report 0x03). usb_hid_controller.winusb_binding_state()
-# remains as the single implementation, used for the connection diagnostics log.
+# user action. The USB transport layer uses it automatically when available and
+# falls back to HID without exposing a manual route selector. Input always remains
+# on the HID interface. usb_hid_controller.winusb_binding_state() remains as the
+# single implementation used for connection diagnostics.
 
 logger = logging.getLogger(__name__)
 
@@ -929,6 +929,116 @@ highlight_color = "#00C3E3"
 text_color = "#FFFFFF"
 button_gray = "#4B4B4B"
 
+# Top-level config.yaml keys that describe *this* machine rather than the user's
+# preferences.  A config file imported from another PC must never overwrite them
+# or the local driver/window state would be corrupted.  Calibration data is
+# intentionally NOT in this list - it travels with the exported settings.
+MACHINE_LOCAL_CONFIG_KEYS = frozenset({
+    "driver_installed",
+    "vigembus_installed",
+    "hidhide_installed",
+    "hidhide_install_prompt_suppressed",
+    "window_width",
+    "window_height",
+    "window_x",
+    "window_y",
+    "ui_scale",
+    "controller_fast_cache",
+    "controller_fast_cache_entries",
+    "winrt_cached_services",
+})
+
+# Everything bound to a specific physical controller (calibration blobs plus every
+# section keyed by a controller MAC), gated by the "Import/Export Controller Related
+# Data" checkbox in the profile import/export dialogs.
+CONTROLLER_RELATED_CONFIG_KEYS = frozenset({
+    "calibration_data",
+    "joystick_calibration_data",
+    "mag_calibration_data",
+    "gc_trigger_calibration_data",
+    "controller_calibration_aliases",
+    "cemuhook_mac_to_pad",
+    "merged_gyro_side",
+    "joycon_hold_mode",
+    "controller_fast_cache_entries",
+    "gyro_bias_l",
+    "gyro_bias_r",
+    "stick_r_bias",
+})
+
+# Only the MAC-keyed sections decide whether the checkbox is worth showing; the bias
+# values always exist, so they would make it visible even with no controller data.
+CONTROLLER_RELATED_PRESENCE_KEYS = (
+    "calibration_data",
+    "joystick_calibration_data",
+    "mag_calibration_data",
+    "gc_trigger_calibration_data",
+    "controller_calibration_aliases",
+    "cemuhook_mac_to_pad",
+    "merged_gyro_side",
+    "joycon_hold_mode",
+    "controller_fast_cache_entries",
+)
+
+# ``joycon_hold_mode`` is keyed by controller address and appears both directly on a
+# profile-shaped mapping and inside each of its emulation-mode category dicts.
+CONTROLLER_RELATED_NESTED_KEYS = ("joycon_hold_mode",)
+
+
+def strip_controller_related_from_profile(profile):
+    """Empty the MAC-keyed entries inside one profile-shaped mapping."""
+    if not isinstance(profile, dict):
+        return
+    for key in CONTROLLER_RELATED_NESTED_KEYS:
+        if isinstance(profile.get(key), dict):
+            profile[key] = {}
+        for value in profile.values():
+            if isinstance(value, dict) and isinstance(value.get(key), dict):
+                value[key] = {}
+
+
+def strip_controller_related(config_data):
+    """Remove every controller-bound entry from a whole config mapping.
+
+    Covers the top-level MAC-keyed blobs, the per-profile category dicts and the
+    legacy ``button_remaps`` block, which is profile-shaped and still carries
+    ``joycon_hold_mode`` entries keyed by controller address.
+    """
+    if not isinstance(config_data, dict):
+        return
+    for key in CONTROLLER_RELATED_CONFIG_KEYS:
+        config_data.pop(key, None)
+    strip_controller_related_from_profile(config_data.get("button_remaps"))
+    profiles = config_data.get("profiles")
+    if isinstance(profiles, dict):
+        for profile_data in profiles.values():
+            strip_controller_related_from_profile(profile_data)
+
+
+def _profile_has_controller_related_data(profile):
+    if not isinstance(profile, dict):
+        return False
+    for key in CONTROLLER_RELATED_NESTED_KEYS:
+        if profile.get(key):
+            return True
+        if any(isinstance(value, dict) and value.get(key) for value in profile.values()):
+            return True
+    return False
+
+
+def has_controller_related_data(data):
+    """True when ``data`` (a config mapping) carries controller-bound entries."""
+    if not isinstance(data, dict):
+        return False
+    if any(data.get(key) for key in CONTROLLER_RELATED_PRESENCE_KEYS):
+        return True
+    if _profile_has_controller_related_data(data.get("button_remaps")):
+        return True
+    profiles = data.get("profiles")
+    if isinstance(profiles, dict):
+        return any(_profile_has_controller_related_data(p) for p in profiles.values())
+    return False
+
 CONTROLLER_UPDATED_EVENT = '<<ControllersUpdated>>'
 pending_merge_vc_index = None
 
@@ -1239,13 +1349,13 @@ class PlayerInfoBlock:
             vib = VibrationData(lf_amp=800, hf_amp=800)
             off = VibrationData(lf_amp=0, hf_amp=0)
             for controller in self.current_vc.controllers:
-                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, vib, vib, ignore_freq_scaling=True), self.current_vc.loop)
+                asyncio.run_coroutine_threadsafe(controller.set_vibration(vib, vib, vib, ignore_freq_scaling=True, pair_sustain=False), self.current_vc.loop)
                 self.parent.after(100, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True, pair_sustain=False), loop))
                 self.parent.after(200, lambda c=controller, loop=self.current_vc.loop, v=vib: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, v, v, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(v, v, v, ignore_freq_scaling=True, pair_sustain=False), loop))
                 self.parent.after(300, lambda c=controller, loop=self.current_vc.loop, o=off: 
-                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True), loop))
+                    asyncio.run_coroutine_threadsafe(c.set_vibration(o, o, o, ignore_freq_scaling=True, pair_sustain=False), loop))
             
             # Brief UI feedback (consistent size)
             if getattr(self, 'vibrate_frame', None):
@@ -9768,6 +9878,264 @@ bg_color=panel_bg, widths=[8, 10])
             CONFIG.profiles[profile_name]["profile_switching_combo"] = value
             CONFIG.save_config()
 
+    def _open_profile_checklist_dialog(self, title, profile_names, action_text, show_keep_current=False, show_calibration=True, calibration_confirm_message=None):
+        """Modal profile picker shared by Import and Export.
+
+        Returns ``(selected_names, keep_current, include_calibration)``; all ``None``
+        when the user cancels.  The title, Select All row, the optional Keep Current
+        Profiles row, the calibration row and the action buttons are pinned outside
+        the scrolling area.
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=background_color)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        spacing = int(10 * scaling_factor)
+        column_gap = int(8 * scaling_factor)
+        # Match the row/checkbox height to the Add/Rename buttons, like the profile popup.
+        ref_btn = getattr(self, "add_profile_btn", None)
+        try:
+            row_height = ref_btn.winfo_reqheight() if ref_btn is not None else 0
+        except Exception:
+            row_height = 0
+        if row_height < int(10 * scaling_factor):
+            row_height = int(30 * scaling_factor)
+        profile_col_width = int(148 * 1.5 * scaling_factor)
+        row_pady = int(5 * scaling_factor)
+        max_rows = 10
+        canvas_height = (row_height + row_pady * 2) * max_rows
+
+        names = list(profile_names)
+        checked = {name: True for name in names}
+        select_all_checked = [True]
+        result = {"selected": None, "keep": None, "calibration": None}
+        keep_current = [True]
+        include_calibration = [True]
+
+        tk.Label(
+            dialog, text=title, bg=background_color, fg=text_color,
+            font=scale_font(("Arial", 11, "bold")), anchor=tk.CENTER
+        ).pack(side=tk.TOP, fill=tk.X, pady=(spacing, spacing))
+
+        # Pack the pinned footer bottom-up so the scrolling list gets the leftovers.
+        btn_frame = tk.Frame(dialog, bg=background_color)
+        btn_frame.pack(side=tk.BOTTOM, pady=(row_pady, spacing))
+
+        calibration_frame = None
+        if show_calibration:
+            calibration_frame = tk.Frame(dialog, bg=background_color)
+            calibration_frame.pack(side=tk.BOTTOM, pady=row_pady)
+
+        keep_frame = None
+        if show_keep_current:
+            keep_frame = tk.Frame(dialog, bg=background_color)
+            keep_frame.pack(side=tk.BOTTOM, pady=row_pady)
+
+        select_all_frame = tk.Frame(dialog, bg=background_color)
+        select_all_frame.pack(side=tk.BOTTOM, pady=(row_pady, row_pady))
+
+        container = tk.Frame(dialog, bg=background_color)
+        container.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=column_gap)
+        canvas = tk.Canvas(container, bg=background_color, highlightthickness=0, height=canvas_height)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable = tk.Frame(canvas, bg=background_color)
+        canvas_window = canvas.create_window((0, 0), window=scrollable, anchor="nw")
+
+        def update_scroll(event=None):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            canvas.configure(scrollregion=bbox)
+            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+            if scrollable.winfo_reqheight() > canvas_height:
+                if not scrollbar.winfo_ismapped():
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                if scrollbar.winfo_ismapped():
+                    scrollbar.pack_forget()
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollable.bind("<Configure>", update_scroll)
+        canvas.bind("<Configure>", update_scroll)
+
+        def on_mousewheel(event):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return "break"
+            # Never scroll while everything already fits in view.
+            if (bbox[3] - bbox[1]) <= canvas.winfo_height():
+                return "break"
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+
+        def bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", on_mousewheel)
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        check_buttons = {}
+
+        def make_check_button(parent, is_checked, command):
+            btn = tk.Button(
+                parent, text="V" if is_checked else "",
+                font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white",
+                relief=tk.FLAT, bd=0, command=command
+            )
+            return btn
+
+        def make_footer_check_row(parent, label_text, command):
+            """A right-hand checkbox whose column lines up with the profile list's."""
+            inner = tk.Frame(
+                parent, bg=background_color,
+                width=profile_col_width + column_gap + row_height, height=row_height
+            )
+            inner.pack(anchor=tk.CENTER)
+            inner.pack_propagate(False)
+            inner.grid_propagate(False)
+            inner.grid_columnconfigure(0, minsize=profile_col_width)
+            inner.grid_columnconfigure(1, minsize=row_height)
+
+            label_cell = tk.Frame(inner, bg=background_color, width=profile_col_width, height=row_height)
+            label_cell.grid(row=0, column=0, sticky=tk.EW, padx=(0, column_gap))
+            label_cell.grid_propagate(False)
+            tk.Label(
+                label_cell, text=label_text, bg=background_color, fg=text_color,
+                font=scale_font(("Arial", 10, "bold")), anchor=tk.E
+            ).place(x=0, y=0, width=profile_col_width, height=row_height)
+
+            box_cell = tk.Frame(inner, bg=background_color, width=row_height, height=row_height)
+            box_cell.grid(row=0, column=1, sticky=tk.W)
+            box_cell.grid_propagate(False)
+            btn = make_check_button(box_cell, True, command)
+            btn.place(x=0, y=0, width=row_height, height=row_height)
+            return btn
+
+        def sync_select_all_button():
+            select_all_btn.config(text="V" if select_all_checked[0] else "")
+
+        def on_profile_toggled(name):
+            checked[name] = not checked[name]
+            check_buttons[name].config(text="V" if checked[name] else "")
+            # Only reflect the aggregate state here - toggling a single profile must
+            # never cascade back onto the other rows.
+            select_all_checked[0] = bool(names) and all(checked[n] for n in names)
+            sync_select_all_button()
+
+        def on_select_all_toggled():
+            # This is the only entry point that cascades: checking it selects every
+            # profile, unchecking it clears every profile.
+            select_all_checked[0] = not select_all_checked[0]
+            for name in names:
+                checked[name] = select_all_checked[0]
+                check_buttons[name].config(text="V" if checked[name] else "")
+            sync_select_all_button()
+
+        for name in names:
+            row = tk.Frame(scrollable, bg=background_color, height=row_height)
+            row.pack(side=tk.TOP, fill=tk.X, pady=row_pady)
+            row.pack_propagate(False)
+            # Keep the name + checkbox pair centered like the footer controls.
+            row_inner = tk.Frame(row, bg=background_color, height=row_height)
+            row_inner.pack(anchor=tk.CENTER, expand=True)
+            row_inner.pack_propagate(False)
+            row_inner.grid_propagate(False)
+            row_inner.configure(width=profile_col_width + column_gap + row_height)
+            row_inner.grid_columnconfigure(0, minsize=profile_col_width)
+            row_inner.grid_columnconfigure(1, minsize=row_height)
+
+            name_cell = tk.Frame(row_inner, bg=background_color, width=profile_col_width, height=row_height)
+            name_cell.grid(row=0, column=0, sticky=tk.EW, padx=(0, column_gap))
+            name_cell.grid_propagate(False)
+            name_lbl = tk.Label(
+                name_cell, text=name, font=scale_font(("Arial", 10, "bold")),
+                bg=button_gray, fg="white", anchor=tk.CENTER, padx=int(5 * scaling_factor)
+            )
+            name_lbl.place(x=0, y=0, width=profile_col_width, height=row_height)
+            # Hovering shows the full profile name when the fixed-width cell clips it.
+            Tooltip(name_lbl, lambda n=name: n)
+
+            check_cell = tk.Frame(row_inner, bg=background_color, width=row_height, height=row_height)
+            check_cell.grid(row=0, column=1, sticky=tk.W)
+            check_cell.grid_propagate(False)
+            chk_btn = make_check_button(check_cell, True, lambda n=name: on_profile_toggled(n))
+            chk_btn.place(x=0, y=0, width=row_height, height=row_height)
+            check_buttons[name] = chk_btn
+
+        select_all_btn = make_footer_check_row(select_all_frame, "Select All", on_select_all_toggled)
+
+        if keep_frame is not None:
+            def on_keep_toggled():
+                keep_current[0] = not keep_current[0]
+                keep_btn.config(text="V" if keep_current[0] else "")
+
+            keep_btn = make_footer_check_row(keep_frame, "Keep Current Profiles", on_keep_toggled)
+
+        if calibration_frame is not None:
+            def on_calibration_toggled():
+                include_calibration[0] = not include_calibration[0]
+                calibration_btn.config(text="V" if include_calibration[0] else "")
+
+            calibration_btn = make_footer_check_row(
+                calibration_frame, f"{action_text} Controller Related Data", on_calibration_toggled
+            )
+
+        def on_action():
+            selected = [name for name in names if checked[name]]
+            calibration = include_calibration[0] if calibration_frame is not None else False
+            # Profiles are optional: controller related data alone is a valid payload.
+            if not selected and not calibration:
+                self.custom_messagebox(
+                    title,
+                    "Please select at least one profile"
+                    + (" or Controller Related Data." if calibration_frame is not None else "."),
+                    type="warning",
+                )
+                dialog.grab_set()
+                return
+            if calibration and calibration_confirm_message:
+                proceed = self.custom_messagebox(
+                    title, calibration_confirm_message, type="yesno",
+                    confirm_text="Proceed", cancel_text="Cancel"
+                )
+                dialog.grab_set()
+                if not proceed:
+                    # Cancel returns to this window with the option turned off.
+                    include_calibration[0] = False
+                    calibration_btn.config(text="")
+                    return
+            result["selected"] = selected
+            result["keep"] = keep_current[0] if show_keep_current else None
+            result["calibration"] = calibration
+            dialog.destroy()
+
+        def on_cancel(event=None):
+            dialog.destroy()
+
+        tk.Button(
+            btn_frame, text=action_text, font=scale_font(("Arial", 11, "bold")),
+            bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_action
+        ).pack(side=tk.LEFT, padx=row_pady)
+        tk.Button(
+            btn_frame, text="Cancel", font=scale_font(("Arial", 11, "bold")),
+            bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=on_cancel
+        ).pack(side=tk.LEFT, padx=row_pady)
+
+        dialog.bind("<Escape>", on_cancel)
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        bind_mousewheel(dialog)
+        dialog.update_idletasks()
+        width = max(int(320 * scaling_factor), dialog.winfo_reqwidth() + column_gap * 2)
+        height = dialog.winfo_reqheight()
+        self.center_window_on_root(dialog, width, height)
+        dialog.grab_set()
+        update_scroll()
+        self.root.wait_window(dialog)
+        return result["selected"], result["keep"], result["calibration"]
+
     def init_settings_panel(self):
         self.settings_frame = tk.Frame(self.root, bg=background_color)
         self.settings_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(int(5 * scaling_factor), 0))
@@ -9812,6 +10180,12 @@ bg_color=panel_bg, widths=[8, 10])
         self.rename_profile_btn = tk.Button(row_profile, text="Rename", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_rename_profile)
         self.rename_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
         
+        self.import_profile_btn = tk.Button(row_profile, text="Import", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_import_profiles)
+        self.import_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
+        self.export_profile_btn = tk.Button(row_profile, text="Export", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_export_profiles)
+        self.export_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
         self.reset_profile_btn = tk.Button(row_profile, text="Reset", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", relief=tk.FLAT, bd=0, command=self.on_reset_profile)
         self.reset_profile_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
@@ -12198,7 +12572,7 @@ bg_color=panel_bg, widths=[8, 10])
         self.root.wait_window(dialog)
         return result[0]
 
-    def custom_messagebox(self, title, message, type="info"):
+    def custom_messagebox(self, title, message, type="info", confirm_text="Yes", cancel_text="No"):
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.configure(bg=background_color)
@@ -12222,8 +12596,8 @@ bg_color=panel_bg, widths=[8, 10])
             dialog.destroy()
             
         if type == "yesno":
-            tk.Button(btn_frame, text="Yes", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
-            tk.Button(btn_frame, text="No", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text=confirm_text, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text=cancel_text, font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(False)).pack(side=tk.LEFT, padx=5)
         else:
             tk.Button(btn_frame, text="OK", font=scale_font(("Arial", 11, "bold")), bg=button_gray, fg="white", width=8, relief=tk.FLAT, bd=0, command=lambda: set_res(True)).pack()
             
@@ -12593,22 +12967,23 @@ bg_color=panel_bg, widths=[8, 10])
             except Exception:
                 pass
 
-    def get_sorted_profiles(self):
+    def _profile_sort_key(self, s):
         import re
-        def sort_key(s):
-            tokens = re.findall(r'[a-zA-Z]+|\d+|[^a-zA-Z\d]+', s)
-            key = []
-            for t in tokens:
-                if t.isalpha():
-                    key.append((0, t.lower()))
-                elif t.isdigit():
-                    key.append((1, int(t)))
-                else:
-                    key.append((2, t))
-            return key
+        tokens = re.findall(r'[a-zA-Z]+|\d+|[^a-zA-Z\d]+', s)
+        key = []
+        for t in tokens:
+            if t.isalpha():
+                key.append((0, t.lower()))
+            elif t.isdigit():
+                key.append((1, int(t)))
+            else:
+                key.append((2, t))
+        return key
+
+    def get_sorted_profiles(self):
         return sorted(
             list(CONFIG.profiles.keys()),
-            key=lambda name: (0 if CONFIG.profiles.get(name, {}).get("change_profile_list", False) else 1, sort_key(name))
+            key=lambda name: (0 if CONFIG.profiles.get(name, {}).get("change_profile_list", False) else 1, self._profile_sort_key(name))
         )
 
     def _change_list_profiles(self):
@@ -12847,6 +13222,240 @@ bg_color=panel_bg, widths=[8, 10])
                 if callable(refresh_popup_rows) and getattr(self, "profile_popup", None) is not None and self.profile_popup.winfo_exists():
                     refresh_popup_rows()
                 
+    def _unique_profile_name(self, existing, name):
+        """Return ``name``, or ``name (2)`` / ``name (3)`` ... when it is taken."""
+        if name not in existing:
+            return name
+        index = 2
+        while f"{name} ({index})" in existing:
+            index += 1
+        return f"{name} ({index})"
+
+    def _normalize_imported_profile(self, profile_data):
+        """Fill an imported profile out to the canonical profile shape."""
+        import copy
+        normalized = CONFIG.get_default_profile_dict()
+        if isinstance(profile_data, dict):
+            normalized.update(copy.deepcopy(profile_data))
+        if not isinstance(normalized.get("assigned_apps"), list):
+            normalized["assigned_apps"] = []
+        normalized["change_profile_list"] = bool(normalized.get("change_profile_list", False))
+        if not isinstance(normalized.get("profile_switching_combo"), str):
+            normalized["profile_switching_combo"] = ""
+        normalized.pop("assigned_app", None)
+        return normalized
+
+    def _dedupe_assigned_apps(self, profiles, priority_names):
+        """An exe may only be assigned to one profile; ``priority_names`` win."""
+        seen = set()
+        ordered = list(priority_names) + [n for n in profiles if n not in priority_names]
+        for profile_name in ordered:
+            profile_data = profiles.get(profile_name)
+            if not isinstance(profile_data, dict):
+                continue
+            kept = []
+            for app in profile_data.get("assigned_apps") or []:
+                app_path = app.get("path") if isinstance(app, dict) else str(app)
+                normalized_path = normalize_app_path(app_path)
+                if not normalized_path or normalized_path in seen:
+                    continue
+                seen.add(normalized_path)
+                kept.append({
+                    "path": os.path.normpath(app_path),
+                    "name": (app.get("name") if isinstance(app, dict) else None) or get_exe_display_name(app_path),
+                })
+            profile_data["assigned_apps"] = kept
+
+    def _write_config_yaml(self, updates):
+        """Merge ``updates`` into config.yaml on disk under the Config save lock."""
+        with CONFIG._save_lock:
+            data = {}
+            if os.path.exists(CONFIG.config_file_path):
+                try:
+                    with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f:
+                        data = yaml.load(f, Loader=_YamlLoader) or {}
+                except Exception:
+                    data = {}
+            data.update(updates)
+            with open(CONFIG.config_file_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, Dumper=_YamlDumper, default_flow_style=False)
+
+    def on_import_profiles(self):
+        # The foreground-app poller must not fire a profile switch while a modal
+        # file dialog owns the foreground window (same guard as choose_app_path).
+        self.app_profile_poll_suspended = True
+        try:
+            file_path = filedialog.askopenfilename(
+                parent=self.root,
+                title="Choose a .yaml File",
+                filetypes=[("YAML files", "*.yaml")],
+            )
+        finally:
+            self.app_profile_poll_suspended = False
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                imported = yaml.load(f, Loader=_YamlLoader)
+        except Exception as e:
+            self.custom_messagebox("Import", f"Failed to read the file:\n{e}", type="error")
+            return
+
+        if not isinstance(imported, dict):
+            self.custom_messagebox("Import", "This file is not a valid config file.", type="error")
+            return
+        imported_profiles = imported.get("profiles")
+        if not isinstance(imported_profiles, dict):
+            imported_profiles = {}
+        file_has_controller_data = has_controller_related_data(imported)
+        if not imported_profiles and not file_has_controller_data:
+            self.custom_messagebox("Import", "This file contains nothing to import.", type="error")
+            return
+
+        names = sorted(imported_profiles.keys(), key=self._profile_sort_key)
+        selected, keep_current, include_calibration = self._open_profile_checklist_dialog(
+            "Choose Profiles to Import", names, "Import", show_keep_current=True,
+            show_calibration=file_has_controller_data,
+            calibration_confirm_message="Warning: Current controller related data will be replaced.",
+        )
+        if selected is None:
+            return
+        if not selected:
+            # Nothing to import into the profile store - never drop the local profiles.
+            keep_current = True
+
+        # Remember the current driver/emu mode on the active profile before the
+        # profile store is rewritten, exactly like on_add_profile does.
+        if CONFIG.active_profile in CONFIG.profiles:
+            CONFIG.profiles[CONFIG.active_profile]["driver_type"] = getattr(CONFIG, "driver_type", "WinUHid")
+            CONFIG.profiles[CONFIG.active_profile]["simulation_mode"] = getattr(CONFIG, "simulation_mode", "PS5")
+
+        import copy
+        merged = copy.deepcopy(CONFIG.profiles) if keep_current else {}
+        imported_names = []
+        for name in selected:
+            target_name = self._unique_profile_name(merged, name) if keep_current else name
+            merged[target_name] = self._normalize_imported_profile(imported_profiles.get(name))
+            imported_names.append(target_name)
+
+        self._dedupe_assigned_apps(merged, imported_names)
+
+        # Keep using the current profile; only fall back when it no longer exists.
+        active = CONFIG.active_profile if CONFIG.active_profile in merged else next(iter(merged))
+
+        if selected:
+            updates = {
+                key: value for key, value in imported.items()
+                if key not in ("profiles", "active_profile") and key not in MACHINE_LOCAL_CONFIG_KEYS
+            }
+            # The profile switching combo trigger only gets overwritten by a real
+            # input: an unset value in the imported file must not clear a local one.
+            if not str(updates.get("profile_switching_combo_trigger") or "").strip():
+                updates.pop("profile_switching_combo_trigger", None)
+            if not include_calibration:
+                # Scrub only what is coming in: dropping these keys from ``updates``
+                # leaves the local values in config.yaml untouched, and only the newly
+                # imported profiles are cleaned so kept profiles keep their entries.
+                strip_controller_related(updates)
+                for name in imported_names:
+                    strip_controller_related_from_profile(merged[name])
+            updates["profiles"] = merged
+            updates["active_profile"] = active
+        else:
+            # Controller related data only - leave the profile store and every other
+            # setting exactly as they are.
+            updates = {
+                key: imported[key] for key in CONTROLLER_RELATED_CONFIG_KEYS
+                if key in imported and key not in MACHINE_LOCAL_CONFIG_KEYS
+            }
+
+        try:
+            self._write_config_yaml(updates)
+        except Exception as e:
+            self.custom_messagebox("Import", f"Failed to write the config file:\n{e}", type="error")
+            return
+
+        CONFIG.load_config()
+        self._set_profile_button_text()
+        self.apply_profile_switch()
+        self.refresh_assigned_apps_ui()
+        self.refresh_profile_switching_combo_trigger_ui()
+        refresh_popup_rows = getattr(self, "refresh_profile_popup_rows", None)
+        if callable(refresh_popup_rows) and getattr(self, "profile_popup", None) is not None and self.profile_popup.winfo_exists():
+            refresh_popup_rows()
+        # Re-save so a save queued before the import cannot land on top of it.
+        CONFIG.save_config()
+        summary = f"Imported {len(imported_names)} profile(s)."
+        if include_calibration:
+            summary = (
+                "Imported controller related data."
+                if not imported_names else summary + "\nController related data imported."
+            )
+        self.custom_messagebox("Import", summary, type="info")
+
+    def on_export_profiles(self):
+        live_snapshot = {key: getattr(CONFIG, key, None) for key in CONTROLLER_RELATED_PRESENCE_KEYS}
+        live_snapshot["profiles"] = CONFIG.profiles
+        selected, _, include_calibration = self._open_profile_checklist_dialog(
+            "Choose Profiles to Export", self.get_sorted_profiles(), "Export",
+            show_calibration=has_controller_related_data(live_snapshot),
+        )
+        if selected is None:
+            return
+
+        self.app_profile_poll_suspended = True
+        try:
+            file_path = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Choose Export Location",
+                defaultextension=".yaml",
+                filetypes=[("YAML files", "*.yaml")],
+                initialfile="switch2_profiles.yaml" if selected else "switch2_controller_data.yaml",
+            )
+        finally:
+            self.app_profile_poll_suspended = False
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".yaml"):
+            file_path = os.path.splitext(file_path)[0] + ".yaml"
+
+        import copy
+        try:
+            with CONFIG._save_lock:
+                data = {}
+                if os.path.exists(CONFIG.config_file_path):
+                    with open(CONFIG.config_file_path, 'r', encoding='utf-8') as f:
+                        data = yaml.load(f, Loader=_YamlLoader) or {}
+                if selected:
+                    # The in-memory profile store is authoritative (saves are async).
+                    data["profiles"] = {
+                        name: copy.deepcopy(CONFIG.profiles[name])
+                        for name in selected if name in CONFIG.profiles
+                    }
+                    if not include_calibration:
+                        strip_controller_related(data)
+                    if CONFIG.active_profile in data["profiles"]:
+                        data["active_profile"] = CONFIG.active_profile
+                    else:
+                        data["active_profile"] = next(iter(data["profiles"]), CONFIG.active_profile)
+                else:
+                    # Controller related data only - no profiles, no other settings.
+                    data = {
+                        key: value for key, value in data.items()
+                        if key in CONTROLLER_RELATED_CONFIG_KEYS
+                    }
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f, Dumper=_YamlDumper, default_flow_style=False)
+        except Exception as e:
+            self.custom_messagebox("Export", f"Failed to export:\n{e}", type="error")
+            return
+
+        summary = f"Exported {len(selected)} profile(s)." if selected else "Exported controller related data."
+        if selected and include_calibration:
+            summary += "\nController related data included."
+        self.custom_messagebox("Export", summary, type="info")
+
     def on_delete_profile(self):
         if len(CONFIG.profiles) <= 1:
             self.custom_messagebox("Delete Profile", "Cannot delete the last profile.", type="warning")
@@ -13313,10 +13922,9 @@ bg_color=panel_bg, widths=[8, 10])
     def refresh_wired_pro2_status_async(self):
         """Poll for a wired controller, then update the HidHide button.
 
-        WinUSB is not checked or managed here at all: the pads advertise the
-        MS_COMP_WINUSB compatible id so Windows binds it unaided, and no feature
-        depends on that binding anyway. When a pad is present and HidHide is absent,
-        prompt to install HidHide once per session."""
+        WinUSB is not checked or managed by the GUI: the USB transport selects it
+        automatically when available and falls back to HID otherwise. When a pad is
+        present and HidHide is absent, prompt to install HidHide once per session."""
         if getattr(self, '_wired_pro2_refresh_running', False) or getattr(self, 'is_quitting', False):
             return
         self._wired_pro2_refresh_running = True

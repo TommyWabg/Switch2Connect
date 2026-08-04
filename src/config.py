@@ -627,6 +627,8 @@ class Config:
             logger.error(f"Error loading config file: {e}")
 
         self.combine_joycons = config.get("combine_joycons", True)
+        self.system_bt_merged_pair_coordinator = config.get(
+            "system_bt_merged_pair_coordinator", True)
         self.deadzone = config.get("deadzone", 50)
         self.controller_mode = config.get("controller_mode", "Xbox")
         self.ui_scale = float(config.get("ui_scale", 1.0))
@@ -1762,6 +1764,7 @@ class Config:
             'controller_fast_cache': self.controller_fast_cache,
             'controller_fast_cache_entries': self.controller_fast_cache_entries,
             'winrt_cached_services': self.winrt_cached_services,
+            'system_bt_merged_pair_coordinator': self.system_bt_merged_pair_coordinator,
             'winrt_skip_pro2_unsupported_init_0101': self.winrt_skip_pro2_unsupported_init_0101,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,

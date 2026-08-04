@@ -50,13 +50,15 @@ import gc
 from controller import (Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         USBIP_PS5_CONCURRENT_RUMBLE_TEST,
-                        ds_motion_scale)
+                        ds_motion_scale,
+                        ensure_system_bt_merged_file_logging)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
 from audio_endpoint_guard import DualSenseAudioEndpointGuard
 from utils import USBIPAllocator
 from dualsense_structs import DualSenseInputReport01
 from dualsense_haptic import DualSenseHapticProcessor
+from system_bt_pair_rumble import SystemBluetoothPairRumbleCoordinator
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
 logger = logging.getLogger(__name__)
@@ -628,6 +630,79 @@ class VirtualController:
         self._merged_pair = (left, right)
         self._controller_mix_keys = tuple(self._controller_mix_key(c) for c in controllers)
 
+    def _is_system_bt_merged_joycon_pair(self):
+        """Scope guard for the System-Bluetooth merged Joy-Con workaround."""
+        controllers = getattr(self, '_controllers_tuple', ())
+        if len(controllers) != 2 or not getattr(self, '_is_merged_pair', False):
+            return False
+        left, right = getattr(self, '_merged_pair', (None, None))
+        if left is None or right is None or left is right:
+            return False
+        for controller in (left, right):
+            if getattr(controller, 'is_esp32s3_bridge', False):
+                return False
+            if getattr(controller, 'is_wired_usb', False):
+                return False
+        return True
+
+    async def _activate_system_bt_merged_pair(self):
+        if not self._is_system_bt_merged_joycon_pair():
+            return
+        left, right = self._merged_pair
+        current = getattr(self, '_system_bt_pair_controllers', None)
+        if current == (left, right):
+            return
+
+        await self._deactivate_system_bt_merged_pair()
+        ensure_system_bt_merged_file_logging()
+        session_id = f"P{self.player_number}-{time.monotonic_ns()}"
+        self._system_bt_pair_session_id = session_id
+        self._system_bt_pair_controllers = (left, right)
+
+        # Do not retain two aggressive ThroughputOptimized requests for the
+        # lifetime of the pair. Windows documents that this reduces the number
+        # of simultaneous Bluetooth connections. Close legacy/session handles
+        # deterministically if this object was activated by older code.
+        left._close_merged_pair_connection_parameter_request()
+        right._close_merged_pair_connection_parameter_request()
+
+        if getattr(CONFIG, 'system_bt_merged_pair_coordinator', True):
+            coordinator = SystemBluetoothPairRumbleCoordinator(
+                self, left, right, session_id)
+            self._system_bt_pair_rumble_coordinator = coordinator
+            coordinator.start()
+
+        logger.info(
+            "System-BT merged Joy-Con session activated session=%s throughput_request=released",
+            session_id,
+            extra={"system_bt_merged": True})
+
+    async def _deactivate_system_bt_merged_pair(self):
+        coordinator = getattr(self, '_system_bt_pair_rumble_coordinator', None)
+        if coordinator is not None:
+            coordinator.stop()
+            self._system_bt_pair_rumble_coordinator = None
+
+        controllers = getattr(self, '_system_bt_pair_controllers', None) or ()
+        for controller in controllers:
+            controller._close_merged_pair_connection_parameter_request()
+        if controllers:
+            logger.info(
+                "System-BT merged Joy-Con session released session=%s",
+                getattr(self, '_system_bt_pair_session_id', 'unknown'),
+                extra={"system_bt_merged": True})
+        self._system_bt_pair_controllers = None
+        self._system_bt_pair_session_id = None
+
+    def _publish_system_bt_pair_rumble(self, controller, uuid, payload, active,
+                                       sustain=True):
+        if not self._is_system_bt_merged_joycon_pair():
+            return False
+        coordinator = getattr(self, '_system_bt_pair_rumble_coordinator', None)
+        if coordinator is None or not coordinator.owns(controller):
+            return False
+        return coordinator.submit(controller, uuid, payload, active, sustain=sustain)
+
     def _clamp_stick_pair(self, stick):
         return (
             max(-1.0, min(1.0, stick[0])),
@@ -897,8 +972,10 @@ class VirtualController:
             return
         elapsed = now - self._rumble_cb_window_start
         if elapsed >= 1.0:
-            logger.info("Rumble callbacks: %.0f/s (mode=%s driver=%s)",
-                        self._rumble_cb_count / elapsed, self.mode, self.driver_type)
+            logger.info("Rumble callbacks: %.0f/s (mode=%s driver=%s session=%s)",
+                        self._rumble_cb_count / elapsed, self.mode, self.driver_type,
+                        getattr(self, '_system_bt_pair_session_id', 'unknown'),
+                        extra={"system_bt_merged": True})
             self._rumble_cb_count = 0
             self._rumble_cb_window_start = now
 
@@ -1564,6 +1641,8 @@ class VirtualController:
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
     def vibration_callback(self, client, target, large_motor, small_motor, led_number, user_data):
+        if self._is_system_bt_merged_joycon_pair():
+            self._count_rumble_callback()
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading
@@ -1809,6 +1888,25 @@ class VirtualController:
 
         now = time.perf_counter()
         with self.vibration_lock:
+            # A single DualSense compatibility-rumble report has no guaranteed
+            # matching stop report. For a merged Joy-Con pair on System Bluetooth,
+            # expire the ordinary source after the same 150 ms source watchdog used
+            # by the other rumble paths. Continuous effects keep renewing
+            # _last_ordinary_rumble_time with each host report.
+            ordinary_last = getattr(self, '_last_ordinary_rumble_time', 0)
+            if (
+                self._is_system_bt_merged_joycon_pair() and
+                getattr(self, 'traditional_rumble_active', False) and
+                ordinary_last > 0 and
+                now - ordinary_last > SWITCH_RUMBLE_TIMEOUT
+            ):
+                logger.info(
+                    "Merged System-BT single-packet rumble expired after %.0fms",
+                    SWITCH_RUMBLE_TIMEOUT * 1000.0,
+                    extra={"system_bt_merged": True},
+                )
+                self._clear_traditional_rumble_locked()
+
             pending = getattr(self, '_trad_rumble_pending_stop_at', None)
             if (pending is not None and now >= pending and
                     getattr(self, 'traditional_rumble_active', False)):
@@ -2013,10 +2111,29 @@ class VirtualController:
                     self.vibration_dirty_r = False
                 self.cycle_start_time = time.perf_counter()
             else:
+                now = time.perf_counter()
                 side_last_active = getattr(self,
                     'last_haptic_l_active_time' if is_left else 'last_haptic_r_active_time', 0)
                 sl = side_latest
-                if side_last_active > 0 and time.perf_counter() - side_last_active > SWITCH_RUMBLE_TIMEOUT:
+                audio_haptic_expired = (
+                    side_last_active > 0 and
+                    now - side_last_active > SWITCH_RUMBLE_TIMEOUT
+                )
+                # The ordinary scheduler reads side_latest on every tick. Without
+                # this source watchdog, one host rumble packet is indistinguishable
+                # from a continuous effect and perpetually renews the pair
+                # coordinator's hold-last payload. Limit this behavior strictly to
+                # merged Joy-Con over System Bluetooth; all other transports retain
+                # their existing semantics.
+                traditional_last_active = getattr(self, 'last_rumble_active_time', 0)
+                traditional_expired = (
+                    self._is_system_bt_merged_joycon_pair() and
+                    traditional_last_active > 0 and
+                    now - traditional_last_active > SWITCH_RUMBLE_TIMEOUT and
+                    not (side_last_active > 0 and
+                         now - side_last_active <= SWITCH_RUMBLE_TIMEOUT)
+                )
+                if audio_haptic_expired or traditional_expired:
                     sl = _zero_vibration()
                 v1 = _copy_vibration(sl)
                 v2 = _copy_vibration(sl)
@@ -2698,6 +2815,7 @@ class VirtualController:
 
         controller.set_input_report_callback(wrapped_callback)
         controller.gyro_fusion_callback = self.gyro_fusion_callback
+        await self._activate_system_bt_merged_pair()
 
 
     def _build_switch1_report(self, inputData: ControllerInputData, buttons: int, controller, device_type: str):
@@ -3796,6 +3914,7 @@ class VirtualController:
             if not getattr(self, 'running', False) and self.vg_controller is None and not self.controllers:
                 return
                 
+            await self._deactivate_system_bt_merged_pair()
             self.running = False
             import time
             current_time = time.strftime("%H:%M:%S")
@@ -3864,6 +3983,9 @@ class VirtualController:
     async def remove_controller(self, controller: Controller, clear_mac_port: bool = False) -> bool:
         if controller not in self.controllers:
             return False
+
+        if self._is_system_bt_merged_joycon_pair():
+            await self._deactivate_system_bt_merged_pair()
             
         self.controllers.remove(controller)
         # Drop the back-reference set in init_added_controller(). Any rumble-scheduler tick

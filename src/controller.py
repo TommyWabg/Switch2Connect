@@ -69,21 +69,64 @@ from ir_mouse_activation import (
 # thread, which then stops reading ISO OUT submits and the audio endpoint halt-storms.
 import atexit as _atexit
 import queue as _queue
-from logging.handlers import QueueHandler as _QueueHandler, QueueListener as _QueueListener
+from logging.handlers import (
+    QueueHandler as _QueueHandler,
+    QueueListener as _QueueListener,
+    RotatingFileHandler as _RotatingFileHandler,
+)
 
 _log_queue = _queue.SimpleQueue()          # unbounded; put() never blocks
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(logging.Formatter(
     fmt='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
     datefmt='%H:%M:%S'))
+
+
+class _SystemBTMergedLogFilter(logging.Filter):
+    def filter(self, record):
+        return bool(getattr(record, "system_bt_merged", False))
+
+
+_merged_bt_file_handler = None
+_merged_bt_file_handler_lock = threading.Lock()
 _root_logger = logging.getLogger()
 for _h in list(_root_logger.handlers):
     _root_logger.removeHandler(_h)
 _root_logger.addHandler(_QueueHandler(_log_queue))
 _root_logger.setLevel(logging.INFO)
-_log_listener = _QueueListener(_log_queue, _console_handler, respect_handler_level=False)
+_log_listener = _QueueListener(_log_queue, _console_handler, respect_handler_level=True)
 _log_listener.start()
 _atexit.register(_log_listener.stop)
+
+
+def ensure_system_bt_merged_file_logging():
+    """Create the scoped rotating log only when a target pair is activated."""
+    global _merged_bt_file_handler
+    if _merged_bt_file_handler is not None:
+        return
+    with _merged_bt_file_handler_lock:
+        if _merged_bt_file_handler is not None:
+            return
+        try:
+            log_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            handler = _RotatingFileHandler(
+                os.path.join(log_dir, "system_bt_merged_joycon.log"),
+                maxBytes=2 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            handler.setLevel(logging.INFO)
+            handler.addFilter(_SystemBTMergedLogFilter())
+            handler.setFormatter(logging.Formatter(
+                fmt='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
+                datefmt='%H:%M:%S'))
+            _merged_bt_file_handler = handler
+            # QueueListener reads this immutable tuple on every record; replacing
+            # the reference is atomic and does not disturb the listener thread.
+            _log_listener.handlers = tuple(_log_listener.handlers) + (handler,)
+        except Exception:
+            _merged_bt_file_handler = None
 # Bleak's WinRT scanner logs every received advertisement at DEBUG and is extremely
 # noisy; keep it quiet even if the root level is lowered for debugging (matches 0.10.1).
 logging.getLogger("bleak").setLevel(logging.WARNING)
@@ -2134,24 +2177,37 @@ class Controller:
         self.last_input_time = time.time()
 
     async def trigger_connection_haptics(self):
+        stop_vibration = VibrationData()
         try:
             bass_thump = VibrationData(lf_freq=0x060, lf_amp=0x350, hf_freq=0x0c0, hf_amp=0x250)
             sharp_click = VibrationData(hf_freq=0x1e2, hf_amp=0x300, lf_amp=0x030)
-            stop_vibration = VibrationData() 
 
-            await self.set_vibration(bass_thump, ignore_freq_scaling=True)
+            await self.set_vibration(
+                bass_thump, ignore_freq_scaling=True, pair_sustain=False)
             await asyncio.sleep(0.2) 
             
-            await self.set_vibration(stop_vibration, ignore_freq_scaling=True)
+            await self.set_vibration(
+                stop_vibration, ignore_freq_scaling=True, pair_sustain=False)
             await asyncio.sleep(0.01) 
             
-            await self.set_vibration(sharp_click, ignore_freq_scaling=True)
+            await self.set_vibration(
+                sharp_click, ignore_freq_scaling=True, pair_sustain=False)
             await asyncio.sleep(1.0) 
             
-            await self.set_vibration(stop_vibration, ignore_freq_scaling=True)
             logger.info(f"Controller {self.device.address}: Connection haptic feedback triggered.")
         except Exception as e:
             logger.warning(f"Failed to trigger haptic feedback for {self.device.address}: {e}")
+        finally:
+            # Do not leave a hold-last payload behind if the effect task is
+            # cancelled or one of its sleeps/writes fails.
+            try:
+                await asyncio.shield(
+                    self.set_vibration(
+                        stop_vibration, ignore_freq_scaling=True,
+                        pair_sustain=False))
+            except Exception as e:
+                logger.warning(
+                    f"Failed to stop connection haptic for {self.device.address}: {e}")
 
     async def connect(self):
         async with BLE_CONNECTION_LOCK:
@@ -2204,6 +2260,8 @@ class Controller:
         logger.info(f"Controller {self.device.address}: Suspending interpolation...")
         self.interp_running = False
         self._stop_worker_threads()
+        # Only merged System-BT pair sessions ever create this attribute.
+        self._close_merged_pair_connection_parameter_request()
 
         # Join the interpolation thread if it exists and is running
         if hasattr(self, 'interp_thread') and self.interp_thread.is_alive():
@@ -2308,6 +2366,38 @@ class Controller:
             return False
         return True
 
+    def _merged_system_bt_scope(self):
+        """True only for an established System-BT Left+Right Joy-Con pair."""
+        vc = getattr(self, 'virtual_controller', None)
+        predicate = getattr(vc, '_is_system_bt_merged_joycon_pair', None)
+        return bool(predicate and predicate())
+
+    def _close_merged_pair_connection_parameter_request(self):
+        request = getattr(self, '_merged_pair_conn_param_request', None)
+        if request is None:
+            return
+        self._merged_pair_conn_param_request = None
+        try:
+            close = getattr(request, 'close', None)
+            if callable(close):
+                close()
+            else:
+                dispose = getattr(request, 'dispose', None)
+                if callable(dispose):
+                    dispose()
+            logger.info(
+                "Released merged System-BT preferred-parameters request address=%s",
+                getattr(self.device, 'address', 'unknown'),
+                extra={"system_bt_merged": True},
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to release merged System-BT preferred-parameters request address=%s: %s",
+                getattr(self.device, 'address', 'unknown'),
+                exc,
+                extra={"system_bt_merged": True},
+            )
+
     def _bridge_rumble_due(self):
         """Rate-gate only transports that require their own rumble cadence.
 
@@ -2364,7 +2454,7 @@ class Controller:
         future.add_done_callback(lambda _f: self._end_rumble_dispatch())
         return True
 
-    def _count_rumble_write(self):
+    def _count_rumble_write(self, merged_session=None, side=None):
         """Report how many rumble writes actually reach the link, once per second.
 
         This is the number that separates a saturated link from a blocked driver: issuing
@@ -2380,14 +2470,17 @@ class Controller:
             return
         elapsed = now - window_start
         if elapsed >= BT_RUMBLE_RATE_LOG_INTERVAL:
+            extra = {"system_bt_merged": True} if merged_session is not None else None
             logger.info(
-                "Rumble writes: %.0f/s on %s",
+                "Rumble writes: %.0f/s on %s%s",
                 self._rumble_write_count / elapsed,
-                getattr(self.device, 'address', 'unknown'))
+                getattr(self.device, 'address', 'unknown'),
+                (f" session={merged_session} side={side}" if merged_session is not None else ""),
+                extra=extra)
             self._rumble_write_count = 0
             self._rumble_write_window_start = now
 
-    def _warn_slow_rumble_write(self, elapsed, timed_out=False):
+    def _warn_slow_rumble_write(self, elapsed, timed_out=False, merged_session=None, side=None):
         """Report a backing-up BLE write queue, at most once every few seconds.
 
         Write latency is the signal that separates a healthy session from a frozen
@@ -2402,9 +2495,68 @@ class Controller:
         self._last_slow_rumble_write_warn = now
         logger.warning(
             "Bluetooth rumble write %s after %.0f ms on %s -- the BLE write queue is "
-            "backing up and input delivery may stutter",
+            "backing up and input delivery may stutter%s",
             "timed out" if timed_out else "was slow",
-            elapsed * 1000, getattr(self.device, 'address', 'unknown'))
+            elapsed * 1000, getattr(self.device, 'address', 'unknown'),
+            (f" session={merged_session} side={side}" if merged_session is not None else ""),
+            extra=({"system_bt_merged": True} if merged_session is not None else None))
+
+    async def _write_merged_system_bt_rumble(self, uuid, payload, pair_session_id, side):
+        """Perform one pair-coordinator-granted GATT write for this side."""
+        started = time.perf_counter()
+        self._count_rumble_write(pair_session_id, side)
+        try:
+            await asyncio.wait_for(
+                self.client.write_gatt_char(uuid, payload, response=False),
+                timeout=BT_RUMBLE_WRITE_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._warn_slow_rumble_write(
+                BT_RUMBLE_WRITE_TIMEOUT, timed_out=True,
+                merged_session=pair_session_id, side=side)
+            return False
+        except Exception as exc:
+            now = time.perf_counter()
+            if now - getattr(self, '_last_merged_rumble_failure_warn', 0.0) >= BT_RUMBLE_WRITE_WARN_INTERVAL:
+                self._last_merged_rumble_failure_warn = now
+                logger.warning(
+                    "Merged System-BT rumble write failed session=%s side=%s address=%s: %s",
+                    pair_session_id, side, getattr(self.device, 'address', 'unknown'), exc,
+                    extra={"system_bt_merged": True})
+            return False
+        else:
+            elapsed = time.perf_counter() - started
+            if elapsed >= BT_RUMBLE_WRITE_SLOW_WARN:
+                self._warn_slow_rumble_write(
+                    elapsed, merged_session=pair_session_id, side=side)
+            return True
+
+    def _count_merged_pair_input_notification(self):
+        if not self._merged_system_bt_scope():
+            return
+        now = time.perf_counter()
+        previous = getattr(self, '_merged_input_last_rt', 0.0)
+        gap = now - previous if previous else 0.0
+        self._merged_input_last_rt = now
+        self._merged_input_count = getattr(self, '_merged_input_count', 0) + 1
+        self._merged_input_max_gap = max(getattr(self, '_merged_input_max_gap', 0.0), gap)
+        start = getattr(self, '_merged_input_window_start', 0.0)
+        if start == 0.0:
+            self._merged_input_window_start = now
+            return
+        elapsed = now - start
+        if elapsed >= 1.0:
+            vc = getattr(self, 'virtual_controller', None)
+            session_id = getattr(vc, '_system_bt_pair_session_id', 'unknown')
+            side = 'Left' if self.is_joycon_left() else 'Right'
+            logger.info(
+                "Input notifications: %.0f/s max_gap=%.1fms session=%s side=%s address=%s",
+                self._merged_input_count / elapsed,
+                self._merged_input_max_gap * 1000.0,
+                session_id, side, getattr(self.device, 'address', 'unknown'),
+                extra={"system_bt_merged": True})
+            self._merged_input_count = 0
+            self._merged_input_max_gap = 0.0
+            self._merged_input_window_start = now
 
     def _begin_rumble_dispatch(self):
         with self._rumble_inflight_lock:
@@ -2857,7 +3009,7 @@ class Controller:
             self._audio_haptic_sender_thread = sender_thread
             sender_thread.start()
 
-    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None, impulse_overlay = None, impulse_overlay_r = None):
+    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None, impulse_overlay = None, impulse_overlay_r = None, pair_sustain = True):
         strength = getattr(CONFIG, "vibration_strength", 5)
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
@@ -3207,6 +3359,21 @@ class Controller:
                         self.vibration_packet_id += 1
                         return
 
+            vc = getattr(self, 'virtual_controller', None)
+            publish_pair = getattr(vc, '_publish_system_bt_pair_rumble', None)
+            if publish_pair is not None and self._merged_system_bt_scope():
+                active = any(
+                    int(getattr(frame, 'lf_amp', 0)) > 0 or
+                    int(getattr(frame, 'hf_amp', 0)) > 0
+                    for frame in (v1, v2, v3)
+                )
+                if publish_pair(
+                        self, uuid_to_use, payload, active,
+                        sustain=pair_sustain):
+                    # The pair coordinator stamps and advances the rolling packet id
+                    # only when a physical write is actually dispatched.
+                    return
+
             if self._uses_bt_rumble_pacing():
                 # Backstop only for merged Joy-Con on System Bluetooth. Those two
                 # links share the event budget and a stalled write can freeze input.
@@ -3330,6 +3497,8 @@ class Controller:
         def input_report_callback(sender, data):
             if getattr(self, 'suspended', False) or getattr(self, '_is_suspending', False):
                 return
+
+            self._count_merged_pair_input_notification()
 
             # Debug log for the first few packets to see what's being sent on wake
             if not hasattr(self, '_packet_count'): self._packet_count = 0

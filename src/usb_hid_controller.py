@@ -47,11 +47,10 @@ triggers keep working; only motion data is lost.  ``input_transport`` says which
 mode is actually live, and it is set from the report id that arrived -- never
 inferred from a command write having succeeded.
 
-Rumble needs none of that.  The official console drives GameCube vibration over the
-ordinary HID interrupt OUT endpoint as output report 0x03 (confirmed from a
-wire-level capture of the console itself), exactly as it drives the Pro Controller 2
-with report 0x02 -- so vibration works on the HID interface alone, with no
-vendor-interface driver.
+GameCube rumble follows the same transport priority as startup: a verified vendor
+interface is tried first, then a failed or unavailable interface 1 falls back to HID
+output report 0x03 on interface 0.  The HID encoding is confirmed from a wire-level
+capture of the official console. Pro Controller 2 rumble remains on HID report 0x02.
 
 GameCube notes: the NSO GameCube Controller speaks the very same command framing and
 differs only in (a) its input report id (0x0A instead of 0x09), (b) its output report
@@ -1295,6 +1294,9 @@ class _UsbHidClient:
         # Kept separate from the command/input transports so one route working is
         # never mistaken for all of them working.
         self.rumble_transport = "none"
+        # Once interface 1 rejects a GameCube rumble write, keep this connection on
+        # interface 0. Retrying bulk for every frame would add latency and log spam.
+        self._gc_bulk_rumble_failed = False
         # Set by USBHidController.initialize() to the route that actually delivered the
         # startup commands. That is the only evidence we have that the vendor endpoint
         # is reachable, and it is what decides where GameCube rumble goes.
@@ -2095,6 +2097,18 @@ class _UsbHidClient:
         return self.command_transport in ("native_winusb", "pyusb")
 
     def _write_rumble_frame(self, data):
+        # GameCube uses the command interface whenever startup proved it reachable.
+        # If the bulk write fails, send the same motor state through HID interface 0
+        # immediately so a transient or missing WinUSB binding does not lose rumble.
+        if (self.is_gamecube and not self._gc_bulk_rumble_failed
+                and self.bulk_rumble_available()):
+            if self.write_rumble_command(data):
+                return
+            self._gc_bulk_rumble_failed = True
+            self.rumble_transport = "none"
+            logger.warning(
+                "Wired USB GameCube interface-1 rumble failed; falling back to HID interface 0")
+
         t0 = time.perf_counter()
         previous_wire_start = self._rumble_trace_last_wire_start
         previous_wire_active = self._rumble_trace_last_wire_active
@@ -2147,9 +2161,8 @@ class _UsbHidClient:
 
         # hidapi's device.write() returns the byte count on success and -1 on failure.
         if written is not None and written > 0:
-            # NOTE: for the GameCube this only means the OS queued the report. Whether
-            # For the GameCube this is the same route the console itself uses, so a
-            # successful write is as good a signal as the protocol offers.
+            # For GameCube this proves only that the OS queued the fallback report;
+            # the USB protocol has no acknowledgement that the motor physically moved.
             self.rumble_transport = "hid_output"
             self._hid_rumble_ok = True
             self._hid_rumble_fail_streak = 0
@@ -2160,25 +2173,18 @@ class _UsbHidClient:
         self._hid_rumble_fail_streak += 1
         self._stall_streak += 1
 
-        # Only fall back to the expensive Bulk/WinUSB path when the device has NEVER
-        # accepted a hid report (init-time transport probe). Once hid writes have
-        # succeeded, a failure is a stall to be healed by reopen -- not a reason to
-        # hammer set_configuration() on interface 1 (which makes recovery impossible).
+        # Pro Controller 2 keeps its bounded init-time Bulk/WinUSB fallback when HID
+        # has never accepted a report. GameCube already tried interface 1 before HID
+        # at the top of this method, so it must not retry bulk after the fallback fails.
         #
         # Also bounded in time. _hid_rumble_ok never flipping true used to mean this ran
         # every 0.5 s for the whole session; on a machine without the WinUSB binding that
         # is an endless stream of libusb round-trips against the composite device. It is a
         # transport probe, so a few seconds after connect is all it is good for.
         now = time.time()
-        # The GameCube keeps the bulk route as a real fallback rather than an
-        # init-time probe: report 0x03 is its primary path, but if those writes are
-        # being rejected the vendor endpoint is the only way left to reach the motor.
-        # Still rate-limited, just not retired after three seconds.
-        gc_bulk = (self.is_gamecube and self.bulk_rumble_available()
-                   and now - self._last_bulk_fallback >= 0.5)
-        if gc_bulk or (not self._hid_rumble_ok
-                       and now - self._connected_at <= self._BULK_FALLBACK_WINDOW
-                       and now - self._last_bulk_fallback >= 0.5):
+        if (not self.is_gamecube and not self._hid_rumble_ok
+                and now - self._connected_at <= self._BULK_FALLBACK_WINDOW
+                and now - self._last_bulk_fallback >= 0.5):
             self._last_bulk_fallback = now
             self.write_rumble_command(data)
             return
@@ -2210,15 +2216,20 @@ class _UsbHidClient:
         if self.is_gamecube:
             # Already a complete USB vibration command; just push it over the vendor
             # bulk endpoint, deduplicated the same way as the Pro Controller 2 path.
-            if data != self._last_usb_rumble_command or (
-                    active and now - self._last_usb_rumble_refresh >= 0.1):
+            should_send = (data != self._last_usb_rumble_command or
+                           (active and now - self._last_usb_rumble_refresh >= 0.1))
+            if should_send:
                 if send_pro_controller2_usb_command(bytes(data), self.product_id,
-                                                    self.transport, require_unique=True):
+                                                     self.transport, require_unique=True):
                     self.rumble_transport = "bulk"
                     self._last_usb_rumble_active = active
                     self._last_usb_rumble_refresh = now
                     self._last_usb_rumble_command = bytes(data)
-            return
+                    return True
+                return False
+            # A deduplicated command still means the interface-1 route is live;
+            # its last accepted motor state remains in effect.
+            return True
         command = _pro2_usb_vibration_command(data)
         if command == self._last_usb_rumble_command and (not active or now - self._last_usb_rumble_refresh < 0.1):
             raw_sent = False
@@ -2236,6 +2247,7 @@ class _UsbHidClient:
             if send_pro_controller2_usb_command(sample_command):
                 self._last_usb_sample_command = sample_command
                 self._last_usb_sample_refresh = now
+        return bool(raw_sent)
 
     def write_output_report(self, data, report_id=None, raw_body=False):
         # Never re-open here. This used to call open(), so a writer that outlived
