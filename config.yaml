@@ -14,9 +14,7 @@ button_remaps:
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
-    joycon_hold_mode:
-      E0:EF:BF:EF:CC:BD: Vertical
-      E0:EF:BF:F0:0E:17: Vertical
+    joycon_hold_mode: {}
     rumble_mode: Xbox
     sll_mapping: Default
     slr_mapping: PS_R_Touch
@@ -34,9 +32,7 @@ button_remaps:
     gl_mapping: PS_L_Touch
     gr_mapping: PS_R_Touch
     home_mapping: Default
-    joycon_hold_mode:
-      E0:EF:BF:EF:CC:BD: Vertical
-      E0:EF:BF:F0:0E:17: Vertical
+    joycon_hold_mode: {}
     rumble_mode: Switch
     sll_mapping: Default
     slr_mapping: PS_R_Touch
@@ -54,9 +50,7 @@ button_remaps:
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Custom[Hold]:VK_ESCAPE
-    joycon_hold_mode:
-      E0:EF:BF:EF:CC:BD: Vertical
-      E0:EF:BF:F0:0E:17: Horizontal
+    joycon_hold_mode: {}
     rumble_mode: Switch
     sll_mapping: Default
     slr_mapping: Default
@@ -73,9 +67,7 @@ button_remaps:
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
-    joycon_hold_mode:
-      E0:EF:BF:EF:CC:BD: Vertical
-      E0:EF:BF:F0:0E:17: Vertical
+    joycon_hold_mode: {}
     rumble_mode: Switch
     sll_mapping: Default
     slr_mapping: GR
@@ -93,9 +85,7 @@ button_remaps:
     gl_mapping: Default
     gr_mapping: Default
     home_mapping: Default
-    joycon_hold_mode:
-      E0:EF:BF:EF:CC:BD: Vertical
-      E0:EF:BF:F0:0E:17: Vertical
+    joycon_hold_mode: {}
     rumble_mode: Xbox
     sll_mapping: Default
     slr_mapping: Default
@@ -106,91 +96,14 @@ button_remaps:
     vibration_strength_switch: 5
     vibration_strength_xbox: 5
 c_mapping: Default
-calibration_data:
-  E0:EF:BF:81:06:9F: &id001
-  - 5.63963963963964
-  - -17.02252252252252
-  - 0.11861861861861862
-  E0:EF:BF:EF:CC:BD:
-  - 3.5403348554033487
-  - -9.270928462709284
-  - 11.19330289193303
-  E0:EF:BF:F0:0E:17:
-  - -1.4772727272727273
-  - 1.1348484848484848
-  - 4.36969696969697
-  E0EFBF81069F: *id001
-  E10000066586: *id001
-  HEK10000066586: *id001
 capt_mapping: Default
-cemuhook_mac_to_pad:
-  E0EFBF81069F: 2
-  E0EFBFEFCCBD: 1
-  E0EFBFF00E17: 0
 cemuhook_pad_overwrite_idx: 0
 change_profile_mode: Auto
-controller_calibration_aliases: {}
 controller_fast_cache: true
-controller_fast_cache_entries:
-  E0:EF:BF:81:06:9F:
-    controller_info_hex: 010048454b313030303030363635383600007e056920010601232323a0a0a0e6e6e6323232ffffffffffffffffffffffffffffffffffffffffffffffffffffff
-    product_id: 8297
-    schema: 1
-    stick_primary:
-      center:
-      - 1944
-      - 2093
-      max:
-      - 1601
-      - 1596
-      min:
-      - 1603
-      - 1525
-    stick_secondary:
-      center:
-      - 2101
-      - 2081
-      max:
-      - 1581
-      - 1619
-      min:
-      - 1518
-      - 1557
-  E0:EF:BF:EF:CC:BD:
-    controller_info_hex: 010048434b313130303233353433333600007e056620010802323232aaaaaaff8c5f323232ffffffffffffffffffffff
-    product_id: 8294
-    schema: 1
-    stick_primary:
-      center:
-      - 2041
-      - 2031
-      max:
-      - 1186
-      - 1174
-      min:
-      - 1189
-      - 1225
-    stick_secondary: null
-  E0:EF:BF:F0:0E:17:
-    controller_info_hex: 010048424b313130303531373836353600007e056720010802323232aaaaaa9be1e6323232ffffffffffffffffffffff
-    product_id: 8295
-    schema: 1
-    stick_primary:
-      center:
-      - 2053
-      - 2141
-      max:
-      - 1167
-      - 1235
-      min:
-      - 1191
-      - 1176
-    stick_secondary: null
 driver_installed: false
 driver_type: WinUHid
 gc_l_click_mapping: Default
 gc_r_click_mapping: Default
-gc_trigger_calibration_data: {}
 gc_trigger_mode: 100% at Max
 gcn_rumble_brake_enabled: false
 gcn_rumble_brake_threshold: 0.65
@@ -202,14 +115,6 @@ gcn_rumble_right_weight: 0.45
 gl_mapping: PS_L_Touch
 gr_mapping: PS_R_Touch
 gyro_activation_mode: Hold
-gyro_bias_l:
-- -1.4772727272727273
-- 1.1348484848484848
-- 4.36969696969697
-gyro_bias_r:
-- 5.63963963963964
-- -17.02252252252252
-- 0.11861861861861862
 gyro_mode: World
 gyro_passthrough_mode: Cemuhook
 gyro_sensitivity: 4.0
@@ -218,48 +123,6 @@ hidhide_install_prompt_suppressed: false
 hidhide_installed: true
 home_mapping: Default
 in_app_gyro_soft_deadzone: 0.0
-joycon_hold_mode: &id012 {}
-joystick_calibration_data:
-  '00': &id002
-    left:
-      center:
-      - 1982
-      - 2154
-      max:
-      - 1810
-      - 1511
-      min:
-      - 1650
-      - 1693
-    right:
-      center:
-      - 2136
-      - 2091
-      max:
-      - 1509
-      - 1646
-      min:
-      - 1659
-      - 1669
-  849896F74C2D: *id002
-mag_calibration_data:
-  E0:EF:BF:81:06:9F: &id003
-  - -14.5
-  - -98.0
-  - -46.0
-  E0:EF:BF:EF:CC:BD:
-  - -330.5
-  - -11.0
-  - -445.5
-  E0:EF:BF:F0:0E:17:
-  - -179.5
-  - 231.5
-  - -264.0
-  E0EFBF81069F: *id003
-  E10000066586: *id003
-  HEK10000066586: *id003
-merged_gyro_side:
-  E0:EF:BF:F0:0E:17+E0:EF:BF:EF:CC:BD: Right
 mouse:
   enabled: false
   ir_activate_threshold: 2
@@ -293,6 +156,7 @@ profiles:
   DJG Demo:
     _mode_shift_enabled_migration_v1: true
     adaptive_triggers_enabled: true
+    assigned_apps: []
     audio_haptics_enabled: true
     cemuhook_sensitivity: 1
     change_profile_list: true
@@ -300,7 +164,7 @@ profiles:
     djg_dominant_side: Left
     djg_enabled: true
     djg_mode: Switch Dominant Side
-    driver_type: WinUHid
+    driver_type: USBIP
     gyro_activation_mode: Hold
     gyro_control_mode: Mouse
     gyro_mode: World
@@ -340,6 +204,49 @@ profiles:
         gl_mapping: PS_L_Touch
         gr_mapping: PS_R_Touch
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 2
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 2
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -380,18 +287,44 @@ profiles:
         left:
           activate_threshold: 2
           function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
           ir_mouse:
-            left_click: L
-            middle_click: None
-            right_click: ZL
+            left_click:
+            - L
+            middle_click: []
+            raw_input: false
+            right_click:
+            - ZL
             sensitivity: 4.0
         right:
           activate_threshold: 2
           function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
           ir_mouse:
-            left_click: R
-            middle_click: None
-            right_click: ZR
+            left_click:
+            - R
+            middle_click: []
+            raw_input: false
+            right_click:
+            - ZR
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
@@ -470,6 +403,49 @@ profiles:
         gl_mapping: PS_L_Touch
         gr_mapping: PS_R_Touch
         home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 2
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 2
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZR
+              sensitivity: 4.0
         l_joystick_custom:
           down: Default
           left: Default
@@ -510,18 +486,44 @@ profiles:
         left:
           activate_threshold: 2
           function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
           ir_mouse:
-            left_click: L
-            middle_click: None
-            right_click: ZL
+            left_click:
+            - L
+            middle_click: []
+            raw_input: false
+            right_click:
+            - ZL
             sensitivity: 4.0
         right:
           activate_threshold: 2
           function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
           ir_mouse:
-            left_click: R
-            middle_click: None
-            right_click: ZR
+            left_click:
+            - R
+            middle_click: []
+            raw_input: false
+            right_click:
+            - ZR
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
@@ -586,7 +588,7 @@ profiles:
       down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
-      gc_trigger_mode: Hair Trigger
+      gc_trigger_mode: 100% at Max
       gl_mapping: PS_L_Touch
       gr_in_app_gyro_dampening_amount_mapping: 90
       gr_in_app_gyro_dampening_effect_after_released_ms_mapping: 200
@@ -1263,10 +1265,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id004 []
+              dampening_mode: &id001 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id005 []
+              deadzone_mode: &id002 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1284,10 +1286,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id004
+              dampening_mode: *id001
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id005
+              deadzone_mode: *id002
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1342,10 +1344,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id006 []
+            dampening_mode: &id003 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id007 []
+            deadzone_mode: &id004 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1363,10 +1365,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id006
+            dampening_mode: *id003
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id007
+            deadzone_mode: *id004
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1463,10 +1465,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id008 []
+              dampening_mode: &id005 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id009 []
+              deadzone_mode: &id006 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1484,10 +1486,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id008
+              dampening_mode: *id005
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id009
+              deadzone_mode: *id006
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1542,10 +1544,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id010 []
+            dampening_mode: &id007 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id011 []
+            deadzone_mode: &id008 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1563,10 +1565,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id010
+            dampening_mode: *id007
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id011
+            deadzone_mode: *id008
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1735,7 +1737,7 @@ profiles:
         y_mapping: Default
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
-      joycon_hold_mode: *id012
+      joycon_hold_mode: {}
       joycon_ir_sensor:
         left:
           activate_threshold: 1
@@ -1843,6 +1845,205 @@ profiles:
       abxy_mode: Switch
       b_mapping: Default
       c_mapping: Calibration
+      capt_mapping: Default
+      down_mapping: Default
+      gc_l_click_mapping: Default
+      gc_r_click_mapping: Default
+      gc_trigger_mode: Hair Trigger
+      gl_mapping: Default
+      gr_mapping: Default
+      home_mapping: Default
+      in_app_gyro_mode_mappings:
+        a_mapping: Default
+        b_mapping: Default
+        c_mapping: Default
+        capt_mapping: Default
+        down_mapping: Default
+        gc_l_click_mapping: Custom[Hold]:MB_3
+        gc_r_click_mapping: Custom[Hold]:MB_1
+        gc_trigger_mode: Hair Trigger
+        gl_mapping: Default
+        gr_mapping: Default
+        home_mapping: Default
+        joycon_ir_sensor:
+          left:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: &id009 []
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: &id010 []
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - L
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZL
+              sensitivity: 4.0
+          right:
+            activate_threshold: 1
+            function: Default
+            in_app_gyro:
+              dampening_amount: 90
+              dampening_effect_after_released_ms: 200
+              dampening_mode: *id009
+              deadzone_amount: 15.0
+              deadzone_effect_after_released_ms: 200
+              deadzone_mode: *id010
+              deadzone_pause_after_pressed_ms: 100
+              deadzone_pause_after_released_ms: 100
+              simul: None
+            ir_mouse:
+              left_click:
+              - R
+              middle_click: []
+              raw_input: false
+              right_click:
+              - ZR
+              sensitivity: 4.0
+        l_joystick_custom:
+          down: Default
+          left: Default
+          right: Default
+          up: Default
+        l_joystick_mapping: Default
+        l_joystick_mouse_sensitivity: 5.0
+        l_joystick_scroll_activation: Hold
+        l_joystick_scroll_mode: Up/Down
+        l_mapping: Default
+        l_stk_mapping: Default
+        left_mapping: Default
+        minus_mapping: Default
+        plus_mapping: Default
+        r_joystick_custom:
+          down: Default
+          left: Default
+          right: Default
+          up: Default
+        r_joystick_mapping: Mouse
+        r_joystick_mouse_sensitivity: 5.0
+        r_joystick_scroll_activation: Hold
+        r_joystick_scroll_mode: Up/Down
+        r_mapping: Default
+        r_stk_mapping: Default
+        right_mapping: Default
+        sll_mapping: Default
+        slr_mapping: Default
+        srl_mapping: Default
+        srr_mapping: Default
+        up_mapping: Default
+        x_mapping: Default
+        y_mapping: Default
+        zl_mapping: Custom[Hold]:MB_3
+        zr_mapping: Custom[Hold]:MB_1
+      joycon_hold_mode: {}
+      joycon_ir_sensor:
+        left:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: &id011 []
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: &id012 []
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - L
+            middle_click: []
+            raw_input: false
+            right_click:
+            - ZL
+            sensitivity: 4.0
+        right:
+          activate_threshold: 1
+          function: Default
+          in_app_gyro:
+            dampening_amount: 90
+            dampening_effect_after_released_ms: 200
+            dampening_mode: *id011
+            deadzone_amount: 15.0
+            deadzone_effect_after_released_ms: 200
+            deadzone_mode: *id012
+            deadzone_pause_after_pressed_ms: 100
+            deadzone_pause_after_released_ms: 100
+            simul: None
+          ir_mouse:
+            left_click:
+            - R
+            middle_click: []
+            raw_input: false
+            right_click:
+            - ZR
+            sensitivity: 4.0
+      joystick_deadzone_settings:
+        joycon:
+          left: 3
+          linked: true
+          right: 3
+        nso_gamecube_controller:
+          left: 3
+          linked: true
+          right: 3
+        pro_controller:
+          left: 3
+          linked: true
+          right: 3
+      l_joystick_custom:
+        down: Default
+        left: Default
+        right: Default
+        up: Default
+      l_joystick_mapping: Default
+      l_joystick_mouse_sensitivity: 5.0
+      l_joystick_scroll_activation: Hold
+      l_joystick_scroll_mode: Up/Down
+      l_mapping: Default
+      l_stk_mapping: Default
+      left_mapping: Default
+      minus_mapping: Default
+      plus_mapping: Default
+      r_joystick_custom:
+        down: Default
+        left: Default
+        right: Default
+        up: Default
+      r_joystick_mapping: Default
+      r_joystick_mouse_sensitivity: 5.0
+      r_joystick_scroll_activation: Hold
+      r_joystick_scroll_mode: Up/Down
+      r_mapping: Default
+      r_stk_mapping: Default
+      right_mapping: Default
+      rumble_mode: Switch
+      sll_mapping: Default
+      slr_mapping: Default
+      srl_mapping: Default
+      srr_mapping: Change Profile
+      up_mapping: Default
+      vibration_frequency: 10
+      vibration_strength_switch: 5
+      vibration_strength_xbox: 5
+      x_mapping: Default
+      y_mapping: Default
+      zl_mapping: Default
+      zr_mapping: Default
+    switch2:
+      a_mapping: Default
+      abxy_mode: Switch
+      b_mapping: Default
+      c_mapping: Default
       capt_mapping: Default
       down_mapping: Default
       gc_l_click_mapping: Default
@@ -2026,27 +2227,29 @@ profiles:
       right_mapping: Default
       rumble_mode: Switch
       sll_mapping: Default
-      slr_mapping: Default
-      srl_mapping: Default
+      slr_mapping: GR
+      srl_mapping: GL
       srr_mapping: Change Profile
       up_mapping: Default
       vibration_frequency: 10
+      vibration_strength: 5
       vibration_strength_switch: 5
       vibration_strength_xbox: 5
       x_mapping: Default
       y_mapping: Default
       zl_mapping: Default
       zr_mapping: Default
-    switch2:
+    virtual_gyro_soft_deadzone: 0.0
+    xbox:
       a_mapping: Default
-      abxy_mode: Switch
+      abxy_mode: Xbox
       b_mapping: Default
-      c_mapping: Default
+      c_mapping: Calibration
       capt_mapping: Default
       down_mapping: Default
       gc_l_click_mapping: Default
       gc_r_click_mapping: Default
-      gc_trigger_mode: Hair Trigger
+      gc_trigger_mode: 100% at Max
       gl_mapping: Default
       gr_mapping: Default
       home_mapping: Default
@@ -2173,207 +2376,6 @@ profiles:
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
             deadzone_mode: *id020
-            deadzone_pause_after_pressed_ms: 100
-            deadzone_pause_after_released_ms: 100
-            simul: None
-          ir_mouse:
-            left_click:
-            - R
-            middle_click: []
-            raw_input: false
-            right_click:
-            - ZR
-            sensitivity: 4.0
-      joystick_deadzone_settings:
-        joycon:
-          left: 3
-          linked: true
-          right: 3
-        nso_gamecube_controller:
-          left: 3
-          linked: true
-          right: 3
-        pro_controller:
-          left: 3
-          linked: true
-          right: 3
-      l_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      l_joystick_mapping: Default
-      l_joystick_mouse_sensitivity: 5.0
-      l_joystick_scroll_activation: Hold
-      l_joystick_scroll_mode: Up/Down
-      l_mapping: Default
-      l_stk_mapping: Default
-      left_mapping: Default
-      minus_mapping: Default
-      plus_mapping: Default
-      r_joystick_custom:
-        down: Default
-        left: Default
-        right: Default
-        up: Default
-      r_joystick_mapping: Default
-      r_joystick_mouse_sensitivity: 5.0
-      r_joystick_scroll_activation: Hold
-      r_joystick_scroll_mode: Up/Down
-      r_mapping: Default
-      r_stk_mapping: Default
-      right_mapping: Default
-      rumble_mode: Switch
-      sll_mapping: Default
-      slr_mapping: GR
-      srl_mapping: GL
-      srr_mapping: Change Profile
-      up_mapping: Default
-      vibration_frequency: 10
-      vibration_strength: 5
-      vibration_strength_switch: 5
-      vibration_strength_xbox: 5
-      x_mapping: Default
-      y_mapping: Default
-      zl_mapping: Default
-      zr_mapping: Default
-    virtual_gyro_soft_deadzone: 0.0
-    xbox:
-      a_mapping: Default
-      abxy_mode: Xbox
-      b_mapping: Default
-      c_mapping: Calibration
-      capt_mapping: Default
-      down_mapping: Default
-      gc_l_click_mapping: Default
-      gc_r_click_mapping: Default
-      gc_trigger_mode: 100% at Max
-      gl_mapping: Default
-      gr_mapping: Default
-      home_mapping: Default
-      in_app_gyro_mode_mappings:
-        a_mapping: Default
-        b_mapping: Default
-        c_mapping: Default
-        capt_mapping: Default
-        down_mapping: Default
-        gc_l_click_mapping: Custom[Hold]:MB_3
-        gc_r_click_mapping: Custom[Hold]:MB_1
-        gc_trigger_mode: Hair Trigger
-        gl_mapping: Default
-        gr_mapping: Default
-        home_mapping: Default
-        joycon_ir_sensor:
-          left:
-            activate_threshold: 1
-            function: Default
-            in_app_gyro:
-              dampening_amount: 90
-              dampening_effect_after_released_ms: 200
-              dampening_mode: &id021 []
-              deadzone_amount: 15.0
-              deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id022 []
-              deadzone_pause_after_pressed_ms: 100
-              deadzone_pause_after_released_ms: 100
-              simul: None
-            ir_mouse:
-              left_click:
-              - L
-              middle_click: []
-              raw_input: false
-              right_click:
-              - ZL
-              sensitivity: 4.0
-          right:
-            activate_threshold: 1
-            function: Default
-            in_app_gyro:
-              dampening_amount: 90
-              dampening_effect_after_released_ms: 200
-              dampening_mode: *id021
-              deadzone_amount: 15.0
-              deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id022
-              deadzone_pause_after_pressed_ms: 100
-              deadzone_pause_after_released_ms: 100
-              simul: None
-            ir_mouse:
-              left_click:
-              - R
-              middle_click: []
-              raw_input: false
-              right_click:
-              - ZR
-              sensitivity: 4.0
-        l_joystick_custom:
-          down: Default
-          left: Default
-          right: Default
-          up: Default
-        l_joystick_mapping: Default
-        l_joystick_mouse_sensitivity: 5.0
-        l_joystick_scroll_activation: Hold
-        l_joystick_scroll_mode: Up/Down
-        l_mapping: Default
-        l_stk_mapping: Default
-        left_mapping: Default
-        minus_mapping: Default
-        plus_mapping: Default
-        r_joystick_custom:
-          down: Default
-          left: Default
-          right: Default
-          up: Default
-        r_joystick_mapping: Mouse
-        r_joystick_mouse_sensitivity: 5.0
-        r_joystick_scroll_activation: Hold
-        r_joystick_scroll_mode: Up/Down
-        r_mapping: Default
-        r_stk_mapping: Default
-        right_mapping: Default
-        sll_mapping: Default
-        slr_mapping: Default
-        srl_mapping: Default
-        srr_mapping: Default
-        up_mapping: Default
-        x_mapping: Default
-        y_mapping: Default
-        zl_mapping: Custom[Hold]:MB_3
-        zr_mapping: Custom[Hold]:MB_1
-      joycon_hold_mode: {}
-      joycon_ir_sensor:
-        left:
-          activate_threshold: 1
-          function: Default
-          in_app_gyro:
-            dampening_amount: 90
-            dampening_effect_after_released_ms: 200
-            dampening_mode: &id023 []
-            deadzone_amount: 15.0
-            deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id024 []
-            deadzone_pause_after_pressed_ms: 100
-            deadzone_pause_after_released_ms: 100
-            simul: None
-          ir_mouse:
-            left_click:
-            - L
-            middle_click: []
-            raw_input: false
-            right_click:
-            - ZL
-            sensitivity: 4.0
-        right:
-          activate_threshold: 1
-          function: Default
-          in_app_gyro:
-            dampening_amount: 90
-            dampening_effect_after_released_ms: 200
-            dampening_mode: *id023
-            deadzone_amount: 15.0
-            deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id024
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -4229,10 +4231,8 @@ stabilized_gyro: true
 start_minimized: false
 steam_roll_compensation: false
 stick_mouse_sensitivity: 5.0
-stick_r_bias:
-- 0.0
-- 0.0
 sw2_zero_command_pacing: true
+system_bt_merged_pair_coordinator: true
 system_bt_rumble_interval_ms: null
 system_bt_rumble_pacing: false
 system_bt_rumble_trace_dry_run: false
@@ -4246,7 +4246,7 @@ vibration_strength_ps5: 10
 vibration_strength_switch: 5
 vibration_strength_xbox: 5
 vigembus_installed: true
-vigembus_sim_mode: PS4
+vigembus_sim_mode: Xbox360
 virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
