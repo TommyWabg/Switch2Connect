@@ -1349,6 +1349,13 @@ class _UsbHidClient:
         # blocking hidapi dev.write() can never stall the shared event loop.
         self._rumble_slot = None            # latest pending output-report payload (new overwrites old)
         self._rumble_slot_lock = threading.Lock()
+        # GameCube rumble is a latched ON/OFF motor state rather than a stream of
+        # HD-rumble samples.  Keep one opposite follow-up transition so an OFF
+        # submitted before a pending ON reaches the wire cannot erase that ON.
+        # Pro Controller 2 never reads these fields and retains its v1.7 latest-frame
+        # producer unchanged.
+        self._gc_rumble_desired_active = False
+        self._gc_rumble_followup = None
         self._rumble_wake = threading.Event()
         self._rumble_stop = threading.Event()
         self._rumble_thread = None
@@ -1528,6 +1535,11 @@ class _UsbHidClient:
                 self._pro_pending_active_frame = None
                 self._pro_pending_stop_frame = None
                 self._pro_active_hold_deadline = 0.0
+                if self.is_gamecube:
+                    # The physical motor state is unknown after reopening.
+                    # Accept the next GameCube transition as a resync command.
+                    self._gc_rumble_desired_active = None
+                    self._gc_rumble_followup = None
             self._inactive_run = 0
             self._stall_streak = 0
             # Restart the staleness clock, otherwise the watchdog fires again
@@ -1610,14 +1622,31 @@ class _UsbHidClient:
         self._rumble_wake.set()
 
     def _submit_gamecube_rumble_write(self, uuid, data):
-        """GameCube-only command conversion and latest on/off slot."""
+        """Queue only GameCube ON/OFF transitions, preserving one opposite edge."""
         payload = self._accept_gamecube_rumble_write(uuid, data)
         if payload is None:
             return
+        active = _gc_rumble_payload_is_active(payload)
         with self._rumble_slot_lock:
-            overwritten = self._rumble_slot is not None
-            self._rumble_slot = payload
-        self._record_rumble_submit(payload, overwritten)
+            # Like the working wireless GameCube path, repeated copies of the
+            # same latched motor state carry no new information.  Dropping them
+            # here also prevents the 7 ms producer from needlessly waking the
+            # Pro-derived 15 ms USB writer.
+            if active == self._gc_rumble_desired_active:
+                return
+            self._gc_rumble_desired_active = active
+
+            if self._rumble_slot is None:
+                self._rumble_slot = payload
+            else:
+                pending_active = _gc_rumble_payload_is_active(self._rumble_slot)
+                if pending_active == active:
+                    # The newest desired state has returned to the pending state;
+                    # an intervening edge that never reached the wire is obsolete.
+                    self._gc_rumble_followup = None
+                else:
+                    self._gc_rumble_followup = payload
+        self._record_rumble_submit(payload, False)
         self._ensure_rumble_thread()
         self._rumble_wake.set()
 
@@ -1892,8 +1921,7 @@ class _UsbHidClient:
             self._write_rumble_frame(data)
 
     def _gamecube_rumble_write_loop(self):
-        """GameCube-only on/off writer; never executes for PID 0x2069."""
-        SILENCE_KEEP = 3
+        """GameCube transition writer using the Pro 2 writer's 15 ms pacing."""
         last_write = 0.0
         while not self._rumble_stop.is_set():
             self._rumble_wake.wait(0.5)
@@ -1905,11 +1933,16 @@ class _UsbHidClient:
                 continue
             with self._rumble_slot_lock:
                 data = self._rumble_slot
-                self._rumble_slot = None
+                self._rumble_slot = self._gc_rumble_followup
+                self._gc_rumble_followup = None
+                has_followup = self._rumble_slot is not None
             if data is None:
                 continue
 
-            target_time = last_write + 0.015
+            interval = 0.015
+            if time.perf_counter() < self._congested_until:
+                interval = max(interval, self._congest_interval)
+            target_time = last_write + interval
             now = time.perf_counter()
             if now < target_time:
                 sleep_amount = target_time - now
@@ -1918,18 +1951,29 @@ class _UsbHidClient:
                 while time.perf_counter() < target_time:
                     pass
             active = _gc_rumble_payload_is_active(data)
-            if active:
-                self._inactive_run = 0
-            else:
-                self._inactive_run += 1
-                if self._inactive_run > SILENCE_KEEP:
-                    continue
             self._rumble_trace_producer_frame_count += 1
             self._trace_rumble_event(
                 "gc_producer_frame", self._rumble_trace_producer_frame_count,
                 int(active), 0, 0)
             last_write = time.perf_counter()
             self._write_rumble_frame(data)
+            write_succeeded = (
+                self.rumble_transport == "bulk"
+                or (self.rumble_transport == "hid_output"
+                    and self._hid_rumble_fail_streak == 0)
+            )
+            if not write_succeeded:
+                # Do not let transition deduplication turn a failed write into
+                # a permanently latched state.  The next identical GameCube
+                # producer update may retry through the existing recovery path.
+                with self._rumble_slot_lock:
+                    if self._gc_rumble_desired_active == active:
+                        self._gc_rumble_desired_active = None
+            if has_followup:
+                # A follow-up was already pending when this transition was
+                # consumed.  Keep the writer event-driven, but do not make it wait
+                # for another producer callback before delivering that edge.
+                self._rumble_wake.set()
 
     def _experimental_deadline_rumble_write_loop(self):
         # Minimum spacing between wire writes. HD rumble frames carry 3x5 ms of
