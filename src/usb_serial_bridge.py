@@ -75,7 +75,7 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "1.2"
+APP_FIRMWARE_VERSION = "2.2"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_3"
 MAX_ESP32S3_CHANNELS = 8
@@ -189,6 +189,9 @@ class ESP32S3SerialClient:
         self._write_count = 0
         self._response_queue = queue.Queue()
         self._closed_by_error = False
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = None
+        self._quiescing = False
         self.firmware_features = {}
         ACTIVE_CLIENTS.append(self)
 
@@ -231,8 +234,31 @@ class ESP32S3SerialClient:
             else:
                 _wake_serial_port(self.handle)
             self.is_connected = True
+            self._start_heartbeat()
         except Exception as e:
             raise OSError(f"Unable to open ESP32-S3 serial port {self.port}: {e}")
+
+    def _start_heartbeat(self):
+        self._heartbeat_stop.clear()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True,
+            name=f"ESP32Heartbeat-{self.port}")
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self):
+        # The firmware arms its host lease only after receiving this command.  If
+        # Windows sleeps, shuts down, or the process dies, the missing heartbeat
+        # makes the independently-powered bridge release every BLE controller.
+        while not self._heartbeat_stop.wait(1.0):
+            if self._quiescing or not self.is_connected or not self.handle:
+                continue
+            with self._write_lock:
+                try:
+                    self.handle.write(b"heartbeat\n")
+                except Exception:
+                    pass
 
     def _try_reopen(self) -> bool:
         """Retry reopening the port indefinitely until success or _read_stop is set.
@@ -322,6 +348,7 @@ class ESP32S3SerialClient:
         self.close_sync()
 
     def close_sync(self):
+        self._heartbeat_stop.set()
         self._read_stop.set()
         with self._input_condition:
             self._input_consumer_stop = True
@@ -355,6 +382,9 @@ class ESP32S3SerialClient:
             self._control_dispatch_thread.join(timeout=0.5)
         if self._rumble_tx_thread and self._rumble_tx_thread.is_alive():
             self._rumble_tx_thread.join(timeout=0.5)
+        if (self._heartbeat_thread and self._heartbeat_thread.is_alive()
+                and self._heartbeat_thread is not threading.current_thread()):
+            self._heartbeat_thread.join(timeout=0.5)
         while True:
             try:
                 self._control_dispatch_queue.get_nowait()
@@ -598,6 +628,19 @@ class ESP32S3SerialClient:
         request/response manager operation.
         """
         return self.send_command_line(command)
+
+    def quiesce_and_disconnect(self, timeout=2.0) -> bool:
+        """Stop bridge activity and wait until firmware confirms all BLE links are down."""
+        self._quiescing = True
+        self._heartbeat_stop.set()
+        with self._rumble_tx_condition:
+            self._rumble_tx_slots.clear()
+        reply = self.send_manager_command("host shutdown", timeout=timeout)
+        try:
+            data = json.loads(reply) if reply else {}
+            return data.get("cmd") == "shutdown_ack" and int(data.get("ble_channels", -1)) == 0
+        except Exception:
+            return False
 
     def send_ble_write(self, channel: int, uuid: str, data, mirror_channel=None):
         uuid_text = str(uuid).lower()
@@ -1231,7 +1274,7 @@ def close_all_clients():
             pass
 
 
-def shutdown_all_bridges():
+def shutdown_all_bridges(timeout=2.0):
     """Bring every active ESP32-S3 bridge to a fully idle state before the app exits.
 
     Stops scanning, disables firmware auto-connect, and drops all BLE links so no
@@ -1240,9 +1283,11 @@ def shutdown_all_bridges():
     """
     for client in list(ACTIVE_CLIENTS):
         try:
-            client.send_fire_and_forget("scan off")
-            client.send_fire_and_forget("auto off")
-            client.send_fire_and_forget("ble disconnect")
+            if not client.quiesce_and_disconnect(timeout=timeout):
+                # Backward-compatible fallback for pre-2.2 firmware.
+                client.send_fire_and_forget("scan off")
+                client.send_fire_and_forget("auto off")
+                client.send_fire_and_forget("ble disconnect")
         except Exception:
             pass
 

@@ -32,10 +32,102 @@ import time
 import threading
 import functools
 import math
+from windows_ble_parameters import preferred_connection_parameters_supported
 import imufusion
 import numpy as np
 import os
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
+
+
+def _fit_full_soft_iron_calibration(samples):
+    """Fit a full ellipsoid and return a bias/matrix only when well-conditioned."""
+    quality = {"model": "full-ellipsoid-v1", "valid": False}
+    try:
+        points = np.asarray(samples, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) < 500:
+            quality["reason"] = "insufficient-samples"
+            quality["sample_count"] = int(len(points)) if points.ndim else 0
+            return None, None, quality
+        points = points[np.all(np.isfinite(points), axis=1)]
+        quality["sample_count"] = int(len(points))
+        if len(points) < 500:
+            quality["reason"] = "insufficient-finite-samples"
+            return None, None, quality
+
+        minimum = np.min(points, axis=0)
+        maximum = np.max(points, axis=0)
+        midpoint = (minimum + maximum) * 0.5
+        radii = (maximum - minimum) * 0.5
+        if np.min(radii) <= 25.0:
+            quality["reason"] = "insufficient-axis-range"
+            return None, None, quality
+        scale = float(np.mean(radii))
+        u = (points - midpoint) / scale
+        x, y, z = u[:, 0], u[:, 1], u[:, 2]
+        design = np.column_stack((
+            x * x, y * y, z * z,
+            2.0 * x * y, 2.0 * x * z, 2.0 * y * z,
+            x, y, z,
+        ))
+        parameters, _, rank, _ = np.linalg.lstsq(
+            design, np.ones(len(u)), rcond=None)
+        if rank < 9:
+            quality["reason"] = "rank-deficient"
+            return None, None, quality
+        quadratic = np.array((
+            (parameters[0], parameters[3], parameters[4]),
+            (parameters[3], parameters[1], parameters[5]),
+            (parameters[4], parameters[5], parameters[2]),
+        ), dtype=np.float64)
+        linear = parameters[6:9]
+        center_u = -0.5 * np.linalg.solve(quadratic, linear)
+        denominator = 1.0 + float(center_u @ quadratic @ center_u)
+        if not math.isfinite(denominator) or denominator <= 1e-9:
+            quality["reason"] = "invalid-ellipsoid-scale"
+            return None, None, quality
+        shape = (quadratic / denominator + quadratic.T / denominator) * 0.5
+        eigenvalues, eigenvectors = np.linalg.eigh(shape)
+        if np.min(eigenvalues) <= 1e-9:
+            quality["reason"] = "non-positive-ellipsoid"
+            return None, None, quality
+        matrix_condition = math.sqrt(float(np.max(eigenvalues) / np.min(eigenvalues)))
+        if matrix_condition > 3.0:
+            quality["reason"] = "ill-conditioned"
+            quality["matrix_condition"] = matrix_condition
+            return None, None, quality
+
+        center = midpoint + scale * center_u
+        unit_correction = eigenvectors @ np.diag(np.sqrt(eigenvalues)) @ eigenvectors.T
+        target_radius = float(np.mean(radii))
+        correction = unit_correction * (target_radius / scale)
+        corrected = (points - center) @ correction.T
+        magnitudes = np.linalg.norm(corrected, axis=1)
+        median_magnitude = float(np.median(magnitudes))
+        relative = magnitudes / max(1e-9, median_magnitude) - 1.0
+        rms_residual = float(math.sqrt(np.mean(relative * relative)))
+        p95_residual = float(np.percentile(np.abs(relative), 95.0))
+        centered = points - center
+        octants = set(tuple(row >= 0.0) for row in centered)
+        quality.update({
+            "matrix_condition": matrix_condition,
+            "reference_magnitude_lsb": median_magnitude,
+            "rms_relative_residual": rms_residual,
+            "p95_relative_residual": p95_residual,
+            "octant_count": len(octants),
+            "axis_radii": radii.tolist(),
+        })
+        if len(octants) < 7:
+            quality["reason"] = "insufficient-orientation-coverage"
+            return None, None, quality
+        if rms_residual > 0.08 or p95_residual > 0.15:
+            quality["reason"] = "excessive-fit-residual"
+            return None, None, quality
+        quality["valid"] = True
+        quality["reason"] = None
+        return center.tolist(), correction.tolist(), quality
+    except (ArithmeticError, ValueError, TypeError, np.linalg.LinAlgError) as exc:
+        quality["reason"] = f"fit-error:{type(exc).__name__}"
+        return None, None, quality
 # Temporary hardware diagnostics for comparing a Joy-Con in the magnetic grip
 # with normal IR Mouse use. Enabled by default for the measurement build; set
 # SWITCH2_IR_DIAGNOSTICS=0 before launch to silence it.
@@ -49,13 +141,35 @@ from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, M
 from utils import (
     apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
-    convert_mac_string_to_value, vector_normalize, vector_cross, vector_dot,
-    quaternion_multiply, quaternion_normalize, quaternion_rotate_vector,
-    quaternion_from_vectors, show_notification, force_ui_update, trigger_change_profile,
+    convert_mac_string_to_value, vector_normalize, vector_cross,
+    quaternion_rotate_vector,
+    show_notification, force_ui_update, trigger_change_profile,
     trigger_switch_profile
 )
 import utils
 import raw_input_mouse
+from gyro import (
+    GYRO_PHASE0_RECORDER,
+    IN_APP_HORIZON_PIPELINE_MODE,
+    INAPP_MOTION_MAG_CLOSURE_MODE,
+    PASSTHROUGH_MOTION_MAG_CLOSURE_MODE,
+    S2_ACCEL_LSB_PER_G,
+    S2_GYRO_LSB_PER_DPS_JOYCON,
+    S2_GYRO_LSB_PER_DPS_PRO,
+    PassthroughHeadingOutputFilter,
+    PassthroughMovingYawBiasConsumer,
+    V2AhrsShadow,
+    V2_OUTPUT_MODES,
+    apply_passthrough_heading_correction,
+    apply_world_yaw_bias_correction,
+    apply_world_yaw_rate_correction,
+    build_v2_accelerometer_output,
+    build_v2_gyro_output,
+    build_in_app_horizon_output,
+    canonicalize_sensor_frame,
+    select_motion_magnetic_closure,
+    validate_soft_iron_matrix,
+)
 from ir_mouse_activation import (
     IR_MOUSE_FREE_SECONDS, IR_MOUSE_VERIFY_BINS,
     IrMouseActivationState, advance_ir_mouse_activation,
@@ -72,7 +186,6 @@ import queue as _queue
 from logging.handlers import (
     QueueHandler as _QueueHandler,
     QueueListener as _QueueListener,
-    RotatingFileHandler as _RotatingFileHandler,
 )
 
 _log_queue = _queue.SimpleQueue()          # unbounded; put() never blocks
@@ -82,13 +195,6 @@ _console_handler.setFormatter(logging.Formatter(
     datefmt='%H:%M:%S'))
 
 
-class _SystemBTMergedLogFilter(logging.Filter):
-    def filter(self, record):
-        return bool(getattr(record, "system_bt_merged", False))
-
-
-_merged_bt_file_handler = None
-_merged_bt_file_handler_lock = threading.Lock()
 _root_logger = logging.getLogger()
 for _h in list(_root_logger.handlers):
     _root_logger.removeHandler(_h)
@@ -97,36 +203,6 @@ _root_logger.setLevel(logging.INFO)
 _log_listener = _QueueListener(_log_queue, _console_handler, respect_handler_level=True)
 _log_listener.start()
 _atexit.register(_log_listener.stop)
-
-
-def ensure_system_bt_merged_file_logging():
-    """Create the scoped rotating log only when a target pair is activated."""
-    global _merged_bt_file_handler
-    if _merged_bt_file_handler is not None:
-        return
-    with _merged_bt_file_handler_lock:
-        if _merged_bt_file_handler is not None:
-            return
-        try:
-            log_dir = os.path.join(os.getcwd(), "logs")
-            os.makedirs(log_dir, exist_ok=True)
-            handler = _RotatingFileHandler(
-                os.path.join(log_dir, "system_bt_merged_joycon.log"),
-                maxBytes=2 * 1024 * 1024,
-                backupCount=3,
-                encoding="utf-8",
-            )
-            handler.setLevel(logging.INFO)
-            handler.addFilter(_SystemBTMergedLogFilter())
-            handler.setFormatter(logging.Formatter(
-                fmt='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
-                datefmt='%H:%M:%S'))
-            _merged_bt_file_handler = handler
-            # QueueListener reads this immutable tuple on every record; replacing
-            # the reference is atomic and does not disturb the listener thread.
-            _log_listener.handlers = tuple(_log_listener.handlers) + (handler,)
-        except Exception:
-            _merged_bt_file_handler = None
 # Bleak's WinRT scanner logs every received advertisement at DEBUG and is extremely
 # noisy; keep it quiet even if the root level is lowered for debugging (matches 0.10.1).
 logging.getLogger("bleak").setLevel(logging.WARNING)
@@ -153,14 +229,11 @@ _IMU_PROBE_REFERENCE_ROTATION = 360.0   # degrees the operator is asked to rotat
 #
 # Accelerometer: 4096 LSB/g (+-8g full scale) on BOTH families -- measured
 # |a| = 4104 on a Pro 2 and 4090 on a Joy-Con 2 R while resting flat.
-S2_ACCEL_LSB_PER_G = 4096.0
 # Gyroscope, both confirmed by integrating a known 360 deg rotation on each axis:
 # - Pro Controller: ST standard +-2000 dps (70 mdps/LSB -> 1000/70 = 14.285714 LSB/dps)
 #   measured 14.111 / 14.325 / 14.266 (Z/Y/X), mean 14.234
 # - Joy-Cons: Nintendo standard +-2000 dps (0.06103 dps/LSB -> 16.384 LSB/dps)
 #   measured 16.213 / 16.418 / 16.372 (Z/Y/X), mean 16.334
-S2_GYRO_LSB_PER_DPS_PRO = 14.285714
-S2_GYRO_LSB_PER_DPS_JOYCON = 16.384
 
 # What the emulated Sony device tells the host its int16 motion fields mean, keyed by
 # (driver_type, mode).  Two candidate scales exist in the wild, both from real
@@ -1484,9 +1557,6 @@ class Controller:
         self.gyro_bias = (0.0, 0.0, 0.0)
             
         self.calibration_samples_gyro = []
-        self.calibration_samples_stick = []
-        self.kp_scale_smoothed = 1.0
-        self.km_scale_smoothed = 1.0
         self.hold_mode = "Vertical"
         
         # Sensor fusion state
@@ -1503,24 +1573,43 @@ class Controller:
         self.last_fusion_time = 0
         self.gyro_bias_integral = (0.0, 0.0, 0.0)
         self.gyro_start_time = 0
-        self.gyro_active_side_prev = False
         self.gyro_steering_origin_accel = None
         
         self.is_mag_calibrating = False
         self.mag_bias = (0.0, 0.0, 0.0)
+        self.mag_soft_iron_matrix = None
+        self.mag_soft_iron_model = None
+        self.mag_reference_magnitude = None
+        self.mag_calibration_samples = []
+        self.mag_full_calibration_valid = False
+        self.mag_calibration_valid = False
         self.mag_min = [32767, 32767, 32767]
         self.mag_max = [-32768, -32768, -32768]
         
         self.q_world_offset = None 
         self.gyro_moving_envelope = 0.0
         self._suspended = False
-        self.prev_q = None
         self._gyro_buf = np.empty(3, dtype=np.float64)
         self._accel_buf = np.empty(3, dtype=np.float64)
         self._mag_buf = np.empty(3, dtype=np.float64)
         self._accel_blend_buf = np.empty(3, dtype=np.float64)
+        # Dedicated scratch for the gravity blend.  This used to alias _mag_buf,
+        # which was correct only because the blend was fully consumed before the
+        # magnetometer was written into the same three floats.
+        self._gravity_buf = np.empty(3, dtype=np.float64)
         self._gyro_config_generation = -1
         self._gyro_config_snapshot = {}
+        # Created lazily; drives output when the V2 pipeline is selected
+        # (9-axis Assist ON), and is observation-only in Shadow mode.
+        # Both estimators run continuously.  Consumers independently select the
+        # quality-gated 9-axis state or the pure gyro+accelerometer 6-axis state,
+        # so neither UI switch can mutate the other path's fusion state.
+        self._gyro_v2_9axis = None
+        self._gyro_v2_6axis = None
+        self._v2_fusion_9axis = None
+        self._v2_fusion_6axis = None
+        self._pass_heading_output_filter = PassthroughHeadingOutputFilter()
+        self._pass_moving_yaw_bias_consumer = PassthroughMovingYawBiasConsumer()
         
     @property
     def suspended(self):
@@ -1551,31 +1640,80 @@ class Controller:
         self.is_calibrating = True
         self.calibration_end_time = time.perf_counter() + 5.0
         self.calibration_samples_gyro = []
-        self.calibration_samples_stick = []
-        
+
         logger.info(f"Calibration started for {self.device.address}. Please keep the controller stationary...")
     
     def start_mag_calibration(self):
         self.is_mag_calibrating = True
         self.mag_min = [32767, 32767, 32767]
         self.mag_max = [-32768, -32768, -32768]
+        self.mag_calibration_samples = []
         logger.info(f"Magnetometer calibration started for {self.device.address}. Please rotate the controller in all directions...")
 
     def stop_mag_calibration(self):
         if not self.is_mag_calibrating: return
         self.is_mag_calibrating = False
         
-        # Calculate bias as the center of the min/max range
+        # Keep the diagonal min/max result as a reversible fallback, but prefer
+        # a full ellipsoid fit when sample coverage and residual checks pass.
         bx = (self.mag_min[0] + self.mag_max[0]) / 2.0
         by = (self.mag_min[1] + self.mag_max[1]) / 2.0
         bz = (self.mag_min[2] + self.mag_max[2]) / 2.0
         self.mag_bias = (bx, by, bz)
+        radii = [max(0.0, (self.mag_max[i] - self.mag_min[i]) / 2.0)
+                 for i in range(3)]
+        mean_radius = sum(radii) / 3.0
+        candidate_matrix = [
+            [mean_radius / radii[0] if radii[0] > 1e-6 else 0.0, 0.0, 0.0],
+            [0.0, mean_radius / radii[1] if radii[1] > 1e-6 else 0.0, 0.0],
+            [0.0, 0.0, mean_radius / radii[2] if radii[2] > 1e-6 else 0.0],
+        ]
+        matrix_valid, matrix_quality = validate_soft_iron_matrix(candidate_matrix)
+        fitted_bias, fitted_matrix, fit_quality = (
+            _fit_full_soft_iron_calibration(self.mag_calibration_samples))
+        fitted_valid, fitted_matrix_quality = validate_soft_iron_matrix(
+            fitted_matrix)
+        if fitted_bias is not None and fitted_valid and fit_quality.get("valid"):
+            self.mag_bias = tuple(fitted_bias)
+            self.mag_soft_iron_matrix = fitted_matrix
+            self.mag_soft_iron_model = "full-ellipsoid-shadow-v1"
+            self.mag_full_calibration_valid = True
+            self.mag_reference_magnitude = fit_quality.get(
+                "reference_magnitude_lsb")
+            matrix_quality = fitted_matrix_quality
+        else:
+            self.mag_soft_iron_matrix = candidate_matrix if matrix_valid else None
+            self.mag_soft_iron_model = "diagonal-minmax-v1" if matrix_valid else None
+            self.mag_full_calibration_valid = False
+            self.mag_reference_magnitude = (
+                mean_radius if matrix_valid and mean_radius > 1e-6 else None)
+        self.mag_calibration_valid = True
         
-        logger.info(f"Magnetometer calibration complete for {self.device.address}. Bias: ({bx:.1f}, {by:.1f}, {bz:.1f})")
+        logger.info(
+            "Magnetometer calibration complete for %s. Bias: (%.1f, %.1f, %.1f), model=%s, fit=%s",
+            self.device.address,
+            self.mag_bias[0], self.mag_bias[1], self.mag_bias[2],
+            self.mag_soft_iron_model, fit_quality.get("reason"),
+        )
         
         # Store in config
-        set_calibration_entry(CONFIG.mag_calibration_data, self, list(self.mag_bias))
+        set_calibration_entry(CONFIG.mag_calibration_data, self, {
+            "bias": list(self.mag_bias),
+            "soft_iron_matrix": self.mag_soft_iron_matrix,
+            "soft_iron_model": self.mag_soft_iron_model,
+            "reference_magnitude_lsb": self.mag_reference_magnitude,
+            "axis_radii": radii,
+            "soft_iron_quality": matrix_quality,
+            "full_ellipsoid_fit_quality": fit_quality,
+        })
         CONFIG.save_config()
+
+        # Calibration changes the magnetic coordinate frame.  Recreate both V2
+        # estimators so a deferred heading reference cannot survive that change.
+        self._gyro_v2_9axis = None
+        self._gyro_v2_6axis = None
+        self._v2_fusion_9axis = None
+        self._v2_fusion_6axis = None
 
         # Reset orientation filter state to prevent continuous sensor fusion skew/direction issues
         ax, ay, az = getattr(self, 'last_accel', (0.0, 16384.0, 0.0))
@@ -1621,7 +1759,12 @@ class Controller:
                     if should_start_joystick_cal:
                         utils.trigger_joystick_calibration(vc)
                     else:
-                        show_notification("Switch 2 Controller", "Magnetometer calibration complete! Calibration data saved successfully.")
+                        message = (
+                            "Full 3D magnetometer center calibration complete. The 3x3 matrix remains in safety Shadow mode."
+                            if gyro_ctrl.mag_full_calibration_valid else
+                            "Magnetometer coverage was insufficient for full 3D calibration. Previous-safe diagonal fallback was saved; rotate through more orientations and retry."
+                        )
+                        show_notification("Switch 2 Controller", message)
                 else:
                     # Cancel active countdown/gyro calibration on ALL controllers in the merged pair
                     for c in vc.controllers:
@@ -1664,7 +1807,12 @@ class Controller:
                 if should_start_joystick_cal:
                     utils.trigger_joystick_calibration(getattr(self, 'virtual_controller', None))
                 else:
-                    show_notification("Switch 2 Controller", "Magnetometer calibration complete! Calibration data saved successfully.")
+                    message = (
+                        "Full 3D magnetometer center calibration complete. The 3x3 matrix remains in safety Shadow mode."
+                        if self.mag_full_calibration_valid else
+                        "Magnetometer coverage was insufficient for full 3D calibration. Previous-safe diagonal fallback was saved; rotate through more orientations and retry."
+                    )
+                    show_notification("Switch 2 Controller", message)
             else:
                 self.is_calibration_counting_down = False
                 self.is_calibrating = False
@@ -1797,6 +1945,14 @@ class Controller:
 
         import sys
         if sys.platform == "win32":
+            preferred_supported, preferred_reason = (
+                preferred_connection_parameters_supported())
+            if not preferred_supported:
+                logger.info(
+                    "Preferred connection parameters unavailable for %s: %s",
+                    self.device.address, preferred_reason)
+                return
+
             wd_bluetooth = None
             try:
                 import winrt.windows.devices.bluetooth as wd_bluetooth
@@ -2134,9 +2290,42 @@ class Controller:
             mag_cal_data = getattr(CONFIG, "mag_calibration_data", {}) or {}
             mag_entry = get_calibration_entry(mag_cal_data, self)
             if mag_entry is not None:
-                self.mag_bias = tuple(mag_entry)
+                if isinstance(mag_entry, dict):
+                    self.mag_bias = tuple(mag_entry.get("bias", (0.0, 0.0, 0.0)))
+                    matrix = mag_entry.get("soft_iron_matrix")
+                    matrix_valid, _matrix_quality = validate_soft_iron_matrix(matrix)
+                    self.mag_soft_iron_matrix = matrix if matrix_valid else None
+                    self.mag_soft_iron_model = mag_entry.get("soft_iron_model")
+                    reference = mag_entry.get("reference_magnitude_lsb")
+                    if not isinstance(reference, (int, float)):
+                        fit_quality = mag_entry.get(
+                            "full_ellipsoid_fit_quality") or {}
+                        reference = fit_quality.get("reference_magnitude_lsb")
+                    if not isinstance(reference, (int, float)):
+                        radii = mag_entry.get("axis_radii") or []
+                        try:
+                            finite_radii = [
+                                float(value) for value in radii
+                                if math.isfinite(float(value))
+                                and float(value) > 1e-6]
+                            reference = (
+                                sum(finite_radii) / len(finite_radii)
+                                if len(finite_radii) == 3 else None)
+                        except (TypeError, ValueError):
+                            reference = None
+                    self.mag_reference_magnitude = (
+                        float(reference)
+                        if isinstance(reference, (int, float))
+                        and math.isfinite(float(reference))
+                        and float(reference) > 1e-6 else None)
+                else:
+                    self.mag_bias = tuple(mag_entry)
+                    self.mag_soft_iron_matrix = None
+                    self.mag_soft_iron_model = None
+                    self.mag_reference_magnitude = None
+                self.mag_calibration_valid = True
                 logger.info(f"Loaded per-device mag calibration for {addr}")
-                
+
             if not cache_hit:
                 try:
                     self.stick_calibration, self.second_stick_calibration = await self.read_calibration_data()
@@ -2513,7 +2702,7 @@ class Controller:
             self._warn_slow_rumble_write(
                 BT_RUMBLE_WRITE_TIMEOUT, timed_out=True,
                 merged_session=pair_session_id, side=side)
-            return False
+            return "timeout"
         except Exception as exc:
             now = time.perf_counter()
             if now - getattr(self, '_last_merged_rumble_failure_warn', 0.0) >= BT_RUMBLE_WRITE_WARN_INTERVAL:
@@ -2522,13 +2711,13 @@ class Controller:
                     "Merged System-BT rumble write failed session=%s side=%s address=%s: %s",
                     pair_session_id, side, getattr(self.device, 'address', 'unknown'), exc,
                     extra={"system_bt_merged": True})
-            return False
+            return "error"
         else:
             elapsed = time.perf_counter() - started
             if elapsed >= BT_RUMBLE_WRITE_SLOW_WARN:
                 self._warn_slow_rumble_write(
                     elapsed, merged_session=pair_session_id, side=side)
-            return True
+            return "ok"
 
     def _count_merged_pair_input_notification(self):
         if not self._merged_system_bt_scope():
@@ -3523,6 +3712,12 @@ class Controller:
                 else:
                     return
 
+            # Phase 0 diagnostics are opt-in and observational.  With the default
+            # disabled recorder this is a single boolean check; when enabled it
+            # copies parsed sensors before Legacy processing mutates inputData.
+            gyro_phase0_trace = GYRO_PHASE0_RECORDER.begin_sample(self, inputData)
+            v2_fusion = None
+
             self.last_input_data = inputData
 
             # Reset inactivity timer if there is physical input change
@@ -3586,7 +3781,8 @@ class Controller:
                 gyro_z = raw_gz - bz
 
                 now = time.perf_counter()
-                if getattr(self, 'last_fusion_time', 0) == 0:
+                fusion_is_initial = getattr(self, 'last_fusion_time', 0) == 0
+                if fusion_is_initial:
                     dt = 0.015
                 else:
                     dt = now - self.last_fusion_time
@@ -3602,7 +3798,109 @@ class Controller:
                 # sensor and cannot disagree with the fusion path about timing.
                 if _IMU_SCALE_PROBE_MODE:
                     self._imu_scale_probe(inputData.accelerometer, (raw_gx, raw_gy, raw_gz), dt)
+                v2_mode = str(getattr(CONFIG, "experimental_9axis_v2_mode", "Legacy"))
+                run_v2 = gyro_phase0_trace is not None or v2_mode in ("Shadow", "V2")
+                if run_v2:
+                    try:
+                        canonical_frame = canonicalize_sensor_frame(
+                            inputData.accelerometer,
+                            (raw_gx, raw_gy, raw_gz),
+                            inputData.magnometer,
+                            None if fusion_is_initial else dt,
+                            is_pro_controller=is_pro,
+                        )
+                        if gyro_phase0_trace is not None:
+                            GYRO_PHASE0_RECORDER.capture_v2_canonical(
+                                gyro_phase0_trace, canonical_frame.to_dict())
+                        def make_v2_estimator():
+                            return V2AhrsShadow(
+                                imufusion.Ahrs(),
+                                buffer_factory=lambda: np.empty(3, dtype=np.float64),
+                                settings_factory=imufusion.Settings,
+                                convention=imufusion.CONVENTION_NWU,
+                                heading_function=lambda accel, mag: imufusion.compass(
+                                    imufusion.CONVENTION_NWU, accel, mag),
+                            )
+                        if self._gyro_v2_9axis is None:
+                            self._gyro_v2_9axis = make_v2_estimator()
+                        if self._gyro_v2_6axis is None:
+                            self._gyro_v2_6axis = make_v2_estimator()
+                        gyro_scale = canonical_frame.gyro_lsb_per_dps
+                        common_v2 = dict(
+                            persistent_gyro_bias_dps=tuple(
+                                value / gyro_scale for value in self.gyro_bias),
+                            magnetometer_bias_lsb=self.mag_bias,
+                            soft_iron_matrix=getattr(
+                                self, "mag_soft_iron_matrix", None),
+                            soft_iron_model=getattr(
+                                self, "mag_soft_iron_model", None),
+                            movement_hint_dps=getattr(self, "gyro_moving_envelope", None),
+                            magnetometer_calibration_valid=getattr(
+                                self, "mag_calibration_valid", False),
+                            magnetometer_reference_magnitude_lsb=getattr(
+                                self, "mag_reference_magnitude", None))
+                        pass_9axis = bool(getattr(
+                            CONFIG, "gyro_passthrough_9axis_enabled", False))
+                        orientation_consumer_active = bool(
+                            pass_9axis
+                            or
+                            getattr(CONFIG, "horizon_lock_v2_enabled", False)
+                            or getattr(self, "gyro_mouse_enabled", False))
+                        self._v2_fusion_9axis = self._gyro_v2_9axis.update(
+                            canonical_frame, magnetometer_enabled=True,
+                            orientation_consumer_active=orientation_consumer_active,
+                            **common_v2)
+                        self._v2_fusion_6axis = self._gyro_v2_6axis.update(
+                            canonical_frame, magnetometer_enabled=False, **common_v2)
+                        v2_fusion = (self._v2_fusion_9axis if pass_9axis
+                                     else self._v2_fusion_6axis)
+                        if gyro_phase0_trace is not None:
+                            fusion_record = dict(v2_fusion)
+                            fusion_record["selected_axes"] = (
+                                "9-axis" if pass_9axis else "6-axis")
+                            fusion_record["consumers"] = {
+                                "pass_through": (
+                                    "9-axis" if pass_9axis else "6-axis"),
+                                "in_app": (
+                                    "9-axis" if getattr(CONFIG, "gyro_mode", "World")
+                                    == "World" else "6-axis"),
+                                "in_app_horizon_lock": True,
+                                "in_app_orientation_source": (
+                                    "v2-9-axis" if getattr(CONFIG, "gyro_mode", "World")
+                                    == "World" else "v2-6-axis"),
+                                "in_app_output_active": bool(
+                                    getattr(self, "gyro_mouse_enabled", False)),
+                            }
+                            fusion_record["alternate_fusion"] = dict(
+                                self._v2_fusion_6axis if pass_9axis
+                                else self._v2_fusion_9axis)
+                            GYRO_PHASE0_RECORDER.capture_v2_fusion(
+                                gyro_phase0_trace, fusion_record)
+                    except Exception:
+                        # Diagnostics must never interrupt the Legacy hot path.
+                        self._gyro_v2_9axis = None
+                        self._gyro_v2_6axis = None
+                        self._v2_fusion_9axis = None
+                        self._v2_fusion_6axis = None
+                        pass
                 self._mahony_update(gyro_x, gyro_y, gyro_z, ax, ay, az, mx, my, mz, dt)
+                if gyro_phase0_trace is not None:
+                    gyro_settings = self._get_gyro_config_snapshot()
+                    GYRO_PHASE0_RECORDER.capture_fusion(
+                        gyro_phase0_trace,
+                        self,
+                        dt,
+                        {
+                            "gyro_mode": gyro_settings["gyro_mode"],
+                            "gyro_control_mode": gyro_settings["gyro_control_mode"],
+                            "stabilized_gyro": gyro_settings["stabilized_gyro"],
+                            "gyro_passthrough_9axis_enabled": gyro_settings[
+                                "gyro_passthrough_9axis_enabled"],
+                            "horizon_lock": bool(getattr(CONFIG, "steam_roll_compensation", False)),
+                            "virtual_gyro_soft_deadzone": gyro_settings["virtual_gyro_soft_deadzone"],
+                            "gyro_passthrough_mode": str(getattr(CONFIG, "gyro_passthrough_mode", "Default")),
+                        },
+                    )
 
             btn_states = {
                 "GL": bool(inputData.buttons & 0x02000000) if is_pro else False,
@@ -3655,6 +3953,8 @@ class Controller:
                     inputData.right_trigger = 0
                 except Exception:
                     pass
+                GYRO_PHASE0_RECORDER.finish_sample(
+                    gyro_phase0_trace, self, inputData, "profile-selection-suppressed")
                 if self.input_report_callback is not None:
                     self.input_report_callback(inputData, self)
                 return
@@ -4380,6 +4680,8 @@ class Controller:
                     if is_gyro_active:
                         show_notification("Switch 2 Controller", "Gyro calibration in progress... Please keep the controller stationary.")
                 
+                GYRO_PHASE0_RECORDER.finish_sample(
+                    gyro_phase0_trace, self, inputData, "gyro-calibration-countdown")
                 if self.input_report_callback is not None:
                     self.input_report_callback(inputData, self)
                 return
@@ -4389,6 +4691,8 @@ class Controller:
                 inputData.right_stick = (0.0, 0.0)
                 inputData.gyroscope = (0.0, 0.0, 0.0)
                 inputData.accelerometer = (0.0, 0.0, 0.0)
+                GYRO_PHASE0_RECORDER.finish_sample(
+                    gyro_phase0_trace, self, inputData, "mag-calibration-waiting")
                 if self.input_report_callback is not None:
                     self.input_report_callback(inputData, self)
                 return
@@ -4399,6 +4703,8 @@ class Controller:
                 inputData.right_stick = (0.0, 0.0)
                 inputData.gyroscope = (0.0, 0.0, 0.0)
                 inputData.accelerometer = (0.0, 0.0, 0.0)
+                GYRO_PHASE0_RECORDER.finish_sample(
+                    gyro_phase0_trace, self, inputData, "joystick-calibration")
                 if self.input_report_callback is not None:
                     self.input_report_callback(inputData, self)
                 return
@@ -4519,6 +4825,177 @@ class Controller:
                 
                 self.simulate_gyro_mouse(inputData, effective_gyro_trigger, effective_zr, effective_zl)
 
+            # Snapshot the calibrated Legacy rate before optional Horizon Lock and
+            # the final virtual-controller deadzone rewrite it.
+            GYRO_PHASE0_RECORDER.capture_pre_horizon(gyro_phase0_trace, self, inputData)
+
+            v2_applied = False
+            v2_mode = str(getattr(CONFIG, "experimental_9axis_v2_mode", "Legacy"))
+            pass_horizon_enabled = bool(getattr(
+                CONFIG, "horizon_lock_v2_enabled", False))
+            if v2_mode not in V2_OUTPUT_MODES:
+                v2_mode = "Legacy"
+            legacy_candidate = None
+            if gyro_phase0_trace is not None:
+                legacy_candidate = build_v2_gyro_output(
+                    inputData.gyroscope,
+                    self.orientation,
+                    gyro_lsb_per_dps=1.0,
+                    is_pro_controller=is_pro,
+                    hold_mode=getattr(self, "hold_mode", "Vertical"),
+                    horizon_lock=bool(
+                        getattr(CONFIG, "steam_roll_compensation", False)),
+                    orientation_valid=True,
+                    heading_constrained=True,
+                    soft_deadzone_lsb=float(
+                        getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0)),
+                )
+            if v2_fusion is not None:
+                quality = v2_fusion.get("magnetometer_quality", {})
+                bias_state = v2_fusion.get("runtime_bias", {})
+                try:
+                    pass_closure = select_motion_magnetic_closure(
+                        v2_fusion.get("motion_magnetic_closure"),
+                        mode=PASSTHROUGH_MOTION_MAG_CLOSURE_MODE,
+                        eligible=pass_9axis,
+                    )
+                    post_motion_heading_allowed = (
+                        PASSTHROUGH_MOTION_MAG_CLOSURE_MODE != "V2")
+                    heading_filter = self._pass_heading_output_filter.update(
+                        quality.get("heading_correction_rate_dps", 0.0),
+                        getattr(self, "_last_dt", 0.015),
+                        eligible=(pass_9axis and not pass_horizon_enabled
+                                  and post_motion_heading_allowed),
+                        correction_authorized=(
+                            v2_fusion.get("update_mode") == "9-axis"
+                            and bool(quality.get("direction_valid", False))
+                            and bool(quality.get("magnitude_valid", False))),
+                    )
+                    observer = dict(v2_fusion.get("moving_yaw_bias", {}))
+                    moving_consumer = self._pass_moving_yaw_bias_consumer.update(
+                        observer.get("filtered_candidate_dps", 0.0),
+                        getattr(self, "_last_dt", 0.015),
+                        assist_enabled=pass_9axis,
+                        authorized=bool(
+                            observer.get("confidence", False)
+                            and quality.get("magnitude_valid", False)
+                            and not quality.get("recovering", False)),
+                        heading_output_rate_dps=heading_filter["output_rate_dps"],
+                    )
+                    moving_correction = apply_world_yaw_bias_correction(
+                        bias_state.get("corrected_gyro_dps", (0.0, 0.0, 0.0)),
+                        v2_fusion.get("orientation_wxyz", (1.0, 0.0, 0.0, 0.0)),
+                        moving_consumer["applied_dps"],
+                    )
+                    closure_correction = apply_world_yaw_rate_correction(
+                        moving_correction["gyroscope_dps"],
+                        v2_fusion.get("orientation_wxyz", (1.0, 0.0, 0.0, 0.0)),
+                        pass_closure["applied_rate_dps"],
+                    )
+                    pass_closure["correction_vector_body_dps"] = (
+                        closure_correction["correction_vector_body_dps"])
+                    heading_output = apply_passthrough_heading_correction(
+                        closure_correction["gyroscope_dps"],
+                        heading_filter["output_rate_dps"],
+                        assist_enabled=pass_9axis,
+                        horizon_lock=pass_horizon_enabled,
+                    )
+                    heading_output["filter"] = heading_filter
+                    observer.update(moving_consumer)
+                    observer.update({
+                        "candidate_vector_body_dps": moving_correction[
+                            "candidate_vector_body_dps"],
+                        "applied_dps": moving_consumer["applied_dps"],
+                    })
+                    v2_candidate = build_v2_gyro_output(
+                        heading_output["gyroscope_dps"],
+                        v2_fusion.get("orientation_wxyz", (1.0, 0.0, 0.0, 0.0)),
+                        gyro_lsb_per_dps=(
+                            S2_GYRO_LSB_PER_DPS_PRO if is_pro
+                            else S2_GYRO_LSB_PER_DPS_JOYCON),
+                        is_pro_controller=is_pro,
+                        hold_mode=getattr(self, "hold_mode", "Vertical"),
+                        horizon_lock=pass_horizon_enabled,
+                        orientation_valid=bool(quality.get("orientation_valid", False)),
+                        heading_constrained=bool(quality.get("direction_valid", False)),
+                        soft_deadzone_lsb=float(
+                            getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0)),
+                    )
+                    v2_candidate["heading_output_assist"] = heading_output
+                    v2_candidate["moving_yaw_bias"] = observer
+                    v2_candidate["motion_magnetic_closure"] = pass_closure
+                    # Keep the accelerometer in the same basis as the projected
+                    # gyroscope; otherwise Steam Input reads a pre-rotated gyro
+                    # against raw local gravity and the mouse axes come out
+                    # rotated by the horizon projection angle.
+                    accel_candidate = build_v2_accelerometer_output(
+                        inputData.accelerometer,
+                        v2_fusion.get("orientation_wxyz", (1.0, 0.0, 0.0, 0.0)),
+                        is_pro_controller=is_pro,
+                        hold_mode=getattr(self, "hold_mode", "Vertical"),
+                        horizon_lock=pass_horizon_enabled,
+                        orientation_valid=bool(quality.get("orientation_valid", False)),
+                    )
+                    if accel_candidate.get("available"):
+                        v2_candidate["accelerometer"] = list(
+                            accel_candidate["accelerometer"])
+                except (TypeError, ValueError):
+                    v2_candidate = {
+                        "available": False,
+                        "reason": "candidate-error",
+                        "horizon_lock": bool(
+                            pass_horizon_enabled),
+                    }
+            else:
+                v2_candidate = {
+                    "available": False,
+                    "reason": "v2-not-running",
+                    "horizon_lock": bool(
+                        pass_horizon_enabled),
+                }
+            v2_candidate["selected_mode"] = v2_mode
+            if v2_candidate.get("available"):
+                v2_candidate["target_gyroscope"] = list(
+                    v2_candidate.get("gyroscope", (0.0, 0.0, 0.0)))
+                if "accelerometer" in v2_candidate:
+                    v2_candidate["target_accelerometer"] = list(
+                        v2_candidate["accelerometer"])
+            if v2_mode == "V2" and v2_candidate.get("available"):
+                pass_axes = ("9-axis" if pass_9axis else "6-axis")
+                handover_key = (pass_axes, bool(v2_candidate.get("horizon_lock")))
+                if handover_key != getattr(self, "_pass_v2_handover_key", None):
+                    self._pass_v2_handover_key = handover_key
+                    self._pass_v2_handover_progress = 0.0
+                    self._pass_v2_handover_gyro = tuple(getattr(
+                        self, "_pass_output_last_gyro", inputData.gyroscope))
+                    self._pass_v2_handover_accel = tuple(getattr(
+                        self, "_pass_output_last_accel", inputData.accelerometer))
+                self._pass_v2_handover_progress = min(
+                    1.0, getattr(self, "_pass_v2_handover_progress", 0.0)
+                    + max(0.001, float(getattr(self, "_last_dt", 0.015))) / 0.35)
+                blend = self._pass_v2_handover_progress
+                target_gyro = tuple(v2_candidate["gyroscope"])
+                source_gyro = self._pass_v2_handover_gyro
+                inputData.gyroscope = tuple(
+                    source_gyro[i] + (target_gyro[i] - source_gyro[i]) * blend
+                    for i in range(3))
+                if "accelerometer" in v2_candidate:
+                    target_accel = tuple(v2_candidate["accelerometer"])
+                    source_accel = self._pass_v2_handover_accel
+                    inputData.accelerometer = tuple(
+                        source_accel[i] + (target_accel[i] - source_accel[i]) * blend
+                        for i in range(3))
+                v2_candidate["fusion_axes"] = pass_axes
+                v2_candidate["handover_progress"] = blend
+                v2_candidate["handover_source_gyroscope"] = list(source_gyro)
+                v2_candidate["applied_gyroscope"] = list(inputData.gyroscope)
+                v2_candidate["applied_accelerometer"] = list(
+                    inputData.accelerometer)
+                v2_applied = True
+            v2_candidate["applied_to_output"] = v2_applied
+            GYRO_PHASE0_RECORDER.capture_v2_output(
+                gyro_phase0_trace, v2_candidate, legacy_candidate)
+
             if trigger_djg != getattr(self, 'prev_djg', False):
                 vc = getattr(self, 'virtual_controller', None)
                 if vc is not None:
@@ -4527,7 +5004,7 @@ class Controller:
 
             # If Steam roll compensation is enabled, apply built-in anti-roll projection to gyroscope and accelerometer
             if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
-                if getattr(CONFIG, 'steam_roll_compensation', False):
+                if getattr(CONFIG, 'steam_roll_compensation', False) and not v2_applied:
                     # 1. Extract current gyroscope and accelerometer vectors
                     gx, gy, gz = inputData.gyroscope
                     ax, ay, az = inputData.accelerometer
@@ -4593,7 +5070,10 @@ class Controller:
                     inputData.accelerometer = (ax_comp, ay_comp, az_comp)
 
             # Apply flat static deadzone (base_dz) to the final virtual controller gyroscope data
-            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_joystick_calibrating', False):
+            if (not getattr(self, 'is_calibrating', False)
+                    and not getattr(self, 'is_mag_calibrating', False)
+                    and not getattr(self, 'is_joystick_calibrating', False)
+                    and not v2_applied):
                 base_dz = float(getattr(CONFIG, 'virtual_gyro_soft_deadzone', 0.0))
                 if base_dz > 0.0:
                     gx_dz, gy_dz, gz_dz = inputData.gyroscope
@@ -4621,6 +5101,9 @@ class Controller:
                     
                     inputData.gyroscope = (gx_dz, gy_dz, gz_dz)
 
+            self._pass_output_last_gyro = tuple(inputData.gyroscope)
+            self._pass_output_last_accel = tuple(inputData.accelerometer)
+            GYRO_PHASE0_RECORDER.finish_sample(gyro_phase0_trace, self, inputData)
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
 
@@ -4727,7 +5210,6 @@ class Controller:
         self.q_world_offset = None
         self.gyro_moving_envelope = 0.0
         self.last_fusion_time = time.perf_counter()
-        self.prev_q = None
 
     def _get_gyro_config_snapshot(self):
         generation = int(getattr(CONFIG, "settings_generation", 0))
@@ -4738,16 +5220,17 @@ class Controller:
         gyro_sensitivity = float(getattr(CONFIG, "gyro_sensitivity", 0.3))
         rstick_sensitivity = float(getattr(CONFIG, "r_joystick_gyro_sensitivity", 5.0))
         snap = {
-            "generation": generation,
             "gyro_mode": getattr(CONFIG, "gyro_mode", "World"),
             "gyro_control_mode": gyro_control_mode,
-            "gyro_activation_mode": getattr(CONFIG, "gyro_activation_mode", "Toggle"),
             "gyro_sensitivity": gyro_sensitivity,
             "gyro_sensitivity_mouse": gyro_sensitivity * 2.0,
             "gyro_sensitivity_roll": gyro_sensitivity * 2.0,
-            "rstick_sens_scaled": rstick_sensitivity * 8.0,
             "rstick_conv_scaled": rstick_sensitivity * 8.0 * 0.002,
+            # Recorder/backward-compatibility metadata only.  This legacy key
+            # no longer selects either V2 consumer.
             "stabilized_gyro": bool(getattr(CONFIG, "stabilized_gyro", False)),
+            "gyro_passthrough_9axis_enabled": bool(getattr(
+                CONFIG, "gyro_passthrough_9axis_enabled", False)),
             "virtual_gyro_soft_deadzone": float(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0)),
         }
         self._gyro_config_snapshot = snap
@@ -4936,7 +5419,7 @@ class Controller:
         blend_factor = (envelope / 0.26) / (1.0 + (envelope / 0.26))
         accel_blended = self._accel_blend_buf
         np.multiply(accel_arr, 1.0 - blend_factor, out=accel_blended)
-        gravity_scaled = self._mag_buf
+        gravity_scaled = self._gravity_buf
         np.multiply(self.ahrs.gravity, blend_factor, out=gravity_scaled)
         np.add(accel_blended, gravity_scaled, out=accel_blended)
         
@@ -5267,13 +5750,6 @@ class Controller:
                 pressed.add(token)
         return frozenset(pressed)
 
-    def _in_app_gyro_ms_setting(self, key, default_ms):
-        try:
-            value = CONFIG.get_mapping_setting_scoped(key, default_ms, None)
-            return max(0.0, float(value)) / 1000.0
-        except Exception:
-            return max(0.0, float(default_ms)) / 1000.0
-
     def _in_app_gyro_inputs_pressed(self, tokens, zr_pressed, zl_pressed, latch_seconds=None):
         # True if any token is pressed now OR within the release-latch window after release,
         # so brief gaps in the button state don't drop the effect. Shared by Trigger
@@ -5338,6 +5814,8 @@ class Controller:
 
         if getattr(self, 'is_mag_calibrating', False):
             mx, my, mz = inputData.magnometer
+            if len(self.mag_calibration_samples) < 20000:
+                self.mag_calibration_samples.append((mx, my, mz))
             self.mag_min[0] = min(self.mag_min[0], mx)
             self.mag_min[1] = min(self.mag_min[1], my)
             self.mag_min[2] = min(self.mag_min[2], mz)
@@ -5380,12 +5858,30 @@ class Controller:
             self.interp_residual_y = 0.0
             return
 
-        activation_mode = cfg["gyro_activation_mode"]
-        if (
-            not trigger_pressed
-            and not getattr(self, "gyro_mouse_enabled", False)
-            and activation_mode != "Always On"
-        ):
+        # Mapping already resolves Custom[Tap] into a latch and Custom[Hold]
+        # into a level.  Applying the old Toggle/Hold state machine again here
+        # caused double toggles, so the resolved mapping state is authoritative.
+        if not trigger_pressed:
+            self.gyro_mouse_enabled = False
+            self._in_app_closure_activation_elapsed = 0.0
+            inactive_mode = cfg.get("gyro_mode", "World")
+            self._in_app_v2_metadata = {
+                "pipeline_mode": IN_APP_HORIZON_PIPELINE_MODE,
+                "axes": "9-axis" if inactive_mode == "World" else "6-axis",
+                "horizon_lock": True,
+                "orientation_source": (
+                    "v2-9-axis" if inactive_mode == "World" else "v2-6-axis"),
+                "orientation_valid": bool(
+                    self._v2_fusion_9axis if inactive_mode == "World"
+                    else self._v2_fusion_6axis),
+                "output_active": False,
+                "motion_magnetic_closure": {
+                    "consumer_mode": INAPP_MOTION_MAG_CLOSURE_MODE,
+                    "eligible": False,
+                    "applied_rate_dps": 0.0,
+                    "stop_zero_enforced": True,
+                },
+            }
             self.gr_was_pressed = False
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
@@ -5396,9 +5892,12 @@ class Controller:
             self.interp_residual_y = 0.0
             return
 
-        bx, by, bz = self.gyro_bias
         raw_gx, raw_gy, raw_gz = inputData.gyroscope
         ax, ay, az = inputData.accelerometer
+        current_mode = cfg["gyro_mode"]
+        in_app_fusion = (self._v2_fusion_9axis if current_mode == "World"
+                         else self._v2_fusion_6axis)
+        orientation_for_in_app = self.orientation
         
         # Continuous Desk-Only Auto-Calibration:
         # Bias creep is instantly cut off (alpha = 0) whenever the controller is hand-held
@@ -5408,6 +5907,7 @@ class Controller:
         accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
         # Load-bearing at 16384.0 -- see the note on G_REF in _mahony_update.
         accel_err = abs(accel_mag - 16384.0)
+        bx, by, bz = self.gyro_bias
         gyro_sub_mag = math.sqrt((raw_gx - bx)**2 + (raw_gy - by)**2 + (raw_gz - bz)**2)
         moving_env = getattr(self, 'gyro_moving_envelope', 0.0)
         
@@ -5420,21 +5920,29 @@ class Controller:
             )
             bx, by, bz = self.gyro_bias
 
-        gyro_x = raw_gx - bx
-        gyro_y = raw_gy - by
-        gyro_z = raw_gz - bz
-
-        if cfg["stabilized_gyro"]:
-            gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
-            gyro_x -= math.degrees(self.gyro_bias_integral[0]) * gyro_scale
-            gyro_y -= math.degrees(self.gyro_bias_integral[1]) * gyro_scale
-            gyro_z -= math.degrees(self.gyro_bias_integral[2]) * gyro_scale
+        gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
+        if isinstance(in_app_fusion, dict):
+            corrected = in_app_fusion.get("runtime_bias", {}).get(
+                "corrected_gyro_dps")
+            quaternion = in_app_fusion.get("orientation_wxyz")
+        else:
+            corrected = quaternion = None
+        if isinstance(corrected, (list, tuple)) and len(corrected) == 3:
+            gyro_x, gyro_y, gyro_z = (
+                float(corrected[0]) * gyro_scale,
+                float(corrected[1]) * gyro_scale,
+                float(corrected[2]) * gyro_scale,
+            )
+        else:
+            # Explicit safety fallback while a V2 estimator is unavailable.
+            gyro_x, gyro_y, gyro_z = raw_gx - bx, raw_gy - by, raw_gz - bz
+        if isinstance(quaternion, (list, tuple)) and len(quaternion) == 4:
+            orientation_for_in_app = tuple(float(value) for value in quaternion)
 
         inputData.gyroscope = (gyro_x, gyro_y, gyro_z)
 
         # Always extract decoupled movements and calculate soft deadzones
         # so that they can be applied to both the gyro mouse and virtual controller data.
-        current_mode = cfg["gyro_mode"]
         self.soft_dz_h = 0.0
         self.soft_dz_v = 0.0
         self.eff_h_final = 0.0
@@ -5522,19 +6030,19 @@ class Controller:
                 g_local = (0.0, gyro_y, gyro_z)
             
             if getattr(self, 'q_world_offset', None) is None:
-                q_abs = self.orientation
+                q_abs = orientation_for_in_app
                 f_world = quaternion_rotate_vector(q_abs, (0, 1, 0))
                 yaw_angle = math.atan2(f_world[0], f_world[1])
                 self.q_world_offset = -yaw_angle
             
-            g_world_abs = quaternion_rotate_vector(self.orientation, g_local)
+            g_world_abs = quaternion_rotate_vector(orientation_for_in_app, g_local)
             
             if self.is_pro_controller() or self.hold_mode == "Vertical":
                 f_local = (0, 1, 0)
             else:
                 f_local = (1, 0, 0)
             
-            f_world = quaternion_rotate_vector(self.orientation, f_local)
+            f_world = quaternion_rotate_vector(orientation_for_in_app, f_local)
             
             fh_x, fh_y = f_world[0], f_world[1]
             fh_mag = math.sqrt(fh_x**2 + fh_y**2)
@@ -5545,6 +6053,32 @@ class Controller:
             
             eff_h = -g_world_abs[2]
             eff_v = g_world_abs[0] * r_h[0] + g_world_abs[1] * r_h[1]
+            in_app_candidate = build_in_app_horizon_output(
+                (gyro_x, gyro_y, gyro_z),
+                orientation_for_in_app,
+                is_pro_controller=self.is_pro_controller(),
+                hold_mode=getattr(self, "hold_mode", "Vertical"),
+            )
+            legacy_eff_h, legacy_eff_v = eff_h, eff_v
+            if IN_APP_HORIZON_PIPELINE_MODE == "V2":
+                eff_h = in_app_candidate["horizontal_lsb"]
+                eff_v = in_app_candidate["vertical_lsb"]
+            self._in_app_v2_metadata = {
+                "pipeline_mode": IN_APP_HORIZON_PIPELINE_MODE,
+                "axes": "9-axis" if current_mode == "World" else "6-axis",
+                "horizon_lock": True,
+                "orientation_source": (
+                    "v2-9-axis" if current_mode == "World" else "v2-6-axis"),
+                "orientation_valid": isinstance(in_app_fusion, dict),
+                "output_active": bool(trigger_pressed),
+                "legacy_horizon_output_lsb": [legacy_eff_h, legacy_eff_v],
+                "candidate_horizon_output_lsb": [
+                    in_app_candidate["horizontal_lsb"],
+                    in_app_candidate["vertical_lsb"],
+                ],
+                "applied_horizon_output_lsb": [eff_h, eff_v],
+                "shadow_only": IN_APP_HORIZON_PIPELINE_MODE == "Shadow",
+            }
             
             gyro_scale = 14.285714 if self.is_pro_controller() else 16.384
             omega = math.sqrt(eff_h**2 + eff_v**2) / gyro_scale
@@ -5568,34 +6102,65 @@ class Controller:
             
             if eff_v > soft_dz: self.eff_v_final = eff_v - soft_dz
             elif eff_v < -soft_dz: self.eff_v_final = eff_v + soft_dz
+
+            closure_dt = max(0.0, float(getattr(self, "_last_dt", 0.015)))
+            if trigger_pressed and self.gr_was_pressed:
+                self._in_app_closure_activation_elapsed = min(
+                    1.0,
+                    getattr(self, "_in_app_closure_activation_elapsed", 0.0)
+                    + closure_dt,
+                )
+            else:
+                self._in_app_closure_activation_elapsed = 0.0
+            in_app_activation_authority = min(
+                1.0,
+                self._in_app_closure_activation_elapsed,
+            )
+            in_app_closure = select_motion_magnetic_closure(
+                (in_app_fusion or {}).get("motion_magnetic_closure")
+                if isinstance(in_app_fusion, dict) else None,
+                mode=INAPP_MOTION_MAG_CLOSURE_MODE,
+                eligible=bool(trigger_pressed and current_mode == "World"),
+                authority_scale=in_app_activation_authority,
+            )
+            closure_horizontal_lsb = (
+                -in_app_closure["applied_rate_dps"] * gyro_scale)
+            self.eff_h_final += closure_horizontal_lsb
+            self._in_app_closure_angle_deg = getattr(
+                self, "_in_app_closure_angle_deg", 0.0
+            ) + in_app_closure["applied_rate_dps"] * closure_dt
+            in_app_closure.update({
+                "candidate_horizontal_lsb": (
+                    -in_app_closure["candidate_rate_dps"] * gyro_scale),
+                "applied_horizontal_lsb": closure_horizontal_lsb,
+                "accumulated_correction_angle_deg": (
+                    self._in_app_closure_angle_deg),
+                "emitted_mouse_counts_from_anchor": [
+                    int(getattr(self, "_in_app_emitted_mouse_x", 0)),
+                    int(getattr(self, "_in_app_emitted_mouse_y", 0)),
+                ],
+            })
+            self._in_app_v2_metadata["motion_magnetic_closure"] = (
+                in_app_closure)
         
         rx, ry = inputData.right_stick
 
         ax, ay, az = inputData.accelerometer
 
-        if activation_mode == "Hold":
-            if trigger_pressed and not getattr(self, 'gr_was_pressed', False):
-                # Reset orientation on activation to prevent jumps
-                if hasattr(self, 'true_accel'):
-                    self._reset_orientation_from_accel(*self.true_accel)
-                else:
-                    self._reset_orientation_from_accel(ax, ay, az)
-                self.gyro_start_time = time.perf_counter()
-                self.gyro_steering_origin_accel = (ax, ay, az)
-                self._interp_wake_event.set()
-            self.gyro_mouse_enabled = trigger_pressed
-        else:
-            if trigger_pressed and not self.gr_was_pressed:
-                self.gyro_mouse_enabled = not self.gyro_mouse_enabled
-                if self.gyro_mouse_enabled:
-                    # Reset orientation on activation to prevent jumps
-                    if hasattr(self, 'true_accel'):
-                        self._reset_orientation_from_accel(*self.true_accel)
-                    else:
-                        self._reset_orientation_from_accel(ax, ay, az)
-                    self.gyro_start_time = time.perf_counter()
-                    self.gyro_steering_origin_accel = (ax, ay, az)
-                    self._interp_wake_event.set()
+        if trigger_pressed and not self.gr_was_pressed:
+            # Keep the continuous V2 estimators untouched.  Activation only
+            # resets this consumer's interpolation/reference state.
+            self.gyro_start_time = time.perf_counter()
+            self.gyro_steering_origin_accel = (ax, ay, az)
+            self.q_world_offset = None
+            self._in_app_closure_anchor_orientation = tuple(
+                orientation_for_in_app)
+            self._in_app_closure_angle_deg = 0.0
+            self._in_app_closure_mouse_integral = 0.0
+            self._in_app_emitted_mouse_x = 0
+            self._in_app_emitted_mouse_y = 0
+            self._interp_wake_event.set()
+        self.gyro_mouse_enabled = bool(trigger_pressed)
                 
         self.gr_was_pressed = trigger_pressed
 
@@ -5654,8 +6219,6 @@ class Controller:
                     damp_amount = in_app_aux_setting(trigger_key, "dampening_amount", 90)
                     gyro_dampening_multiplier = (100.0 - float(damp_amount)) / 100.0
             
-            gyro_deadzone = 0.2 
-            
             if current_mode in ["World", "Yaw"]:
                 sensitivity = cfg["gyro_sensitivity_mouse"] * gyro_dampening_multiplier
                 accel_factor = 0.002
@@ -5670,6 +6233,18 @@ class Controller:
                 if (now - getattr(self, "last_click_event_time", 0.0)) >= 0.02:
                     target_vx += self.eff_h_final * sensitivity * accel_factor
                     target_vy += self.eff_v_final * v_sign * sensitivity * accel_factor 
+                    closure_velocity = (
+                        closure_horizontal_lsb * sensitivity * accel_factor)
+                    self._in_app_closure_mouse_integral = getattr(
+                        self, "_in_app_closure_mouse_integral", 0.0
+                    ) + closure_velocity * max(
+                        0.0, float(getattr(self, "_last_dt", 0.015)))
+                    self._in_app_v2_metadata[
+                        "motion_magnetic_closure"].update({
+                            "candidate_mouse_velocity": closure_velocity,
+                            "accumulated_mouse_count_proxy": (
+                                self._in_app_closure_mouse_integral),
+                        })
             elif current_mode == "Roll":
                 ax, ay, az = inputData.accelerometer
                 
@@ -6474,6 +7049,12 @@ class Controller:
 
                 move_x = int(total_dx)
                 move_y = int(total_dy)
+
+                if self.gyro_mouse_enabled:
+                    self._in_app_emitted_mouse_x = getattr(
+                        self, "_in_app_emitted_mouse_x", 0) + move_x
+                    self._in_app_emitted_mouse_y = getattr(
+                        self, "_in_app_emitted_mouse_y", 0) + move_y
 
                 self.interp_residual_x = total_dx - move_x
                 self.interp_residual_y = total_dy - move_y

@@ -92,7 +92,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.1"
+APP_VERSION = "v2.2"
 
 def _set_current_thread_priority(level):
     try:
@@ -6405,7 +6405,7 @@ class ControllerWindow:
             self.comp_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
         tk.Label(self.comp_frame, text="9-axis Assist:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
-        self.stabilized_gyro_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "stabilized_gyro", False), command=self.update_stabilized_gyro_setting, bg_color=panel_bg)
+        self.stabilized_gyro_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "gyro_passthrough_9axis_enabled", False), command=self.update_stabilized_gyro_setting, bg_color=panel_bg)
         self.stabilized_gyro_switch.grid(row=0, column=1, columnspan=2, padx=int(5 * scaling_factor), sticky="w")
         tk.Label(self.comp_frame, text="Horizon Lock:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), sticky="e")
         self.steam_roll_comp_switch = ToggleSwitch(self.comp_frame, labels=["ON", "OFF"], values=[True, False], initial_value=getattr(CONFIG, "steam_roll_compensation", False), command=self.update_steam_roll_comp_setting, bg_color=panel_bg)
@@ -6677,32 +6677,29 @@ bg_color=panel_bg, widths=[8, 10])
 
         tk.Label(l2, text=" pattern during calibration.", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT)
 
-        # ---- Row 1: Gyro Control + Mode Shift + Calibrate Gyro ----
+        # ---- Row 1: Gyro Control + Sensitivity + Calibrate Gyro ----
         tk.Label(self.gyro_frame, text="Gyro Control:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
         initial_gyro_control = "Steering" if getattr(CONFIG, "gyro_mode", "World") == "Roll" else getattr(CONFIG, "gyro_control_mode", "Mouse")
         self.gyro_control_switch = ToggleSwitch(self.gyro_frame, labels=["Mouse", "R Joystick", "Steering"], values=["Mouse", "R Joystick", "Steering"], initial_value=initial_gyro_control, command=self.update_gyro_control_mode, bg_color=panel_bg)
         self.gyro_control_switch.grid(row=1, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
-        tk.Label(self.gyro_frame, text="Mode Shift:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.mode_shift_switch = ToggleSwitch(self.gyro_frame, labels=["On", "Off"], values=[True, False], initial_value=CONFIG.mode_shift_enabled, command=self.update_mode_shift_setting, bg_color=panel_bg)
-        self.mode_shift_switch.grid(row=1, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        tk.Label(self.gyro_frame, text="Sensitivity:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=1, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
+        self.sens_scale = tk.Scale(self.gyro_frame, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
+        self.sens_scale.set(self._current_gyro_control_sensitivity())
+        self.sens_scale.grid(row=1, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
         gyro_calib_row.grid(row=1, column=4, columnspan=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
 
-        # ---- Row 2: Mode + Sensitivity + Mag Cal hint ----
+        # ---- Row 2: Mode + Deadzone + Mag Cal hint ----
         tk.Label(self.gyro_frame, text="Mode:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=2, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
         self.gyro_mode_switch = ToggleSwitch(self.gyro_frame, labels=["9-Axis", "6-Axis"], values=["World", "Yaw"], initial_value=(CONFIG.gyro_mode if CONFIG.gyro_mode in ("World", "Yaw") else "World"), command=self.update_mode_setting, bg_color=panel_bg)
         self.gyro_mode_switch.grid(row=2, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
-        tk.Label(self.gyro_frame, text="Sensitivity:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=2, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.sens_scale = tk.Scale(self.gyro_frame, from_=1, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
-        self.sens_scale.set(self._current_gyro_control_sensitivity())
-        self.sens_scale.grid(row=2, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        tk.Label(self.gyro_frame, text="Deadzone:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=2, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
         mag_hint_frame.grid(row=2, column=4, columnspan=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
 
-        # ---- Row 3: Activation + Deadzone + Stick Assist ----
-        tk.Label(self.gyro_frame, text="Activation:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=3, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
-        self.gyro_act_switch = ToggleSwitch(self.gyro_frame, labels=["Toggle", "Hold"], values=["Toggle", "Hold"], initial_value=CONFIG.gyro_activation_mode, command=self.update_act_setting, bg_color=panel_bg)
-        self.gyro_act_switch.grid(row=3, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        # ---- Row 3: Mode Shift + Stick Assist ----
+        tk.Label(self.gyro_frame, text="Mode Shift:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=3, column=0, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="e")
+        self.mode_shift_switch = ToggleSwitch(self.gyro_frame, labels=["On", "Off"], values=[True, False], initial_value=CONFIG.mode_shift_enabled, command=self.update_mode_shift_setting, bg_color=panel_bg)
+        self.mode_shift_switch.grid(row=3, column=1, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
-        tk.Label(self.gyro_frame, text="Deadzone:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=3, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
         self.in_app_deadzone_scale = tk.Scale(
             self.gyro_frame,
             from_=0.0,
@@ -6723,13 +6720,13 @@ bg_color=panel_bg, widths=[8, 10])
             command=self.update_in_app_gyro_soft_deadzone_setting
         )
         self.in_app_deadzone_scale.set(getattr(CONFIG, "in_app_gyro_soft_deadzone", 0.0))
-        self.in_app_deadzone_scale.grid(row=3, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        self.in_app_deadzone_scale.grid(row=2, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
         self.stick_assist_label = tk.Label(self.gyro_frame, text="Stick Assist:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold")))
-        self.stick_assist_label.grid(row=3, column=4, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
+        self.stick_assist_label.grid(row=3, column=2, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="e")
         self.stick_scale = tk.Scale(self.gyro_frame, from_=0, to=10, resolution=0.2, orient=tk.HORIZONTAL, length=int(120 * scaling_factor), bg=panel_bg, fg=text_color, troughcolor=button_gray, activebackground=highlight_color, highlightthickness=0, bd=0, sliderrelief=tk.FLAT, sliderlength=int(15 * scaling_factor), width=int(15 * scaling_factor), font=scale_font(("Arial", 11, "bold")), command=self.on_gyro_setting_changed)
         self.stick_scale.set(getattr(CONFIG, "stick_mouse_sensitivity", 5.0))
-        self.stick_scale.grid(row=3, column=5, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
+        self.stick_scale.grid(row=3, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
         self._update_gyro_control_visibility(initial_gyro_control)
 
@@ -6813,14 +6810,19 @@ bg_color=panel_bg, widths=[8, 10])
         self.on_gyro_setting_changed()
 
     def update_stabilized_gyro_setting(self, val):
-        CONFIG.stabilized_gyro = val
+        # Pass-through only: ON selects the quality-gated V2 9-axis estimator;
+        # OFF selects the independent pure V2 6-axis estimator.
+        CONFIG.gyro_passthrough_9axis_enabled = val
+        CONFIG._bump_settings_generation()
         CONFIG.save_config()
-        logger.info(f"9-Axis Stabilization (for 6-Axis): {val}")
+        logger.info(f"Pass-through V2 9-axis Assist: {val}")
 
     def update_steam_roll_comp_setting(self, val):
+        # Drives V2 Horizon while V2 is active, Legacy Horizon Lock otherwise.
         CONFIG.steam_roll_compensation = val
+        CONFIG._bump_settings_generation()
         CONFIG.save_config()
-        logger.info(f"Roll Compensation: {val}")
+        logger.info(f"Horizon Lock: {val}")
 
     def update_virtual_gyro_soft_deadzone_setting(self, val):
         val = float(val)
@@ -6901,7 +6903,6 @@ bg_color=panel_bg, widths=[8, 10])
         self.refresh_joycon_ir_sensor_buttons()
 
     def _update_gyro_control_visibility(self, val):
-        self._current_gyro_control_ui_value = val
         # Stick Assist only applies to gyro Mouse control; hide it for R Joystick/Steering.
         if not hasattr(self, 'stick_scale') or not hasattr(self, 'stick_assist_label'):
             return
@@ -13501,8 +13502,6 @@ bg_color=panel_bg, widths=[8, 10])
         if hasattr(self, 'gyro_mode_switch'):
             mode_value = getattr(CONFIG, "gyro_mode", "World")
             self.gyro_mode_switch.set_value(mode_value if mode_value in ("World", "Yaw") else "World")
-        if hasattr(self, 'gyro_act_switch'):
-            self.gyro_act_switch.set_value(getattr(CONFIG, "gyro_activation_mode", "Toggle"))
         if hasattr(self, 'mode_shift_switch'):
             self.mode_shift_switch.set_value(CONFIG.mode_shift_enabled)
         if hasattr(self, 'gyro_control_switch'):
@@ -13526,13 +13525,14 @@ bg_color=panel_bg, widths=[8, 10])
             except ValueError:
                 pass
                 
-        # Update Horizon Lock
+        # Update 9-axis Assist / Horizon Lock.  The V2 pipeline and V2 Horizon are
+        # derived from these two, so there is nothing else to re-sync here.
         if hasattr(self, 'stabilized_gyro_switch'):
-            self.stabilized_gyro_switch.set_value(getattr(CONFIG, "stabilized_gyro", False))
-                
+            self.stabilized_gyro_switch.set_value(getattr(CONFIG, "gyro_passthrough_9axis_enabled", False))
+
         if hasattr(self, 'steam_roll_comp_switch'):
             self.steam_roll_comp_switch.set_value(getattr(CONFIG, "steam_roll_compensation", False))
-                
+
         if hasattr(self, 'deadzone_scale'):
             self.deadzone_scale.set(getattr(CONFIG, "virtual_gyro_soft_deadzone", 0.0))
         if hasattr(self, 'in_app_deadzone_scale'):
@@ -13740,6 +13740,51 @@ bg_color=panel_bg, widths=[8, 10])
         self.tray_icon = pystray.Icon("Switch2Connect", img, "Switch 2 Connect", menu, action=self.show_window)
         self.tray_icon.run_detached()
 
+    def _shutdown_virtual_devices_for_power_event(self, detach_timeout=1.0):
+        """Detach USBIP first, then stop every virtual-device server.
+
+        Windows must not be allowed to tear down this process while usbip-win2
+        still has an attached device backed by our user-mode socket.  Mark every
+        controller terminal before detaching so a PS5 disconnect callback cannot
+        race the shutdown by starting its reconnect worker.
+        """
+        vcs = [vc for vc in getattr(self, 'current_controllers', []) or [] if vc is not None]
+        try:
+            from discoverer import VIRTUAL_CONTROLLERS
+            for vc in VIRTUAL_CONTROLLERS:
+                if vc is not None and vc not in vcs:
+                    vcs.append(vc)
+        except Exception:
+            pass
+        for vc in vcs:
+            try:
+                vc.running = False
+                vc._suppress_usbip_reconnect = True
+                with vc._usbip_reconnect_lock:
+                    vc._usbip_reconnect_generation += 1
+                    vc._usbip_reconnect_active = False
+                for controller in getattr(vc, 'controllers', []) or []:
+                    controller.interp_running = False
+                    controller.suspended = True
+                    controller._is_suspending = True
+            except Exception:
+                logger.debug("Failed to mark virtual controller for power shutdown", exc_info=True)
+
+        # One inventory query handles every player.  This must happen before any
+        # server/socket is stopped, otherwise the kernel USBIP client observes an
+        # abrupt transport loss and can display an error during Windows shutdown.
+        try:
+            from virtual_controller import detach_all_usbip_devices
+            detach_all_usbip_devices(timeout=detach_timeout)
+        except Exception:
+            logger.debug("Power shutdown USBIP detach failed", exc_info=True)
+
+        for vc in vcs:
+            try:
+                vc.force_close(usbip_already_detached=True)
+            except Exception:
+                logger.debug("Power shutdown virtual-device close failed", exc_info=True)
+
     def on_quit(self):
         if getattr(self, 'is_cleaning_up', False): return
         self._close_kofi_window()
@@ -13792,6 +13837,7 @@ bg_color=panel_bg, widths=[8, 10])
             except: pass
         def cleanup():
             try:
+                self._shutdown_virtual_devices_for_power_event(detach_timeout=1.5)
                 vcs = [vc for vc in getattr(self, 'current_controllers', []) if vc and getattr(vc, 'loop', None) and vc.loop.is_running()]
                 if vcs:
                     async def disconnect():
@@ -13829,29 +13875,26 @@ bg_color=panel_bg, widths=[8, 10])
         if wparam == win32con.PBT_APMSUSPEND:
             logger.info(f"[{current_time}] System Suspend detected (PBT_APMSUSPEND). Starting cleanup...")
             set_suspending(True)
-            
+
+            # Match the proven 2.1 suspend path.  Do not touch CDC here: once the
+            # host sleeps, heartbeat stops naturally and firmware releases BLE via
+            # its host-lease timeout without a serial write/close race.
             if hasattr(self, 'current_controllers'):
-                # Iterate and close each controller synchronously
                 for vc in self.current_controllers:
                     if vc is not None:
-                        # 1. Stop the 1000Hz loop thread and reset inputs
                         vc.running = False
                         vc.reset_inputs()
-                        
-                        # 2. ALSO stop physical controller threads to prevent background work
                         for c in vc.controllers:
                             c.interp_running = False
-                            c.suspended = True 
-                            c._is_suspending = True 
-                        
-                        # 3. IMMEDIATELY and SYNCHRONOUSLY destroy the virtual device handle
+                            c.suspended = True
+                            c._is_suspending = True
                         vc.force_close()
             
             # CRITICAL: Reset the ViGEm bus singleton to release the driver handle entirely
             from virtual_controller import reset_vigem_bus
             reset_vigem_bus()
-            
-            # Final pause to let any OS-level driver cleanup settle
+
+            # Preserve the 2.1 settling interval for OS driver handle cleanup.
             time.sleep(1.0)
             
             self.quit_event.set()

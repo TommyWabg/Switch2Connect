@@ -1205,7 +1205,8 @@ async def run_discovery(quit_event, startup_bridge_context=None):
 
                     if shared_client:
                         try:
-                            if fallback_to_system_bluetooth or quit_event.is_set():
+                            if ((fallback_to_system_bluetooth or quit_event.is_set())
+                                    and not (IS_SHUTTING_DOWN or _IS_SUSPENDING)):
                                 # Issue 5: bring the bridge to a fully idle state before we
                                 # let go of it — stop scanning, keep auto-connect disabled,
                                 # and drop every BLE link so no controller stays connected
@@ -1364,22 +1365,27 @@ async def run_discovery(quit_event, startup_bridge_context=None):
             nonlocal pending_connections_count
             controller = None
             try:
-                # 1. Serialize BLE connection & pairing phase to prevent WinRT concurrency crashes
+                controller = Controller(device, advertised_product_id=advertised_product_id,
+                                        paired_connection=paired)
+                # Serialize only native link establishment. Initialization uses
+                # this controller's independent GATT characteristics and may run
+                # while the peer starts connecting.
                 async with CONNECTION_LOCK:
-                    controller = Controller(device, advertised_product_id=advertised_product_id,
-                                            paired_connection=paired)
                     await controller.connect_ble()
-                    logger.info(f"Controller connected via system bluetooth: {device.address}")
-                    controller.disconnected_callback = disconnected_controller
-                
-                    await controller.initialize()
-                
-                    if not paired:
+                logger.info(f"Controller connected via system bluetooth: {device.address}")
+                controller.disconnected_callback = disconnected_controller
+
+                await controller.initialize()
+
+                if not paired:
+                    # Pairing changes shared Windows bonding/radio state and
+                    # therefore remains serialized.
+                    async with CONNECTION_LOCK:
                         await controller.pair()
-                        logger.info(f"Paired successfully to {device.address}")
-                    # BLE connection confirmed — promote to connected so scanner won't retry
-                    _connecting_macs.discard(device.address)
-                    connected_mac_addresses.append(device.address)
+                    logger.info(f"Paired successfully to {device.address}")
+                # BLE connection confirmed -- promote to connected so scanner won't retry
+                _connecting_macs.discard(device.address)
+                connected_mac_addresses.append(device.address)
             
                 # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
                 async with GLOBAL_LOCK:

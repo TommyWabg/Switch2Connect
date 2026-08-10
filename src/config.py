@@ -25,10 +25,26 @@ import logging
 import sys
 import threading
 
+V2_OUTPUT_MODES = ("Legacy", "Shadow", "V2")
+
 logger = logging.getLogger(__name__)
 
 DJG_MODES = ("Switch Dominant Side", "Switch Gyro Side", "Single Side Toggle")
 DJG_DOMINANT_SIDES = ("Left", "Right", "None")
+
+# Temporary escape hatch while the Legacy gyro path is retained alongside V2.
+# Read once at import; changing it requires a restart. Remove together with the
+# Legacy path once V2 is proven.
+GYRO_V2_MODE_OVERRIDE = os.environ.get("SWITCH2_GYRO_V2_MODE", "").strip()
+if GYRO_V2_MODE_OVERRIDE not in V2_OUTPUT_MODES:
+    GYRO_V2_MODE_OVERRIDE = ""
+
+
+def derive_gyro_v2_mode(stabilized_gyro, override=""):
+    """Normal UI positions use V2; override retains reversible Legacy/Shadow."""
+    if override in V2_OUTPUT_MODES:
+        return override
+    return "V2"
 
 def normalize_djg_settings(mode, dominant_side):
     """Normalize current DJG settings and migrate the removed Direct Merge mode."""
@@ -942,9 +958,14 @@ class Config:
             "gyro_activation_mode": config.get("gyro_activation_mode", "Toggle"),
             "stick_mouse_sensitivity": float(config.get("stick_mouse_sensitivity", 20.0)),
             "stabilized_gyro": bool(config.get("stabilized_gyro", False)),
+            "gyro_passthrough_9axis_enabled": bool(config.get(
+                "gyro_passthrough_9axis_enabled",
+                config.get("stabilized_gyro", False))),
             "virtual_gyro_soft_deadzone": float(deadzone),
             "in_app_gyro_soft_deadzone": float(in_app_deadzone),
             "gyro_passthrough_mode": config.get("gyro_passthrough_mode", "Default"),
+            "experimental_9axis_v2_mode": config.get("experimental_9axis_v2_mode", "Legacy"),
+            "horizon_lock_v2_enabled": bool(config.get("horizon_lock_v2_enabled", False)),
             "cemuhook_sensitivity": int(config.get("cemuhook_sensitivity", 1)),
             "steam_roll_compensation": bool(config.get("steam_roll_compensation", False)),
             "djg_enabled": bool(config.get("djg_enabled", False)),
@@ -971,9 +992,12 @@ class Config:
             "gyro_activation_mode": "Toggle",
             "stick_mouse_sensitivity": 20.0,
             "stabilized_gyro": False,
+            "gyro_passthrough_9axis_enabled": False,
             "virtual_gyro_soft_deadzone": 0.0,
             "in_app_gyro_soft_deadzone": 0.0,
             "gyro_passthrough_mode": "Default",
+            "experimental_9axis_v2_mode": "Legacy",
+            "horizon_lock_v2_enabled": False,
             "cemuhook_sensitivity": 1,
             "steam_roll_compensation": False,
             "djg_enabled": False,
@@ -1403,82 +1427,12 @@ class Config:
         return False
         
     @property
-    def gyro_passthrough_mode(self):
-        return self.profiles.get(self.active_profile, {}).get("gyro_passthrough_mode", "Default")
-
-    @gyro_passthrough_mode.setter
-    def gyro_passthrough_mode(self, value):
-        if self.active_profile in self.profiles:
-            self.profiles[self.active_profile]["gyro_passthrough_mode"] = value
-
-    @property
-    def steam_roll_compensation(self):
-        return self.profiles.get(self.active_profile, {}).get("steam_roll_compensation", False)
-
-    @steam_roll_compensation.setter
-    def steam_roll_compensation(self, value):
-        if self.active_profile in self.profiles:
-            self.profiles[self.active_profile]["steam_roll_compensation"] = value
-
-    @property
-    def cemuhook_sensitivity(self):
-        return self.profiles.get(self.active_profile, {}).get("cemuhook_sensitivity", 1)
-
-    @cemuhook_sensitivity.setter
-    def cemuhook_sensitivity(self, value):
-        if self.active_profile in self.profiles:
-            self.profiles[self.active_profile]["cemuhook_sensitivity"] = int(value)
-
-    @property
-    def djg_enabled(self):
-        return self.profiles.get(self.active_profile, {}).get("djg_enabled", False)
-
-    @djg_enabled.setter
-    def djg_enabled(self, value):
-        if self.active_profile in self.profiles:
-            self.profiles[self.active_profile]["djg_enabled"] = value
-
-    @property
-    def djg_dominant_side(self):
-        return self.profiles.get(self.active_profile, {}).get("djg_dominant_side", "Right")
-
-    @djg_dominant_side.setter
-    def djg_dominant_side(self, value):
-        if self.active_profile in self.profiles:
-            self.profiles[self.active_profile]["djg_dominant_side"] = value
-            
-    @property
-    def djg_mode(self):
-        return self.profiles.get(self.active_profile, {}).get("djg_mode", "Single Side Toggle")
-
-    @djg_mode.setter
-    def djg_mode(self, value):
-        if self.active_profile in self.profiles:
-            self.profiles[self.active_profile]["djg_mode"] = value
-
-    @property
     def in_app_gyro_soft_deadzone(self):
         return float(self._get_profile_setting("in_app_gyro_soft_deadzone"))
 
     @in_app_gyro_soft_deadzone.setter
     def in_app_gyro_soft_deadzone(self, value):
         self._set_profile_setting("in_app_gyro_soft_deadzone", float(value))
-
-    @property
-    def audio_haptics_enabled(self):
-        return bool(self._get_profile_setting("audio_haptics_enabled"))
-
-    @audio_haptics_enabled.setter
-    def audio_haptics_enabled(self, value):
-        self._set_profile_setting("audio_haptics_enabled", bool(value))
-
-    @property
-    def adaptive_triggers_enabled(self):
-        return bool(self._get_profile_setting("adaptive_triggers_enabled"))
-
-    @adaptive_triggers_enabled.setter
-    def adaptive_triggers_enabled(self, value):
-        self._set_profile_setting("adaptive_triggers_enabled", bool(value))
 
     @property
     def impulse_trigger_enabled(self):
@@ -1665,6 +1619,15 @@ class Config:
         self._set_profile_setting("stabilized_gyro", bool(value))
 
     @property
+    def gyro_passthrough_9axis_enabled(self):
+        """Fusion source for pass-through only; never controls In-App Gyro."""
+        return bool(self._get_profile_setting("gyro_passthrough_9axis_enabled"))
+
+    @gyro_passthrough_9axis_enabled.setter
+    def gyro_passthrough_9axis_enabled(self, value):
+        self._set_profile_setting("gyro_passthrough_9axis_enabled", bool(value))
+
+    @property
     def virtual_gyro_soft_deadzone(self):
         return float(self._get_profile_setting("virtual_gyro_soft_deadzone"))
 
@@ -1679,6 +1642,22 @@ class Config:
     @gyro_passthrough_mode.setter
     def gyro_passthrough_mode(self, value):
         self._set_profile_setting("gyro_passthrough_mode", value)
+
+    # Derived, not stored: "9-axis Assist" selects the pipeline and "Horizon Lock"
+    # selects V2 Horizon. Deriving here (rather than writing through from the GUI)
+    # keeps profile switching and imported profiles correct for free, and makes any
+    # stored value of these two keys inert.
+    @property
+    def experimental_9axis_v2_mode(self):
+        # Both normal switch positions use V2.  The switch selects the V2
+        # estimator (quality-gated 9-axis or pure 6-axis), while this override
+        # remains the explicit reversible Legacy/Shadow escape hatch.
+        return derive_gyro_v2_mode(
+            self.gyro_passthrough_9axis_enabled, GYRO_V2_MODE_OVERRIDE)
+
+    @property
+    def horizon_lock_v2_enabled(self):
+        return bool(self.steam_roll_compensation)
 
     @property
     def steam_roll_compensation(self):
@@ -1791,6 +1770,7 @@ class Config:
             'open_when_startup': self.open_when_startup,
             'start_minimized': self.start_minimized,
             'stabilized_gyro': self.stabilized_gyro,
+            'gyro_passthrough_9axis_enabled': self.gyro_passthrough_9axis_enabled,
             'virtual_gyro_soft_deadzone': self.virtual_gyro_soft_deadzone,
             'in_app_gyro_soft_deadzone': self.in_app_gyro_soft_deadzone,
             'abxy_mode': self.abxy_mode,

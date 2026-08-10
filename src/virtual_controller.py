@@ -50,8 +50,7 @@ import gc
 from controller import (Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         USBIP_PS5_CONCURRENT_RUMBLE_TEST,
-                        ds_motion_scale,
-                        ensure_system_bt_merged_file_logging)
+                        ds_motion_scale)
 from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
 from usbip_server import USBIPServer
 from audio_endpoint_guard import DualSenseAudioEndpointGuard
@@ -221,7 +220,7 @@ def get_ds4_dpad(up, down, left, right):
 def float_to_byte(val):
     return int(max(0, min(255, round(val * 127.5 + 128))))
 
-def detach_usbip_device(server_port: int):
+def detach_usbip_device(server_port: int, timeout=2.0):
     import subprocess
     import os
     import re
@@ -232,7 +231,9 @@ def detach_usbip_device(server_port: int):
         
     bus_id = f"1-{server_port - 3240 + 1}"
     try:
-        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True,
+                             timeout=max(0.1, float(timeout)),
+                             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
         if res.returncode != 0:
             return
             
@@ -248,13 +249,13 @@ def detach_usbip_device(server_port: int):
                 if f":{server_port}" in port_block or f"/{bus_id}" in port_block:
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with server port {server_port} (bus_id: {bus_id})")
                     try:
-                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=2.0)
+                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=max(0.1, float(timeout)))
                     except subprocess.TimeoutExpired:
                         logger.warning(f"Timeout while detaching USBIP port {port_num_str}. Process may be hung.")
     except Exception as e:
         logger.error(f"Error detaching USBIP device for port {server_port}: {e}")
 
-def detach_all_usbip_devices():
+def detach_all_usbip_devices(timeout=2.0):
     import subprocess
     import os
     import re
@@ -264,7 +265,9 @@ def detach_all_usbip_devices():
         return
         
     try:
-        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        res = subprocess.run([usbip_exe, "port"], capture_output=True, text=True,
+                             timeout=max(0.1, float(timeout)),
+                             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
         if res.returncode != 0:
             return
             
@@ -286,7 +289,7 @@ def detach_all_usbip_devices():
                 if should_detach:
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with a virtual controller slot")
                     try:
-                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=2.0)
+                        subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=max(0.1, float(timeout)))
                     except subprocess.TimeoutExpired:
                         logger.warning(f"Timeout while detaching USBIP port {port_num_str}. Process may be hung.")
     except Exception as e:
@@ -529,6 +532,12 @@ class VirtualController:
             return
         if getattr(self, '_suppress_usbip_reconnect', False):
             return
+        try:
+            from discoverer import IS_SHUTTING_DOWN, _IS_SUSPENDING
+            if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                return
+        except Exception:
+            pass
         if not getattr(self, 'running', False):
             return
         with self._usbip_reconnect_lock:
@@ -560,6 +569,12 @@ class VirtualController:
                 time.sleep(delay)
                 if not getattr(self, 'running', False):
                     return
+                try:
+                    from discoverer import IS_SHUTTING_DOWN, _IS_SUSPENDING
+                    if IS_SHUTTING_DOWN or _IS_SUSPENDING:
+                        return
+                except Exception:
+                    pass
                 with self._usbip_reconnect_lock:
                     if generation != self._usbip_reconnect_generation:
                         return
@@ -654,7 +669,6 @@ class VirtualController:
             return
 
         await self._deactivate_system_bt_merged_pair()
-        ensure_system_bt_merged_file_logging()
         session_id = f"P{self.player_number}-{time.monotonic_ns()}"
         self._system_bt_pair_session_id = session_id
         self._system_bt_pair_controllers = (left, right)
@@ -1074,7 +1088,7 @@ class VirtualController:
                     self._submit_fail_count, self.mode, self.driver_type)
         return submitted
 
-    def cleanup_vg_controller(self):
+    def cleanup_vg_controller(self, detach_usbip=True):
         self._suppress_usbip_reconnect = True
         self._stop_submit_thread()
         self._stop_dualsense_audio_guard()
@@ -1083,7 +1097,7 @@ class VirtualController:
             server_attr = f'usbip_server{suffix}' if suffix else 'usbip_server'
             
             if hasattr(self, server_attr) and getattr(self, server_attr):
-                if hasattr(self, port_attr) and getattr(self, port_attr):
+                if detach_usbip and hasattr(self, port_attr) and getattr(self, port_attr):
                     try:
                         detach_usbip_device(getattr(self, port_attr))
                     except Exception:
@@ -3882,7 +3896,7 @@ class VirtualController:
             self.was_touching_1 = False
             self.touch_start_time = 0.0
 
-    def force_close(self):
+    def force_close(self, usbip_already_detached=False):
         """Synchronously and forcefully close the virtual device handle."""
         self.running = False
         
@@ -3895,10 +3909,11 @@ class VirtualController:
         with self.state_lock:
             if hasattr(self, 'vg_controller') and self.vg_controller is not None:
                 logger.info(f"Player {self.player_number}: Forcefully destroying virtual device handle.")
-                self.cleanup_vg_controller()
+                self.cleanup_vg_controller(detach_usbip=not usbip_already_detached)
                 
         server_port = self.server_port
-        detach_usbip_device(server_port)
+        if not usbip_already_detached:
+            detach_usbip_device(server_port)
         if hasattr(self, 'usbip_server') and self.usbip_server:
             try:
                 self.usbip_server.stop()

@@ -218,23 +218,6 @@ def quaternion_rotate_vector(q, v):
     res = quaternion_multiply(quaternion_multiply(q, qv), q_inv)
     return (res[1], res[2], res[3])
 
-def quaternion_from_vectors(v_from, v_to):
-    v_from = vector_normalize(v_from)
-    v_to = vector_normalize(v_to)
-    dot = vector_dot(v_from, v_to)
-    if dot < -0.999999:
-        axis = vector_cross((1, 0, 0), v_from)
-        if math.sqrt(sum(x*x for x in axis)) < 0.000001:
-            axis = vector_cross((0, 1, 0), v_from)
-        return quaternion_normalize((0, axis[0], axis[1], axis[2]))
-    elif dot > 0.999999:
-        return (1, 0, 0, 0)
-    
-    s = math.sqrt((1 + dot) * 2)
-    inv_s = 1 / s
-    cross = vector_cross(v_from, v_to)
-    return quaternion_normalize((s * 0.5, cross[0] * inv_s, cross[1] * inv_s, cross[2] * inv_s))
-
 _IS_PACKAGED_CACHE = None
 
 def is_packaged():
