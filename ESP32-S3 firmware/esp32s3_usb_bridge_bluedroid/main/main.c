@@ -55,7 +55,7 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "1.2"
+#define APP_FIRMWARE_VERSION      "2.2"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_3"
 #define CDC_LINE_STATE_DTR        0x01
@@ -236,6 +236,13 @@ static QueueHandle_t s_ack_queue;   // ack/cmd notifications (P0)
 static QueueHandle_t s_notify_queue; // handle-routed notifications for GCN/WinRT parity
 static QueueHandle_t s_out_queue;   // outbound JSON lines from BLE callbacks
 static volatile bool s_request_status = false;
+static volatile bool s_host_lease_armed = false;
+static volatile bool s_shutdown_ack_pending = false;
+static volatile bool s_dtr_present = false;
+static volatile uint32_t s_last_heartbeat_ms = 0;
+static volatile uint32_t s_dtr_lost_ms = 0;
+#define HOST_LEASE_TIMEOUT_MS 5000
+#define DTR_LOSS_DEBOUNCE_MS 1000
 typedef struct { char text[256]; } line_t;
 typedef struct { uint8_t ch; uint8_t len; uint16_t handle; uint8_t data[REPORT_SIZE]; } in_report_t;
 static char s_rx_buf[512];
@@ -659,6 +666,7 @@ static void do_disc_all(void) {  // "ble disconnect": drop every live link (clea
     // controller's HCI state and cause crashes (status=133 flooding → assert).
     // Scanning will resume automatically once the queue drains.
     s_resume_scan = false;  // kick_disc_queue will set this when done
+    for (int i = 0; i < MAX_CH; i++) rumble_shadow_deactivate(i);
     portENTER_CRITICAL(&s_disc_mux);
     for (int i = 0; i < MAX_CH; i++)
         if (s_ch[i].used) s_disc_mask |= (1u << i);
@@ -737,6 +745,18 @@ static void do_wrpair(char *args) {  // wrpair <ch_l> <ch_r> <kind> <hex_l> <hex
 }
 static void handle_command(char *cmd) {
     if (strncmp(cmd, "status", 6) == 0)         { s_request_status = true; }
+    else if (strcmp(cmd, "heartbeat") == 0)     {
+        s_host_lease_armed = true;
+        s_last_heartbeat_ms = now_ms();
+    }
+    else if (strcmp(cmd, "host shutdown") == 0) {
+        s_scan_mode = false;
+        s_resume_scan = false;
+        esp_ble_gap_stop_scanning();
+        s_host_lease_armed = false;
+        s_shutdown_ack_pending = true;
+        do_disc_all();
+    }
     else if (strncmp(cmd, "scan on", 7) == 0)   {
         // The host sends "scan on" right after "disc <ch>" to re-arm detection.  Never
         // start the scan synchronously here: a gap_disconnect issued by do_disc is still
@@ -783,9 +803,32 @@ void tinyusb_cdc_rx_callback(int itf, cdcacm_event_t *event) {
         }
     }
 }
+
+static void tinyusb_cdc_line_state_callback(int itf, cdcacm_event_t *event) {
+    (void)itf;
+    if (event->type != CDC_EVENT_LINE_STATE_CHANGED) return;
+    s_dtr_present = event->line_state_changed_data.dtr;
+    if (s_dtr_present) {
+        s_dtr_lost_ms = 0;
+    } else {
+        s_dtr_lost_ms = now_ms();
+    }
+}
 static void cdc_task(void *arg) {
     (void)arg;
     for (;;) {
+        uint32_t now = now_ms();
+        bool heartbeat_expired = s_host_lease_armed &&
+            (int32_t)(now - s_last_heartbeat_ms) >= HOST_LEASE_TIMEOUT_MS;
+        bool dtr_expired = s_host_lease_armed && !s_dtr_present && s_dtr_lost_ms != 0 &&
+            (int32_t)(now - s_dtr_lost_ms) >= DTR_LOSS_DEBOUNCE_MS;
+        if (heartbeat_expired || dtr_expired) {
+            s_host_lease_armed = false;
+            s_scan_mode = false;
+            s_resume_scan = false;
+            esp_ble_gap_stop_scanning();
+            do_disc_all();
+        }
         if (s_request_status) { s_request_status = false; send_status_response(); }
         // Deferred 3rd-link open: the existing links were widened to 15ms in do_conn;
         // open the 3rd once that has settled (scan is already stopped by then).
@@ -802,6 +845,11 @@ static void cdc_task(void *arg) {
         // so a stuck disconnect doesn't wedge the bridge until replug.
         if (!s_disc_in_flight && s_disc_mask && now_ms() >= s_gap_busy_until)
             kick_disc_queue();
+        if (s_shutdown_ack_pending && !s_disc_in_flight && s_disc_mask == 0 &&
+                ch_active_mask() == 0) {
+            s_shutdown_ack_pending = false;
+            send_json("{\"cmd\":\"shutdown_ack\",\"ble_channels\":0}\n");
+        }
         in_report_t ack;
         if (xQueueReceive(s_ack_queue, &ack, 0) == pdTRUE) send_report_frame(ack.ch, ack.data, ack.len, true);
         in_report_t ntf;
@@ -1277,6 +1325,7 @@ void app_main(void) {
     tinyusb_config_cdcacm_t acm = {
         .usb_dev = TINYUSB_USBDEV_0, .cdc_port = TINYUSB_CDC_ACM_0,
         .rx_unread_buf_sz = 1024, .callback_rx = &tinyusb_cdc_rx_callback,
+        .callback_line_state_changed = &tinyusb_cdc_line_state_callback,
     };
     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm));
     xTaskCreatePinnedToCore(cdc_task, "cdc_task", 4096, NULL, 10, NULL, 1);
