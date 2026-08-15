@@ -27,15 +27,10 @@ import random
 import sys
 import threading
 import heapq
+import timer_resolution
+import power_saving
 
 import numpy as np  # module-level import: avoid repeated in-function import cost on each diagnostic cycle
-
-# Request 1ms timer resolution on Windows so time.sleep() is accurate enough for ISO pacing.
-try:
-    sys.setswitchinterval(0.001)
-    ctypes.windll.winmm.timeBeginPeriod(1)
-except Exception:
-    pass
 
 # A real USB DualSense exposes NO serial number (iSerialNumber = 0 in the device
 # descriptor), and neither do we — see dualsense_descriptors.py.  A PlayStation HID
@@ -127,7 +122,7 @@ def _native_timing_candidates():
 
 def _set_thread_priority(level):
     try:
-        if sys.platform == "win32":
+        if sys.platform == "win32" and not power_saving.is_full():
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.GetCurrentThread()
             kernel32.SetThreadPriority(handle, level)
@@ -685,7 +680,15 @@ class USBIPDualSenseServer(USBIPServer):
             )
 
     def start(self):
-        super().start()
+        if not getattr(self, "_timer_resolution_acquired", False):
+            self._timer_resolution_acquired = timer_resolution.acquire()
+        try:
+            super().start()
+        except Exception:
+            if getattr(self, "_timer_resolution_acquired", False):
+                timer_resolution.release()
+                self._timer_resolution_acquired = False
+            raise
         self.iso_out_thread = threading.Thread(target=self._iso_out_loop, daemon=True)
         self.iso_in_thread = threading.Thread(target=self._iso_in_loop, daemon=True)
         self.audio_out_thread = threading.Thread(target=self._audio_out_loop, daemon=True)
@@ -1318,7 +1321,12 @@ class USBIPDualSenseServer(USBIPServer):
             self._enqueue_tx(None, None, TX_PRIORITY_OTHER)
         except Exception:
             pass
-        super().stop()
+        try:
+            super().stop()
+        finally:
+            if getattr(self, "_timer_resolution_acquired", False):
+                timer_resolution.release()
+                self._timer_resolution_acquired = False
 
     def _enqueue_tx(self, sock, payload, priority=TX_PRIORITY_OTHER,
                     seqnum=None, stream_key=None, generation=None, claim_audio=False):

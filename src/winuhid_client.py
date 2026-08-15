@@ -442,6 +442,14 @@ def setup_prototypes():
     
     _winuhid_devs.WinUHidPS5ReportInput.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINUHID_PS5_INPUT_REPORT)]
     _winuhid_devs.WinUHidPS5ReportInput.restype = ctypes.c_bool
+
+    # Optional for compatibility with older externally supplied DLLs. Packaged
+    # builds expose this cache-only path so power-saving modes never wait on a
+    # synchronous HID read completion for each physical input report.
+    update_input_state = getattr(_winuhid_devs, "WinUHidPS5UpdateInputState", None)
+    if update_input_state is not None:
+        update_input_state.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINUHID_PS5_INPUT_REPORT)]
+        update_input_state.restype = ctypes.c_bool
     
     _winuhid_devs.WinUHidPS5Destroy.argtypes = [ctypes.c_void_p]
     _winuhid_devs.WinUHidPS5Destroy.restype = None
@@ -596,6 +604,14 @@ class VDS5Gamepad:
     def update(self):
         if self.device and _winuhid_devs:
             return bool(_winuhid_devs.WinUHidPS5ReportInput(self.device, ctypes.byref(self.report)))
+        return False
+
+    def update_latest(self):
+        if self.device and _winuhid_devs:
+            update_input_state = getattr(_winuhid_devs, "WinUHidPS5UpdateInputState", None)
+            if update_input_state is not None:
+                return bool(update_input_state(self.device, ctypes.byref(self.report)))
+            return self.update()
         return False
 
     def close(self):

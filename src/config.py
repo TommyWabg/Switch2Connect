@@ -645,6 +645,19 @@ class Config:
         self.combine_joycons = config.get("combine_joycons", True)
         self.system_bt_merged_pair_coordinator = config.get(
             "system_bt_merged_pair_coordinator", True)
+        self.system_bt_merged_pair_throughput_request = config.get(
+            "system_bt_merged_pair_throughput_request", True)
+        self.system_bt_merged_pair_request_mode = str(config.get(
+            "system_bt_merged_pair_request_mode", "both")).lower()
+        try:
+            self.system_bt_merged_pair_cadence_hz = int(config.get(
+                "system_bt_merged_pair_cadence_hz", 66))
+        except (TypeError, ValueError):
+            self.system_bt_merged_pair_cadence_hz = 66
+        if self.system_bt_merged_pair_cadence_hz not in (66, 50, 40, 30):
+            self.system_bt_merged_pair_cadence_hz = 66
+        self.system_bt_merged_pair_adaptive_cadence = config.get(
+            "system_bt_merged_pair_adaptive_cadence", True)
         self.deadzone = config.get("deadzone", 50)
         self.controller_mode = config.get("controller_mode", "Xbox")
         self.ui_scale = float(config.get("ui_scale", 1.0))
@@ -783,6 +796,11 @@ class Config:
         
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
+        self.power_saving_mode = config.get("power_saving_mode", "Off")
+        if self.power_saving_mode not in ("Off", "Auto", "Full"):
+            self.power_saving_mode = "Off"
+        self.power_saving_auto_warning_suppressed = bool(config.get("power_saving_auto_warning_suppressed", False))
+        self.power_saving_full_warning_suppressed = bool(config.get("power_saving_full_warning_suppressed", False))
         self.driver_installed = config.get("driver_installed", False)
         if _packaged_build():
             # The persisted value is not trusted as a capability grant.  Refresh
@@ -1744,6 +1762,10 @@ class Config:
             'controller_fast_cache_entries': self.controller_fast_cache_entries,
             'winrt_cached_services': self.winrt_cached_services,
             'system_bt_merged_pair_coordinator': self.system_bt_merged_pair_coordinator,
+            'system_bt_merged_pair_throughput_request': self.system_bt_merged_pair_throughput_request,
+            'system_bt_merged_pair_request_mode': self.system_bt_merged_pair_request_mode,
+            'system_bt_merged_pair_cadence_hz': self.system_bt_merged_pair_cadence_hz,
+            'system_bt_merged_pair_adaptive_cadence': self.system_bt_merged_pair_adaptive_cadence,
             'winrt_skip_pro2_unsupported_init_0101': self.winrt_skip_pro2_unsupported_init_0101,
             'vigembus_sim_mode': self.vigembus_sim_mode,
             'winuhid_sim_mode': self.winuhid_sim_mode,
@@ -1769,6 +1791,9 @@ class Config:
             'simulation_mode': self.simulation_mode,
             'open_when_startup': self.open_when_startup,
             'start_minimized': self.start_minimized,
+            'power_saving_mode': self.power_saving_mode,
+            'power_saving_auto_warning_suppressed': self.power_saving_auto_warning_suppressed,
+            'power_saving_full_warning_suppressed': self.power_saving_full_warning_suppressed,
             'stabilized_gyro': self.stabilized_gyro,
             'gyro_passthrough_9axis_enabled': self.gyro_passthrough_9axis_enabled,
             'virtual_gyro_soft_deadzone': self.virtual_gyro_soft_deadzone,

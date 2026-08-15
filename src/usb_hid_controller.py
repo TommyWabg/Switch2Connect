@@ -67,6 +67,8 @@ import asyncio
 import os
 import json
 from collections import deque
+import timer_resolution
+import power_saving
 
 from config import CONFIG
 from controller import (
@@ -1337,8 +1339,10 @@ class _UsbHidClient:
         self._read_stop = threading.Event()
         self._write_lock = threading.Lock()
         self.is_high_speed_usb = False
-        self._input_deltas = []
+        self._input_deltas = deque(maxlen=50)
+        self._input_delta_sum = 0.0
         self._last_input_time = 0.0
+        self._next_input_stats_update = 0.0
         self._last_usb_rumble_active = None
         self._last_usb_rumble_refresh = 0.0
         self._last_usb_rumble_command = None
@@ -1417,6 +1421,9 @@ class _UsbHidClient:
         self._rumble_trace = deque(maxlen=trace_size) if trace_enabled else None
         self._rumble_trace_path = os.environ.get(
             "SWITCH2_USB_RUMBLE_TRACE_PATH", "logs/usb_rumble_trace.jsonl")
+        self._blackbox_enabled = os.environ.get(
+            "SWITCH2_USB_RUMBLE_BLACKBOX", "0").lower() in (
+                "1", "true", "yes", "on")
         self._rumble_trace_last_wire_start = 0.0
         self._rumble_trace_last_wire_active = False
         self._rumble_trace_gap_count = 0
@@ -1545,7 +1552,8 @@ class _UsbHidClient:
             # Restart the staleness clock, otherwise the watchdog fires again
             # immediately on the gap the fault itself created.
             self._last_input_time = 0.0
-            self._input_deltas = []
+            self._input_deltas.clear()
+            self._input_delta_sum = 0.0
             logger.info(
                 "Wired USB HID handle reopened (attempt %d/%d)",
                 self._recover_attempts, self._MAX_RECOVER_ATTEMPTS)
@@ -1666,7 +1674,6 @@ class _UsbHidClient:
         if self._rumble_thread and self._rumble_thread.is_alive():
             return
         self._rumble_stop.clear()
-        self._set_timer_resolution(True)
         self._rumble_thread = threading.Thread(target=self._rumble_write_loop, daemon=True)
         self._rumble_thread.start()
 
@@ -1674,18 +1681,11 @@ class _UsbHidClient:
         """Raise/restore Windows multimedia timer resolution to 1 ms so the writer
         thread's 15 ms pacing is honoured (default granularity is ~15.6 ms). No-op
         off Windows; balanced by a matching timeEndPeriod on stop."""
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-            if enable and not self._timer_res_raised:
-                ctypes.windll.winmm.timeBeginPeriod(1)
-                self._timer_res_raised = True
-            elif not enable and self._timer_res_raised:
-                ctypes.windll.winmm.timeEndPeriod(1)
-                self._timer_res_raised = False
-        except Exception as e:
-            logger.debug("timeBeginPeriod/timeEndPeriod failed: %s", e)
+        if enable and not self._timer_res_raised:
+            self._timer_res_raised = timer_resolution.acquire()
+        elif not enable and self._timer_res_raised:
+            timer_resolution.release()
+            self._timer_res_raised = False
 
     def _set_rumble_thread_priority(self) -> None:
         """Raise only the current USB writer thread to ABOVE_NORMAL on Windows.
@@ -1695,6 +1695,8 @@ class _UsbHidClient:
         restoration is required during disconnect.
         """
         enabled = self._rumble_high_priority_enabled
+        if power_saving.is_full():
+            enabled = False
         if not enabled or os.name != "nt":
             self._trace_rumble_event(
                 "thread_priority", int(enabled), 0, 0, 0)
@@ -1879,7 +1881,7 @@ class _UsbHidClient:
         SILENCE_KEEP = 3
         last_write = 0.0
         while not self._rumble_stop.is_set():
-            self._rumble_wake.wait(0.5)
+            self._rumble_wake.wait()
             if self._rumble_stop.is_set():
                 break
             self._rumble_wake.clear()
@@ -1891,6 +1893,7 @@ class _UsbHidClient:
                 self._rumble_slot = None
             if data is None:
                 continue
+            self._set_timer_resolution(True)
 
             interval = 0.015
             if time.perf_counter() < self._congested_until:
@@ -1899,10 +1902,13 @@ class _UsbHidClient:
             now = time.perf_counter()
             if now < target_time:
                 sleep_amount = target_time - now
-                if sleep_amount > 0.002:
-                    time.sleep(sleep_amount - 0.002)
-                while time.perf_counter() < target_time:
-                    pass
+                if power_saving.is_off():
+                    if sleep_amount > 0.002:
+                        time.sleep(sleep_amount - 0.002)
+                    while time.perf_counter() < target_time:
+                        pass
+                elif self._rumble_stop.wait(sleep_amount):
+                    break
 
             active = _pro2_rumble_payload_is_active(data)
             if active:
@@ -1911,6 +1917,7 @@ class _UsbHidClient:
                 self._inactive_run += 1
                 if self._inactive_run > SILENCE_KEEP:
                     self._trace_rumble_event("silence_drop", self._inactive_run)
+                    self._set_timer_resolution(False)
                     continue
 
             self._rumble_trace_producer_frame_count += 1
@@ -1919,12 +1926,15 @@ class _UsbHidClient:
                 int(active), 0, 0)
             last_write = time.perf_counter()
             self._write_rumble_frame(data)
+            if not active:
+                self._set_timer_resolution(False)
+        self._set_timer_resolution(False)
 
     def _gamecube_rumble_write_loop(self):
         """GameCube transition writer using the Pro 2 writer's 15 ms pacing."""
         last_write = 0.0
         while not self._rumble_stop.is_set():
-            self._rumble_wake.wait(0.5)
+            self._rumble_wake.wait()
             if self._rumble_stop.is_set():
                 break
             self._rumble_wake.clear()
@@ -1938,6 +1948,7 @@ class _UsbHidClient:
                 has_followup = self._rumble_slot is not None
             if data is None:
                 continue
+            self._set_timer_resolution(True)
 
             interval = 0.015
             if time.perf_counter() < self._congested_until:
@@ -1946,10 +1957,13 @@ class _UsbHidClient:
             now = time.perf_counter()
             if now < target_time:
                 sleep_amount = target_time - now
-                if sleep_amount > 0.002:
-                    time.sleep(sleep_amount - 0.002)
-                while time.perf_counter() < target_time:
-                    pass
+                if power_saving.is_off():
+                    if sleep_amount > 0.002:
+                        time.sleep(sleep_amount - 0.002)
+                    while time.perf_counter() < target_time:
+                        pass
+                elif self._rumble_stop.wait(sleep_amount):
+                    break
             active = _gc_rumble_payload_is_active(data)
             self._rumble_trace_producer_frame_count += 1
             self._trace_rumble_event(
@@ -1974,6 +1988,9 @@ class _UsbHidClient:
                 # consumed.  Keep the writer event-driven, but do not make it wait
                 # for another producer callback before delivering that edge.
                 self._rumble_wake.set()
+            else:
+                self._set_timer_resolution(False)
+        self._set_timer_resolution(False)
 
     def _experimental_deadline_rumble_write_loop(self):
         # Minimum spacing between wire writes. HD rumble frames carry 3x5 ms of
@@ -2058,12 +2075,15 @@ class _UsbHidClient:
                 self._trace_rumble_event(
                     "pace", interval * 1000.0, sleep_amount * 1000.0,
                     max(0.0, self._congested_until - now) * 1000.0, 0)
-                if sleep_amount > 0.002:
-                    # Sleep most of the way, leaving 2ms for spin-wait accuracy
-                    time.sleep(sleep_amount - 0.002)
-                # Spin-wait the remaining time to guarantee strict interval
-                while time.perf_counter() < target_time:
-                    pass
+                if power_saving.is_off():
+                    if sleep_amount > 0.002:
+                        # Sleep most of the way, leaving 2ms for spin-wait accuracy
+                        time.sleep(sleep_amount - 0.002)
+                    # Spin-wait the remaining time to guarantee strict interval
+                    while time.perf_counter() < target_time:
+                        pass
+                elif self._rumble_stop.wait(sleep_amount):
+                    break
             # A stop submitted while this frame was being paced must preempt a
             # locally-held sustain replay; otherwise one stale active frame can be
             # emitted just before the queued stop and extend stop latency by 15 ms.
@@ -2320,8 +2340,8 @@ class _UsbHidClient:
                 t0 = time.perf_counter()
                 written = self.dev.write(list(report))
                 
-        # BLACKBOX RECORD
-        if not getattr(self, "_blackbox_frozen", False):
+        # Opt-in diagnostic: report.hex() is deliberately kept off the hot path.
+        if self._blackbox_enabled and not getattr(self, "_blackbox_frozen", False):
             if not hasattr(self, "_blackbox_history"):
                 self._blackbox_history = []
                 
@@ -2348,7 +2368,7 @@ class _UsbHidClient:
                 t0 = time.perf_counter()
                 written = self.dev.write(list(report))
 
-        if not getattr(self, "_blackbox_frozen", False):
+        if self._blackbox_enabled and not getattr(self, "_blackbox_frozen", False):
             if not hasattr(self, "_blackbox_history"):
                 self._blackbox_history = []
             elapsed = time.perf_counter() - t0
@@ -2467,19 +2487,24 @@ class _UsbHidClient:
 
 
             now = time.perf_counter()
-            if self._last_input_time > 0:
+            update_stats = now >= self._next_input_stats_update
+            if self._last_input_time > 0 and update_stats:
                 delta = now - self._last_input_time
                 if delta < 0.05:
+                    if len(self._input_deltas) == self._input_deltas.maxlen:
+                        self._input_delta_sum -= self._input_deltas[0]
                     self._input_deltas.append(delta)
-                    if len(self._input_deltas) > 50:
-                        self._input_deltas.pop(0)
-                        avg_delta = sum(self._input_deltas) / 50.0
+                    self._input_delta_sum += delta
+                    if len(self._input_deltas) == self._input_deltas.maxlen:
+                        avg_delta = self._input_delta_sum / self._input_deltas.maxlen
                         new_is_high_speed_usb = (avg_delta <= 0.0015)
                         if getattr(self, '_logged_speed', None) is None:
                             self._logged_speed = True
                             rate = 1.0 / avg_delta if avg_delta > 0 else 0
                             logger.info(f"Wired USB Polling Rate Detected: {rate:.1f} Hz (avg interval: {avg_delta*1000:.2f} ms). High Speed: {new_is_high_speed_usb}")
                         self.is_high_speed_usb = new_is_high_speed_usb
+                        self._next_input_stats_update = (
+                            now if power_saving.is_off() else now + 0.25)
             self._last_input_time = now
 
             # Restore the recovery budget once input has been flowing again for a
@@ -2501,7 +2526,9 @@ class _UsbHidClient:
                 cb = self._notify.get(INPUT_REPORT_UUID.lower())
                 if cb:
                     try:
-                        cb(None, bytearray(translated))
+                        payload = (bytearray(translated) if power_saving.is_off()
+                                   else translated)
+                        cb(None, payload)
                     except Exception as e:
                         # Throttle: this runs ~500x/s, so log at most once per second.
                         now = time.time()
@@ -2774,6 +2801,7 @@ class USBHidController(Controller):
             return
         self._disconnect_notified = True
         self.interp_running = False
+        self._interp_wake_event.set()
         logger.info("Wired USB %s hardware disconnect detected (%s, %s)",
                     _device_label(self.usb_product_id), reason, self.device.address)
         callback = self.disconnected_callback
@@ -2986,6 +3014,7 @@ class USBHidController(Controller):
     async def disconnect(self):
         self._disconnect_notified = True
         self.interp_running = False
+        self._interp_wake_event.set()
         task = getattr(self, "_reinit_task", None)
         if task is not None:
             task.cancel()

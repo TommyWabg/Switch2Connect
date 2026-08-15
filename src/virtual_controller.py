@@ -47,6 +47,8 @@ import threading
 import ctypes
 import logging
 import gc
+import timer_resolution
+import power_saving
 from controller import (Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         USBIP_PS5_CONCURRENT_RUMBLE_TEST,
@@ -203,6 +205,38 @@ def _merge_djg_direct_motion(left_g, right_g, left_a, right_a,
     return zero, zero
 
 
+def _sync_merged_in_app_gyro_state(controllers, active):
+    """Publish one authoritative In-App Gyro state to a merged Joy-Con pair.
+
+    The operation is idempotent because either controller callback may observe a
+    release first. A skipped/non-dominant side must never retain a live gyro
+    producer after the shared trigger is off.
+    """
+    active = bool(active)
+    for controller in controllers:
+        was_active = bool(getattr(controller, "gyro_mouse_enabled", False))
+        controller.gyro_mouse_enabled = active
+        if active:
+            if not was_active:
+                wake = getattr(controller, "_wake_interpolation_output", None)
+                if wake is not None:
+                    wake()
+                else:
+                    controller._interp_wake_event.set()
+            continue
+        controller.gr_was_pressed = False
+        controller.gyro_target_vx = 0.0
+        controller.gyro_target_vy = 0.0
+        controller._gyro_rstick_out = (0.0, 0.0)
+        controller.gyro_steering_origin_accel = None
+        if was_active:
+            wake = getattr(controller, "_wake_interpolation_output", None)
+            if wake is not None:
+                wake()
+            else:
+                controller._interp_wake_event.set()
+
+
 MAC_TO_USBIP = {}
 
 
@@ -303,6 +337,9 @@ SUBMIT_SLOW_WARN_MS = 10.0
 # Seconds between submit warnings, so a struggling session reports the problem
 # without the logging itself adding to the load.
 SUBMIT_WARN_INTERVAL = 5.0
+# Yield only when the submit worker has continuously had another frame waiting.
+# This bounds one busy GIL-owning burst without adding work to low-rate input.
+SUBMIT_COOPERATIVE_BUDGET_S = 0.004
 AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE = 5
 # DualSense 0x02 output-report bytes masked out of the traditional-rumble stop
 # signature: motors [3],[4] plus valid_flag0/1 [1],[2] and valid_flag2 [39].
@@ -342,6 +379,18 @@ def get_or_assign_port_for_mac(mac):
 
 
 class VirtualController:
+    def _wake_rumble_schedulers(self):
+        for controller in tuple(getattr(self, "controllers", ())):
+            controller._poke_rumble_scheduler(activate=True)
+
+    def _run_rumble_callback(self, callback, *args):
+        try:
+            if power_saving.rumble_allowed():
+                return callback(*args)
+            return None
+        finally:
+            self._wake_rumble_schedulers()
+
     @property
     def player_number(self):
         return self._player_number
@@ -449,7 +498,6 @@ class VirtualController:
         self.was_touching_0 = False
         self.was_touching_1 = False
         self.touch_start_time = 0.0
-        
         self.hold_mode = "Vertical"
         self.active_gyro_side = "Right"
         
@@ -477,7 +525,13 @@ class VirtualController:
             self.vg_controller = None
             self.usbip_server = None
         
+        # Driver/device lifetime lock. Never take this from a physical BLE input
+        # callback: update()/teardown calls below may block in a native driver.
         self.state_lock = threading.RLock()
+        # Short-lived lock for state shared by the two physical Joy-Con callback
+        # threads. Keeping it separate prevents a slow virtual-pad submit from
+        # stalling notification delivery (and therefore IR Mouse input).
+        self.merged_input_lock = threading.RLock()
         self._disconnect_lock = asyncio.Lock()
 
         # Input submits run on a dedicated thread. The virtual-pad drivers submit
@@ -496,8 +550,13 @@ class VirtualController:
         self._submit_fail_count = 0
         self._last_submit_fail_warn = 0.0
         self._last_slow_submit_warn = 0.0
+        self._submit_superseded_count = 0
+        self._submit_cooperative_yield_count = 0
         self._rumble_cb_count = 0
         self._rumble_cb_window_start = 0.0
+        self._update_wake = threading.Event()
+        self._full_submit_signatures = {}
+        self._last_submit_power_mode = None
         
         # Adaptive Trigger State Tracking (for Weapon mode recoil kicks)
         self.trigger_r_prev_force = 0
@@ -644,6 +703,21 @@ class VirtualController:
                 pass
         self._merged_pair = (left, right)
         self._controller_mix_keys = tuple(self._controller_mix_key(c) for c in controllers)
+        # A merged pair has exactly one mouse interpolation/output owner. Keep the
+        # right Joy-Con as owner so its IR Mouse and Raw Input device retain their
+        # natural sink while gyro targets from either side are mixed into it.
+        if self._is_merged_pair and left is not None and right is not None:
+            sources = (left, right)
+            for controller in sources:
+                controller._merged_mouse_sources = sources
+                controller._merged_mouse_output_owner = right
+            right._interp_wake_event.set()
+            left._interp_wake_event.set()
+        else:
+            for controller in controllers:
+                controller._merged_mouse_sources = (controller,)
+                controller._merged_mouse_output_owner = controller
+                controller._interp_wake_event.set()
 
     def _is_system_bt_merged_joycon_pair(self):
         """Scope guard for the System-Bluetooth merged Joy-Con workaround."""
@@ -673,25 +747,76 @@ class VirtualController:
         self._system_bt_pair_session_id = session_id
         self._system_bt_pair_controllers = (left, right)
 
-        # Do not retain two aggressive ThroughputOptimized requests for the
-        # lifetime of the pair. Windows documents that this reduces the number
-        # of simultaneous Bluetooth connections. Close legacy/session handles
-        # deterministically if this object was activated by older code.
-        left._close_merged_pair_connection_parameter_request()
-        right._close_merged_pair_connection_parameter_request()
+        retained_left = False
+        retained_right = False
+        request_enabled = bool(getattr(
+            CONFIG, 'system_bt_merged_pair_throughput_request', True))
+        request_mode = str(getattr(
+            CONFIG, 'system_bt_merged_pair_request_mode', 'both')).lower()
+        if request_mode not in ('off', 'left', 'right', 'both', 'both_delayed'):
+            request_mode = 'both'
+        if not request_enabled:
+            request_mode = 'off'
+        try:
+            if request_mode in ('left', 'both'):
+                retained_left = await left._create_merged_pair_connection_parameter_request(
+                    session_id, "Left")
+            if request_mode in ('right', 'both'):
+                retained_right = await right._create_merged_pair_connection_parameter_request(
+                    session_id, "Right")
 
-        if getattr(CONFIG, 'system_bt_merged_pair_coordinator', True):
-            coordinator = SystemBluetoothPairRumbleCoordinator(
-                self, left, right, session_id)
-            self._system_bt_pair_rumble_coordinator = coordinator
-            coordinator.start()
+            if getattr(CONFIG, 'system_bt_merged_pair_coordinator', True):
+                coordinator = SystemBluetoothPairRumbleCoordinator(
+                    self, left, right, session_id,
+                    cadence_hz=getattr(CONFIG, 'system_bt_merged_pair_cadence_hz', 66),
+                    adaptive=getattr(CONFIG, 'system_bt_merged_pair_adaptive_cadence', True),
+                    request_mode=request_mode)
+                self._system_bt_pair_rumble_coordinator = coordinator
+                coordinator.start()
+            if request_mode == 'both_delayed':
+                async def create_delayed_requests():
+                    await asyncio.sleep(2.0)
+                    if (getattr(self, '_system_bt_pair_session_id', None) != session_id or
+                            getattr(self, '_system_bt_pair_controllers', None) != (left, right)):
+                        return
+                    delayed_left = await left._create_merged_pair_connection_parameter_request(
+                        session_id, "Left")
+                    delayed_right = await right._create_merged_pair_connection_parameter_request(
+                        session_id, "Right")
+                    logger.info(
+                        "System-BT merged delayed preferred requests session=%s left=%s right=%s",
+                        session_id, "retained" if delayed_left else "not-retained",
+                        "retained" if delayed_right else "not-retained",
+                        extra={"system_bt_merged": True})
+                self._system_bt_pair_request_task = asyncio.create_task(
+                    create_delayed_requests())
+        except BaseException:
+            # Cancellation or setup failure must not strand a request belonging
+            # to a pair session that never completed activation.
+            left._close_merged_pair_connection_parameter_request()
+            right._close_merged_pair_connection_parameter_request()
+            self._system_bt_pair_controllers = None
+            self._system_bt_pair_session_id = None
+            raise
 
         logger.info(
-            "System-BT merged Joy-Con session activated session=%s throughput_request=released",
+            "System-BT merged Joy-Con session activated session=%s "
+            "request_mode=%s throughput_request_left=%s throughput_request_right=%s",
             session_id,
+            request_mode,
+            "retained" if retained_left else "not-retained",
+            "retained" if retained_right else "not-retained",
             extra={"system_bt_merged": True})
 
     async def _deactivate_system_bt_merged_pair(self):
+        request_task = getattr(self, '_system_bt_pair_request_task', None)
+        self._system_bt_pair_request_task = None
+        if request_task is not None:
+            request_task.cancel()
+            try:
+                await request_task
+            except (asyncio.CancelledError, Exception):
+                pass
         coordinator = getattr(self, '_system_bt_pair_rumble_coordinator', None)
         if coordinator is not None:
             coordinator.stop()
@@ -830,7 +955,9 @@ class VirtualController:
             utils.force_ui_update_callback()
 
     def gyro_fusion_callback(self, inputData: ControllerInputData, controller):
-        with self.state_lock:
+        # This runs inline on the physical input path and must never wait for the
+        # driver lock, which is allowed to span blocking native calls.
+        with self.merged_input_lock:
             if getattr(controller, 'is_calibrating', False) or getattr(controller, 'is_mag_calibrating', False):
                 controller._skip_gyro_mouse = False
                 return
@@ -995,12 +1122,36 @@ class VirtualController:
 
     def _publish_input_submit(self, inputData, buttons, controller, buttonsConfig):
         """Hand the newest input frame to the submit thread and return immediately."""
+        power_mode = power_saving.mode()
+        if power_mode != self._last_submit_power_mode:
+            self._full_submit_signatures.clear()
+            self._last_submit_power_mode = power_mode
+        if power_mode == "Full":
+            now = time.perf_counter()
+            def quantize_stick(stick):
+                return tuple(int(round(float(value) * 32767.0)) for value in stick)
+            signature = (
+                int(buttons), quantize_stick(inputData.left_stick),
+                quantize_stick(inputData.right_stick),
+                int(getattr(inputData, 'left_trigger', 0)),
+                int(getattr(inputData, 'right_trigger', 0)), id(buttonsConfig),
+            )
+            previous = self._full_submit_signatures.get(controller)
+            if previous is not None and previous[0] == signature and now - previous[1] < 0.05:
+                return
+            self._full_submit_signatures[controller] = (signature, now)
+            import copy
+            inputData = copy.copy(inputData)
+            inputData.gyroscope = (0.0, 0.0, 0.0)
+            inputData.accelerometer = (0.0, 0.0, 0.0)
         with self._submit_lock:
             if self._submit_pending is not None:
                 # The previous frame never reached the driver. Carry its presses
                 # forward so a button tapped and released between two submits is
                 # still delivered once, instead of vanishing.
                 self._submit_sticky_buttons |= self._submit_pending[1]
+                self._submit_superseded_count = getattr(
+                    self, "_submit_superseded_count", 0) + 1
             self._submit_pending = (inputData, buttons, controller, buttonsConfig)
         if self._submit_thread is None or not self._submit_thread.is_alive():
             self._start_submit_thread()
@@ -1027,6 +1178,7 @@ class VirtualController:
             self._submit_sticky_buttons = 0
 
     def _input_submit_loop(self):
+        continuous_busy_started = None
         while not self._submit_stop:
             self._submit_wake.wait(timeout=0.05)
             self._submit_wake.clear()
@@ -1037,16 +1189,35 @@ class VirtualController:
                     self._submit_pending = None
                     self._submit_sticky_buttons = 0
                 if pending is None:
+                    continuous_busy_started = None
                     break
+                if continuous_busy_started is None:
+                    continuous_busy_started = time.perf_counter()
                 inputData, buttons, controller, buttonsConfig = pending
                 try:
                     self._run_input_submit(
                         inputData, buttons | sticky, controller, buttonsConfig)
                 except Exception:
                     logger.exception("Virtual input submit failed")
+                if not power_saving.is_off():
+                    with self._submit_lock:
+                        backlog = self._submit_pending is not None
+                    if (backlog and time.perf_counter() - continuous_busy_started
+                            >= SUBMIT_COOPERATIVE_BUDGET_S):
+                        # Sleep(0) only yields the remainder of this thread's
+                        # quantum; it does not request precision timing.
+                        time.sleep(0)
+                        self._submit_cooperative_yield_count = getattr(
+                            self, "_submit_cooperative_yield_count", 0) + 1
+                        continuous_busy_started = time.perf_counter()
+                    elif not backlog:
+                        continuous_busy_started = None
+                else:
+                    continuous_busy_started = None
 
     def _run_input_submit(self, inputData, buttons, controller, buttonsConfig):
         started_ns = time.perf_counter_ns()
+        self._last_submit_phase_ms = None
         submitted = False
         if self.mode == "PS4":
             submitted = self.update_as_ps4(inputData, buttons, controller)
@@ -1066,14 +1237,26 @@ class VirtualController:
 
         elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
         now = time.perf_counter()
-        # A submit this slow means the driver held us up; on the old inline path
-        # that time was taken straight out of input delivery.
+        # Report slow end-to-end updates, with PS5 phase timings when available.
         if elapsed_ms >= SUBMIT_SLOW_WARN_MS and now - self._last_slow_submit_warn >= SUBMIT_WARN_INTERVAL:
             self._last_slow_submit_warn = now
-            logger.warning(
-                "Virtual controller submit took %.1f ms (mode=%s driver=%s) -- "
-                "the virtual pad driver is blocking input updates",
-                elapsed_ms, self.mode, self.driver_type)
+            phases = self._last_submit_phase_ms
+            if phases is None:
+                logger.warning(
+                    "Virtual controller submit took %.1f ms (mode=%s driver=%s "
+                    "superseded=%d yields=%d)",
+                    elapsed_ms, self.mode, self.driver_type,
+                    getattr(self, "_submit_superseded_count", 0),
+                    getattr(self, "_submit_cooperative_yield_count", 0))
+            else:
+                logger.warning(
+                    "Virtual controller submit took %.1f ms (mode=%s driver=%s "
+                    "lock=%.1f ms map=%.1f ms native=%.1f ms "
+                    "superseded=%d yields=%d)",
+                    elapsed_ms, self.mode, self.driver_type,
+                    phases[0], phases[1], phases[2],
+                    getattr(self, "_submit_superseded_count", 0),
+                    getattr(self, "_submit_cooperative_yield_count", 0))
         if submitted:
             self._submit_fail_count = 0
         else:
@@ -1628,6 +1811,9 @@ class VirtualController:
         self.was_touching_0 = False
         self.was_touching_1 = False
         self.touch_start_time = 0.0
+        update_wake = getattr(self, '_update_wake', None)
+        if update_wake is not None:
+            update_wake.set()
 
     def set_mode(self, new_mode):
         if self.mode != new_mode:
@@ -1651,6 +1837,7 @@ class VirtualController:
                 if self.vg_controller is not None:
                     self._setup_vg_controller()
             self.reset_inputs()
+            self._update_wake.set()
             if self.loop and self.loop.is_running():
                 asyncio.run_coroutine_threadsafe(self.update_leds(), self.loop)
 
@@ -1660,9 +1847,9 @@ class VirtualController:
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading
-            threading.Timer(delay / 1000.0, self._vibration_callback_internal, args=(client, target, large_motor, small_motor, led_number, user_data)).start()
+            threading.Timer(delay / 1000.0, self._run_rumble_callback, args=(self._vibration_callback_internal, client, target, large_motor, small_motor, led_number, user_data)).start()
         else:
-            self._vibration_callback_internal(client, target, large_motor, small_motor, led_number, user_data)
+            self._run_rumble_callback(self._vibration_callback_internal, client, target, large_motor, small_motor, led_number, user_data)
 
     def _vibration_callback_internal(self, client, target, large_motor, small_motor, led_number, user_data):
         import math
@@ -1721,11 +1908,11 @@ class VirtualController:
         if delay > 0:
             threading.Timer(
                 delay / 1000.0,
-                self._xbox_force_feedback_callback_internal,
-                args=(large_motor, small_motor, left_trigger, right_trigger, generation),
+                self._run_rumble_callback,
+                args=(self._xbox_force_feedback_callback_internal, large_motor, small_motor, left_trigger, right_trigger, generation),
             ).start()
         else:
-            self._xbox_force_feedback_callback_internal(
+            self._run_rumble_callback(self._xbox_force_feedback_callback_internal,
                 large_motor, small_motor, left_trigger, right_trigger, generation)
 
     def _xbox_force_feedback_callback_internal(self, large_motor, small_motor, left_trigger, right_trigger, generation):
@@ -2350,10 +2537,7 @@ class VirtualController:
         controller._shared_dampening_btn_states = {}
         controller.gyro_target_vx = 0.0
         controller.gyro_target_vy = 0.0
-        controller.current_vx = 0.0
-        controller.current_vy = 0.0
-        controller.interp_residual_x = 0.0
-        controller.interp_residual_y = 0.0
+        controller._request_interpolation_reset()
         controller.gyro_steering_origin_accel = None
         
         def input_report_callback(inputData: ControllerInputData, controller: Controller):
@@ -2404,19 +2588,24 @@ class VirtualController:
                 # when both sides are gyro-active is prevented in gyro_fusion_callback, which
                 # makes the non-dominant (sub) side skip its own gyro-mouse emission so only
                 # the dominant side emits the fused motion.
-                # Sync Gyro Trigger
-                if not hasattr(self, '_in_app_gyro_shared_toggle'):
-                    self._in_app_gyro_shared_toggle = False
-                if getattr(controller, '_own_in_app_gyro_tap_edge', False):
-                    self._in_app_gyro_shared_toggle = not self._in_app_gyro_shared_toggle
-                    controller._own_in_app_gyro_tap_edge = False
-                shared_in_app_gyro_toggle = bool(self._in_app_gyro_shared_toggle)
-                shared_in_app_gyro_hold_pressed = (
-                    getattr(left_c, '_own_in_app_gyro_hold_pressed', False) or
-                    getattr(right_c, '_own_in_app_gyro_hold_pressed', False)
-                )
-                
-                shared_in_app_gyro = shared_in_app_gyro_toggle != shared_in_app_gyro_hold_pressed
+                # Consume Tap edges, resolve Hold state, and publish the producer
+                # lifecycle as one short atomic operation. Nothing driver-facing is
+                # allowed under this lock.
+                with self.merged_input_lock:
+                    if not hasattr(self, '_in_app_gyro_shared_toggle'):
+                        self._in_app_gyro_shared_toggle = False
+                    if getattr(controller, '_own_in_app_gyro_tap_edge', False):
+                        self._in_app_gyro_shared_toggle = not self._in_app_gyro_shared_toggle
+                        controller._own_in_app_gyro_tap_edge = False
+                    shared_in_app_gyro_toggle = bool(self._in_app_gyro_shared_toggle)
+                    shared_in_app_gyro_hold_pressed = (
+                        getattr(left_c, '_own_in_app_gyro_hold_pressed', False) or
+                        getattr(right_c, '_own_in_app_gyro_hold_pressed', False)
+                    )
+                    shared_in_app_gyro = (
+                        shared_in_app_gyro_toggle != shared_in_app_gyro_hold_pressed)
+                    _sync_merged_in_app_gyro_state(
+                        controllers, shared_in_app_gyro)
 
                 # Commit the Trigger Dampening / Trigger Deadzone source key only when the
                 # shared In-app Gyro state transitions off->on. The controller whose report
@@ -2495,12 +2684,6 @@ class VirtualController:
                 )
                 shared_mode_shift = shared_mode_shift_toggle != shared_mode_shift_hold_pressed
 
-                # Sync activation state before sharing gyro-derived outputs. In Hold mode,
-                # the per-side gyro_mouse_enabled flag is driven by the shared trigger.
-                if getattr(CONFIG, 'gyro_activation_mode', 'Hold') == 'Hold':
-                    for c in controllers:
-                        c.gyro_mouse_enabled = shared_gyro
-                
                 # Sync Steer Value and gyro-driven right stick output.
                 shared_steer = 0.0
                 shared_rs = (0.0, 0.0)
@@ -2824,8 +3007,9 @@ class VirtualController:
             return True
 
         def wrapped_callback(inputData: ControllerInputData, controller: Controller):
-            with self.state_lock:
-                return input_report_callback(inputData, controller)
+            # A native driver submit may hold state_lock indefinitely. Serializing
+            # the entire physical report behind it stalls subsequent BLE/IR reports.
+            return input_report_callback(inputData, controller)
 
         controller.set_input_report_callback(wrapped_callback)
         controller.gyro_fusion_callback = self.gyro_fusion_callback
@@ -3322,13 +3506,28 @@ class VirtualController:
 
     def update_as_ps5(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         submitted = False
+        lock_started_ns = time.perf_counter_ns()
         with self.state_lock:
+            lock_acquired_ns = time.perf_counter_ns()
             if self.vg_controller is None:
                 submitted = False
+                mapped_ns = lock_acquired_ns
+                native_done_ns = mapped_ns
             else:
                 self._update_as_ps5_locked(inputData, buttons, controller)
-                result = self.vg_controller.update()
+                mapped_ns = time.perf_counter_ns()
+                if (self.driver_type == "WinUHid" and not power_saving.is_off()
+                        and hasattr(self.vg_controller, "update_latest")):
+                    result = self.vg_controller.update_latest()
+                else:
+                    result = self.vg_controller.update()
+                native_done_ns = time.perf_counter_ns()
                 submitted = result is not False
+        self._last_submit_phase_ms = (
+            (lock_acquired_ns - lock_started_ns) / 1_000_000.0,
+            (mapped_ns - lock_acquired_ns) / 1_000_000.0,
+            (native_done_ns - mapped_ns) / 1_000_000.0,
+        )
         return submitted
 
     def _update_as_ps5_locked(self, inputData: ControllerInputData, buttons: int, controller: Controller):
@@ -3766,14 +3965,30 @@ class VirtualController:
     def _1000hz_loop(self):
         import time
         last_time = time.perf_counter()
+        timer_acquired = False
         while self.running:
+            if power_saving.is_full():
+                if timer_acquired:
+                    timer_resolution.release()
+                    timer_acquired = False
+                self._update_wake.wait()
+                self._update_wake.clear()
+                last_time = time.perf_counter()
+                continue
             driver_type = getattr(self, 'driver_type', None)
             mode = getattr(self, 'mode', None)
             
             if driver_type != "ViGEmBus" or mode != "PS4":
-                time.sleep(0.015)
+                if timer_acquired:
+                    timer_resolution.release()
+                    timer_acquired = False
+                self._update_wake.wait()
+                self._update_wake.clear()
                 last_time = time.perf_counter()
                 continue
+
+            if not timer_acquired:
+                timer_acquired = timer_resolution.acquire()
 
             now = time.perf_counter()
             dt = now - last_time
@@ -3808,6 +4023,8 @@ class VirtualController:
                         logger.error(f"Failed to update DS4 ex via ViGEmBus: {e}")
                         self.vg_controller.update()
         
+        if timer_acquired:
+            timer_resolution.release()
         logger.info(f"Player {self.player_number}: Update loop thread finished.")
 
     def reset_inputs(self):
@@ -3899,6 +4116,7 @@ class VirtualController:
     def force_close(self, usbip_already_detached=False):
         """Synchronously and forcefully close the virtual device handle."""
         self.running = False
+        self._update_wake.set()
         
         # 1. Wait for the high-frequency update thread to terminate
         if hasattr(self, 'update_thread') and self.update_thread.is_alive():
@@ -3931,6 +4149,7 @@ class VirtualController:
                 
             await self._deactivate_system_bt_merged_pair()
             self.running = False
+            self._update_wake.set()
             import time
             current_time = time.strftime("%H:%M:%S")
             logger.info(f"[{current_time}] Player {self.player_number}: Starting disconnect sequence (is_suspending={is_suspending})...")
@@ -4022,6 +4241,7 @@ class VirtualController:
             # (e.g. from a split that was followed immediately by a merge) sees the flag
             # and skips creating a zombie USBIP server.
             self.running = False
+            self._update_wake.set()
             with self.state_lock:
                 self.cleanup_vg_controller()
                 
@@ -4083,9 +4303,9 @@ class VirtualController:
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading
-            threading.Timer(delay / 1000.0, self._dualsense_rumble_callback_internal, args=(out_data, side)).start()
+            threading.Timer(delay / 1000.0, self._run_rumble_callback, args=(self._dualsense_rumble_callback_internal, out_data, side)).start()
         else:
-            self._dualsense_rumble_callback_internal(out_data, side)
+            self._run_rumble_callback(self._dualsense_rumble_callback_internal, out_data, side)
 
     def _dualsense_rumble_callback_internal(self, out_data, side="Pro"):
         if len(out_data) < 2:
@@ -4488,6 +4708,8 @@ class VirtualController:
 
     def _usbip_audio_callback(self, data):
         """Handle 4-channel audio stream from DualSense USBIP ep=1 OUT"""
+        if power_saving.is_full():
+            return
         if hasattr(self, 'haptic_processor'):
             if data is None or getattr(getattr(self, 'usbip_server', None), 'dualsense_haptics_blocked', False):
                 self.haptic_processor.reset()
@@ -4502,12 +4724,15 @@ class VirtualController:
                     self.audio_haptic_ttl_l = 0
                     self.audio_haptic_ttl_r = 0
                     self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
+                self._wake_rumble_schedulers()
                 return
             if len(data) > 0:
                 self.last_usbip_audio_packet_time = time.perf_counter()
                 self.haptic_processor.process_audio_packet(data)
 
     def _proxy_haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
+        if power_saving.is_full():
+            return
         self.last_usbip_audio_packet_time = time.perf_counter()
         self._haptic_callback(left_intensity, right_intensity, mode, spectral=spectral)
 
@@ -4516,6 +4741,8 @@ class VirtualController:
         self.last_usbip_audio_packet_time = time.perf_counter() if active else 0.0
 
     def _haptic_callback(self, left_intensity, right_intensity, mode="CONTINUOUS", spectral=None):
+        if power_saving.is_full():
+            return
         # Passive locking arbitration: AudioPcm path switches BACK to audio_haptics
         # only when a genuine SPECTRAL haptic signal arrives from Ch3/Ch4.
         # SILENCE callbacks never change the mode (avoid releasing the lock on quiet frames).
@@ -4577,6 +4804,7 @@ class VirtualController:
                 self.audio_haptic_vibration_dirty_r = True
                 self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
                 self.last_rumble_received_time = now
+            self._wake_rumble_schedulers()
             return
 
         def mix_freq(low, high, intensity):
@@ -4683,14 +4911,15 @@ class VirtualController:
             self.audio_haptic_vibration_dirty_r = True
             self.audio_haptic_seq = getattr(self, 'audio_haptic_seq', 0) + 1
             self.last_rumble_received_time = now
+        self._wake_rumble_schedulers()
 
     def _usbip_rumble_callback(self, out_data, side="Left"):
         delay = getattr(CONFIG, "rumble_delay_ms", 0)
         if delay > 0:
             import threading
-            threading.Timer(delay / 1000.0, self._usbip_rumble_callback_internal, args=(out_data, side)).start()
+            threading.Timer(delay / 1000.0, self._run_rumble_callback, args=(self._usbip_rumble_callback_internal, out_data, side)).start()
         else:
-            self._usbip_rumble_callback_internal(out_data, side)
+            self._run_rumble_callback(self._usbip_rumble_callback_internal, out_data, side)
 
     def _usbip_rumble_callback_internal(self, out_data, side="Left"):
         # Disconnect active-push: bytearray(64) from usbip_server means connection dropped

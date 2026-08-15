@@ -8,6 +8,7 @@ import logging
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -33,8 +34,19 @@ SYSTEM_BT_SLOW_WRITE_WINDOW = 0.250
 SYSTEM_BT_SLOW_WRITE_COUNT = 3
 SYSTEM_BT_HEALTHY_WRITE_THRESHOLD = 0.008
 SYSTEM_BT_DEGRADED_HOLD = 0.500
-SYSTEM_BT_TIMEOUT_COOLDOWN = 0.100
+# Allow one additional Windows scheduler tick beyond the nominal 100 ms write
+# timeout before resuming. This prevents an immediate requeue when the callback
+# and high-resolution timer wake at the cooldown boundary.
+SYSTEM_BT_TIMEOUT_COOLDOWN = 0.120
 SYSTEM_BT_RECOVERY_SUCCESS_COUNT = 12
+SYSTEM_BT_CADENCE_LEVELS = (66, 50, 40, 30)
+SYSTEM_BT_NOTIFICATION_GRACE = 2.0
+SYSTEM_BT_NOTIFICATION_GUARD_GAP = 0.075
+SYSTEM_BT_NOTIFICATION_STARVED_GAP = 0.100
+SYSTEM_BT_NOTIFICATION_HARD_GAP = 0.150
+SYSTEM_BT_NOTIFICATION_RECOVERY_SECONDS = 3.0
+SYSTEM_BT_NOTIFICATION_HEALTHY_GAP = 0.075
+SYSTEM_BT_NOTIFICATION_HEALTHY_RATE = 55.0
 
 
 def _percentile(values, percentile: float) -> float:
@@ -145,11 +157,31 @@ class _SideState:
     dispatch_intervals_ms: Optional[list] = None
     success_intervals_ms: Optional[list] = None
     write_latencies_ms: Optional[list] = None
+    notification_times: object = None
+    notification_gaps_ms: Optional[list] = None
+    last_notification_time: float = 0.0
+    notification_total: int = 0
+    gap_over_50: int = 0
+    gap_over_75: int = 0
+    gap_over_100: int = 0
+    gap_over_150: int = 0
+    gap_over_200: int = 0
+    dispatch_notification_ages_ms: Optional[list] = None
+    pending_dispatch_time: float = 0.0
+    dispatch_to_notification_ms: Optional[list] = None
+    last_write_completion_time: float = 0.0
+    completion_to_notification_ms: Optional[list] = None
+    sustain_block_until: float = 0.0
 
     def __post_init__(self):
         self.dispatch_intervals_ms = []
         self.success_intervals_ms = []
         self.write_latencies_ms = []
+        self.notification_times = deque()
+        self.notification_gaps_ms = []
+        self.dispatch_notification_ages_ms = []
+        self.dispatch_to_notification_ms = []
+        self.completion_to_notification_ms = []
 
 
 class SystemBluetoothPairRumbleCoordinator:
@@ -160,10 +192,23 @@ class SystemBluetoothPairRumbleCoordinator:
     One pair-wide in-flight slot prevents the Windows BLE write queue from growing.
     """
 
-    def __init__(self, virtual_controller, left, right, session_id: str):
+    def __init__(self, virtual_controller, left, right, session_id: str,
+                 cadence_hz: int = 66, adaptive: bool = True,
+                 request_mode: str = "both"):
         self._vc = virtual_controller
         self.session_id = str(session_id)
-        self._slot_interval = SYSTEM_BT_PAIR_SLOT_INTERVAL
+        try:
+            requested_hz = int(cadence_hz)
+        except (TypeError, ValueError):
+            requested_hz = 66
+        self._cadence_levels = tuple(
+            level for level in SYSTEM_BT_CADENCE_LEVELS if level <= requested_hz)
+        if not self._cadence_levels:
+            self._cadence_levels = (30,)
+        self._cadence_level_index = 0
+        self._adaptive = bool(adaptive)
+        self._request_mode = str(request_mode or "both").lower()
+        self._slot_interval = self._slot_for_hz(self._cadence_levels[0])
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._running = False
@@ -197,6 +242,151 @@ class SystemBluetoothPairRumbleCoordinator:
         self._stale_completions = 0
         self._slow_write_times = []
         self._slow_write_outliers = 0
+        self._health_state = "NORMAL"
+        self._health_started = time.perf_counter()
+        self._healthy_since = 0.0
+        self._starvation_entries = 0
+        self._pair_stall_entries = 0
+
+    @staticmethod
+    def _slot_for_hz(hz: int) -> float:
+        if int(hz) >= 66:
+            return SYSTEM_BT_PAIR_SLOT_INTERVAL
+        return 0.5 / max(1, int(hz))
+
+    @property
+    def effective_cadence_hz(self) -> int:
+        return self._cadence_levels[self._cadence_level_index]
+
+    def _side_interval(self) -> float:
+        # The legacy 66 Hz level uses a 7 ms alternating grid and a 12 ms
+        # tolerance. Requiring the mathematical 15.15 ms period here rejects
+        # every few 14-15 ms opportunities and reduces the real rate to ~47 Hz.
+        if self.effective_cadence_hz >= 66:
+            return SYSTEM_BT_SIDE_MIN_DISPATCH_INTERVAL
+        return max(SYSTEM_BT_SIDE_MIN_DISPATCH_INTERVAL,
+                   1.0 / self.effective_cadence_hz)
+
+    def _global_interval(self) -> float:
+        return min(self._slot_interval,
+                   max(SYSTEM_BT_PAIR_MIN_DISPATCH_INTERVAL,
+                       self._slot_interval * 0.93))
+
+    def record_notification(self, controller, timestamp=None) -> None:
+        """Record a raw BLE callback heartbeat before input processing."""
+        now = time.perf_counter() if timestamp is None else float(timestamp)
+        side_name = "Left" if controller is self._sides["Left"].controller else (
+            "Right" if controller is self._sides["Right"].controller else None)
+        if side_name is None:
+            return
+        with self._lock:
+            state = self._sides[side_name]
+            previous = state.last_notification_time
+            if previous:
+                gap = now - previous
+                state.notification_gaps_ms.append(gap * 1000.0)
+                state.gap_over_50 += int(gap >= 0.050)
+                state.gap_over_75 += int(gap >= 0.075)
+                state.gap_over_100 += int(gap >= 0.100)
+                state.gap_over_150 += int(gap >= 0.150)
+                state.gap_over_200 += int(gap >= 0.200)
+            state.last_notification_time = now
+            state.notification_total += 1
+            state.notification_times.append(now)
+            cutoff = now - 1.0
+            while state.notification_times and state.notification_times[0] < cutoff:
+                state.notification_times.popleft()
+            if state.last_write_completion_time:
+                state.completion_to_notification_ms.append(
+                    max(0.0, now - state.last_write_completion_time) * 1000.0)
+                state.last_write_completion_time = 0.0
+            if state.pending_dispatch_time:
+                state.dispatch_to_notification_ms.append(
+                    max(0.0, now - state.pending_dispatch_time) * 1000.0)
+                state.pending_dispatch_time = 0.0
+        self._wake.set()
+
+    def _notification_snapshot_locked(self, now):
+        snapshot = {}
+        for name, state in self._sides.items():
+            cutoff = now - 1.0
+            while state.notification_times and state.notification_times[0] < cutoff:
+                state.notification_times.popleft()
+            age = now - state.last_notification_time if state.last_notification_time else float("inf")
+            snapshot[name] = {
+                "age": age,
+                "rate": float(len(state.notification_times)),
+                "ready": bool(state.last_notification_time),
+            }
+        return snapshot
+
+    def _set_cadence_level_locked(self, index, health_state, now, reason):
+        index = max(0, min(len(self._cadence_levels) - 1, int(index)))
+        old_level = self.effective_cadence_hz
+        old_state = self._health_state
+        self._cadence_level_index = index
+        self._slot_interval = self._slot_for_hz(self.effective_cadence_hz)
+        self._health_state = health_state
+        if health_state in ("STARVED", "PAIR_STALL") and old_state != health_state:
+            self._starvation_entries += 1
+            if health_state == "PAIR_STALL":
+                self._pair_stall_entries += 1
+        if old_level != self.effective_cadence_hz or old_state != health_state:
+            logger.warning(
+                "System-BT merged input health session=%s state=%s->%s cadence=%d->%dHz reason=%s",
+                self.session_id, old_state, health_state, old_level,
+                self.effective_cadence_hz, reason,
+                extra={"system_bt_merged": True})
+
+    def _update_notification_health_locked(self, now):
+        if not self._adaptive or self._idle:
+            return
+        if now - self._health_started < SYSTEM_BT_NOTIFICATION_GRACE:
+            return
+        snapshot = self._notification_snapshot_locked(now)
+        if not all(item["ready"] for item in snapshot.values()):
+            return
+        left_age = snapshot["Left"]["age"]
+        right_age = snapshot["Right"]["age"]
+        max_age = max(left_age, right_age)
+        both_stalled = (left_age >= SYSTEM_BT_NOTIFICATION_STARVED_GAP and
+                        right_age >= SYSTEM_BT_NOTIFICATION_STARVED_GAP)
+        if max_age >= SYSTEM_BT_NOTIFICATION_STARVED_GAP:
+            state_name = "PAIR_STALL" if both_stalled else "STARVED"
+            victim = "both" if both_stalled else (
+                "Left" if left_age > right_age else "Right")
+            self._set_cadence_level_locked(
+                len(self._cadence_levels) - 1, state_name, now,
+                f"{victim}_notification_age={max_age * 1000.0:.1f}ms")
+            if not both_stalled:
+                self._sides[victim].sustain_block_until = max(
+                    self._sides[victim].sustain_block_until,
+                    now + self._side_interval())
+            self._healthy_since = 0.0
+            return
+        if max_age >= SYSTEM_BT_NOTIFICATION_GUARD_GAP:
+            self._set_cadence_level_locked(
+                min(len(self._cadence_levels) - 1, self._cadence_level_index + 1),
+                "GUARDED", now, f"notification_age={max_age * 1000.0:.1f}ms")
+            self._healthy_since = 0.0
+            return
+        healthy = all(
+            item["age"] < SYSTEM_BT_NOTIFICATION_HEALTHY_GAP and
+            item["rate"] >= SYSTEM_BT_NOTIFICATION_HEALTHY_RATE
+            for item in snapshot.values())
+        if not healthy:
+            self._healthy_since = 0.0
+            return
+        if not self._healthy_since:
+            self._healthy_since = now
+        if (self._cadence_level_index > 0 and
+                now - self._healthy_since >= SYSTEM_BT_NOTIFICATION_RECOVERY_SECONDS):
+            self._set_cadence_level_locked(
+                self._cadence_level_index - 1, "RECOVERY", now,
+                "both_sides_healthy_3s")
+            self._healthy_since = now
+        elif self._cadence_level_index == 0 and self._health_state != "NORMAL":
+            self._set_cadence_level_locked(0, "NORMAL", now, "fully_recovered")
 
     def owns(self, controller) -> bool:
         return any(state.controller is controller for state in self._sides.values())
@@ -212,9 +402,10 @@ class SystemBluetoothPairRumbleCoordinator:
         )
         self._thread.start()
         logger.info(
-            "System-BT merged rumble coordinator started session=%s slot=%.1fms",
+            "System-BT merged rumble coordinator started session=%s slot=%.1fms cadence=%dHz adaptive=%d request_mode=%s",
             self.session_id,
             self._slot_interval * 1000.0,
+            self.effective_cadence_hz, int(self._adaptive), self._request_mode,
             extra={"system_bt_merged": True},
         )
 
@@ -337,6 +528,15 @@ class SystemBluetoothPairRumbleCoordinator:
                 state.dispatch_intervals_ms.clear()
                 state.success_intervals_ms.clear()
                 state.write_latencies_ms.clear()
+                state.notification_gaps_ms.clear()
+                state.dispatch_notification_ages_ms.clear()
+                state.dispatch_to_notification_ms.clear()
+                state.completion_to_notification_ms.clear()
+                state.gap_over_50 = 0
+                state.gap_over_75 = 0
+                state.gap_over_100 = 0
+                state.gap_over_150 = 0
+                state.gap_over_200 = 0
             self._slot_count = 0
             self._slot_interval_sum_ms = 0.0
             self._slot_intervals_ms.clear()
@@ -382,6 +582,8 @@ class SystemBluetoothPairRumbleCoordinator:
                     self._reset_diagnostics_for_resume(now)
                     deadline = now
                     self._idle = False
+                    with self._lock:
+                        self._update_notification_health_locked(now)
                     logger.info(
                         "System-BT merged coordinator resumed session=%s",
                         self.session_id,
@@ -445,10 +647,12 @@ class SystemBluetoothPairRumbleCoordinator:
     def _choose_side(self, now: float):
         """Pick the most overdue eligible side without replaying missed slots."""
         with self._lock:
+            self._update_notification_health_locked(now)
             if now < self._transport_cooldown_until:
                 return None
-            side_interval = (SYSTEM_BT_DEGRADED_SIDE_INTERVAL if self._degraded
-                             else SYSTEM_BT_SIDE_MIN_DISPATCH_INTERVAL)
+            side_interval = max(
+                SYSTEM_BT_DEGRADED_SIDE_INTERVAL if self._degraded else 0.0,
+                self._side_interval())
             candidates = []
             for order, side_name in enumerate(self._side_order):
                 state = self._sides[side_name]
@@ -459,6 +663,8 @@ class SystemBluetoothPairRumbleCoordinator:
                 elif not state.active and state.zero_remaining > 0:
                     priority = 1
                 elif state.active and state.sustain:
+                    if now < state.sustain_block_until:
+                        continue
                     if (state.last_dispatch_time and
                             now - state.last_dispatch_time < side_interval):
                         continue
@@ -489,7 +695,7 @@ class SystemBluetoothPairRumbleCoordinator:
                 self._global_busy_skips += 1
                 return
             if (self._last_global_dispatch and dispatch_time - self._last_global_dispatch <
-                    SYSTEM_BT_PAIR_MIN_DISPATCH_INTERVAL):
+                    self._global_interval()):
                 self._global_interval_skips += 1
                 return
             if state.payload is None or state.uuid is None:
@@ -521,8 +727,9 @@ class SystemBluetoothPairRumbleCoordinator:
                 raw_payload = state.payload
                 uuid = state.uuid
             elif state.active and state.sustain:
-                side_interval = (SYSTEM_BT_DEGRADED_SIDE_INTERVAL if self._degraded
-                                 else SYSTEM_BT_SIDE_MIN_DISPATCH_INTERVAL)
+                side_interval = max(
+                    SYSTEM_BT_DEGRADED_SIDE_INTERVAL if self._degraded else 0.0,
+                    self._side_interval())
                 if (state.last_dispatch_time and dispatch_time - state.last_dispatch_time <
                         side_interval):
                     return
@@ -544,6 +751,11 @@ class SystemBluetoothPairRumbleCoordinator:
                 state.dispatch_intervals_ms.append(
                     (dispatch_time - state.last_dispatch_time) * 1000.0)
             state.last_dispatch_time = dispatch_time
+            if state.last_notification_time:
+                state.dispatch_notification_ages_ms.append(
+                    max(0.0, dispatch_time - state.last_notification_time) * 1000.0)
+            if not state.pending_dispatch_time:
+                state.pending_dispatch_time = dispatch_time
 
         loop = getattr(self._vc, "loop", None)
         if loop is None or loop.is_closed():
@@ -630,6 +842,11 @@ class SystemBluetoothPairRumbleCoordinator:
                     self._degraded = False
                     self._healthy_write_streak = 0
             if succeeded:
+                # Preserve the first completion since the previous notification.
+                # Replacing it on every queued write would hide a 210 ms delivery
+                # drought behind the most recent fast WinRT completion.
+                if not state.last_write_completion_time:
+                    state.last_write_completion_time = completed_at
                 state.successful += 1
                 if state.last_success_time:
                     state.success_intervals_ms.append(
@@ -678,6 +895,7 @@ class SystemBluetoothPairRumbleCoordinator:
             late_p95 = _percentile(self._deadline_lateness_ms, 0.95)
             logger.info(
                 "System-BT merged cadence session=%s timer=%s slot_avg=%.2fms "
+                "health=%s cadence=%dHz adaptive=%d request_mode=%s "
                 "slot_p95=%.2fms slot_p99=%.2fms slot_max=%.2fms "
                 "late_p95=%.2fms missed=%d "
                 "L_dispatch=%d L_success=%d L_gap_p95=%.2fms L_write_p95=%.2fms L_skip=%d "
@@ -691,6 +909,8 @@ class SystemBluetoothPairRumbleCoordinator:
                 self.session_id,
                 self._timer_mode,
                 avg_slot,
+                self._health_state, self.effective_cadence_hz,
+                int(self._adaptive), self._request_mode,
                 slot_p95, slot_p99, slot_max, late_p95, self._missed_deadlines,
                 left.dispatched,
                 left.successful,
@@ -714,6 +934,39 @@ class SystemBluetoothPairRumbleCoordinator:
                 self._stale_completions,
                 extra={"system_bt_merged": True},
             )
+            notification_snapshot = self._notification_snapshot_locked(now)
+            logger.info(
+                "System-BT merged input-link session=%s health=%s cadence=%dHz "
+                "L_rate_1s=%.0f L_age=%.1fms L_gap_p95=%.1fms L_gap_p99=%.1fms L_gap_max=%.1fms "
+                "L_gap50=%d L_gap75=%d L_gap100=%d L_gap150=%d L_gap200=%d "
+                "L_dispatch_notify_age_p95=%.1fms L_dispatch_to_notify_p95=%.1fms L_write_done_to_notify_p95=%.1fms "
+                "R_rate_1s=%.0f R_age=%.1fms R_gap_p95=%.1fms R_gap_p99=%.1fms R_gap_max=%.1fms "
+                "R_gap50=%d R_gap75=%d R_gap100=%d R_gap150=%d R_gap200=%d "
+                "R_dispatch_notify_age_p95=%.1fms R_dispatch_to_notify_p95=%.1fms R_write_done_to_notify_p95=%.1fms "
+                "starvation_entries=%d pair_stall_entries=%d",
+                self.session_id, self._health_state, self.effective_cadence_hz,
+                notification_snapshot["Left"]["rate"],
+                notification_snapshot["Left"]["age"] * 1000.0,
+                _percentile(left.notification_gaps_ms, 0.95),
+                _percentile(left.notification_gaps_ms, 0.99),
+                max(left.notification_gaps_ms, default=0.0),
+                left.gap_over_50, left.gap_over_75, left.gap_over_100,
+                left.gap_over_150, left.gap_over_200,
+                _percentile(left.dispatch_notification_ages_ms, 0.95),
+                _percentile(left.dispatch_to_notification_ms, 0.95),
+                _percentile(left.completion_to_notification_ms, 0.95),
+                notification_snapshot["Right"]["rate"],
+                notification_snapshot["Right"]["age"] * 1000.0,
+                _percentile(right.notification_gaps_ms, 0.95),
+                _percentile(right.notification_gaps_ms, 0.99),
+                max(right.notification_gaps_ms, default=0.0),
+                right.gap_over_50, right.gap_over_75, right.gap_over_100,
+                right.gap_over_150, right.gap_over_200,
+                _percentile(right.dispatch_notification_ages_ms, 0.95),
+                _percentile(right.dispatch_to_notification_ms, 0.95),
+                _percentile(right.completion_to_notification_ms, 0.95),
+                self._starvation_entries, self._pair_stall_entries,
+                extra={"system_bt_merged": True})
             for state in (left, right):
                 state.submitted = 0
                 state.dispatched = 0
@@ -722,6 +975,15 @@ class SystemBluetoothPairRumbleCoordinator:
                 state.dispatch_intervals_ms.clear()
                 state.success_intervals_ms.clear()
                 state.write_latencies_ms.clear()
+                state.notification_gaps_ms.clear()
+                state.dispatch_notification_ages_ms.clear()
+                state.dispatch_to_notification_ms.clear()
+                state.completion_to_notification_ms.clear()
+                state.gap_over_50 = 0
+                state.gap_over_75 = 0
+                state.gap_over_100 = 0
+                state.gap_over_150 = 0
+                state.gap_over_200 = 0
             self._slot_count = 0
             self._slot_interval_sum_ms = 0.0
             self._slot_intervals_ms.clear()

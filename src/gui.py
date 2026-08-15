@@ -59,6 +59,8 @@ from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
 from utils import set_startup, disable_power_throttling
 import utils
+from gyro import GYRO_PHASE0_RECORDER
+from mag_tester import export_recorded_file, mag_tester_build_enabled
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageTk
@@ -92,7 +94,8 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.2"
+APP_VERSION = "v2.3"
+MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
     try:
@@ -101,6 +104,16 @@ def _set_current_thread_priority(level):
             kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
     except Exception:
         pass
+
+def _get_current_thread_priority():
+    try:
+        if os.name == "nt":
+            kernel32 = ctypes.windll.kernel32
+            priority = int(kernel32.GetThreadPriority(kernel32.GetCurrentThread()))
+            return None if priority == 0x7FFFFFFF else priority
+    except Exception:
+        pass
+    return None
 
 class SHELLEXECUTEINFOW(ctypes.Structure):
     _fields_ = [
@@ -946,6 +959,9 @@ MACHINE_LOCAL_CONFIG_KEYS = frozenset({
     "controller_fast_cache",
     "controller_fast_cache_entries",
     "winrt_cached_services",
+    "power_saving_mode",
+    "power_saving_auto_warning_suppressed",
+    "power_saving_full_warning_suppressed",
 })
 
 # Everything bound to a specific physical controller (calibration blobs plus every
@@ -955,6 +971,7 @@ CONTROLLER_RELATED_CONFIG_KEYS = frozenset({
     "calibration_data",
     "joystick_calibration_data",
     "mag_calibration_data",
+    "mag_v2_calibration_data",
     "gc_trigger_calibration_data",
     "controller_calibration_aliases",
     "cemuhook_mac_to_pad",
@@ -972,6 +989,7 @@ CONTROLLER_RELATED_PRESENCE_KEYS = (
     "calibration_data",
     "joystick_calibration_data",
     "mag_calibration_data",
+    "mag_v2_calibration_data",
     "gc_trigger_calibration_data",
     "controller_calibration_aliases",
     "cemuhook_mac_to_pad",
@@ -2323,6 +2341,10 @@ class GCTriggerCalibrationWizard:
 
 class ControllerWindow:
     def __init__(self):
+        self._ui_base_thread_priority = _get_current_thread_priority()
+        initial_power_saving_mode = getattr(CONFIG, "power_saving_mode", "Off")
+        if initial_power_saving_mode in ("Auto", "Full"):
+            self._apply_power_saving_ui_priority(initial_power_saving_mode)
         self.root = None
         self.main_frame = None
         self.settings_frame = None
@@ -2338,6 +2360,11 @@ class ControllerWindow:
         self.last_foreground_app_path = None
         self.app_profile_poll_suspended = False
         self.app_profile_switching = False
+        self.mag_tester_window = None
+        self.mag_tester_refresh_after_id = None
+        self.mag_tester_values = {}
+        self.mag_tester_last_recording = None
+        self.mag_tester_stop_pending = False
         self.esp32s3_bridge_status = None
         self.esp32s3_detected = False
         # Wired USB Pro Controller 2 detection (drives the HidHide button visibility).
@@ -4525,6 +4552,7 @@ class ControllerWindow:
         # First, unpack all frames from top_btn_frame to preserve order
         if hasattr(self, 'driver_frame'): self.driver_frame.pack_forget()
         if hasattr(self, 'wired_pro_settings_frame'): self.wired_pro_settings_frame.pack_forget()
+        if hasattr(self, 'power_saving_frame'): self.power_saving_frame.pack_forget()
         if hasattr(self, 'esp32s3_frame'): self.esp32s3_frame.pack_forget()
         if hasattr(self, 'hidhide_frame'): self.hidhide_frame.pack_forget()
         if hasattr(self, 'usbip_frame'): self.usbip_frame.pack_forget()
@@ -4573,6 +4601,9 @@ class ControllerWindow:
                 self.wired_pro_settings_btn.config(text=self.wired_controller_label())
             self.wired_pro_settings_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
 
+        if hasattr(self, 'power_saving_frame'):
+            self.power_saving_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
+
         # Pack the rest of the buttons
         if hasattr(self, 'startup_frame'): self.startup_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
         if hasattr(self, 'min_frame'): self.min_frame.pack(side=tk.LEFT, padx=int(5 * scaling_factor))
@@ -4606,6 +4637,12 @@ class ControllerWindow:
         launched, so the donation link never breaks.
         """
         process = getattr(self, "_kofi_process", None)
+        if process is not None and process.poll() is None and getattr(
+                self, "_kofi_closing", False):
+            # Preserve the click while the previous WebView2 process completes
+            # its graceful shutdown; never write to its already-closed stdin.
+            self._kofi_reopen_after_close = True
+            return
         if process is not None and process.poll() is None:
             # The button toggles: hide when shown, show when hidden. (Clicks that
             # land on the button are excluded from the outside-click dismissal by
@@ -4921,7 +4958,10 @@ class ControllerWindow:
         With prewarm=True the child is started but left parked off-screen; the
         window only appears when a later `show` command arrives.
         """
-        self._close_kofi_window()
+        existing = getattr(self, "_kofi_process", None)
+        if existing is not None and existing.poll() is None:
+            return
+        self._finalize_kofi_process(existing)
         if not prewarm:
             # Put something under the button before doing any of the slow work,
             # so the click always produces a window immediately.
@@ -4965,6 +5005,10 @@ class ControllerWindow:
             self._kofi_process = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, creationflags=flags
             )
+            self._assign_kofi_process_job(self._kofi_process)
+            self._kofi_process_generation = getattr(
+                self, "_kofi_process_generation", 0) + 1
+            self._kofi_closing = False
             self._poll_kofi_process()
             if prewarm:
                 # Nothing is on screen yet, so there is no popup to dismiss.
@@ -5049,12 +5093,32 @@ class ControllerWindow:
             return
         anchor_center_x, anchor_bottom_y = self._kofi_anchor()
         self._reposition_kofi_placeholder()
-        self._send_kofi_command(f"move {anchor_center_x} {anchor_bottom_y}")
+        anchor = (anchor_center_x, anchor_bottom_y)
+        if anchor == getattr(self, "_kofi_last_anchor", None):
+            return
+        self._kofi_pending_anchor = anchor
+        if getattr(self, "_kofi_move_idle_id", None) is None:
+            try:
+                self._kofi_move_idle_id = self.root.after_idle(
+                    self._flush_kofi_move)
+            except Exception:
+                self._kofi_move_idle_id = None
+
+    def _flush_kofi_move(self):
+        """Send only the newest position while retaining frame-synchronous motion."""
+        self._kofi_move_idle_id = None
+        anchor = getattr(self, "_kofi_pending_anchor", None)
+        self._kofi_pending_anchor = None
+        if anchor is None or not getattr(self, "_kofi_visible", False):
+            return
+        if anchor == getattr(self, "_kofi_last_anchor", None):
+            return
+        if self._send_kofi_command(f"move {anchor[0]} {anchor[1]}"):
+            self._kofi_last_anchor = anchor
 
     def _close_kofi_window(self):
-        """Terminate the managed Ko-fi child and drop all popup state (on quit)."""
+        """Gracefully close WebView2; force termination only after a timeout."""
         process = getattr(self, "_kofi_process", None)
-        self._kofi_process = None
         self._kofi_visible = False
         # The next open starts a new child, so its window is not ready any more
         # and will be sized for wherever the button is by then.
@@ -5062,18 +5126,152 @@ class ControllerWindow:
         self._kofi_active_scale = None
         self._hide_kofi_placeholder()
         self._cancel_kofi_idle_close()
-        if process is not None and process.poll() is None:
-            try:
-                if process.stdin is not None:
-                    try:
-                        process.stdin.write(b"quit\n")
-                        process.stdin.flush()
-                    except Exception:
-                        pass
-                process.terminate()
-            except Exception as e:
-                logger.debug(f"Failed to close Ko-fi webview process: {e}")
+        self._cancel_kofi_move()
         self._unbind_kofi_outside_click()
+        if process is None or process.poll() is not None:
+            self._finalize_kofi_process(process)
+            return
+        if getattr(self, "_kofi_closing", False):
+            return
+        self._kofi_closing = True
+        try:
+            if process.stdin is not None:
+                process.stdin.write(b"quit\n")
+                process.stdin.flush()
+                process.stdin.close()
+        except Exception as e:
+            logger.debug(f"Failed to request Ko-fi shutdown: {e}")
+        generation = getattr(self, "_kofi_process_generation", 0)
+        deadline = time.monotonic() + 5.0
+        self._poll_kofi_shutdown(process, generation, deadline)
+
+    def _poll_kofi_shutdown(self, process, generation, deadline):
+        if process.poll() is not None:
+            self._finalize_kofi_process(process)
+            return
+        if time.monotonic() >= deadline:
+            try:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    process.kill()
+                    process.wait(timeout=2)
+            except Exception as e:
+                logger.debug(f"Failed to force-close Ko-fi webview process: {e}")
+            self._finalize_kofi_process(process)
+            return
+        try:
+            self._kofi_shutdown_poll_id = self.root.after(
+                100, lambda: self._poll_kofi_shutdown(process, generation, deadline))
+        except Exception:
+            # Tk is already shutting down. Do not leave the child unmanaged.
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            self._finalize_kofi_process(process)
+
+    def _assign_kofi_process_job(self, process):
+        """Put the host and WebView2 descendants in a kill-on-close Windows job."""
+        if sys.platform != "win32" or process is None:
+            return
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            kernel32.AssignProcessToJobObject.argtypes = [
+                wintypes.HANDLE, wintypes.HANDLE]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                    ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                    "ReadOperationCount", "WriteOperationCount",
+                    "OtherOperationCount", "ReadTransferCount",
+                    "WriteTransferCount", "OtherTransferCount")]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+            configured = kernel32.SetInformationJobObject(
+                job, 9, ctypes.byref(info), ctypes.sizeof(info))
+            assigned = configured and kernel32.AssignProcessToJobObject(
+                job, wintypes.HANDLE(int(process._handle)))
+            if not assigned:
+                kernel32.CloseHandle(job)
+                return
+            old_job = getattr(self, "_kofi_job_handle", None)
+            self._kofi_job_handle = job
+            self._kofi_job_process = process
+            if old_job:
+                kernel32.CloseHandle(old_job)
+        except Exception as e:
+            logger.debug(f"Could not assign Ko-fi process job: {e}")
+
+    def _finalize_kofi_process(self, process):
+        if process is not None:
+            try:
+                process.wait(timeout=0)
+            except Exception:
+                pass
+        if getattr(self, "_kofi_process", None) is process:
+            self._kofi_process = None
+        self._kofi_closing = False
+        self._kofi_shutdown_poll_id = None
+        job = None
+        if getattr(self, "_kofi_job_process", None) is process:
+            job = getattr(self, "_kofi_job_handle", None)
+            self._kofi_job_handle = None
+            self._kofi_job_process = None
+        if job and sys.platform == "win32":
+            try:
+                ctypes.windll.kernel32.CloseHandle(job)
+            except Exception:
+                pass
+        if getattr(self, "_kofi_reopen_after_close", False):
+            self._kofi_reopen_after_close = False
+            try:
+                self.root.after_idle(self._spawn_kofi_window)
+            except Exception:
+                pass
+
+    def _cancel_kofi_move(self):
+        move_id = getattr(self, "_kofi_move_idle_id", None)
+        self._kofi_move_idle_id = None
+        self._kofi_pending_anchor = None
+        self._kofi_last_anchor = None
+        if move_id:
+            try:
+                self.root.after_cancel(move_id)
+            except Exception:
+                pass
 
     def _click_on_kofi_button(self, button, event):
         """DPI-safe test for whether a <ButtonPress> landed on the Ko-fi button.
@@ -5142,10 +5340,28 @@ class ControllerWindow:
         process = getattr(self, "_kofi_process", None)
         if process is None:
             return
+        generation = getattr(self, "_kofi_process_generation", 0)
         if process.poll() is not None:
-            self._close_kofi_window()
+            self._finalize_kofi_process(process)
             return
-        self.root.after(500, self._poll_kofi_process)
+        poll_id = getattr(self, "_kofi_process_poll_id", None)
+        if poll_id:
+            try:
+                self.root.after_cancel(poll_id)
+            except Exception:
+                pass
+        self._kofi_process_poll_id = self.root.after(
+            500, lambda: self._poll_kofi_process_generation(process, generation))
+
+    def _poll_kofi_process_generation(self, process, generation):
+        self._kofi_process_poll_id = None
+        if (process is not getattr(self, "_kofi_process", None)
+                or generation != getattr(self, "_kofi_process_generation", 0)):
+            return
+        if process.poll() is not None:
+            self._finalize_kofi_process(process)
+            return
+        self._poll_kofi_process()
 
     def update_header_status(self):
         if not hasattr(self, 'header_label'):
@@ -5574,6 +5790,399 @@ class ControllerWindow:
             self.start_discoverer_thread()
         return usbip_removed_ok
 
+    @staticmethod
+    def _mag_tester_value_color(value):
+        normalized = str(value).strip().lower()
+        blocking_terms = (
+            "blocked", "rejected", "missing", "not available",
+            "unavailable", "interference", "recovering", "suspended",
+            "invalid", "waiting", "collecting", "frozen", "reset",
+            "mismatch", "noise", "error", "failed",
+        )
+        if any(term in normalized for term in blocking_terms):
+            return "#ff9f0a"
+        if re.search(r"\b(valid|accepted|allowed|ready)\b", normalized):
+            return "#30d158"
+        return text_color
+
+    def open_mag_tester(self):
+        if not MAG_TESTER_BUILD_ENABLED:
+            return
+        if (self.mag_tester_window is not None
+                and self.mag_tester_window.winfo_exists()):
+            self.mag_tester_window.lift()
+            self.mag_tester_window.focus_force()
+            return
+
+        GYRO_PHASE0_RECORDER.set_monitoring(True)
+        popup = tk.Toplevel(self.root)
+        self.mag_tester_window = popup
+        popup.title("Mag Tester")
+        popup.configure(bg=background_color)
+        popup.resizable(False, False)
+        popup.transient(self.root)
+        popup.protocol("WM_DELETE_WINDOW", self._close_mag_tester)
+
+        content = tk.Frame(popup, bg=background_color)
+        content.pack(fill=tk.BOTH, expand=True, padx=int(14 * scaling_factor),
+                     pady=int(12 * scaling_factor))
+
+        indicators = tk.LabelFrame(
+            content, text="Real-time Indicators", bg=background_color,
+            fg=text_color, bd=1, relief=tk.GROOVE,
+            font=scale_font(("Arial", 11, "bold")))
+        indicators.pack(fill=tk.X)
+
+        tk.Label(indicators, text="Controller:", bg=background_color,
+                 fg=text_color, font=scale_font(("Arial", 10, "bold"))).grid(
+                     row=0, column=0, sticky="e", padx=8, pady=(8, 4))
+        self.mag_tester_controller_var = tk.StringVar(value="")
+        self.mag_tester_controller_combo = ttk.Combobox(
+            indicators, textvariable=self.mag_tester_controller_var,
+            state="readonly", width=34)
+        self.mag_tester_controller_combo.grid(
+            row=0, column=1, sticky="w", padx=8, pady=(8, 4))
+
+        rows = (
+            ("status", "Magnetometer Status"),
+            ("magnitude", "Magnitude / Reference / Ratio"),
+            ("motion", "Motion State"),
+            ("confidence", "Model Confidence / Effective Authority / Eligibility"),
+            ("confidence_state", "Confidence State"),
+            ("heading", "Model State"),
+            ("bias", "Bias Observation / Estimate"),
+            ("correction", "Candidate / Pass / In-App Correction"),
+            ("budget", "Pass / In-App Correction Debt Remaining | Used"),
+            ("accumulated", "Pass / In-App Epoch | Session Correction"),
+            ("blocked", "Blocked Reason"),
+        )
+        self.mag_tester_values = {}
+        for row_index, (key, title) in enumerate(rows, start=1):
+            tk.Label(indicators, text=f"{title}:", bg=background_color,
+                     fg=text_color,
+                     font=scale_font(("Arial", 10, "bold"))).grid(
+                         row=row_index, column=0, sticky="e", padx=8, pady=2)
+            value = tk.Label(
+                indicators, text="Waiting for controller data",
+                bg=background_color, fg="#AAAAAA", anchor="w",
+                justify=tk.LEFT, width=68,
+                font=scale_font(("Consolas", 10)))
+            value.grid(row=row_index, column=1, sticky="w", padx=8, pady=2)
+            self.mag_tester_values[key] = value
+
+        controls = tk.Frame(content, bg=background_color)
+        controls.pack(fill=tk.X, pady=(12, 0))
+        self.mag_tester_record_border = tk.Frame(
+            controls, bg=background_color, highlightbackground="#ff453a",
+            highlightcolor="#ff453a", highlightthickness=0, bd=0)
+        self.mag_tester_record_border.pack(side=tk.LEFT)
+        self.mag_tester_record_button = tk.Button(
+            self.mag_tester_record_border, text="Start Recording",
+            command=self._toggle_mag_tester_recording,
+            bg=button_gray, fg="white", bd=0, relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")))
+        self.mag_tester_record_button.pack(padx=2, pady=2)
+        self.mag_tester_export_button = tk.Button(
+            controls, text="Export Recorded File",
+            command=self._export_mag_tester_recording,
+            bg=button_gray, fg="white", bd=0, relief=tk.FLAT,
+            state=(tk.NORMAL if self.mag_tester_last_recording else tk.DISABLED),
+            font=scale_font(("Arial", 10, "bold")))
+        self.mag_tester_export_button.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.mag_tester_file_label = tk.Label(
+            content, text="No recording in this session.",
+            bg=background_color, fg="#888888", anchor="w",
+            justify=tk.LEFT, height=2,
+            wraplength=int(930 * scaling_factor),
+            font=scale_font(("Arial", 9)))
+        self.mag_tester_file_label.pack(fill=tk.X, pady=(8, 0))
+
+        popup.update_idletasks()
+        # Size from the actual widgets so the long diagnostic values are not
+        # clipped and the popup does not retain the old fixed empty area below
+        # the recording controls.
+        requested_width = popup.winfo_reqwidth()
+        requested_height = popup.winfo_reqheight()
+        popup_width = max(
+            requested_width + int(8 * scaling_factor),
+            int(980 * scaling_factor))
+        popup_height = requested_height + int(8 * scaling_factor)
+        popup_width = min(
+            popup_width, max(1, int(popup.winfo_screenwidth() * 0.95)))
+        popup_height = min(
+            popup_height, max(1, int(popup.winfo_screenheight() * 0.90)))
+        self.center_window_on_root(
+            popup, popup_width, popup_height)
+        self._set_mag_tester_recording_ui(GYRO_PHASE0_RECORDER.is_recording)
+        self._refresh_mag_tester()
+
+    def _set_mag_tester_recording_ui(self, recording):
+        button = getattr(self, "mag_tester_record_button", None)
+        border = getattr(self, "mag_tester_record_border", None)
+        if button is None or border is None:
+            return
+        button.config(text=("Stop Recording" if recording
+                            else "Start Recording"))
+        border.config(highlightthickness=(2 if recording else 0))
+        export = getattr(self, "mag_tester_export_button", None)
+        if export is not None:
+            export.config(state=(
+                tk.NORMAL if not recording and self.mag_tester_last_recording
+                else tk.DISABLED))
+
+    def _toggle_mag_tester_recording(self):
+        if self.mag_tester_stop_pending:
+            return
+        if GYRO_PHASE0_RECORDER.is_recording:
+            self.mag_tester_stop_pending = True
+            self.mag_tester_record_button.config(state=tk.DISABLED)
+
+            def stop_worker():
+                path = GYRO_PHASE0_RECORDER.stop_recording(timeout=5.0)
+                try:
+                    self.root.after(0, self._finish_mag_tester_stop, path)
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=stop_worker, daemon=True).start()
+            return
+
+        directory = os.path.dirname(CONFIG.config_file_path)
+        filename = f"mag-tester-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        path = os.path.join(directory, filename)
+        started = GYRO_PHASE0_RECORDER.start_recording(
+            path, text_mode=True,
+            metadata={
+                "App_Version": APP_VERSION,
+                "Format": "tab-separated values",
+                "Config_Directory": directory,
+            })
+        if not started:
+            self.show_centered_message(
+                "Mag Tester", "Unable to start recording. Check the console log for details.")
+            return
+        self.mag_tester_last_recording = None
+        self.mag_tester_file_label.config(text=f"Recording: {path}")
+        self._set_mag_tester_recording_ui(True)
+
+    def _finish_mag_tester_stop(self, path):
+        self.mag_tester_stop_pending = False
+        button = getattr(self, "mag_tester_record_button", None)
+        if button is not None:
+            button.config(state=tk.NORMAL)
+        path = os.fspath(path) if path is not None else ""
+        if path and os.path.isfile(path):
+            self.mag_tester_last_recording = path
+            self.mag_tester_file_label.config(text=f"Recorded: {path}")
+        else:
+            self.mag_tester_file_label.config(text="Recording did not create a file.")
+        error = GYRO_PHASE0_RECORDER.writer_error
+        if error is not None:
+            self.mag_tester_file_label.config(text=f"Recording error: {error}")
+        self._set_mag_tester_recording_ui(False)
+
+    def _export_mag_tester_recording(self):
+        source = self.mag_tester_last_recording
+        if not source or not os.path.isfile(source):
+            self.show_centered_message("Mag Tester", "No completed recording is available.")
+            return
+        self.app_profile_poll_suspended = True
+        try:
+            destination = filedialog.asksaveasfilename(
+                parent=self.mag_tester_window or self.root,
+                title="Choose Export Location",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt")],
+                initialfile=os.path.basename(source))
+        finally:
+            self.app_profile_poll_suspended = False
+        if not destination:
+            return
+        if not destination.lower().endswith(".txt"):
+            destination = os.path.splitext(destination)[0] + ".txt"
+        try:
+            exported = export_recorded_file(source, destination)
+            self.mag_tester_last_recording = None
+            self.mag_tester_export_button.config(state=tk.DISABLED)
+            self.mag_tester_file_label.config(
+                text=f"Exported: {exported}\nTemporary recording removed.")
+        except Exception as exc:
+            self.show_centered_message("Mag Tester", f"Export failed: {exc}")
+
+    def _refresh_mag_tester(self):
+        popup = self.mag_tester_window
+        if popup is None or not popup.winfo_exists():
+            return
+        snapshots = GYRO_PHASE0_RECORDER.latest_snapshots()
+        choices = sorted(snapshots)
+        combo = self.mag_tester_controller_combo
+        if list(combo.cget("values")) != choices:
+            combo.config(values=choices)
+        selected = self.mag_tester_controller_var.get()
+        if selected not in snapshots and choices:
+            selected = choices[0]
+            self.mag_tester_controller_var.set(selected)
+        item = snapshots.get(selected)
+        if item:
+            robust_bias_mode = item["correction_law"] == "RobustBiasRate"
+            model_confidence = (
+                item["robust_bias_confidence"] if robust_bias_mode
+                else item["consistency_confidence"])
+            if robust_bias_mode:
+                if item["robust_bias_valid_buckets"] < 10:
+                    model_state = "Warming Up"
+                elif item["robust_bias_decay_active"]:
+                    model_state = "Observation Aging / Estimate Decaying"
+                else:
+                    model_state = "Bias Tracking"
+                heading_text = (
+                    f'{model_state} / bias age '
+                    f'{item["robust_bias_observation_age_seconds"]:.2f} s / '
+                    f'transient {item["transient_event_error_deg"]:+.2f} deg')
+                bias_text = (
+                    f'{item["robust_bias_raw_observation_dps"]:+.3f} / '
+                    f'{item["robust_bias_bounded_observation_dps"]:+.3f} / '
+                    f'{item["robust_bias_estimate_dps"]:+.3f} dps'
+                    f' ({item["robust_bias_valid_buckets"]} samples)')
+                budget_text = (
+                    f'{item["pass_transient_debt_remaining_deg"]:+.3f} / '
+                    f'{item["in_app_transient_debt_remaining_deg"]:+.3f} | '
+                    f'{item["pass_transient_debt_used_deg"]:.3f} / '
+                    f'{item["in_app_transient_debt_used_deg"]:.3f} deg '
+                    '(Transient)')
+            else:
+                heading_text = (
+                    f'{item["committed_heading_error_deg"]:+.3f} deg / '
+                    f'{item["residual_state"]}')
+                bias_text = (
+                    f'{item["observed_bias_rate_dps"]:+.3f} dps / '
+                    f'{"Accepted" if item["bias_rate_valid"] and item["commit_scale_valid"] else "Rejected"}')
+                budget_text = (
+                    f'{item["pass_repayment_budget_remaining_deg"]:.3f} / '
+                    f'{item["in_app_repayment_budget_remaining_deg"]:.3f} | '
+                    f'{item["pass_repayment_budget_used_deg"]:.3f} / '
+                    f'{item["in_app_repayment_budget_used_deg"]:.3f} deg')
+            values = {
+                "calibration": ("Accepted" if item["calibration_accepted"]
+                                else "Not Available"),
+                "status": (
+                    f'{item["mag_status"]} / '
+                    f'{"Calibration Accepted" if item["calibration_accepted"] else "Calibration Missing"}'),
+                "model": item.get("calibration_model") or "Unavailable",
+                "magnitude": (f'{item["magnitude"]:.3f} / '
+                              f'{item["reference_magnitude"]:.3f} LSB / '
+                              f'{item["magnitude_ratio"]:.4f}'),
+                "ratio": f'{item["magnitude_ratio"]:.4f}',
+                "direction": "Yes" if item["direction_valid"] else "No",
+                "heading": heading_text,
+                "bias": bias_text,
+                "filtered_heading": (
+                    f'{item["consumer_measurement_deg"]:+.3f} deg'),
+                "delta_gate": (
+                    f'{item["relative_delta_innovation_deg"]:+.3f} deg / '
+                    f'{"Yes" if item["relative_delta_rejected"] else "No"}'),
+                "gyro_relative": (
+                    f'{item["gyro_relative_heading_deg"]:+.3f} deg'),
+                "mag_relative": (
+                    f'{item["magnetic_relative_heading_deg"]:+.3f} deg'),
+                "raw_mag_delta": (
+                    f'{item["raw_magnetic_heading_delta_deg"]:+.6f} deg'),
+                "norm_mag_delta": (
+                    f'{item["normalized_magnetic_heading_delta_deg"]:+.6f} deg'),
+                "gyro_yaw_delta": (
+                    f'{item["gyro_world_yaw_delta_deg"]:+.6f} deg'),
+                "gyro_heading_delta": (
+                    f'{item["gyro_reference_heading_delta_deg"]:+.6f} deg'),
+                "direction_agreement": (
+                    "Yes" if item["heading_delta_direction_agreement"]
+                    else "No"),
+                "absolute_innovation": (
+                    f'{item["absolute_heading_innovation_deg"]:+.3f} deg'),
+                "motion": item["motion_state"],
+                "rate": f'{item["gyro_yaw_rate_dps"]:+.3f} dps',
+                "confidence": (
+                    f'{model_confidence * 100.0:.1f}% / '
+                    f'{item["confidence"] * 100.0:.1f}% / '
+                    f'{"Allowed" if item["correction_eligible"] else "Blocked"}'),
+                "confidence_state": (
+                    f'{item["confidence_state"]} / '
+                    f'{"Authority Suspended" if item["authority_suspended"] else "Authority Available"}'),
+                "correction": (
+                    f'{item["candidate_correction_dps"]:+.6f} / '
+                    f'{item["pass_applied_correction_dps"]:+.6f} / '
+                    f'{item["in_app_applied_correction_dps"]:+.6f} dps'),
+                "budget": budget_text,
+                "accumulated": (
+                    f'{item["pass_accumulated_correction_deg"]:+.3f} / '
+                    f'{item["in_app_accumulated_correction_deg"]:+.3f} | '
+                    f'{item["pass_session_accumulated_correction_deg"]:+.3f} / '
+                    f'{item["in_app_session_accumulated_correction_deg"]:+.3f} deg'),
+                "consistency": (
+                    f'{item["consistency_correlation"]:.3f} / '
+                    f'{item["consistency_scale"]:.3f} / '
+                    f'{item["consistency_confidence"] * 100.0:.1f}%'),
+                "epoch": (
+                    f'{item["measurement_epoch"]} / '
+                    f'{item["heading_gravity_source"]}'),
+                "window": (
+                    f'{item["residual_state"]} / '
+                    f'{item["window_magnetic_delta_deg"]:+.3f} / '
+                    f'{item["window_gyro_delta_deg"]:+.3f} deg'),
+                "committed": (
+                    f'{item["committed_heading_error_deg"]:+.3f} deg'),
+                "eligible": ("Allowed" if item["correction_eligible"]
+                             else "Blocked"),
+                "law": item["correction_law"],
+                "raw_target": (
+                    f'{item["raw_correction_demand_dps"]:+.6f} dps'),
+                "target": f'{item["confidence_target_dps"]:+.6f} dps',
+                "cap": f'{item["dynamic_safety_cap_dps"]:.6f} dps',
+                "slew": (f'{item["attack_slew_dps_per_second"]:.6f} '
+                         'dps/s'),
+                "limit": item["limiting_reason"],
+                "candidate": f'{item["candidate_correction_dps"]:+.6f} dps',
+                "pass": f'{item["pass_applied_correction_dps"]:+.6f} dps',
+                "pass_feedback": (
+                    f'{item["pass_consumer_residual_deg"]:+.3f} / '
+                    f'{item["pass_accumulated_correction_deg"]:+.3f} deg / '
+                    f'{item["pass_reentry_ramp_progress"] * 100.0:.0f}% / '
+                    f'Inv {"OK" if item["pass_invariant_valid"] else "FAIL"}'),
+                "inapp": f'{item["in_app_applied_correction_dps"]:+.6f} dps',
+                "inapp_feedback": (
+                    f'{item["in_app_consumer_residual_deg"]:+.3f} / '
+                    f'{item["in_app_accumulated_correction_deg"]:+.3f} deg / '
+                    f'{item["in_app_reentry_ramp_progress"] * 100.0:.0f}% / '
+                    f'Inv {"OK" if item["in_app_invariant_valid"] else "FAIL"}'),
+                "blocked": ", ".join(item["blocked_reasons"]) or "None",
+            }
+            for key, label in self.mag_tester_values.items():
+                value = values[key]
+                label.config(
+                    text=value, fg=self._mag_tester_value_color(value))
+        self.mag_tester_refresh_after_id = popup.after(
+            150, self._refresh_mag_tester)
+
+    def _close_mag_tester(self):
+        if self.mag_tester_stop_pending:
+            self.root.after(100, self._close_mag_tester)
+            return
+        if GYRO_PHASE0_RECORDER.is_recording:
+            path = GYRO_PHASE0_RECORDER.stop_recording(timeout=5.0)
+            if path is not None and os.path.isfile(path):
+                self.mag_tester_last_recording = os.fspath(path)
+        popup = self.mag_tester_window
+        if popup is not None and self.mag_tester_refresh_after_id is not None:
+            try:
+                popup.after_cancel(self.mag_tester_refresh_after_id)
+            except tk.TclError:
+                pass
+        self.mag_tester_refresh_after_id = None
+        GYRO_PHASE0_RECORDER.set_monitoring(False)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+        self.mag_tester_window = None
+
 
     def init_interface(self):
         # 1. Enable Windows High DPI Mode
@@ -5767,6 +6376,22 @@ class ControllerWindow:
             anchor=tk.W,
         )
         self.version_label.pack(side=tk.LEFT, padx=(int(12 * scaling_factor), 0), fill=tk.Y)
+        if MAG_TESTER_BUILD_ENABLED:
+            self.mag_tester_button = tk.Button(
+                self.header_frame,
+                text="Mag Tester",
+                command=self.open_mag_tester,
+                bg=button_gray,
+                fg="white",
+                activebackground=highlight_color,
+                activeforeground="white",
+                bd=0,
+                relief=tk.FLAT,
+                padx=int(6 * scaling_factor),
+                font=scale_font(("Arial", 9, "bold")),
+            )
+            self.mag_tester_button.pack(
+                side=tk.LEFT, padx=(int(8 * scaling_factor), 0), fill=tk.Y)
 
         self.header_label = tk.Label(
             self.header_frame,
@@ -5854,6 +6479,15 @@ class ControllerWindow:
             command=lambda: self.open_wired_pro_controller_settings_popup(self.wired_pro_settings_frame)
         )
         self.wired_pro_settings_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        self.power_saving_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
+        self.power_saving_btn = tk.Button(
+            self.power_saving_frame,
+            text=f"Power Saving: {getattr(CONFIG, 'power_saving_mode', 'Off')}",
+            bg=button_gray, fg=text_color, bd=0, relief=tk.FLAT,
+            font=scale_font(("Arial", 10, "bold")),
+            command=self.cycle_power_saving_mode)
+        self.power_saving_btn.pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         # ESP32-S3 N16R8 Firmware Button
         self.esp32s3_frame = tk.Frame(self.top_btn_frame, bg=button_gray)
@@ -11918,6 +12552,99 @@ bg_color=panel_bg, widths=[8, 10])
         if hasattr(self, 'startup_frame'):
             self.startup_frame.config(bg=highlight_color if val else button_gray)
 
+    def _confirm_power_saving_mode(self, target):
+        suppressed = bool(getattr(
+            CONFIG, f"power_saving_{target.lower()}_warning_suppressed", False))
+        if suppressed:
+            return True
+        messages = {
+            "Auto": (
+                "Auto mode reduces idle CPU power use by requesting precision timing only "
+                "while it is needed.\n\n"
+                "Buttons, sticks, triggers and motion controls remain fully enabled.\n\n"
+                "HD Rumble, Audio Haptics and Impulse Trigger feedback may be less consistent, "
+                "delayed, interrupted or occasionally lost."
+            ),
+            "Full": (
+                "Full mode prioritizes the lowest CPU power use.\n\n"
+                "Buttons, sticks, triggers and non-motion mappings remain enabled.\n\n"
+                "Vibration output and motion-based and mouse features are disabled, including Gyro Pass-Through, In-app Gyro, "
+                "DJG, IR Mouse, and Joystick Mouse.\n\n"
+                "Periodic ESP32 and Wired/HidHide scanner will be disabled.\n\n"
+                "Automatic controller scanning pauses after 1 Pro/NSO GCN controller "
+                "or 2 Joy-Con controllers are connected. Existing controller connections "
+                "will not be disconnected."
+            ),
+        }
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Power Saving: {target}")
+        dialog.resizable(False, False)
+        dialog.config(bg="#1E1E1E")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog_height = 300 if target == "Auto" else 390
+        self.center_window_on_root(
+            dialog, int(540 * scaling_factor), int(dialog_height * scaling_factor))
+        result = {"proceed": False}
+        suppress_var = tk.BooleanVar(value=False)
+        tk.Label(dialog, text=messages[target], fg="white", bg="#1E1E1E",
+                 font=scale_font(("Arial", 11, "bold")), justify=tk.CENTER,
+                 wraplength=int(480 * scaling_factor)).pack(
+                     padx=int(24 * scaling_factor), pady=(int(24 * scaling_factor), int(12 * scaling_factor)))
+        tk.Checkbutton(dialog, text="Do not show again.", variable=suppress_var,
+                       bg="#1E1E1E", fg="white", activebackground="#1E1E1E",
+                       activeforeground="white", selectcolor=button_gray,
+                       font=scale_font(("Arial", 10))).pack(pady=(0, int(12 * scaling_factor)))
+        buttons = tk.Frame(dialog, bg="#1E1E1E")
+        buttons.pack(pady=(0, int(18 * scaling_factor)))
+        def close(proceed):
+            result["proceed"] = bool(proceed)
+            if proceed and suppress_var.get():
+                setattr(CONFIG, f"power_saving_{target.lower()}_warning_suppressed", True)
+            dialog.destroy()
+        for text, proceed in (("Proceed", True), ("Cancel", False)):
+            tk.Button(buttons, text=text, bg=button_gray, fg=text_color,
+                      bd=0, relief=tk.FLAT, width=9,
+                      font=scale_font(("Arial", 10, "bold")),
+                      command=lambda value=proceed: close(value)).pack(
+                          side=tk.LEFT, padx=int(6 * scaling_factor))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        self.root.wait_window(dialog)
+        return result["proceed"]
+
+    def cycle_power_saving_mode(self):
+        import power_saving
+        current = getattr(CONFIG, "power_saving_mode", "Off")
+        modes = ("Off", "Auto", "Full")
+        target = modes[(modes.index(current) + 1) % len(modes)] if current in modes else "Off"
+        if target != "Off" and not self._confirm_power_saving_mode(target):
+            return
+        previous_mode = current
+        CONFIG.power_saving_mode = target
+        CONFIG.save_config()
+        power_saving.notify_mode_changed()
+        self._apply_power_saving_ui_priority(target)
+        request_wired_rescan("power_saving_mode_changed", manual=False)
+        for vc in getattr(self, "current_controllers", ()) or ():
+            wake_update = getattr(vc, "_update_wake", None)
+            if wake_update is not None:
+                wake_update.set()
+            for controller in getattr(vc, "controllers", ()) or ():
+                controller._poke_rumble_scheduler()
+                apply_mode = getattr(controller, "on_power_saving_mode_changed", None)
+                if callable(apply_mode):
+                    apply_mode(previous_mode, target)
+        if hasattr(self, "power_saving_btn"):
+            self.power_saving_btn.config(text=f"Power Saving: {target}")
+
+    def _apply_power_saving_ui_priority(self, mode):
+        # Prioritize only Tk's main thread while it is runnable. Thread priority
+        # does not create a periodic wake source or request precision timing.
+        if mode in ("Auto", "Full"):
+            _set_current_thread_priority(1)  # THREAD_PRIORITY_ABOVE_NORMAL
+        elif self._ui_base_thread_priority is not None:
+            _set_current_thread_priority(self._ui_base_thread_priority)
+
     def update_minimized_setting(self, val):
         CONFIG.start_minimized = val
         CONFIG.save_config()
@@ -13440,6 +14167,8 @@ bg_color=panel_bg, widths=[8, 10])
                         data["active_profile"] = CONFIG.active_profile
                     else:
                         data["active_profile"] = next(iter(data["profiles"]), CONFIG.active_profile)
+                    for key in MACHINE_LOCAL_CONFIG_KEYS:
+                        data.pop(key, None)
                 else:
                     # Controller related data only - no profiles, no other settings.
                     data = {
@@ -13789,6 +14518,13 @@ bg_color=panel_bg, widths=[8, 10])
         if getattr(self, 'is_cleaning_up', False): return
         self._close_kofi_window()
         try:
+            if (MAG_TESTER_BUILD_ENABLED
+                    and (self.mag_tester_window is not None
+                         or GYRO_PHASE0_RECORDER.is_recording)):
+                self._close_mag_tester()
+        except Exception:
+            logger.exception("Failed to close Mag Tester")
+        try:
             if getattr(self, "wired_device_listener", None):
                 self.wired_device_listener.stop()
         except Exception as e:
@@ -13958,8 +14694,10 @@ bg_color=panel_bg, widths=[8, 10])
 
     def start_esp32s3_refresh_timer(self):
         if not getattr(self, 'is_quitting', False):
-            self.refresh_esp32s3_status_async()
-            self.refresh_wired_pro2_status_async()
+            import power_saving
+            if not power_saving.is_full():
+                self.refresh_esp32s3_status_async()
+                self.refresh_wired_pro2_status_async()
             self.root.after(5000, self.start_esp32s3_refresh_timer)
 
     def refresh_wired_pro2_status_async(self):

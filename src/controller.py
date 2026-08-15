@@ -36,6 +36,7 @@ from windows_ble_parameters import preferred_connection_parameters_supported
 import imufusion
 import numpy as np
 import os
+import sys
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
 
 
@@ -131,13 +132,11 @@ def _fit_full_soft_iron_calibration(samples):
 # Temporary hardware diagnostics for comparing a Joy-Con in the magnetic grip
 # with normal IR Mouse use. Enabled by default for the measurement build; set
 # SWITCH2_IR_DIAGNOSTICS=0 before launch to silence it.
-_IR_SENSOR_DIAGNOSTICS = os.environ.get('SWITCH2_IR_DIAGNOSTICS', '1') != '0'
-try:
-    ctypes.windll.winmm.timeBeginPeriod(1)
-    ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080)
-except Exception:
-    pass
+_IR_SENSOR_DIAGNOSTICS = os.environ.get('SWITCH2_IR_DIAGNOSTICS', '0') != '0'
+import timer_resolution
 from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
+import power_saving
+power_saving.notify_mode_changed()
 from utils import (
     apply_calibration_to_axis, apply_radial_deadzone, get_stick_xy, press_or_release_mouse_button,
     reverse_bits, signed_looping_difference_16bit, to_hex, decodeu, decodes, 
@@ -156,6 +155,7 @@ from gyro import (
     S2_ACCEL_LSB_PER_G,
     S2_GYRO_LSB_PER_DPS_JOYCON,
     S2_GYRO_LSB_PER_DPS_PRO,
+    MotionMagneticClosureConsumer,
     PassthroughHeadingOutputFilter,
     PassthroughMovingYawBiasConsumer,
     V2AhrsShadow,
@@ -167,6 +167,7 @@ from gyro import (
     build_v2_gyro_output,
     build_in_app_horizon_output,
     canonicalize_sensor_frame,
+    quaternion_heading_deg,
     select_motion_magnetic_closure,
     validate_soft_iron_matrix,
 )
@@ -300,7 +301,7 @@ def ds_motion_scale(controller, driver_type, mode):
 
 def _set_current_thread_priority(level):
     try:
-        if os.name == "nt":
+        if os.name == "nt" and not power_saving.is_full():
             kernel32 = ctypes.windll.kernel32
             kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
     except Exception:
@@ -1449,6 +1450,56 @@ def _limit_joycon_total_amplitude(v):
     v.hf_amp = hf_amp
     return v
 
+
+def _collect_interpolation_sources(controller):
+    """Snapshot all mouse producers routed to this controller's output worker.
+
+    A merged Joy-Con pair assigns both controllers to one owner. Non-owners keep
+    parsing input and updating targets, but never run a competing 1 kHz mouse
+    output loop.
+    """
+    owner = getattr(controller, "_merged_mouse_output_owner", controller)
+    if owner is not controller:
+        return False, False, 0.0, 0.0, 0.0, 0.0, None
+
+    sources = getattr(controller, "_merged_mouse_sources", (controller,))
+    gyro_active = False
+    other_active = False
+    gyro_vx = gyro_vy = 0.0
+    other_vx = other_vy = 0.0
+    raw_mouse = getattr(controller, "_raw_mouse", None)
+    for source in sources:
+        source_gyro_active = bool(
+            getattr(source, "gyro_mouse_enabled", False)
+            and not getattr(source, "_skip_gyro_mouse", False)
+            and getattr(source, "gyro_active", True))
+        if source_gyro_active:
+            gyro_active = True
+            gyro_vx += float(getattr(source, "gyro_target_vx", 0.0))
+            gyro_vy += float(getattr(source, "gyro_target_vy", 0.0))
+
+        source_other_active = bool(
+            getattr(source, "jc_mouse_active", False)
+            or getattr(source, "joystick_mouse_active", False))
+        if source_other_active:
+            other_active = True
+            # IR Mouse and Joystick Mouse are independent producers. They must not
+            # share a target field: leaving the In-App Gyro mapping scope clears
+            # the joystick vector on every report and used to overwrite a fresh IR
+            # delta with zero before this worker could sample it.
+            other_vx += (
+                float(getattr(source, "jc_target_vx", 0.0))
+                + float(getattr(source, "js_target_vx", 0.0)))
+            other_vy += (
+                float(getattr(source, "jc_target_vy", 0.0))
+                + float(getattr(source, "js_target_vy", 0.0)))
+            source_raw_mouse = getattr(source, "_raw_mouse", None)
+            if source_raw_mouse is not None:
+                raw_mouse = source_raw_mouse
+
+    return (gyro_active, other_active, gyro_vx, gyro_vy,
+            other_vx, other_vy, raw_mouse)
+
 class Controller:
     def __init__(self, device: BLEDevice, advertised_product_id: int | None = None,
                  paired_connection: bool = False):
@@ -1518,6 +1569,9 @@ class Controller:
         self.jc_target_vx = 0.0
         self.jc_target_vy = 0.0    
         self.jc_mouse_active = False
+        self.js_target_vx = 0.0
+        self.js_target_vy = 0.0
+        self.joystick_mouse_active = False
         # IR Mouse alone uses a timed gate: during its initial free window it
         # follows per-report displacement, then motion-only verification must
         # succeed before it latches. Other IR functions use _ir_sensor_active*
@@ -1530,6 +1584,10 @@ class Controller:
         self.current_vy = 0.0
         self.interp_residual_x = 0.0
         self.interp_residual_y = 0.0
+        # Runtime callbacks only request a reset. The interpolation worker is the
+        # sole runtime owner of current_v* and interp_residual_* so a gyro callback
+        # cannot erase an IR Mouse delta between the worker's read and write steps.
+        self._interp_reset_event = threading.Event()
         self.interp_task = None
         self._interp_wake_event = threading.Event()
         self.virtual_controller = None
@@ -1610,6 +1668,8 @@ class Controller:
         self._v2_fusion_6axis = None
         self._pass_heading_output_filter = PassthroughHeadingOutputFilter()
         self._pass_moving_yaw_bias_consumer = PassthroughMovingYawBiasConsumer()
+        self._pass_motion_mag_consumer = MotionMagneticClosureConsumer()
+        self._in_app_motion_mag_consumer = MotionMagneticClosureConsumer()
         
     @property
     def suspended(self):
@@ -1985,7 +2045,9 @@ class Controller:
                             except Exception:
                                 status_name = str(status_val)
                             
-                            logger.info(f"Controller {self.device.address}: 7.5ms Request Result Status: {status_name}")
+                            logger.info(
+                                "Controller %s: Preferred connection parameters request status=%s retained=False",
+                                self.device.address, status_name)
                         else:
                             logger.warning(f"Could not extract valid WinRT BluetoothLEDevice for {self.device.address}, optimization skipped.")
                     else:
@@ -2442,12 +2504,42 @@ class Controller:
         if sender_thread and sender_thread.is_alive():
             sender_thread.join(timeout=0.25)
 
+    def on_power_saving_mode_changed(self, previous_mode, new_mode):
+        """Reconfigure only runtime motion workers; never reconnect the controller."""
+        self.gyro_target_vx = 0.0
+        self.gyro_target_vy = 0.0
+        self.jc_target_vx = 0.0
+        self.jc_target_vy = 0.0
+        self.js_target_vx = 0.0
+        self.js_target_vy = 0.0
+        self._request_interpolation_reset()
+
+        thread = getattr(self, "interp_thread", None)
+        thread_alive = bool(thread and thread.is_alive())
+        if new_mode == "Full":
+            self._power_saving_release_raw_mouse = True
+        elif previous_mode == "Full":
+            # Recover controllers whose worker was killed by the former event-name bug.
+            if not thread_alive:
+                try:
+                    self._release_raw_input_device()
+                except Exception:
+                    logger.debug("Failed to release stale Raw Input mouse", exc_info=True)
+                if getattr(self, "interp_running", False):
+                    self.interp_thread = threading.Thread(
+                        target=self._interpolation_thread_loop, daemon=True)
+                    self.interp_thread.start()
+            self._power_saving_resync_raw_mouse = True
+        self._interp_wake_event.set()
+
     async def disconnect(self):
         if not getattr(self, 'interp_running', False) and not self.client:
+            self._close_merged_pair_connection_parameter_request()
             return
 
         logger.info(f"Controller {self.device.address}: Suspending interpolation...")
         self.interp_running = False
+        self._interp_wake_event.set()
         self._stop_worker_threads()
         # Only merged System-BT pair sessions ever create this attribute.
         self._close_merged_pair_connection_parameter_request()
@@ -2587,6 +2679,97 @@ class Controller:
                 extra={"system_bt_merged": True},
             )
 
+    async def _create_merged_pair_connection_parameter_request(self, session_id, side):
+        """Create and retain one request for an established System-BT pair side."""
+        self._close_merged_pair_connection_parameter_request()
+        address = getattr(self.device, 'address', 'unknown')
+        request = None
+        retained = False
+        status_name = "UNAVAILABLE"
+        try:
+            if (sys.platform != "win32" or
+                    getattr(self, 'is_esp32s3_bridge', False) or
+                    getattr(self, 'is_wired_usb', False) or
+                    self.client is None):
+                return False
+
+            preferred_supported, preferred_reason = (
+                preferred_connection_parameters_supported())
+            if not preferred_supported:
+                logger.info(
+                    "Merged System-BT preferred request unavailable session=%s side=%s address=%s reason=%s",
+                    session_id, side, address, preferred_reason,
+                    extra={"system_bt_merged": True})
+                return False
+
+            try:
+                import winrt.windows.devices.bluetooth as wd_bluetooth
+            except ImportError:
+                try:
+                    import bleak_winrt.windows.devices.bluetooth as wd_bluetooth
+                except ImportError:
+                    wd_bluetooth = None
+            if wd_bluetooth is None or not hasattr(
+                    wd_bluetooth, 'BluetoothLEPreferredConnectionParameters'):
+                return False
+
+            native_device = getattr(self.client, "_device", None)
+            if native_device is None and hasattr(self.client, "_backend"):
+                native_device = getattr(self.client._backend, "_device", None)
+            if native_device is None and hasattr(self.client, "_backend"):
+                native_device = getattr(self.client._backend, "_requester", None)
+            if native_device is None:
+                return False
+
+            params = wd_bluetooth.BluetoothLEPreferredConnectionParameters.throughput_optimized
+            if hasattr(native_device, 'request_preferred_connection_parameters_async'):
+                request = await native_device.request_preferred_connection_parameters_async(params)
+            elif hasattr(native_device, 'request_preferred_connection_parameters'):
+                request = native_device.request_preferred_connection_parameters(params)
+            else:
+                return False
+
+            status = getattr(request, 'status', getattr(request, 'Status', request))
+            status_name = getattr(status, 'name', str(status))
+            try:
+                status_value = int(status)
+            except (TypeError, ValueError):
+                status_value = None
+            succeeded = str(status_name).upper() == "SUCCESS" or status_value == 1
+            if succeeded:
+                self._merged_pair_conn_param_request = request
+                retained = True
+                request = None
+            logger.info(
+                "Merged System-BT preferred request session=%s side=%s address=%s status=%s retained=%s",
+                session_id, side, address, status_name, retained,
+                extra={"system_bt_merged": True})
+            return retained
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to create merged System-BT preferred request session=%s side=%s address=%s: %s",
+                session_id, side, address, exc,
+                extra={"system_bt_merged": True})
+            return False
+        finally:
+            # Failed/non-successful requests are never left to projection GC.
+            if request is not None:
+                try:
+                    close = getattr(request, 'close', None)
+                    if callable(close):
+                        close()
+                    else:
+                        dispose = getattr(request, 'dispose', None)
+                        if callable(dispose):
+                            dispose()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to close unretained preferred request session=%s side=%s address=%s: %s",
+                        session_id, side, address, exc,
+                        extra={"system_bt_merged": True})
+
     def _bridge_rumble_due(self):
         """Rate-gate only transports that require their own rumble cadence.
 
@@ -2723,6 +2906,10 @@ class Controller:
         if not self._merged_system_bt_scope():
             return
         now = time.perf_counter()
+        vc = getattr(self, 'virtual_controller', None)
+        coordinator = getattr(vc, '_system_bt_pair_rumble_coordinator', None)
+        if coordinator is not None:
+            coordinator.record_notification(self, now)
         previous = getattr(self, '_merged_input_last_rt', 0.0)
         gap = now - previous if previous else 0.0
         self._merged_input_last_rt = now
@@ -2734,7 +2921,6 @@ class Controller:
             return
         elapsed = now - start
         if elapsed >= 1.0:
-            vc = getattr(self, 'virtual_controller', None)
             session_id = getattr(vc, '_system_bt_pair_session_id', 'unknown')
             side = 'Left' if self.is_joycon_left() else 'Right'
             logger.info(
@@ -2937,20 +3123,47 @@ class Controller:
             if not reserved:
                 self._rumble_task_running = False
 
-    def _poke_rumble_scheduler(self):
+    def _poke_rumble_scheduler(self, activate=False):
         try:
+            if activate and power_saving.is_auto():
+                self.rumble_stopped = False
             self._rumble_scheduler_event.set()
         except Exception:
             pass
 
     def _rumble_scheduler_loop(self):
-        while getattr(self, '_rumble_scheduler_running', False):
-            self._rumble_scheduler_event.wait(timeout=0.0015)
-            self._rumble_scheduler_event.clear()
-            try:
-                self._run_rumble_scheduler_once()
-            except Exception as e:
-                logger.debug(f"Async rumble scheduler failed: {e}")
+        timer_acquired = False
+        try:
+            while getattr(self, '_rumble_scheduler_running', False):
+                if power_saving.is_off():
+                    if not timer_acquired:
+                        timer_acquired = timer_resolution.acquire()
+                    timeout = 0.0015
+                elif power_saving.is_full():
+                    if timer_acquired:
+                        timer_resolution.release()
+                        timer_acquired = False
+                    timeout = None
+                else:
+                    active = not getattr(self, 'rumble_stopped', True)
+                    if active:
+                        if not timer_acquired:
+                            timer_acquired = timer_resolution.acquire()
+                    elif timer_acquired:
+                        timer_resolution.release()
+                        timer_acquired = False
+                    timeout = 0.0015 if active else None
+                self._rumble_scheduler_event.wait(timeout=timeout)
+                self._rumble_scheduler_event.clear()
+                if power_saving.is_full():
+                    continue
+                try:
+                    self._run_rumble_scheduler_once()
+                except Exception as e:
+                    logger.debug(f"Async rumble scheduler failed: {e}")
+        finally:
+            if timer_acquired:
+                timer_resolution.release()
 
     def _run_xbox_impulse_scheduler_once(self, vc):
         """Preserve Impulse Trigger without changing v0.12.11 Audio scheduling."""
@@ -2987,6 +3200,19 @@ class Controller:
             v1_l = v2_l = v3_l = VibrationData(); zero_l = True
         i1_l, i2_l, i3_l, izero_l = vc.get_current_xbox_impulse_frames(is_left=True)
         i1_r, i2_r, i3_r, izero_r = vc.get_current_xbox_impulse_frames(is_left=False)
+        impulse_zero = ((izero_l and izero_r) if self.is_pro_controller()
+                        else (izero_l if self.is_joycon_left() else izero_r))
+        pending_impulse = getattr(self, '_pending_xbox_impulse_frames', None)
+        if not impulse_zero and pending_impulse is None:
+            pending_impulse = (i1_l, i2_l, i3_l, izero_l,
+                               i1_r, i2_r, i3_r, izero_r)
+            self._pending_xbox_impulse_frames = pending_impulse
+            self._pending_xbox_impulse_sequences = (
+                state['sequence_l'], state['sequence_r'],
+                state['stop_sequence_l'], state['stop_sequence_r'])
+        if pending_impulse is not None:
+            (i1_l, i2_l, i3_l, izero_l,
+             i1_r, i2_r, i3_r, izero_r) = pending_impulse
         is_zero = ((zero_l and izero_l and zero_r and izero_r) if self.is_pro_controller()
                    else (zero_l and izero_l if self.is_joycon_left() else zero_r and izero_r))
         if getattr(self, '_rumble_task_running', False):
@@ -3009,15 +3235,25 @@ class Controller:
                     self._xbox_impulse_rumble_send_worker(
                         v1_l, v2_l, v3_l, v1_r, v2_r, v3_r,
                         i1_l, i2_l, i3_l, i1_r, i2_r, i3_r)):
-                self._last_xbox_impulse_sequence_sent_l = state['sequence_l']
-                self._last_xbox_impulse_sequence_sent_r = state['sequence_r']
-                self._last_xbox_impulse_stop_sequence_sent_l = state['stop_sequence_l']
-                self._last_xbox_impulse_stop_sequence_sent_r = state['stop_sequence_r']
+                sent_sequences = getattr(
+                    self, '_pending_xbox_impulse_sequences', None)
+                if sent_sequences is None:
+                    sent_sequences = (
+                        state['sequence_l'], state['sequence_r'],
+                        state['stop_sequence_l'], state['stop_sequence_r'])
+                (self._last_xbox_impulse_sequence_sent_l,
+                 self._last_xbox_impulse_sequence_sent_r,
+                 self._last_xbox_impulse_stop_sequence_sent_l,
+                 self._last_xbox_impulse_stop_sequence_sent_r) = sent_sequences
+                self._pending_xbox_impulse_frames = None
+                self._pending_xbox_impulse_sequences = None
         return True
 
 
 
     def _run_rumble_scheduler_once(self):
+        if not power_saving.rumble_allowed():
+            return
         vc = getattr(self, 'virtual_controller', None)
         if vc is None:
             return
@@ -3683,6 +3919,11 @@ class Controller:
         await self.write_command(COMMAND_PAIR, SUBCOMMAND_PAIR_FINISH, b'\0')
 
     async def enable_input_notify_callback(self):
+        # Immutable for a connected controller; avoid repeated attribute walks on
+        # every wired report while leaving all live profile/config reads untouched.
+        product_id = getattr(self.controller_info, 'product_id', 0)
+        device_address = self.device.address
+
         def input_report_callback(sender, data):
             if getattr(self, 'suspended', False) or getattr(self, '_is_suspending', False):
                 return
@@ -3693,11 +3934,10 @@ class Controller:
             if not hasattr(self, '_packet_count'): self._packet_count = 0
             if self._packet_count < 5:
                 self._packet_count += 1
-                pid = getattr(self.controller_info, 'product_id', 0)
-                logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {self.device.address} pid=0x{pid:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
+                logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {device_address} pid=0x{product_id:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
 
-            gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(self.device.address, [36, 190, 240, 36, 190, 240])
-            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, getattr(self.controller_info, 'product_id', 0), gc_trigger_calib)
+            gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(device_address, [36, 190, 240, 36, 190, 240])
+            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, product_id, gc_trigger_calib)
 
             # Connection settle gate: right after (re)connection the controller can
             # emit transient/garbage frames (or the wake button is still held), which
@@ -3715,7 +3955,9 @@ class Controller:
             # Phase 0 diagnostics are opt-in and observational.  With the default
             # disabled recorder this is a single boolean check; when enabled it
             # copies parsed sensors before Legacy processing mutates inputData.
-            gyro_phase0_trace = GYRO_PHASE0_RECORDER.begin_sample(self, inputData)
+            full_power_saving = power_saving.is_full()
+            gyro_phase0_trace = (None if full_power_saving else
+                                 GYRO_PHASE0_RECORDER.begin_sample(self, inputData))
             v2_fusion = None
 
             self.last_input_data = inputData
@@ -3759,7 +4001,7 @@ class Controller:
             # which the mapping turns into permanent ZL/ZR. Only the NSO GameCube
             # controller legitimately uses bits 30/31 (its digital trigger clicks), so it
             # keeps the wider 0xC3FFFFFF mask.
-            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
+            if product_id == NSO_GAMECUBE_CONTROLLER_PID:
                 inputData.buttons &= 0xC3FFFFFF
             else:
                 inputData.buttons &= 0x03FFFFFF
@@ -3773,7 +4015,12 @@ class Controller:
                 self._deactivate_ir_mouse(reset_activation=True)
 
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
-            if not getattr(self, 'is_calibrating', False) and not getattr(self, 'is_mag_calibrating', False) and not getattr(self, 'is_calibration_counting_down', False) and not getattr(self, 'is_mag_calibration_waiting', False) and not getattr(self, 'is_joystick_calibrating', False):
+            if (not full_power_saving
+                    and not getattr(self, 'is_calibrating', False)
+                    and not getattr(self, 'is_mag_calibrating', False)
+                    and not getattr(self, 'is_calibration_counting_down', False)
+                    and not getattr(self, 'is_mag_calibration_waiting', False)
+                    and not getattr(self, 'is_joystick_calibrating', False)):
                 bx, by, bz = self.gyro_bias
                 raw_gx, raw_gy, raw_gz = inputData.gyroscope
                 gyro_x = raw_gx - bx
@@ -3846,12 +4093,17 @@ class Controller:
                             or
                             getattr(CONFIG, "horizon_lock_v2_enabled", False)
                             or getattr(self, "gyro_mouse_enabled", False))
+                        self._v2_fusion_6axis = self._gyro_v2_6axis.update(
+                            canonical_frame, magnetometer_enabled=False, **common_v2)
+                        six_axis_heading_deg = quaternion_heading_deg(
+                            self._v2_fusion_6axis["orientation_wxyz"])
                         self._v2_fusion_9axis = self._gyro_v2_9axis.update(
                             canonical_frame, magnetometer_enabled=True,
                             orientation_consumer_active=orientation_consumer_active,
+                            closure_reference_heading_deg=six_axis_heading_deg,
+                            closure_reference_orientation_wxyz=(
+                                self._v2_fusion_6axis["orientation_wxyz"]),
                             **common_v2)
-                        self._v2_fusion_6axis = self._gyro_v2_6axis.update(
-                            canonical_frame, magnetometer_enabled=False, **common_v2)
                         v2_fusion = (self._v2_fusion_9axis if pass_9axis
                                      else self._v2_fusion_6axis)
                         if gyro_phase0_trace is not None:
@@ -3962,7 +4214,7 @@ class Controller:
                 self._ps_was_active = False
 
             inputData.buttons &= ~(0x03FFFFFF)
-            if self.controller_info.product_id == NSO_GAMECUBE_CONTROLLER_PID:
+            if product_id == NSO_GAMECUBE_CONTROLLER_PID:
                 inputData.buttons &= ~(0xC0000000)
 
             trigger_gyro = False
@@ -4808,6 +5060,13 @@ class Controller:
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
 
+            if full_power_saving:
+                inputData.gyroscope = (0.0, 0.0, 0.0)
+                inputData.accelerometer = (0.0, 0.0, 0.0)
+                if self.input_report_callback is not None:
+                    self.input_report_callback(inputData, self)
+                return
+
             if getattr(self, 'gyro_fusion_callback', None):
                 self.gyro_fusion_callback(inputData, self)
 
@@ -4858,6 +5117,8 @@ class Controller:
                         v2_fusion.get("motion_magnetic_closure"),
                         mode=PASSTHROUGH_MOTION_MAG_CLOSURE_MODE,
                         eligible=pass_9axis,
+                        consumer=self._pass_motion_mag_consumer,
+                        dt_seconds=getattr(self, "_last_dt", 0.015),
                     )
                     post_motion_heading_allowed = (
                         PASSTHROUGH_MOTION_MAG_CLOSURE_MODE != "V2")
@@ -5107,9 +5368,10 @@ class Controller:
             if self.input_report_callback is not None:
                 self.input_report_callback(inputData, self)
 
-            self._poke_rumble_scheduler()
+            if power_saving.is_off():
+                self._poke_rumble_scheduler()
 
-        if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+        if product_id == NSO_GAMECUBE_CONTROLLER_PID:
             # GCN input callback: filter out short packets (command acks, Format 0) and
             # only process the 63-byte Format 3 input reports.
             def gc_input_report_callback(sender: BleakGATTCharacteristic, data: bytearray):
@@ -5525,6 +5787,7 @@ class Controller:
 
             if ir_active:
                 self.jc_mouse_active = True 
+                self._wake_interpolation_output()
                 
                 # Each IR mouse click can be bound to multiple physical inputs.  The
                 # config loader normalizes old scalar values to ordered lists, but keep
@@ -5852,16 +6115,19 @@ class Controller:
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
             self._gyro_rstick_out = (0.0, 0.0)
-            self.current_vx = 0.0
-            self.current_vy = 0.0
-            self.interp_residual_x = 0.0
-            self.interp_residual_y = 0.0
+            if not trigger_pressed:
+                self.gyro_mouse_enabled = False
+                self.gr_was_pressed = False
+            # Do not touch current_v* or interp_residual_* here.  Those fields
+            # belong to the interpolation worker and may currently carry IR Mouse
+            # motion from this same (non-dominant) Joy-Con.
             return
 
         # Mapping already resolves Custom[Tap] into a latch and Custom[Hold]
         # into a level.  Applying the old Toggle/Hold state machine again here
         # caused double toggles, so the resolved mapping state is authoritative.
         if not trigger_pressed:
+            self._in_app_motion_mag_consumer.reset()
             self.gyro_mouse_enabled = False
             self._in_app_closure_activation_elapsed = 0.0
             inactive_mode = cfg.get("gyro_mode", "World")
@@ -5886,10 +6152,6 @@ class Controller:
             self.gyro_target_vx = 0.0
             self.gyro_target_vy = 0.0
             self._gyro_rstick_out = (0.0, 0.0)
-            self.current_vx = 0.0
-            self.current_vy = 0.0
-            self.interp_residual_x = 0.0
-            self.interp_residual_y = 0.0
             return
 
         raw_gx, raw_gy, raw_gz = inputData.gyroscope
@@ -6122,6 +6384,8 @@ class Controller:
                 mode=INAPP_MOTION_MAG_CLOSURE_MODE,
                 eligible=bool(trigger_pressed and current_mode == "World"),
                 authority_scale=in_app_activation_authority,
+                consumer=self._in_app_motion_mag_consumer,
+                dt_seconds=closure_dt,
             )
             closure_horizontal_lsb = (
                 -in_app_closure["applied_rate_dps"] * gyro_scale)
@@ -6159,7 +6423,7 @@ class Controller:
             self._in_app_closure_mouse_integral = 0.0
             self._in_app_emitted_mouse_x = 0
             self._in_app_emitted_mouse_y = 0
-            self._interp_wake_event.set()
+            self._wake_interpolation_output()
         self.gyro_mouse_enabled = bool(trigger_pressed)
                 
         self.gr_was_pressed = trigger_pressed
@@ -6316,7 +6580,7 @@ class Controller:
             self.gyro_target_vx = target_vx
             self.gyro_target_vy = target_vy
             if target_vx != 0.0 or target_vy != 0.0 or self._gyro_rstick_out != (0.0, 0.0):
-                self._interp_wake_event.set()
+                self._wake_interpolation_output()
 
         else:
             self.gyro_target_vx = 0.0
@@ -6329,8 +6593,6 @@ class Controller:
             if getattr(self, 'prev_r_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
             self.prev_l_click = self.prev_r_click = False
             self.gyro_residual_x = self.gyro_residual_y = 0.0
-            self.current_vx = self.current_vy = 0.0
-            self.interp_residual_x = self.interp_residual_y = 0.0
 
     def _action_to_joystick_tokens(self, action, default_token=None):
         if action == "Default":
@@ -6707,9 +6969,11 @@ class Controller:
 
     def _update_joystick_mouse_target(self):
         vectors = getattr(self, "joystick_mouse_vectors", {})
-        self.jc_target_vx = sum(v[0] for v in vectors.values())
-        self.jc_target_vy = sum(v[1] for v in vectors.values())
+        self.js_target_vx = sum(v[0] for v in vectors.values())
+        self.js_target_vy = sum(v[1] for v in vectors.values())
         self.joystick_mouse_active = any(abs(v[0]) > 0.001 or abs(v[1]) > 0.001 for v in vectors.values())
+        if self.joystick_mouse_active:
+            self._wake_interpolation_output()
 
     def _apply_joystick_mouse(self, key, stick):
         if not hasattr(self, "joystick_mouse_vectors"):
@@ -7018,21 +7282,60 @@ class Controller:
         if side is not None:
             raw_input_mouse.release(side)
 
+    def _wake_interpolation_output(self):
+        """Wake this controller's output worker, or the merged pair owner."""
+        owner = getattr(self, "_merged_mouse_output_owner", self)
+        owner._interp_wake_event.set()
+
+    def _request_interpolation_reset(self):
+        """Ask the interpolation worker to clear its private accumulator state."""
+        self._interp_reset_event.set()
+        self._interp_wake_event.set()
+
     def _interpolation_thread_loop(self):
         last_time = time.perf_counter()
+        timer_acquired = False
         while self.interp_running:
+            if self._interp_reset_event.is_set():
+                # Clear before resetting so a concurrent request made during the
+                # assignments remains set for the following iteration.
+                self._interp_reset_event.clear()
+                self.current_vx = 0.0
+                self.current_vy = 0.0
+                self.interp_residual_x = 0.0
+                self.interp_residual_y = 0.0
+            if power_saving.is_full():
+                if timer_acquired:
+                    timer_resolution.release()
+                    timer_acquired = False
+                if getattr(self, "_power_saving_release_raw_mouse", False):
+                    self._power_saving_release_raw_mouse = False
+                    try:
+                        self._release_raw_input_device()
+                    except Exception:
+                        logger.debug("Failed to release Raw Input mouse for Full mode", exc_info=True)
+                last_time = time.perf_counter()
+                self._interp_wake_event.wait()
+                self._interp_wake_event.clear()
+                continue
             # Kept above the activity check: the idle branch below continues the loop,
             # so syncing inside it would never create the device until the IR mouse
             # first became active.
             self._sync_raw_input_device()
-            if self.client and self.client.is_connected and (self.gyro_mouse_enabled or getattr(self, 'jc_mouse_active', False) or getattr(self, 'joystick_mouse_active', False)):
+            self._power_saving_resync_raw_mouse = False
+            (gyro_output_active, other_mouse_active,
+             gyro_vx, gyro_vy, other_vx, other_vy,
+             output_raw_mouse) = _collect_interpolation_sources(self)
+            if self.client and self.client.is_connected and (gyro_output_active or other_mouse_active):
+                if not timer_acquired:
+                    timer_acquired = timer_resolution.acquire()
                 self._interp_wake_event.clear()
                 if getattr(self, 'is_calibrating', False) or getattr(self, 'is_joystick_calibrating', False):
                     self.current_vx = 0.0
                     self.current_vy = 0.0
                 else:
-                    self.current_vx = self.gyro_target_vx + getattr(self, 'jc_target_vx', 0.0)
-                    self.current_vy = self.gyro_target_vy + getattr(self, 'jc_target_vy', 0.0)
+                    self.current_vx = gyro_vx + other_vx
+                    self.current_vy = gyro_vy + other_vy
 
                 now = time.perf_counter()
                 dt = now - last_time
@@ -7050,7 +7353,7 @@ class Controller:
                 move_x = int(total_dx)
                 move_y = int(total_dy)
 
-                if self.gyro_mouse_enabled:
+                if gyro_output_active:
                     self._in_app_emitted_mouse_x = getattr(
                         self, "_in_app_emitted_mouse_x", 0) + move_x
                     self._in_app_emitted_mouse_y = getattr(
@@ -7064,18 +7367,29 @@ class Controller:
                     # virtual HID mouse, gyro contribution included: interp_residual_x/y
                     # is a single accumulator, and splitting it across two output sinks
                     # would produce jitter. Both paths drive the same system cursor.
-                    raw_mouse = self._raw_mouse
+                    raw_mouse = output_raw_mouse
                     if raw_mouse is not None:
                         raw_mouse.report_motion(move_x, move_y)
                     else:
                         win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, move_x, move_y, 0, 0)
             else:
+                if timer_acquired:
+                    timer_resolution.release()
+                    timer_acquired = False
+                # Runtime ownership of the combined accumulator stays in this
+                # worker. Clear it only when every mouse producer is inactive.
+                self.current_vx = 0.0
+                self.current_vy = 0.0
+                self.interp_residual_x = 0.0
+                self.interp_residual_y = 0.0
                 last_time = time.perf_counter()
-                self._interp_wake_event.wait(0.02)
+                self._interp_wake_event.wait(0.25)
                 self._interp_wake_event.clear()
                 continue
 
             time.sleep(0.001)
+        if timer_acquired:
+            timer_resolution.release()
 
     ### Info Helpers ###
 

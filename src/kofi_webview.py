@@ -219,7 +219,6 @@ def _position_native_window(anchor_center_x, anchor_bottom_y, hwnd=None, scale=N
     if hwnd is None:
         return None
 
-    _log_event("position_get_rect", f"hwnd={_hwnd_number(hwnd)}")
     outer = _get_window_rect(hwnd)
     client = _get_client_rect(hwnd)
     if outer is None or client is None:
@@ -239,15 +238,9 @@ def _position_native_window(anchor_center_x, anchor_bottom_y, hwnd=None, scale=N
     left = int(round(anchor_center_x - desired_outer_width / 2.0))
     top = int(anchor_bottom_y)
     flags = 0x0004 | 0x0010  # NOZORDER | NOACTIVATE
-    _log_event(
-        "position_set",
-        f"left={left}, top={top}, width={desired_outer_width}, "
-        f"height={desired_outer_height}, scale={scale}",
-    )
     if not ctypes.windll.user32.SetWindowPos(
             hwnd, 0, left, top, desired_outer_width, desired_outer_height, flags):
         return None
-    _log_event("position_complete")
     return hwnd
 
 
@@ -294,10 +287,9 @@ def _apply_tool_window_style(hwnd):
         _log_event("tool_window_style_error")
 
 
-# Parking spot far off any monitor. The window stays genuinely shown here (so
-# WebView2 keeps rendering and the page never reloads) but is invisible to the
-# user. Hiding by ShowWindow(SW_HIDE) desyncs the WebView2 render surface and
-# leaves the content blank on the next show, so we move instead of hide.
+# Parking spot used only during initial WebView2 creation. Once the page has
+# painted, cached hides use the real WinForms/WebView2 visibility and suspension
+# APIs below, so Chromium does not keep rendering for the three-minute cache.
 _OFFSCREEN_X = -32000
 _OFFSCREEN_Y = -32000
 
@@ -316,6 +308,57 @@ def _move_offscreen(hwnd):
         )
     except Exception:
         _log_event("move_offscreen_error")
+
+
+def _webview2_control(window):
+    """Return pywebview's WinForms WebView2 control when it is available."""
+    try:
+        return window.native.browser.webview
+    except Exception:
+        return None
+
+
+def _invoke_webview2(window, callback, event):
+    """Run a WebView2 operation on its WinForms UI thread."""
+    control = _webview2_control(window)
+    if control is None:
+        _log_event(f"{event}_unavailable")
+        return False
+    try:
+        from System import Action
+        control.Invoke(Action(callback))
+        return True
+    except Exception:
+        import traceback
+        _log_event(f"{event}_error", traceback.format_exc())
+        return False
+
+
+def _suspend_window(window):
+    """Actually hide the controller, then ask Chromium to release idle resources."""
+    try:
+        window.hide()
+    except Exception:
+        _log_event("hide_error")
+
+    def suspend():
+        core = _webview2_control(window).CoreWebView2
+        if core is not None and not core.IsSuspended:
+            core.TrySuspendAsync()
+
+    if _invoke_webview2(window, suspend, "suspend"):
+        _log_event("suspend_requested")
+
+
+def _resume_window(window):
+    """Wake a cached WebView before it is positioned and shown again."""
+    def resume():
+        core = _webview2_control(window).CoreWebView2
+        if core is not None and core.IsSuspended:
+            core.Resume()
+
+    if _invoke_webview2(window, resume, "resume"):
+        _log_event("resume_complete")
 
 
 def _bring_to_top(hwnd):
@@ -612,7 +655,7 @@ def main(argv=None):
                     _log_event("command", command)
                     if command == "hide":
                         wants_onscreen["anchor"] = None
-                        _move_offscreen(state["hwnd"] or _native_hwnd(window))
+                        _suspend_window(window)
                     elif command == "show":
                         try:
                             if len(parts) >= 3:
@@ -620,8 +663,11 @@ def main(argv=None):
                                 # not up yet, or has not painted, this is applied
                                 # the moment it is ready instead of being lost.
                                 wants_onscreen["anchor"] = (int(parts[1]), int(parts[2]))
+                            _resume_window(window)
                             if not place_onscreen_if_ready("show_command"):
                                 _log_event("show_deferred")
+                            else:
+                                window.show()
                         except Exception:
                             _log_event("show_command_error")
                     elif command == "move":

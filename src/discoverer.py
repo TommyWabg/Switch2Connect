@@ -21,6 +21,7 @@
 """
 import threading
 from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic
+import power_saving
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakError
@@ -1461,6 +1462,8 @@ async def run_discovery(quit_event, startup_bridge_context=None):
 
         async def callback(device: BLEDevice, advertising_data: AdvertisementData):
             nonlocal pending_connections_count
+            if full_capacity_reached():
+                return
             if device.address in connected_mac_addresses or device.address in _connecting_macs:
                 return
             nintendo_manufacturer_data = advertising_data.manufacturer_data.get(NINTENDO_BLUETOOTH_MANUFACTURER_ID)
@@ -1483,13 +1486,24 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                             pending_connections_count += 1
                         asyncio.create_task(add_controller(device, True, product_id))
 
+        def full_capacity_reached():
+            controllers = [c for vc in VIRTUAL_CONTROLLERS
+                           for c in (getattr(vc, "controllers", ()) or ())]
+            return power_saving.full_scan_capacity_reached(controllers)
+
         while not quit_event.is_set():
+            if full_capacity_reached():
+                await asyncio.sleep(1.0)
+                continue
             try:
                 async with BleakScanner(callback) as scanner:
                     _SYSTEM_BT_AVAILABLE = True
                     print("Press a button on a paired controller, or hold sync button on an unpaired controller")
                     while not quit_event.is_set():
                         await asyncio.sleep(1.0)
+                        if full_capacity_reached():
+                            logger.info("Full power-saving capacity reached; pausing automatic BLE scan")
+                            break
                         # On Windows, check if the watcher was aborted (e.g. Bluetooth turned off)
                         if hasattr(scanner, '_backend') and hasattr(scanner._backend, 'watcher'):
                             status = getattr(scanner._backend.watcher, 'status', None)
@@ -1793,7 +1807,13 @@ async def run_usb_hid_discovery(quit_event):
         while not quit_event.is_set():
             try:
                 try:
-                    await asyncio.wait_for(WIRED_RESCAN_EVENT.wait(), timeout=0.5)
+                    controllers = [c for vc in VIRTUAL_CONTROLLERS
+                                   for c in (getattr(vc, "controllers", ()) or ())]
+                    full_capacity = power_saving.full_scan_capacity_reached(controllers)
+                    if full_capacity:
+                        await WIRED_RESCAN_EVENT.wait()
+                    else:
+                        await asyncio.wait_for(WIRED_RESCAN_EVENT.wait(), timeout=0.5)
                 except asyncio.TimeoutError:
                     if not getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True)):
                         for retry_path in list(arrival_retry_tasks):
@@ -1828,6 +1848,12 @@ async def run_usb_hid_discovery(quit_event):
                 manual_requested = any(manual or reason == "manual_refresh" for reason, _path, manual in requests)
                 removal_requested = any(reason == "device_removal" for reason, _path, _manual in requests)
                 auto_enabled = getattr(CONFIG, "wired_auto_scan_enabled", getattr(CONFIG, "wired_usb_enabled", True))
+                controllers = [c for vc in VIRTUAL_CONTROLLERS
+                               for c in (getattr(vc, "controllers", ()) or ())]
+                if (power_saving.full_scan_capacity_reached(controllers)
+                        and not manual_requested and not removal_requested):
+                    logger.debug("Ignoring wired auto scan at Full-mode capacity: %s", requests)
+                    continue
                 if not auto_enabled and not manual_requested and not removal_requested:
                     logger.debug("Ignoring wired auto scan while Auto Scan is Off: %s", requests)
                     continue

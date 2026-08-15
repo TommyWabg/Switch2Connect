@@ -73,6 +73,7 @@ import sys
 import threading
 import time
 from typing import Optional
+import timer_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,8 @@ class ESP32BridgeRumbleDispatcher:
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._loop = None
+        self._wake = None
 
     # ------------------------------------------------------------------
     # Packet-id stamping
@@ -261,6 +264,10 @@ class ESP32BridgeRumbleDispatcher:
             else:
                 side.wants_stop = True
                 side.explicit_zero_payload = bytes(payload)
+        loop = self._loop
+        wake = self._wake
+        if loop is not None and wake is not None:
+            loop.call_soon_threadsafe(wake.set)
 
     # ------------------------------------------------------------------
     # Task lifecycle
@@ -274,25 +281,19 @@ class ESP32BridgeRumbleDispatcher:
         honoured so rumble frames are spaced ~15 ms apart (no motor gap).  No-op
         off Windows.  Always balanced by a matching timeEndPeriod on stop.
         """
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            if enable and not self._timer_res_raised:
-                ctypes.windll.winmm.timeBeginPeriod(1)
-                self._timer_res_raised = True
-            elif not enable and self._timer_res_raised:
-                ctypes.windll.winmm.timeEndPeriod(1)
-                self._timer_res_raised = False
-        except Exception as e:
-            logger.debug("timeBeginPeriod/timeEndPeriod failed: %s", e)
+        if enable and not self._timer_res_raised:
+            self._timer_res_raised = timer_resolution.acquire()
+        elif not enable and self._timer_res_raised:
+            timer_resolution.release()
+            self._timer_res_raised = False
 
     def start(self) -> None:
         """Start the dispatch loop as an asyncio task in the running event loop."""
         if self._running:
             return
         self._running = True
-        self._set_timer_resolution(True)
+        self._loop = asyncio.get_running_loop()
+        self._wake = asyncio.Event()
         self._last_dispatch_t = time.perf_counter()
         self._task = asyncio.create_task(self._dispatch_loop())
         logger.info(
@@ -305,6 +306,8 @@ class ESP32BridgeRumbleDispatcher:
     def stop(self) -> None:
         """Stop the dispatch loop."""
         self._running = False
+        if self._loop is not None and self._wake is not None:
+            self._loop.call_soon_threadsafe(self._wake.set)
         if self._task is not None:
             try:
                 self._task.cancel()
@@ -312,6 +315,8 @@ class ESP32BridgeRumbleDispatcher:
                 pass
             self._task = None
         self._set_timer_resolution(False)
+        self._loop = None
+        self._wake = None
         logger.debug("ESP32 rumble dispatcher stopped")
 
     # ------------------------------------------------------------------
@@ -320,6 +325,13 @@ class ESP32BridgeRumbleDispatcher:
 
     async def _dispatch_loop(self) -> None:
         while self._running:
+            if not self._has_dispatch_work():
+                self._set_timer_resolution(False)
+                await self._wake.wait()
+                self._wake.clear()
+                if not self._running:
+                    break
+            self._set_timer_resolution(True)
             t0 = time.perf_counter()
             try:
                 if self._client.is_connected:
@@ -329,6 +341,17 @@ class ESP32BridgeRumbleDispatcher:
             elapsed = time.perf_counter() - t0
             sleep_t = max(0.001, ESP32_BRIDGE_RUMBLE_PAIR_INTERVAL_SEC - elapsed)
             await asyncio.sleep(sleep_t)
+
+    def _has_dispatch_work(self) -> bool:
+        now = time.perf_counter()
+        with self._lock:
+            if self._left.dirty or self._right.dirty:
+                return True
+            if not self._last_active_t:
+                return False
+            if now - self._last_active_t < ESP32_BRIDGE_RUMBLE_GLOBAL_ZERO_AFTER_SEC:
+                return True
+            return not self._global_zero_sent
 
     def _get_pair_mode(self) -> str:
         """Read pair mode from CONFIG if available, otherwise use module default."""

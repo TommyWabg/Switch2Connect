@@ -64,7 +64,8 @@ CDC_WRITE_TIMEOUT_SECONDS = 0.003
 
 def _set_current_thread_priority(level):
     try:
-        if os.name == "nt":
+        import power_saving
+        if os.name == "nt" and not power_saving.is_full():
             kernel32 = ctypes.windll.kernel32
             kernel32.SetThreadPriority(kernel32.GetCurrentThread(), int(level))
     except Exception:

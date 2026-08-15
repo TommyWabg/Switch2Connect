@@ -147,19 +147,34 @@ MOVING_YAW_BIAS_DIRECTION_SPREAD_LIMIT_DPS = 0.75
 MOVING_YAW_BIAS_MIN_WINDOWS_PER_DIRECTION = 2
 MOVING_YAW_BIAS_SLEW_DPS_PER_SECOND = 0.01
 MOTION_MAG_CLOSURE_MODES = ("Off", "Shadow", "V2")
+PRODUCTION_INAPP_MOTION_MAG_CLOSURE_MODE = "V2"
+PRODUCTION_PASSTHROUGH_MOTION_MAG_CLOSURE_MODE = "V2"
 INAPP_MOTION_MAG_CLOSURE_MODE = os.environ.get(
-    "SWITCH2_INAPP_MOTION_MAG_CLOSURE", "V2").strip()
+    "SWITCH2_INAPP_MOTION_MAG_CLOSURE",
+    PRODUCTION_INAPP_MOTION_MAG_CLOSURE_MODE).strip()
 if INAPP_MOTION_MAG_CLOSURE_MODE not in MOTION_MAG_CLOSURE_MODES:
-    INAPP_MOTION_MAG_CLOSURE_MODE = "V2"
+    INAPP_MOTION_MAG_CLOSURE_MODE = (
+        PRODUCTION_INAPP_MOTION_MAG_CLOSURE_MODE)
 PASSTHROUGH_MOTION_MAG_CLOSURE_MODE = os.environ.get(
-    "SWITCH2_PASSTHROUGH_MOTION_MAG_CLOSURE", "V2").strip()
+    "SWITCH2_PASSTHROUGH_MOTION_MAG_CLOSURE",
+    PRODUCTION_PASSTHROUGH_MOTION_MAG_CLOSURE_MODE).strip()
 if PASSTHROUGH_MOTION_MAG_CLOSURE_MODE not in MOTION_MAG_CLOSURE_MODES:
-    PASSTHROUGH_MOTION_MAG_CLOSURE_MODE = "V2"
+    PASSTHROUGH_MOTION_MAG_CLOSURE_MODE = (
+        PRODUCTION_PASSTHROUGH_MOTION_MAG_CLOSURE_MODE)
 MOTION_MAG_CLOSURE_RATE_LOWPASS_SECONDS = 0.15
 MOTION_MAG_CLOSURE_INNOVATION_LOWPASS_SECONDS = 1.5
-MOTION_MAG_CLOSURE_KP = 0.075
+MOTION_MAG_CLOSURE_KP = 0.8
 MOTION_MAG_CLOSURE_MAX_DPS = 0.10
 MOTION_MAG_CLOSURE_MAX_RATE_FRACTION = 0.02
+MOTION_MAG_CORRECTION_LAWS = ("Legacy", "DynamicRate", "RobustBiasRate")
+PRODUCTION_MOTION_MAG_CORRECTION_LAW = "RobustBiasRate"
+MOTION_MAG_CORRECTION_LAW = os.environ.get(
+    "SWITCH2_MOTION_MAG_CORRECTION_LAW",
+    PRODUCTION_MOTION_MAG_CORRECTION_LAW).strip()
+if MOTION_MAG_CORRECTION_LAW not in MOTION_MAG_CORRECTION_LAWS:
+    MOTION_MAG_CORRECTION_LAW = PRODUCTION_MOTION_MAG_CORRECTION_LAW
+MOTION_MAG_DYNAMIC_CORRECTION_RATIO = 0.80
+MOTION_MAG_DYNAMIC_ATTACK_SLEW_RATIO_PER_SECOND = 0.40
 MOTION_MAG_CLOSURE_MOTION_ENTER_DPS = 3.0
 MOTION_MAG_CLOSURE_MOTION_EXIT_DPS = 0.5
 MOTION_MAG_CLOSURE_BIN_COUNT = 24
@@ -176,6 +191,44 @@ MOTION_MAG_CLOSURE_SETTLING_SECONDS = 0.20
 MOTION_MAG_CLOSURE_SETTLING_ZERO_SECONDS = 0.05
 MOTION_MAG_CLOSURE_BIN_PAUSE_LIMIT_SECONDS = 0.10
 MOTION_MAG_CLOSURE_SLEW_DPS_PER_SECOND = 0.01
+MOTION_MAG_CONSUMER_REENTRY_ZERO_SECONDS = 0.05
+MOTION_MAG_CONSUMER_REENTRY_RAMP_SECONDS = 0.25
+MOTION_MAG_RELATIVE_DELTA_REJECTION_DEG = 0.75
+MOTION_MAG_RELATIVE_DELTA_REJECTION_SECONDS = 0.20
+MOTION_MAG_CONSISTENCY_WINDOW_SECONDS = 1.0
+MOTION_MAG_CONSISTENCY_MIN_SECONDS = 0.5
+MOTION_MAG_CONSISTENCY_BUCKET_SECONDS = 0.10
+MOTION_MAG_CONSISTENCY_MIN_SAMPLES = 5
+MOTION_MAG_CONSISTENCY_MIN_NET_GYRO_DEG = 0.10
+MOTION_MAG_CONSISTENCY_FULL_NET_GYRO_DEG = 0.50
+MOTION_MAG_CONSISTENCY_MIN_RAW_SAMPLES = 30
+MOTION_MAG_CONSISTENCY_MIN_RAW_GYRO_DELTA_DEG = 0.005
+MOTION_MAG_CONFIDENCE_RELEASE_SECONDS = 3.0
+MOTION_MAG_CONFIDENCE_INVALID_RESET_SECONDS = 5.0
+MOTION_MAG_AUTHORITY_MISMATCH_SECONDS = 1.0
+MOTION_MAG_AUTHORITY_CONFIRM_BUCKETS = 2
+ROBUST_BIAS_BUCKET_SECONDS = 0.10
+ROBUST_BIAS_OBSERVATION_CAP_DPS = 0.25
+ROBUST_BIAS_ESTIMATE_SECONDS = 5.0
+ROBUST_BIAS_OUTPUT_CAP_DPS = 0.10
+ROBUST_BIAS_MIN_BUCKETS = 10
+ROBUST_BIAS_FULL_BUCKETS = 30
+ROBUST_BIAS_DECAY_DELAY_SECONDS = 1.0
+TRANSIENT_RECOVERY_VALIDATION_SECONDS = 0.40
+TRANSIENT_RECOVERY_SAMPLE_SECONDS = 0.10
+TRANSIENT_RECOVERY_MIN_SAMPLES = 3
+TRANSIENT_RECOVERY_STABILITY_DEG = 0.35
+TRANSIENT_RECOVERY_MIN_ERROR_DEG = 0.15
+TRANSIENT_RECOVERY_MAX_DEBT_DEG = 3.0
+TRANSIENT_RECOVERY_KP = 0.8
+TRANSIENT_RECOVERY_OUTPUT_CAP_DPS = 0.30
+MOTION_MAG_CONSISTENCY_CORRELATION_FLOOR = 0.50
+MOTION_MAG_CONSISTENCY_CORRELATION_FULL = 0.85
+MOTION_MAG_CONSISTENCY_SCALE_MIN = 0.75
+MOTION_MAG_CONSISTENCY_SCALE_MAX = 1.25
+MOTION_MAG_COMMIT_SCALE_MIN = 0.85
+MOTION_MAG_COMMIT_SCALE_MAX = 1.15
+MOTION_MAG_MAX_BIAS_RATE_DPS = 0.50
 
 
 @dataclass(frozen=True)
@@ -402,13 +455,84 @@ class PassthroughHeadingOutputFilter:
 class MotionMagneticClosureEstimator:
     """Low-frequency magnetic path-closure authority, emitted only in motion."""
 
-    def __init__(self):
+    def __init__(self, correction_law: str | None = None):
+        self.correction_law = (
+            correction_law
+            if correction_law in MOTION_MAG_CORRECTION_LAWS
+            else MOTION_MAG_CORRECTION_LAW)
         self.reset()
 
     def reset(self) -> None:
+        self.measurement_epoch = getattr(self, "measurement_epoch", -1) + 1
         self.anchor_heading_deg = None
         self.unwrapped_gyro_heading_deg = 0.0
         self.unwrapped_magnetic_heading_deg = 0.0
+        self.gyro_relative_heading_deg = 0.0
+        self.magnetic_relative_heading_deg = 0.0
+        self.relative_closure_error_deg = 0.0
+        self.raw_magnetic_heading_delta_deg = 0.0
+        self.normalized_magnetic_heading_delta_deg = 0.0
+        self.gyro_world_yaw_delta_deg = 0.0
+        self.gyro_reference_heading_delta_deg = 0.0
+        self.heading_delta_direction_agreement = True
+        self.relative_delta_innovation_deg = 0.0
+        self.relative_delta_rejected = False
+        self._relative_delta_reject_elapsed = 0.0
+        self._consistency_samples = deque()
+        self._raw_consistency_samples = deque()
+        self._consistency_seconds = 0.0
+        self._consistency_clock = 0.0
+        self.consistency_correlation = 0.0
+        self.consistency_scale = 0.0
+        self.consistency_confidence = 0.0
+        self.rolling_consistency_confidence = 0.0
+        self.aggregate_consistency_confidence = 0.0
+        self._validated_consistency_confidence = 0.0
+        self._confidence_invalid_elapsed = 0.0
+        self._authority_mismatch_elapsed = 0.0
+        self._authority_confirmation_buckets = 0
+        self.authority_suspended = False
+        self.observed_bias_rate_dps = 0.0
+        self.bias_rate_valid = False
+        self.commit_scale_valid = False
+        self.committed_error_increment_deg = 0.0
+        self.frozen_correction_blocked = False
+        self.robust_bias_bucket_elapsed = 0.0
+        self.robust_bias_bucket_magnetic_delta_deg = 0.0
+        self.robust_bias_bucket_gyro_delta_deg = 0.0
+        self.robust_bias_raw_observation_dps = 0.0
+        self.robust_bias_bounded_observation_dps = 0.0
+        self.robust_bias_estimate_dps = 0.0
+        self.robust_bias_valid_buckets = 0
+        self.robust_bias_observation_age_seconds = float("inf")
+        self.robust_bias_confidence = 0.0
+        self.robust_bias_observation_clipped = False
+        self.robust_bias_decay_active = False
+        self.transient_epoch = getattr(self, "transient_epoch", -1) + 1
+        self.transient_event_active = False
+        self.transient_event_valid = False
+        self.transient_event_error_deg = 0.0
+        self.transient_validation_elapsed = 0.0
+        self.transient_validation_bucket_elapsed = 0.0
+        self.transient_validation_samples = deque()
+        self.transient_confidence = 0.0
+        self.transient_commit_increment_deg = 0.0
+        self.transient_authority_active = False
+        self._transient_was_dynamic = False
+        self.window_accepted = False
+        self.window_magnetic_delta_deg = 0.0
+        self.window_gyro_delta_deg = 0.0
+        self.committed_heading_error_deg = 0.0
+        self.residual_state = "Reset"
+        self._consistency_reference_ready = False
+        self._was_stationary = True
+        self._consistency_bucket_elapsed = 0.0
+        self._consistency_bucket_mag_delta = 0.0
+        self._consistency_bucket_gyro_delta = 0.0
+        self.confidence_state = "Waiting for Motion"
+        self._relative_last_magnetic_heading = None
+        self._relative_last_gyro_heading = None
+        self._relative_anchor_required = True
         self._last_current_heading = None
         self._last_magnetic_heading = None
         self._last_raw_innovation = None
@@ -433,6 +557,33 @@ class MotionMagneticClosureEstimator:
     def _smoothstep(value: float) -> float:
         value = max(0.0, min(1.0, value))
         return value * value * (3.0 - 2.0 * value)
+
+    @classmethod
+    def _correlation_confidence(cls, mag_values, gyro_values):
+        if len(mag_values) < 2 or len(mag_values) != len(gyro_values):
+            return 0.0, 0.0, 0.0
+        mag_mean = statistics.fmean(mag_values)
+        gyro_mean = statistics.fmean(gyro_values)
+        covariance = statistics.fmean(
+            (mag_value - mag_mean) * (gyro_value - gyro_mean)
+            for mag_value, gyro_value in zip(mag_values, gyro_values))
+        mag_variance = statistics.fmean(
+            (value - mag_mean) ** 2 for value in mag_values)
+        gyro_variance = statistics.fmean(
+            (value - gyro_mean) ** 2 for value in gyro_values)
+        denominator = math.sqrt(mag_variance * gyro_variance)
+        correlation = covariance / denominator if denominator > 1e-12 else 0.0
+        scale = covariance / gyro_variance if gyro_variance > 1e-12 else 0.0
+        correlation_weight = cls._smoothstep(
+            (correlation - MOTION_MAG_CONSISTENCY_CORRELATION_FLOOR)
+            / (MOTION_MAG_CONSISTENCY_CORRELATION_FULL
+               - MOTION_MAG_CONSISTENCY_CORRELATION_FLOOR))
+        if (scale < MOTION_MAG_CONSISTENCY_SCALE_MIN
+                or scale > MOTION_MAG_CONSISTENCY_SCALE_MAX):
+            scale_weight = 0.0
+        else:
+            scale_weight = max(0.0, 1.0 - abs(scale - 1.0) / 0.5)
+        return correlation, scale, correlation_weight * scale_weight
 
     def _bin_state(self, index: int, orientation_bin: str) -> dict:
         item = self._bins[index].setdefault(
@@ -500,9 +651,89 @@ class MotionMagneticClosureEstimator:
             "revalidation_required": self._revalidation_required,
             "revalidation_elapsed_seconds": self._revalidation_elapsed,
             "error_debt_deg": self.filtered_innovation_deg,
+            "raw_relative_closure_error_deg": self.relative_closure_error_deg,
+            "filtered_relative_closure_error_deg": self.filtered_innovation_deg,
+            "consumer_measurement_deg": self.filtered_innovation_deg,
+            "gyro_relative_heading_deg": self.gyro_relative_heading_deg,
+            "magnetic_relative_heading_deg": self.magnetic_relative_heading_deg,
+            "relative_closure_error_deg": self.relative_closure_error_deg,
+            "raw_magnetic_heading_delta_deg": (
+                self.raw_magnetic_heading_delta_deg),
+            "normalized_magnetic_heading_delta_deg": (
+                self.normalized_magnetic_heading_delta_deg),
+            "gyro_world_yaw_delta_deg": self.gyro_world_yaw_delta_deg,
+            "gyro_reference_heading_delta_deg": (
+                self.gyro_reference_heading_delta_deg),
+            "heading_delta_direction_agreement": (
+                self.heading_delta_direction_agreement),
+            "relative_delta_innovation_deg": self.relative_delta_innovation_deg,
+            "relative_delta_rejected": self.relative_delta_rejected,
+            "relative_delta_reject_elapsed_seconds": (
+                self._relative_delta_reject_elapsed),
+            "measurement_epoch": self.measurement_epoch,
+            "consistency_correlation": self.consistency_correlation,
+            "consistency_scale": self.consistency_scale,
+            "consistency_confidence": self.consistency_confidence,
+            "rolling_consistency_confidence": (
+                self.rolling_consistency_confidence),
+            "aggregate_consistency_confidence": (
+                self.aggregate_consistency_confidence),
+            "consistency_samples": len(self._consistency_samples),
+            "consistency_seconds": self._consistency_seconds,
+            "window_accepted": self.window_accepted,
+            "window_magnetic_delta_deg": self.window_magnetic_delta_deg,
+            "window_gyro_delta_deg": self.window_gyro_delta_deg,
+            "committed_heading_error_deg": self.committed_heading_error_deg,
+            "residual_state": self.residual_state,
+            "confidence_state": self.confidence_state,
+            "authority_suspended": self.authority_suspended,
+            "observed_bias_rate_dps": self.observed_bias_rate_dps,
+            "bias_rate_valid": self.bias_rate_valid,
+            "commit_scale_valid": self.commit_scale_valid,
+            "committed_error_increment_deg": (
+                self.committed_error_increment_deg),
+            "invalid_confidence_debt_seconds": (
+                self._confidence_invalid_elapsed),
+            "frozen_correction_blocked": self.frozen_correction_blocked,
+            "robust_bias_bucket_elapsed_seconds": (
+                self.robust_bias_bucket_elapsed),
+            "robust_bias_bucket_magnetic_delta_deg": (
+                self.robust_bias_bucket_magnetic_delta_deg),
+            "robust_bias_bucket_gyro_delta_deg": (
+                self.robust_bias_bucket_gyro_delta_deg),
+            "robust_bias_raw_observation_dps": (
+                self.robust_bias_raw_observation_dps),
+            "robust_bias_bounded_observation_dps": (
+                self.robust_bias_bounded_observation_dps),
+            "robust_bias_estimate_dps": self.robust_bias_estimate_dps,
+            "robust_bias_valid_buckets": self.robust_bias_valid_buckets,
+            "robust_bias_observation_age_seconds": (
+                self.robust_bias_observation_age_seconds),
+            "robust_bias_confidence": self.robust_bias_confidence,
+            "robust_bias_observation_clipped": (
+                self.robust_bias_observation_clipped),
+            "robust_bias_decay_active": self.robust_bias_decay_active,
+            "transient_epoch": self.transient_epoch,
+            "transient_event_active": self.transient_event_active,
+            "transient_event_valid": self.transient_event_valid,
+            "transient_event_error_deg": self.transient_event_error_deg,
+            "transient_validation_elapsed_seconds": (
+                self.transient_validation_elapsed),
+            "transient_validation_samples": len(
+                self.transient_validation_samples),
+            "transient_confidence": self.transient_confidence,
+            "transient_commit_increment_deg": (
+                self.transient_commit_increment_deg),
+            "transient_authority_active": self.transient_authority_active,
             "absolute_cap_dps": 0.0,
             "relative_cap_dps": 0.0,
             "correction_target_dps": 0.0,
+            "correction_law": self.correction_law,
+            "raw_proportional_target_dps": 0.0,
+            "confidence_weighted_target_dps": 0.0,
+            "dynamic_safety_cap_dps": 0.0,
+            "attack_slew_dps_per_second": 0.0,
+            "limiting_reason": "blocked",
             "candidate_rate_dps": 0.0,
             "applied_rate_dps": 0.0,
             "output_active": False,
@@ -514,8 +745,76 @@ class MotionMagneticClosureEstimator:
         # Output authority is revoked in the same frame.  The low-frequency
         # estimate remains continuous so recovery cannot create a heading snap.
         self._output_rate_dps = 0.0
+        if not self._relative_anchor_required:
+            self.measurement_epoch += 1
         self.filtered_innovation_deg = 0.0
         self._last_raw_innovation = None
+        self.gyro_relative_heading_deg = 0.0
+        self.magnetic_relative_heading_deg = 0.0
+        self.relative_closure_error_deg = 0.0
+        self.raw_magnetic_heading_delta_deg = 0.0
+        self.normalized_magnetic_heading_delta_deg = 0.0
+        self.gyro_world_yaw_delta_deg = 0.0
+        self.gyro_reference_heading_delta_deg = 0.0
+        self.heading_delta_direction_agreement = True
+        self.relative_delta_innovation_deg = 0.0
+        self.relative_delta_rejected = False
+        self._relative_delta_reject_elapsed = 0.0
+        self._consistency_samples.clear()
+        self._raw_consistency_samples.clear()
+        self._consistency_seconds = 0.0
+        self._consistency_clock = 0.0
+        self.consistency_correlation = 0.0
+        self.consistency_scale = 0.0
+        self.consistency_confidence = 0.0
+        self.rolling_consistency_confidence = 0.0
+        self.aggregate_consistency_confidence = 0.0
+        self._validated_consistency_confidence = 0.0
+        self._confidence_invalid_elapsed = 0.0
+        self._authority_mismatch_elapsed = 0.0
+        self._authority_confirmation_buckets = 0
+        self.authority_suspended = False
+        self.observed_bias_rate_dps = 0.0
+        self.bias_rate_valid = False
+        self.commit_scale_valid = False
+        self.committed_error_increment_deg = 0.0
+        self.frozen_correction_blocked = False
+        self.robust_bias_bucket_elapsed = 0.0
+        self.robust_bias_bucket_magnetic_delta_deg = 0.0
+        self.robust_bias_bucket_gyro_delta_deg = 0.0
+        self.robust_bias_raw_observation_dps = 0.0
+        self.robust_bias_bounded_observation_dps = 0.0
+        self.robust_bias_estimate_dps = 0.0
+        self.robust_bias_valid_buckets = 0
+        self.robust_bias_observation_age_seconds = float("inf")
+        self.robust_bias_confidence = 0.0
+        self.robust_bias_observation_clipped = False
+        self.robust_bias_decay_active = False
+        self.transient_epoch += 1
+        self.transient_event_active = False
+        self.transient_event_valid = False
+        self.transient_event_error_deg = 0.0
+        self.transient_validation_elapsed = 0.0
+        self.transient_validation_bucket_elapsed = 0.0
+        self.transient_validation_samples.clear()
+        self.transient_confidence = 0.0
+        self.transient_commit_increment_deg = 0.0
+        self.transient_authority_active = False
+        self._transient_was_dynamic = False
+        self.window_accepted = False
+        self.window_magnetic_delta_deg = 0.0
+        self.window_gyro_delta_deg = 0.0
+        self.committed_heading_error_deg = 0.0
+        self.residual_state = "Reset"
+        self._consistency_reference_ready = False
+        self._was_stationary = True
+        self._consistency_bucket_elapsed = 0.0
+        self._consistency_bucket_mag_delta = 0.0
+        self._consistency_bucket_gyro_delta = 0.0
+        self.confidence_state = "Waiting for Motion"
+        self._relative_last_magnetic_heading = None
+        self._relative_last_gyro_heading = None
+        self._relative_anchor_required = True
         self._revalidation_required = True
         self._revalidation_elapsed = 0.0
         self._bin_elapsed = 0.0
@@ -535,10 +834,25 @@ class MotionMagneticClosureEstimator:
                yaw_rate_dps: float, accelerometer_g: Sequence[float],
                timing: V2Timing, *, magnetic_quality_valid: bool,
                magnetic_direction_valid: bool = True,
-               stationary_hint: bool = False) -> dict:
+               stationary_hint: bool = False,
+               gyro_world_yaw_rate_dps: float | None = None,
+               gyro_reference_heading_deg: float | None = None) -> dict:
         current = float(current_heading_deg)
         magnetic = float(magnetic_heading_deg)
-        rate = float(yaw_rate_dps)
+        heading_rate = float(yaw_rate_dps)
+        world_yaw_rate = (
+            heading_rate if gyro_world_yaw_rate_dps is None
+            else float(gyro_world_yaw_rate_dps))
+        if not math.isfinite(world_yaw_rate):
+            world_yaw_rate = 0.0
+        gyro_reference = (
+            current if gyro_reference_heading_deg is None
+            else float(gyro_reference_heading_deg))
+        if not math.isfinite(gyro_reference):
+            gyro_reference = current
+        relative_rate_law = self.correction_law in (
+            "DynamicRate", "RobustBiasRate")
+        rate = world_yaw_rate if relative_rate_law else heading_rate
         accel = _vector3(accelerometer_g, "accelerometer_g")
         if self.anchor_heading_deg is None:
             self.anchor_heading_deg = current
@@ -563,6 +877,74 @@ class MotionMagneticClosureEstimator:
             self._revalidation_elapsed = 0.0
             self.filtered_innovation_deg = 0.0
             self._last_raw_innovation = None
+        if not magnetic_quality_valid or not magnetic_direction_valid:
+            if not self._relative_anchor_required:
+                self.measurement_epoch += 1
+            self.gyro_relative_heading_deg = 0.0
+            self.magnetic_relative_heading_deg = 0.0
+            self.relative_closure_error_deg = 0.0
+            self.raw_magnetic_heading_delta_deg = 0.0
+            self.normalized_magnetic_heading_delta_deg = 0.0
+            self.gyro_world_yaw_delta_deg = 0.0
+            self.gyro_reference_heading_delta_deg = 0.0
+            self.heading_delta_direction_agreement = True
+            self.relative_delta_innovation_deg = 0.0
+            self.relative_delta_rejected = False
+            self._relative_delta_reject_elapsed = 0.0
+            self._relative_last_magnetic_heading = None
+            self._relative_last_gyro_heading = None
+            self._relative_anchor_required = True
+            self._consistency_samples.clear()
+            self._raw_consistency_samples.clear()
+            self._consistency_seconds = 0.0
+            self._consistency_clock = 0.0
+            self.consistency_correlation = 0.0
+            self.consistency_scale = 0.0
+            self.consistency_confidence = 0.0
+            self.rolling_consistency_confidence = 0.0
+            self.aggregate_consistency_confidence = 0.0
+            self._validated_consistency_confidence = 0.0
+            self._confidence_invalid_elapsed = 0.0
+            self._authority_mismatch_elapsed = 0.0
+            self._authority_confirmation_buckets = 0
+            self.authority_suspended = False
+            self.observed_bias_rate_dps = 0.0
+            self.bias_rate_valid = False
+            self.commit_scale_valid = False
+            self.committed_error_increment_deg = 0.0
+            self.frozen_correction_blocked = False
+            self.robust_bias_bucket_elapsed = 0.0
+            self.robust_bias_bucket_magnetic_delta_deg = 0.0
+            self.robust_bias_bucket_gyro_delta_deg = 0.0
+            self.robust_bias_raw_observation_dps = 0.0
+            self.robust_bias_bounded_observation_dps = 0.0
+            self.robust_bias_estimate_dps = 0.0
+            self.robust_bias_valid_buckets = 0
+            self.robust_bias_observation_age_seconds = float("inf")
+            self.robust_bias_confidence = 0.0
+            self.robust_bias_observation_clipped = False
+            self.robust_bias_decay_active = False
+            self.transient_epoch += 1
+            self.transient_event_active = False
+            self.transient_event_valid = False
+            self.transient_event_error_deg = 0.0
+            self.transient_validation_elapsed = 0.0
+            self.transient_validation_bucket_elapsed = 0.0
+            self.transient_validation_samples.clear()
+            self.transient_confidence = 0.0
+            self.transient_commit_increment_deg = 0.0
+            self.transient_authority_active = False
+            self._transient_was_dynamic = False
+            self.window_accepted = False
+            self.window_magnetic_delta_deg = 0.0
+            self.window_gyro_delta_deg = 0.0
+            self.committed_heading_error_deg = 0.0
+            self.residual_state = "Reset"
+            self._consistency_reference_ready = False
+            self._consistency_bucket_elapsed = 0.0
+            self._consistency_bucket_mag_delta = 0.0
+            self._consistency_bucket_gyro_delta = 0.0
+            self.confidence_state = "Magnetic Interference"
         accel_error = abs(math.sqrt(sum(value * value for value in accel)) - 1.0)
         if accel_error > 0.03:
             blocked.append("linear-acceleration")
@@ -573,6 +955,9 @@ class MotionMagneticClosureEstimator:
             blocked.append("innovation-jump")
         self._last_raw_innovation = raw_innovation
         revalidation_reason = None
+        self.committed_error_increment_deg = 0.0
+        self.transient_commit_increment_deg = 0.0
+        self.frozen_correction_blocked = False
         if self._revalidation_required:
             if not magnetic_direction_valid:
                 self._revalidation_elapsed = 0.0
@@ -590,20 +975,474 @@ class MotionMagneticClosureEstimator:
                     self._revalidation_elapsed = (
                         MOTION_MAG_CLOSURE_REVALIDATION_SECONDS)
                     revalidation_reason = None
-                    self.filtered_innovation_deg = raw_innovation
+                    self.filtered_innovation_deg = (
+                        0.0 if relative_rate_law
+                        else raw_innovation)
                     self._settling_elapsed = 0.0
             if revalidation_reason is not None:
                 blocked.append(revalidation_reason)
+        if relative_rate_law:
+            window_committed_this_frame = False
+            innovation_update_seconds = 0.0
+            if self._relative_anchor_required:
+                if not blocked and not self._revalidation_required:
+                    self.gyro_relative_heading_deg = 0.0
+                    self.magnetic_relative_heading_deg = 0.0
+                    self.relative_closure_error_deg = 0.0
+                    self.raw_magnetic_heading_delta_deg = 0.0
+                    self.normalized_magnetic_heading_delta_deg = 0.0
+                    self.gyro_world_yaw_delta_deg = 0.0
+                    self.gyro_reference_heading_delta_deg = 0.0
+                    self.heading_delta_direction_agreement = True
+                    self.relative_delta_innovation_deg = 0.0
+                    self.relative_delta_rejected = False
+                    self._relative_delta_reject_elapsed = 0.0
+                    self._relative_last_magnetic_heading = magnetic
+                    self._relative_last_gyro_heading = gyro_reference
+                    self._relative_anchor_required = False
+                    self.residual_state = "Reanchoring"
+                rate = 0.0
+                controller_innovation = 0.0
+            else:
+                if self._relative_last_magnetic_heading is not None:
+                    self.raw_magnetic_heading_delta_deg = _wrap_degrees(
+                        magnetic - self._relative_last_magnetic_heading)
+                    # Magnetic heading and the independent 6-axis quaternion
+                    # heading share the same NWU Euler-heading convention.
+                    self.normalized_magnetic_heading_delta_deg = (
+                        self.raw_magnetic_heading_delta_deg)
+                self._relative_last_magnetic_heading = magnetic
+                if timing.integrate and timing.dt_seconds > 0.0:
+                    self.gyro_world_yaw_delta_deg = (
+                        world_yaw_rate * timing.dt_seconds)
+                    if self._relative_last_gyro_heading is not None:
+                        self.gyro_reference_heading_delta_deg = _wrap_degrees(
+                            gyro_reference - self._relative_last_gyro_heading)
+                    else:
+                        self.gyro_reference_heading_delta_deg = 0.0
+                    self._relative_last_gyro_heading = gyro_reference
+                    rate = (
+                        self.gyro_reference_heading_delta_deg
+                        / timing.dt_seconds)
+                mag_delta = self.normalized_magnetic_heading_delta_deg
+                gyro_delta = self.gyro_reference_heading_delta_deg
+                self.heading_delta_direction_agreement = bool(
+                    abs(mag_delta) <= 1e-9 or abs(gyro_delta) <= 1e-9
+                    or mag_delta * gyro_delta > 0.0)
+                self.relative_delta_innovation_deg = _wrap_degrees(
+                    mag_delta - gyro_delta)
+                moving = abs(rate) > MOTION_MAG_CLOSURE_MOTION_EXIT_DPS
+                self.relative_delta_rejected = bool(
+                    moving and abs(self.relative_delta_innovation_deg)
+                    > MOTION_MAG_RELATIVE_DELTA_REJECTION_DEG)
+                if self.relative_delta_rejected:
+                    self._relative_delta_reject_elapsed += max(
+                        0.0, timing.dt_seconds)
+                    if (self._relative_delta_reject_elapsed
+                            >= MOTION_MAG_RELATIVE_DELTA_REJECTION_SECONDS):
+                        blocked.append("relative-heading-delta")
+                else:
+                    self._relative_delta_reject_elapsed = 0.0
+                self._consistency_clock += max(0.0, timing.dt_seconds)
+                bucket_completed = False
+                current_consistency_evidence = 0.0
+                sample_valid = bool(
+                    moving and not self.relative_delta_rejected
+                    and not blocked)
+                if self.correction_law == "RobustBiasRate":
+                    dt_value = max(0.0, timing.dt_seconds)
+                    if sample_valid:
+                        self.robust_bias_observation_age_seconds = 0.0
+                        self.robust_bias_decay_active = False
+                        self.robust_bias_bucket_elapsed += dt_value
+                        self.robust_bias_bucket_magnetic_delta_deg += mag_delta
+                        self.robust_bias_bucket_gyro_delta_deg += gyro_delta
+                        if (self.robust_bias_bucket_elapsed
+                                >= ROBUST_BIAS_BUCKET_SECONDS):
+                            bucket_seconds = self.robust_bias_bucket_elapsed
+                            self.robust_bias_raw_observation_dps = (
+                                (self.robust_bias_bucket_magnetic_delta_deg
+                                 - self.robust_bias_bucket_gyro_delta_deg)
+                                / bucket_seconds)
+                            self.robust_bias_bounded_observation_dps = max(
+                                -ROBUST_BIAS_OBSERVATION_CAP_DPS,
+                                min(ROBUST_BIAS_OBSERVATION_CAP_DPS,
+                                    self.robust_bias_raw_observation_dps))
+                            self.robust_bias_observation_clipped = bool(
+                                abs(self.robust_bias_raw_observation_dps)
+                                > ROBUST_BIAS_OBSERVATION_CAP_DPS)
+                            robust_alpha = 1.0 - math.exp(
+                                -bucket_seconds
+                                / ROBUST_BIAS_ESTIMATE_SECONDS)
+                            self.robust_bias_estimate_dps += robust_alpha * (
+                                self.robust_bias_bounded_observation_dps
+                                - self.robust_bias_estimate_dps)
+                            self.robust_bias_valid_buckets += 1
+                            self.robust_bias_bucket_elapsed = 0.0
+                            self.robust_bias_bucket_magnetic_delta_deg = 0.0
+                            self.robust_bias_bucket_gyro_delta_deg = 0.0
+                    else:
+                        if math.isfinite(
+                                self.robust_bias_observation_age_seconds):
+                            self.robust_bias_observation_age_seconds += dt_value
+                        if (self.robust_bias_observation_age_seconds
+                                > ROBUST_BIAS_DECAY_DELAY_SECONDS):
+                            self.robust_bias_decay_active = True
+                            decay = math.exp(
+                                -dt_value / ROBUST_BIAS_ESTIMATE_SECONDS)
+                            self.robust_bias_estimate_dps *= decay
+                    sample_progress = self._smoothstep(
+                        (self.robust_bias_valid_buckets
+                         - ROBUST_BIAS_MIN_BUCKETS)
+                        / (ROBUST_BIAS_FULL_BUCKETS
+                           - ROBUST_BIAS_MIN_BUCKETS))
+                    if math.isfinite(
+                            self.robust_bias_observation_age_seconds):
+                        age_weight = math.exp(
+                            -max(0.0,
+                                 self.robust_bias_observation_age_seconds
+                                 - ROBUST_BIAS_DECAY_DELAY_SECONDS)
+                            / ROBUST_BIAS_ESTIMATE_SECONDS)
+                    else:
+                        age_weight = 0.0
+                    self.robust_bias_confidence = max(
+                        0.0, min(1.0, sample_progress * age_weight))
+                if (sample_valid and abs(gyro_delta)
+                        >= MOTION_MAG_CONSISTENCY_MIN_RAW_GYRO_DELTA_DEG):
+                    self._raw_consistency_samples.append(
+                        (self._consistency_clock, mag_delta, gyro_delta))
+                while (self._raw_consistency_samples
+                       and self._consistency_clock
+                       - self._raw_consistency_samples[0][0]
+                       > MOTION_MAG_CONSISTENCY_WINDOW_SECONDS):
+                    self._raw_consistency_samples.popleft()
+                raw_seconds = (
+                    self._consistency_clock
+                    - self._raw_consistency_samples[0][0]
+                    if self._raw_consistency_samples else 0.0)
+                if (len(self._raw_consistency_samples)
+                        >= MOTION_MAG_CONSISTENCY_MIN_RAW_SAMPLES
+                        and raw_seconds
+                        >= MOTION_MAG_CONSISTENCY_MIN_SECONDS):
+                    raw_mag_values = [
+                        item[1] for item in self._raw_consistency_samples]
+                    raw_gyro_values = [
+                        item[2] for item in self._raw_consistency_samples]
+                    (rolling_correlation, rolling_scale,
+                     self.rolling_consistency_confidence) = (
+                        self._correlation_confidence(
+                            raw_mag_values, raw_gyro_values))
+                else:
+                    rolling_correlation = 0.0
+                    rolling_scale = 0.0
+                    self.rolling_consistency_confidence = 0.0
+                if self.rolling_consistency_confidence > 0.0:
+                    current_consistency_evidence = (
+                        self.rolling_consistency_confidence)
+                    self._validated_consistency_confidence = max(
+                        self._validated_consistency_confidence,
+                        current_consistency_evidence)
+                    self.consistency_confidence = (
+                        self._validated_consistency_confidence)
+                    if (self.rolling_consistency_confidence
+                            >= self.aggregate_consistency_confidence):
+                        self.consistency_correlation = rolling_correlation
+                        self.consistency_scale = rolling_scale
+                if sample_valid:
+                    self._consistency_bucket_elapsed += max(
+                        0.0, timing.dt_seconds)
+                    self._consistency_bucket_mag_delta += mag_delta
+                    self._consistency_bucket_gyro_delta += gyro_delta
+                    if (self._consistency_bucket_elapsed
+                            >= MOTION_MAG_CONSISTENCY_BUCKET_SECONDS):
+                        self._consistency_samples.append((
+                            self._consistency_clock,
+                            self._consistency_bucket_mag_delta,
+                            self._consistency_bucket_gyro_delta,
+                        ))
+                        self._consistency_seconds += (
+                            self._consistency_bucket_elapsed)
+                        self._consistency_bucket_elapsed = 0.0
+                        self._consistency_bucket_mag_delta = 0.0
+                        self._consistency_bucket_gyro_delta = 0.0
+                        bucket_completed = True
+                        if (self._consistency_reference_ready
+                                and self._consistency_samples):
+                            confirm_mag = self._consistency_samples[-1][1]
+                            confirm_gyro = self._consistency_samples[-1][2]
+                            confirm_scale = (
+                                confirm_mag / confirm_gyro
+                                if abs(confirm_gyro) > 1e-9 else 0.0)
+                            confirm_bias_rate = (
+                                (confirm_mag - confirm_gyro)
+                                / MOTION_MAG_CONSISTENCY_BUCKET_SECONDS)
+                            confirmation_compatible = bool(
+                                confirm_mag * confirm_gyro > 0.0
+                                and abs(confirm_gyro) >= 0.02
+                                    and MOTION_MAG_COMMIT_SCALE_MIN
+                                    <= confirm_scale
+                                    <= MOTION_MAG_COMMIT_SCALE_MAX
+                                and abs(confirm_bias_rate)
+                                    <= MOTION_MAG_MAX_BIAS_RATE_DPS)
+                            if (confirmation_compatible
+                                    and (not self.window_accepted
+                                         or self.authority_suspended)):
+                                self._authority_confirmation_buckets += 1
+                                if (self._authority_confirmation_buckets
+                                        >= MOTION_MAG_AUTHORITY_CONFIRM_BUCKETS):
+                                    self.window_accepted = True
+                                    self.authority_suspended = False
+                                    self._authority_mismatch_elapsed = 0.0
+                                    self._authority_confirmation_buckets = 0
+                                    self.residual_state = "Tracking"
+                                    self.confidence_state = "Ready"
+                            elif not confirmation_compatible:
+                                self._authority_confirmation_buckets = 0
+                elif moving:
+                    # Reject only this sample.  Preserving the unfinished
+                    # bucket avoids making confidence impossible when a
+                    # low-rate magnetometer delivers an occasional jump.
+                    self.confidence_state = "Collecting"
+                if (len(self._consistency_samples)
+                        >= MOTION_MAG_CONSISTENCY_MIN_SAMPLES
+                        and self._consistency_seconds
+                        >= MOTION_MAG_CONSISTENCY_MIN_SECONDS):
+                    mag_values = [item[1] for item in self._consistency_samples]
+                    gyro_values = [item[2] for item in self._consistency_samples]
+                    net_mag = sum(mag_values)
+                    net_gyro = sum(gyro_values)
+                    aggregate_scale = (
+                        net_mag / net_gyro
+                        if abs(net_gyro) > 1e-9 else 0.0)
+                    if (aggregate_scale
+                            < MOTION_MAG_CONSISTENCY_SCALE_MIN
+                            or aggregate_scale
+                            > MOTION_MAG_CONSISTENCY_SCALE_MAX):
+                        scale_weight = 0.0
+                    else:
+                        scale_weight = max(
+                            0.0, 1.0
+                            - abs(aggregate_scale - 1.0) / 0.5)
+                    residual_rms = math.sqrt(statistics.fmean(
+                        (mag_value
+                         - aggregate_scale * gyro_value) ** 2
+                        for mag_value, gyro_value
+                        in zip(mag_values, gyro_values)))
+                    mean_signal = max(
+                        0.01,
+                        statistics.fmean(abs(value)
+                                         for value in mag_values))
+                    noise_weight = self._smoothstep(
+                        (0.75 - residual_rms / mean_signal) / 0.50)
+                    net_motion_weight = self._smoothstep(
+                        (abs(net_gyro)
+                         - MOTION_MAG_CONSISTENCY_MIN_NET_GYRO_DEG)
+                        / (MOTION_MAG_CONSISTENCY_FULL_NET_GYRO_DEG
+                           - MOTION_MAG_CONSISTENCY_MIN_NET_GYRO_DEG))
+                    direction_weight = (
+                        1.0 if net_mag * net_gyro > 0.0 else 0.0)
+                    self.observed_bias_rate_dps = (
+                        (net_mag - net_gyro) / self._consistency_seconds
+                        if self._consistency_seconds > 1e-9 else 0.0)
+                    self.bias_rate_valid = bool(
+                        abs(self.observed_bias_rate_dps)
+                        <= MOTION_MAG_MAX_BIAS_RATE_DPS)
+                    self.commit_scale_valid = bool(
+                        MOTION_MAG_COMMIT_SCALE_MIN <= aggregate_scale
+                        <= MOTION_MAG_COMMIT_SCALE_MAX)
+                    aggregate_weight = (
+                        net_motion_weight * direction_weight * noise_weight)
+                    self.aggregate_consistency_confidence = (
+                        aggregate_weight * scale_weight)
+                    current_consistency_evidence = max(
+                        self.rolling_consistency_confidence,
+                        self.aggregate_consistency_confidence)
+                    self._validated_consistency_confidence = max(
+                        self._validated_consistency_confidence,
+                        current_consistency_evidence)
+                    self.consistency_confidence = (
+                        self._validated_consistency_confidence)
+                    if (self.rolling_consistency_confidence
+                            >= self.aggregate_consistency_confidence):
+                        self.consistency_correlation = rolling_correlation
+                        self.consistency_scale = rolling_scale
+                    else:
+                        self.consistency_correlation = 0.0
+                        self.consistency_scale = aggregate_scale
+                    if abs(net_gyro) < MOTION_MAG_CONSISTENCY_MIN_NET_GYRO_DEG:
+                        self.confidence_state = "Low Net Rotation"
+                    elif direction_weight == 0.0:
+                        self.confidence_state = "Direction Mismatch"
+                        self.authority_suspended = True
+                        self._authority_confirmation_buckets = 0
+                    elif scale_weight == 0.0:
+                        self.confidence_state = "Scale Mismatch"
+                        self._authority_mismatch_elapsed += max(
+                            0.0, timing.dt_seconds)
+                        if (self._authority_mismatch_elapsed
+                                >= MOTION_MAG_AUTHORITY_MISMATCH_SECONDS):
+                            self.authority_suspended = True
+                            self._authority_confirmation_buckets = 0
+                    elif noise_weight == 0.0:
+                        self.confidence_state = "Magnetic Noise"
+                        self._authority_mismatch_elapsed += max(
+                            0.0, timing.dt_seconds)
+                        if (self._authority_mismatch_elapsed
+                                >= MOTION_MAG_AUTHORITY_MISMATCH_SECONDS):
+                            self.authority_suspended = True
+                            self._authority_confirmation_buckets = 0
+                    elif current_consistency_evidence > 0.0:
+                        self.confidence_state = "Ready"
+                        self._authority_mismatch_elapsed = 0.0
+                    else:
+                        self.confidence_state = "Collecting"
+                else:
+                    if not self._consistency_reference_ready:
+                        self.consistency_correlation = 0.0
+                        self.consistency_scale = 0.0
+                        self.consistency_confidence = 0.0
+                    if self.window_accepted:
+                        self.confidence_state = "Ready"
+                    elif moving:
+                        self.confidence_state = "Collecting"
+                    else:
+                        self.confidence_state = "Waiting for Motion"
+                window_complete = bool(
+                    len(self._consistency_samples)
+                    >= MOTION_MAG_CONSISTENCY_MIN_SAMPLES
+                    and self._consistency_seconds
+                    >= MOTION_MAG_CONSISTENCY_MIN_SECONDS)
+                window_expired = bool(
+                    self._consistency_seconds
+                    >= MOTION_MAG_CONSISTENCY_WINDOW_SECONDS)
+                window_trusted = bool(
+                    window_complete and current_consistency_evidence > 0.0
+                    and not blocked and moving
+                    and not self.relative_delta_rejected)
+                commit_allowed = bool(
+                    window_trusted and self.bias_rate_valid
+                    and self.commit_scale_valid)
+                if window_trusted:
+                    self._confidence_invalid_elapsed = max(
+                        0.0,
+                        self._confidence_invalid_elapsed
+                        - self._consistency_seconds)
+                    self._authority_mismatch_elapsed = 0.0
+                    self.window_magnetic_delta_deg = sum(
+                        item[1] for item in self._consistency_samples)
+                    self.window_gyro_delta_deg = sum(
+                        item[2] for item in self._consistency_samples)
+                    if self._consistency_reference_ready:
+                        if commit_allowed:
+                            innovation_update_seconds = (
+                                self._consistency_seconds)
+                            self.magnetic_relative_heading_deg += (
+                                self.window_magnetic_delta_deg)
+                            self.gyro_relative_heading_deg += (
+                                self.window_gyro_delta_deg)
+                            self.committed_error_increment_deg = (
+                                self.window_magnetic_delta_deg
+                                - self.window_gyro_delta_deg)
+                            self.window_accepted = True
+                            self.authority_suspended = False
+                            self._authority_confirmation_buckets = 0
+                            window_committed_this_frame = True
+                            self.residual_state = "Tracking"
+                        else:
+                            self.authority_suspended = True
+                            self._authority_confirmation_buckets = 0
+                            self.residual_state = "Frozen"
+                            self.confidence_state = (
+                                "Bias Rate Rejected"
+                                if not self.bias_rate_valid
+                                else "Commit Scale Rejected")
+                    else:
+                        # A recovered window establishes a fresh reference;
+                        # it is never repaid as correction debt.
+                        self._consistency_reference_ready = True
+                        self.residual_state = "Reanchoring"
+                    self._consistency_samples.clear()
+                    self._consistency_seconds = 0.0
+                elif window_expired:
+                    invalid_seconds = max(
+                        self._consistency_seconds,
+                        MOTION_MAG_CONSISTENCY_WINDOW_SECONDS)
+                    self._confidence_invalid_elapsed += invalid_seconds
+                    self._validated_consistency_confidence *= math.exp(
+                        -invalid_seconds
+                        / MOTION_MAG_CONFIDENCE_RELEASE_SECONDS)
+                    self.consistency_confidence = (
+                        self._validated_consistency_confidence)
+                    hard_confidence_reset = bool(
+                        self._confidence_invalid_elapsed
+                        >= MOTION_MAG_CONFIDENCE_INVALID_RESET_SECONDS)
+                    # One uncertain window only decays previously validated
+                    # authority.  Repeated inconsistency resets the reference
+                    # so stale debt can never persist indefinitely.
+                    if (self._consistency_reference_ready
+                            and hard_confidence_reset):
+                        self.measurement_epoch += 1
+                        self.gyro_relative_heading_deg = 0.0
+                        self.magnetic_relative_heading_deg = 0.0
+                        self.relative_closure_error_deg = 0.0
+                        self.filtered_innovation_deg = 0.0
+                        self.committed_heading_error_deg = 0.0
+                    if hard_confidence_reset:
+                        self._consistency_reference_ready = False
+                        self.window_accepted = False
+                        self._validated_consistency_confidence = 0.0
+                        self.consistency_confidence = 0.0
+                        self._confidence_invalid_elapsed = 0.0
+                        self._authority_mismatch_elapsed = 0.0
+                        self._authority_confirmation_buckets = 0
+                        self.authority_suspended = False
+                        self.residual_state = "Reset"
+                    else:
+                        self.residual_state = "Frozen"
+                        self.confidence_state = "Collecting"
+                    self._consistency_samples.clear()
+                    self._consistency_seconds = 0.0
+                elif not moving:
+                    self.residual_state = "Frozen"
+                    self.confidence_state = "Waiting for Motion"
+                self.relative_closure_error_deg = _wrap_degrees(
+                    self.magnetic_relative_heading_deg
+                    - self.gyro_relative_heading_deg)
+                self.committed_heading_error_deg = (
+                    self.relative_closure_error_deg)
+                controller_innovation = self.relative_closure_error_deg
+        else:
+            window_committed_this_frame = True
+            innovation_update_seconds = max(0.0, timing.dt_seconds)
+            controller_innovation = raw_innovation
+            self.relative_closure_error_deg = raw_innovation
+
+        raw_stationary = bool(
+            abs(rate) <= MOTION_MAG_CLOSURE_MOTION_EXIT_DPS)
+        if relative_rate_law:
+            if raw_stationary and not self._was_stationary:
+                self._consistency_samples.clear()
+                self._raw_consistency_samples.clear()
+                self._consistency_seconds = 0.0
+                self._consistency_bucket_elapsed = 0.0
+                self._consistency_bucket_mag_delta = 0.0
+                self._consistency_bucket_gyro_delta = 0.0
+                self.residual_state = "Frozen"
+                self.confidence_state = "Waiting for Motion"
+            self._was_stationary = raw_stationary
+        innovation_tracking_allowed = bool(
+            not relative_rate_law
+            or (window_committed_this_frame and not raw_stationary))
         if timing.dt_seconds > 0.0:
             rate_alpha = 1.0 - math.exp(
                 -timing.dt_seconds / MOTION_MAG_CLOSURE_RATE_LOWPASS_SECONDS)
             self.filtered_rate_dps += rate_alpha * (
                 rate - self.filtered_rate_dps)
-            if magnetic_direction_valid:
+            if magnetic_direction_valid and innovation_tracking_allowed:
                 innovation_alpha = 1.0 - math.exp(
-                    -timing.dt_seconds
+                    -innovation_update_seconds
                     / MOTION_MAG_CLOSURE_INNOVATION_LOWPASS_SECONDS)
-                innovation = raw_innovation
+                innovation = controller_innovation
                 innovation_delta = _wrap_degrees(
                     innovation - self.filtered_innovation_deg)
                 self.filtered_innovation_deg = _wrap_degrees(
@@ -639,8 +1478,6 @@ class MotionMagneticClosureEstimator:
         # motion conservatively.  Closure must not copy that classification or
         # it would suppress the exact slow-motion repayment window.  The hint
         # is diagnostic only above this estimator's hard stop guard.
-        raw_stationary = bool(
-            abs(rate) <= MOTION_MAG_CLOSURE_MOTION_EXIT_DPS)
         if (not raw_stationary
                 and filtered_angular_acceleration_dps2
                 >= MOTION_MAG_CLOSURE_DYNAMIC_ACCEL_ENTER_DPS2):
@@ -700,6 +1537,100 @@ class MotionMagneticClosureEstimator:
         # tail after the physical gyro rate has stopped.
         if raw_stationary:
             motion_weight = 0.0
+        if self.correction_law == "RobustBiasRate":
+            dt_value = max(0.0, timing.dt_seconds)
+            hard_transient_invalid = bool(
+                timing.status != "valid" or not timing.integrate
+                or not magnetic_quality_valid
+                or not magnetic_direction_valid
+                or "innovation-jump" in blocked
+                or self.relative_delta_rejected)
+            if dynamic and not self._transient_was_dynamic:
+                # A new rapid-motion event invalidates any unconsumed old
+                # event.  Each output consumer observes this epoch change and
+                # clears its own transient debt independently.
+                self.transient_epoch += 1
+                self.transient_event_active = True
+                self.transient_event_valid = not hard_transient_invalid
+                self.transient_event_error_deg = 0.0
+                self.transient_validation_elapsed = 0.0
+                self.transient_validation_bucket_elapsed = 0.0
+                self.transient_validation_samples.clear()
+                self.transient_confidence = 0.0
+                self.transient_authority_active = False
+            if dynamic and self.transient_event_active:
+                if hard_transient_invalid:
+                    self.transient_event_valid = False
+                elif self.transient_event_valid:
+                    self.transient_event_error_deg = max(
+                        -TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                        min(TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                            self.transient_event_error_deg
+                            + self.relative_delta_innovation_deg))
+                self.transient_validation_elapsed = 0.0
+                self.transient_validation_bucket_elapsed = 0.0
+                self.transient_validation_samples.clear()
+            elif self.transient_event_active:
+                validation_valid = bool(
+                    self.transient_event_valid
+                    and not hard_transient_invalid
+                    and not raw_stationary
+                    and settling_authority_weight > 0.0)
+                if validation_valid:
+                    self.transient_event_error_deg = max(
+                        -TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                        min(TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                            self.transient_event_error_deg
+                            + self.relative_delta_innovation_deg))
+                    self.transient_validation_elapsed += dt_value
+                    self.transient_validation_bucket_elapsed += dt_value
+                    if (self.transient_validation_bucket_elapsed
+                            >= TRANSIENT_RECOVERY_SAMPLE_SECONDS):
+                        self.transient_validation_samples.append(
+                            self.transient_event_error_deg)
+                        self.transient_validation_bucket_elapsed = 0.0
+                    if (self.transient_validation_elapsed
+                            >= TRANSIENT_RECOVERY_VALIDATION_SECONDS
+                            and len(self.transient_validation_samples)
+                            >= TRANSIENT_RECOVERY_MIN_SAMPLES):
+                        samples = list(self.transient_validation_samples)
+                        stable = bool(
+                            max(samples) - min(samples)
+                            <= TRANSIENT_RECOVERY_STABILITY_DEG)
+                        final_error = statistics.median(samples[-3:])
+                        sign_consistent = all(
+                            abs(value) < TRANSIENT_RECOVERY_MIN_ERROR_DEG
+                            or value * final_error > 0.0
+                            for value in samples)
+                        if stable and sign_consistent:
+                            committed = max(
+                                -TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                                min(TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                                    final_error))
+                            if (abs(committed)
+                                    >= TRANSIENT_RECOVERY_MIN_ERROR_DEG):
+                                self.transient_commit_increment_deg = committed
+                                stability_weight = self._smoothstep(
+                                    (TRANSIENT_RECOVERY_STABILITY_DEG
+                                     - (max(samples) - min(samples)))
+                                    / TRANSIENT_RECOVERY_STABILITY_DEG)
+                                self.transient_confidence = stability_weight
+                                self.transient_authority_active = True
+                            self.transient_event_active = False
+                        else:
+                            # Do not retain an ambiguous event as future debt.
+                            self.transient_event_active = False
+                            self.transient_confidence = 0.0
+                            self.transient_authority_active = False
+                else:
+                    self.transient_validation_elapsed = 0.0
+                    self.transient_validation_bucket_elapsed = 0.0
+                    self.transient_validation_samples.clear()
+                    if hard_transient_invalid:
+                        self.transient_event_active = False
+                        self.transient_confidence = 0.0
+                        self.transient_authority_active = False
+            self._transient_was_dynamic = dynamic
         bin_index = int(
             ((magnetic % 360.0) / 360.0) * MOTION_MAG_CLOSURE_BIN_COUNT
         ) % MOTION_MAG_CLOSURE_BIN_COUNT
@@ -715,7 +1646,8 @@ class MotionMagneticClosureEstimator:
         learning_eligible = bool(
             not blocked and motion_weight > 0.0
             and not dynamic and settling_authority_weight > 0.0
-            and dynamic_weight > 0.0)
+            and dynamic_weight > 0.0
+            and not relative_rate_law)
         bin_timer_reset_reason = None
         if learning_eligible:
             self._bin_pause_elapsed = 0.0
@@ -742,11 +1674,18 @@ class MotionMagneticClosureEstimator:
                     self._bin_elapsed = 0.0
                     bin_timer_reset_reason = "pause-timeout"
         corrected_innovation = self.filtered_innovation_deg
-        local_confidence = max(
-            MOTION_MAG_CLOSURE_BASE_CONFIDENCE,
-            float(bin_state.get("model_confidence", 0.0)),
-        )
-        if bin_state["confidence"] and bin_state["offset_deg"] is not None:
+        if self.correction_law == "RobustBiasRate":
+            local_confidence = max(
+                self.robust_bias_confidence, self.transient_confidence)
+        elif self.correction_law == "DynamicRate":
+            local_confidence = self.consistency_confidence
+        else:
+            local_confidence = max(
+                MOTION_MAG_CLOSURE_BASE_CONFIDENCE,
+                float(bin_state.get("model_confidence", 0.0)))
+        if (not relative_rate_law
+                and bin_state["confidence"]
+                and bin_state["offset_deg"] is not None):
             corrected_innovation = _wrap_degrees(
                 corrected_innovation - bin_state["offset_deg"])
         instantaneous_quality = (
@@ -755,21 +1694,64 @@ class MotionMagneticClosureEstimator:
             if not blocked else 0.0)
         effective_confidence = max(
             0.0, min(1.0, local_confidence * instantaneous_quality))
-        absolute_cap = MOTION_MAG_CLOSURE_MAX_DPS * effective_confidence
-        relative_cap = (
-            abs(rate) * MOTION_MAG_CLOSURE_MAX_RATE_FRACTION
-            * effective_confidence)
-        correction_limit = min(absolute_cap, relative_cap)
+        raw_proportional_target = (
+            self.robust_bias_estimate_dps * motion_weight
+            if self.correction_law == "RobustBiasRate"
+            else MOTION_MAG_CLOSURE_KP * corrected_innovation * motion_weight)
+        confidence_weighted_target = (
+            raw_proportional_target * effective_confidence)
+        dynamic_safety_cap = (
+            abs(rate) * MOTION_MAG_DYNAMIC_CORRECTION_RATIO)
+        if self.correction_law == "RobustBiasRate":
+            absolute_cap = ROBUST_BIAS_OUTPUT_CAP_DPS
+            relative_cap = dynamic_safety_cap
+            correction_limit = min(absolute_cap, relative_cap)
+            attack_slew_dps_per_second = (
+                abs(rate) * MOTION_MAG_DYNAMIC_ATTACK_SLEW_RATIO_PER_SECOND)
+        elif self.correction_law == "DynamicRate":
+            absolute_cap = dynamic_safety_cap
+            relative_cap = dynamic_safety_cap
+            correction_limit = min(
+                dynamic_safety_cap, MOTION_MAG_MAX_BIAS_RATE_DPS)
+            attack_slew_dps_per_second = (
+                abs(rate) * MOTION_MAG_DYNAMIC_ATTACK_SLEW_RATIO_PER_SECOND)
+        else:
+            absolute_cap = MOTION_MAG_CLOSURE_MAX_DPS * effective_confidence
+            relative_cap = (
+                abs(rate) * MOTION_MAG_CLOSURE_MAX_RATE_FRACTION
+                * effective_confidence)
+            correction_limit = min(absolute_cap, relative_cap)
+            attack_slew_dps_per_second = (
+                MOTION_MAG_CLOSURE_SLEW_DPS_PER_SECOND)
         correction_target = 0.0
+        limiting_reason = "blocked"
+        tracking_authority = bool(
+            self.correction_law != "DynamicRate"
+            or self.residual_state == "Tracking")
+        self.frozen_correction_blocked = bool(
+            self.correction_law == "DynamicRate"
+            and not tracking_authority)
         correction_eligible = bool(
             not blocked and motion_weight > 0.0
-            and not dynamic and settling_authority_weight > 0.0)
+            and not dynamic and settling_authority_weight > 0.0
+            and effective_confidence > 0.0
+            and tracking_authority
+            and (self.correction_law != "DynamicRate"
+                 or (self.window_accepted
+                     and not self.authority_suspended)))
         if correction_eligible:
+            requested_target = (
+                confidence_weighted_target
+                if relative_rate_law
+                else raw_proportional_target)
             correction_target = max(
                 -correction_limit,
-                min(correction_limit,
-                    MOTION_MAG_CLOSURE_KP * corrected_innovation
-                    * motion_weight))
+                min(correction_limit, requested_target))
+            limiting_reason = (
+                ("robust-bias-cap" if self.correction_law == "RobustBiasRate"
+                 else "dynamic-rate-cap")
+                if abs(requested_target) > correction_limit
+                else "none")
         if not correction_eligible:
             self._output_rate_dps = 0.0
         else:
@@ -780,12 +1762,14 @@ class MotionMagneticClosureEstimator:
                     and self._output_rate_dps * target < 0.0):
                 target = 0.0
             maximum_step = (
-                MOTION_MAG_CLOSURE_SLEW_DPS_PER_SECOND
+                attack_slew_dps_per_second
                 * max(0.0, timing.dt_seconds))
             delta = max(
                 -maximum_step,
                 min(maximum_step, target - self._output_rate_dps))
             self._output_rate_dps += delta
+            if abs(delta) + 1e-12 < abs(target - (self._output_rate_dps - delta)):
+                limiting_reason = "attack-slew"
             # A falling confidence/rate cap is a hard authority boundary; a
             # previous larger output may never leak through while slewing down.
             self._output_rate_dps = max(
@@ -804,6 +1788,21 @@ class MotionMagneticClosureEstimator:
             blocked,
             anchor_heading_deg=self.anchor_heading_deg,
             raw_innovation_deg=raw_innovation,
+            absolute_heading_innovation_deg=raw_innovation,
+            gyro_world_yaw_rate_dps=world_yaw_rate,
+            gyro_relative_heading_deg=self.gyro_relative_heading_deg,
+            magnetic_relative_heading_deg=self.magnetic_relative_heading_deg,
+            relative_closure_error_deg=self.relative_closure_error_deg,
+            relative_anchor_required=self._relative_anchor_required,
+            raw_magnetic_heading_delta_deg=(
+                self.raw_magnetic_heading_delta_deg),
+            normalized_magnetic_heading_delta_deg=(
+                self.normalized_magnetic_heading_delta_deg),
+            gyro_world_yaw_delta_deg=self.gyro_world_yaw_delta_deg,
+            gyro_reference_heading_delta_deg=(
+                self.gyro_reference_heading_delta_deg),
+            heading_delta_direction_agreement=(
+                self.heading_delta_direction_agreement),
             corrected_innovation_deg=corrected_innovation,
             motion_weight=motion_weight,
             quality_weight=effective_confidence,
@@ -828,8 +1827,17 @@ class MotionMagneticClosureEstimator:
             correction_eligible=correction_eligible,
             learning_eligible=learning_eligible,
             error_debt_deg=corrected_innovation,
+            raw_relative_closure_error_deg=self.relative_closure_error_deg,
+            filtered_relative_closure_error_deg=self.filtered_innovation_deg,
+            consumer_measurement_deg=corrected_innovation,
             absolute_cap_dps=absolute_cap,
             relative_cap_dps=relative_cap,
+            correction_law=self.correction_law,
+            raw_proportional_target_dps=raw_proportional_target,
+            confidence_weighted_target_dps=confidence_weighted_target,
+            dynamic_safety_cap_dps=dynamic_safety_cap,
+            attack_slew_dps_per_second=attack_slew_dps_per_second,
+            limiting_reason=limiting_reason,
             correction_target_dps=correction_target,
             candidate_rate_dps=candidate,
             output_active=candidate != 0.0,
@@ -1131,14 +2139,286 @@ def apply_world_yaw_rate_correction(
     }
 
 
+class MotionMagneticClosureConsumer:
+    """Independent closed-loop correction state for one output consumer."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self, *, preserve_session: bool = False) -> None:
+        session_accumulated = (
+            getattr(self, "session_accumulated_applied_correction_deg", 0.0)
+            if preserve_session else 0.0)
+        self.measurement_origin_deg = None
+        self.accumulated_applied_correction_deg = 0.0
+        self.session_accumulated_applied_correction_deg = session_accumulated
+        self.output_rate_dps = 0.0
+        self._measurement_epoch = None
+        self._estimator_was_allowed = False
+        self._reentry_elapsed = 0.0
+        self.repayment_budget_remaining_deg = 0.0
+        self.repayment_budget_used_deg = 0.0
+        self._transient_epoch = None
+        self.transient_debt_remaining_deg = 0.0
+        self.transient_debt_used_deg = 0.0
+
+    @staticmethod
+    def _smoothstep(value: float) -> float:
+        value = max(0.0, min(1.0, value))
+        return value * value * (3.0 - 2.0 * value)
+
+    def update(self, estimator_state: Mapping | None, *, mode: str,
+               eligible: bool, dt_seconds: float,
+               authority_scale: float = 1.0) -> dict:
+        state = dict(estimator_state or {})
+        if mode not in MOTION_MAG_CLOSURE_MODES:
+            mode = "Off"
+        dt = max(0.0, float(dt_seconds))
+        authority_scale = max(0.0, min(1.0, float(authority_scale)))
+        selected = bool(eligible) and mode in ("Shadow", "V2")
+        try:
+            measurement_epoch = int(state.get("measurement_epoch", 0))
+        except (TypeError, ValueError):
+            measurement_epoch = 0
+        epoch_changed = bool(
+            self._measurement_epoch is not None
+            and self._measurement_epoch != measurement_epoch)
+        if epoch_changed:
+            self.reset(preserve_session=True)
+        self._measurement_epoch = measurement_epoch
+        measurement = float(state.get(
+            "consumer_measurement_deg",
+            state.get("error_debt_deg", 0.0)) or 0.0)
+        if not math.isfinite(measurement):
+            measurement = 0.0
+        try:
+            transient_epoch = int(state.get("transient_epoch", 0))
+        except (TypeError, ValueError):
+            transient_epoch = 0
+        transient_epoch_changed = bool(
+            self._transient_epoch is not None
+            and self._transient_epoch != transient_epoch)
+        if transient_epoch_changed:
+            self.transient_debt_remaining_deg = 0.0
+            self.output_rate_dps = 0.0
+        self._transient_epoch = transient_epoch
+        if not selected:
+            self.reset()
+            state.update({
+                "consumer_mode": mode,
+                "eligible": bool(eligible),
+                "consumer_measurement_origin_deg": None,
+                "consumer_residual_deg": 0.0,
+                "accumulated_applied_correction_deg": 0.0,
+                "session_accumulated_applied_correction_deg": 0.0,
+                "consumer_reentry_ramp_progress": 0.0,
+                "repayment_budget_remaining_deg": 0.0,
+                "repayment_budget_used_deg": 0.0,
+                "transient_debt_remaining_deg": 0.0,
+                "transient_debt_used_deg": 0.0,
+                "consumer_transient_epoch": transient_epoch,
+                "consumer_transient_epoch_changed": transient_epoch_changed,
+                "consumer_requested_rate_dps": 0.0,
+                "consumer_feedback_invariant_error_deg": 0.0,
+                "consumer_feedback_invariant_valid": True,
+                "consumer_measurement_epoch": measurement_epoch,
+                "consumer_epoch_changed": epoch_changed,
+                "applied_rate_dps": 0.0,
+                "applied": False,
+                "shadow_only": mode == "Shadow" and bool(eligible),
+                "stop_zero_enforced": True,
+            })
+            return state
+
+        origin_initialized = self.measurement_origin_deg is not None
+        if not origin_initialized:
+            self.measurement_origin_deg = measurement
+            self.accumulated_applied_correction_deg = 0.0
+            self.output_rate_dps = 0.0
+        robust_bias_mode = state.get("correction_law") == "RobustBiasRate"
+        budget_enforced = (
+            "committed_error_increment_deg" in state
+            and not robust_bias_mode)
+        committed_increment = abs(float(
+            state.get("committed_error_increment_deg", 0.0) or 0.0))
+        if origin_initialized and math.isfinite(committed_increment):
+            self.repayment_budget_remaining_deg += committed_increment
+        transient_commit = float(
+            state.get("transient_commit_increment_deg", 0.0) or 0.0)
+        if (robust_bias_mode and origin_initialized
+                and math.isfinite(transient_commit)):
+            self.transient_debt_remaining_deg = max(
+                -TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                min(TRANSIENT_RECOVERY_MAX_DEBT_DEG,
+                    self.transient_debt_remaining_deg + transient_commit))
+        residual = _wrap_degrees(
+            measurement - self.measurement_origin_deg
+            - self.accumulated_applied_correction_deg)
+        estimator_allowed = bool(state.get("correction_eligible", False))
+        if estimator_allowed and not self._estimator_was_allowed:
+            self._reentry_elapsed = 0.0
+        if estimator_allowed:
+            self._reentry_elapsed = min(
+                MOTION_MAG_CONSUMER_REENTRY_RAMP_SECONDS,
+                self._reentry_elapsed + dt)
+        else:
+            self._reentry_elapsed = 0.0
+        self._estimator_was_allowed = estimator_allowed
+        if self._reentry_elapsed <= MOTION_MAG_CONSUMER_REENTRY_ZERO_SECONDS:
+            ramp = 0.0
+        elif self._reentry_elapsed >= MOTION_MAG_CONSUMER_REENTRY_RAMP_SECONDS:
+            ramp = 1.0
+        else:
+            ramp = self._smoothstep(
+                (self._reentry_elapsed - MOTION_MAG_CONSUMER_REENTRY_ZERO_SECONDS)
+                / (MOTION_MAG_CONSUMER_REENTRY_RAMP_SECONDS
+                   - MOTION_MAG_CONSUMER_REENTRY_ZERO_SECONDS))
+        confidence = max(0.0, min(
+            1.0, float(state.get("effective_confidence", 0.0) or 0.0)))
+        motion_weight = max(0.0, min(
+            1.0, float(state.get("motion_weight", 0.0) or 0.0)))
+        if robust_bias_mode:
+            bias_requested = float(
+                state.get("correction_target_dps", 0.0) or 0.0) * ramp
+            transient_requested = (
+                TRANSIENT_RECOVERY_KP
+                * self.transient_debt_remaining_deg
+                * confidence * motion_weight * ramp)
+            transient_requested = max(
+                -TRANSIENT_RECOVERY_OUTPUT_CAP_DPS,
+                min(TRANSIENT_RECOVERY_OUTPUT_CAP_DPS,
+                    transient_requested))
+            requested = bias_requested + transient_requested
+            cap = min(
+                abs(float(
+                    state.get("dynamic_safety_cap_dps", 0.0) or 0.0)),
+                (TRANSIENT_RECOVERY_OUTPUT_CAP_DPS
+                 if abs(self.transient_debt_remaining_deg) > 1e-9
+                 else ROBUST_BIAS_OUTPUT_CAP_DPS))
+        else:
+            bias_requested = 0.0
+            transient_requested = 0.0
+            requested = (
+                MOTION_MAG_CLOSURE_KP * residual
+                * confidence * motion_weight * ramp)
+            cap = min(
+                abs(float(
+                    state.get("dynamic_safety_cap_dps", 0.0) or 0.0)),
+                MOTION_MAG_MAX_BIAS_RATE_DPS)
+        target = max(-cap, min(cap, requested))
+        if not estimator_allowed:
+            self.output_rate_dps = 0.0
+        else:
+            if (self.output_rate_dps != 0.0 and target != 0.0
+                    and self.output_rate_dps * target < 0.0):
+                target = 0.0
+            slew = max(0.0, float(
+                state.get("attack_slew_dps_per_second", 0.0) or 0.0))
+            maximum_step = slew * dt
+            self.output_rate_dps += max(
+                -maximum_step,
+                min(maximum_step, target - self.output_rate_dps))
+            self.output_rate_dps = max(
+                -cap, min(cap, self.output_rate_dps))
+        candidate = self.output_rate_dps
+        applied = (
+            candidate * authority_scale if mode == "V2" else 0.0)
+        if budget_enforced and dt > 0.0:
+            budget_rate = self.repayment_budget_remaining_deg / dt
+            if mode == "V2":
+                applied = max(-budget_rate, min(budget_rate, applied))
+                if authority_scale > 0.0:
+                    candidate = applied / authority_scale
+                    self.output_rate_dps = candidate
+            else:
+                candidate = max(-budget_rate, min(budget_rate, candidate))
+                self.output_rate_dps = candidate
+        feedback_rate = applied if mode == "V2" else candidate
+        feedback_delta = feedback_rate * dt
+        self.accumulated_applied_correction_deg += feedback_delta
+        transient_fraction = (
+            min(1.0, abs(transient_requested)
+                / max(1e-12, abs(bias_requested)
+                      + abs(transient_requested)))
+            if robust_bias_mode else 0.0)
+        transient_feedback_delta = feedback_delta * transient_fraction
+        transient_used = 0.0
+        if (self.transient_debt_remaining_deg != 0.0
+                and transient_feedback_delta
+                * self.transient_debt_remaining_deg > 0.0):
+            transient_used = min(
+                abs(self.transient_debt_remaining_deg),
+                abs(transient_feedback_delta))
+            self.transient_debt_remaining_deg -= math.copysign(
+                transient_used, self.transient_debt_remaining_deg)
+            if abs(self.transient_debt_remaining_deg) <= 1e-9:
+                self.transient_debt_remaining_deg = 0.0
+        self.transient_debt_used_deg += transient_used
+        used_delta = min(
+            self.repayment_budget_remaining_deg, abs(feedback_delta))
+        self.repayment_budget_remaining_deg = max(
+            0.0, self.repayment_budget_remaining_deg - used_delta)
+        self.repayment_budget_used_deg += used_delta
+        self.session_accumulated_applied_correction_deg += applied * dt
+        residual_after = _wrap_degrees(
+            measurement - self.measurement_origin_deg
+            - self.accumulated_applied_correction_deg)
+        invariant_error = _wrap_degrees(
+            (self.accumulated_applied_correction_deg + residual_after)
+            - (measurement - self.measurement_origin_deg))
+        invariant_valid = bool(
+            math.isfinite(invariant_error) and abs(invariant_error) <= 1e-6)
+        if not invariant_valid:
+            self.output_rate_dps = 0.0
+            applied = 0.0
+        state.update({
+            "consumer_mode": mode,
+            "eligible": bool(eligible),
+            "consumer_measurement_origin_deg": self.measurement_origin_deg,
+            "consumer_residual_deg": residual_after,
+            "accumulated_applied_correction_deg": (
+                self.accumulated_applied_correction_deg),
+            "session_accumulated_applied_correction_deg": (
+                self.session_accumulated_applied_correction_deg),
+            "consumer_reentry_ramp_progress": ramp,
+            "repayment_budget_remaining_deg": (
+                self.repayment_budget_remaining_deg),
+            "repayment_budget_used_deg": self.repayment_budget_used_deg,
+            "transient_debt_remaining_deg": (
+                self.transient_debt_remaining_deg),
+            "transient_debt_used_deg": self.transient_debt_used_deg,
+            "consumer_transient_epoch": transient_epoch,
+            "consumer_transient_epoch_changed": transient_epoch_changed,
+            "consumer_transient_requested_dps": transient_requested,
+            "consumer_requested_rate_dps": requested,
+            "consumer_feedback_invariant_error_deg": invariant_error,
+            "consumer_feedback_invariant_valid": invariant_valid,
+            "consumer_measurement_epoch": measurement_epoch,
+            "consumer_epoch_changed": epoch_changed,
+            "candidate_rate_dps": candidate,
+            "applied_rate_dps": applied,
+            "consumer_authority_scale": authority_scale,
+            "applied": applied != 0.0,
+            "shadow_only": mode == "Shadow",
+            "stop_zero_enforced": not estimator_allowed,
+        })
+        return state
+
+
 def select_motion_magnetic_closure(
     estimator_state: Mapping | None,
     *,
     mode: str,
     eligible: bool,
     authority_scale: float = 1.0,
+    consumer: MotionMagneticClosureConsumer | None = None,
+    dt_seconds: float = 0.0,
 ) -> dict:
     """Select an independent consumer without retaining post-stop output."""
+    if consumer is not None:
+        return consumer.update(
+            estimator_state, mode=mode, eligible=eligible,
+            dt_seconds=dt_seconds, authority_scale=authority_scale)
     if mode not in MOTION_MAG_CLOSURE_MODES:
         mode = "Off"
     state = dict(estimator_state or {})
@@ -1148,8 +2428,14 @@ def select_motion_magnetic_closure(
         candidate = 0.0
     if not math.isfinite(candidate):
         candidate = 0.0
-    candidate = max(-MOTION_MAG_CLOSURE_MAX_DPS,
-                    min(MOTION_MAG_CLOSURE_MAX_DPS, candidate))
+    try:
+        consumer_cap = abs(float(state.get(
+            "dynamic_safety_cap_dps", MOTION_MAG_CLOSURE_MAX_DPS)))
+    except (TypeError, ValueError):
+        consumer_cap = MOTION_MAG_CLOSURE_MAX_DPS
+    if not math.isfinite(consumer_cap):
+        consumer_cap = MOTION_MAG_CLOSURE_MAX_DPS
+    candidate = max(-consumer_cap, min(consumer_cap, candidate))
     try:
         authority_scale = float(authority_scale)
     except (TypeError, ValueError):
@@ -1774,6 +3060,7 @@ class V2AhrsShadow:
         self._gyro_buf = buffer_factory()
         self._accel_buf = buffer_factory()
         self._mag_buf = buffer_factory()
+        self._heading_accel_buf = buffer_factory()
         self._settings_factory = settings_factory
         self._convention = convention
         self._recovery_seconds = float(recovery_seconds)
@@ -1847,6 +3134,8 @@ class V2AhrsShadow:
         soft_iron_matrix=None,
         soft_iron_model: str | None = None,
         orientation_consumer_active: bool = False,
+        closure_reference_heading_deg: float | None = None,
+        closure_reference_orientation_wxyz: Sequence[float] | None = None,
     ) -> dict:
         timing = frame.timing
         if timing.reset_estimator:
@@ -1928,7 +3217,32 @@ class V2AhrsShadow:
         moving_yaw_bias = self.moving_yaw_bias_observer.snapshot()
         motion_closure = self.motion_magnetic_closure.snapshot()
         if use_magnetometer and self._heading_function is not None:
-            magnetic_heading = float(self._heading_function(accel_array, mag_array))
+            heading_accel = accel_array
+            if closure_reference_orientation_wxyz is not None:
+                try:
+                    reference_q = tuple(
+                        float(value)
+                        for value in closure_reference_orientation_wxyz)
+                    if len(reference_q) != 4:
+                        raise ValueError("reference quaternion length")
+                    inverse_q = (
+                        reference_q[0], -reference_q[1],
+                        -reference_q[2], -reference_q[3])
+                    stabilized_gravity = _quaternion_rotate_vector_wxyz(
+                        inverse_q, (0.0, 0.0, 1.0))
+                    heading_accel = _fill_buffer(
+                        self._heading_accel_buf, stabilized_gravity)
+                    mag_quality["heading_gravity_source"] = (
+                        "six-axis-quaternion")
+                    mag_quality["heading_gravity_body"] = list(
+                        stabilized_gravity)
+                except (TypeError, ValueError):
+                    mag_quality["heading_gravity_source"] = (
+                        "raw-accelerometer-fallback")
+            else:
+                mag_quality["heading_gravity_source"] = "raw-accelerometer"
+            magnetic_heading = float(self._heading_function(
+                heading_accel, mag_array))
             current_heading = _quaternion_heading_deg(self.ahrs.quaternion)
             angular_rate_dps = math.sqrt(sum(value * value for value in gyro))
             direction = self.magnetometer_gate.evaluate_direction(
@@ -1937,6 +3251,13 @@ class V2AhrsShadow:
                 defer_initialization=(
                     orientation_consumer_active
                     and HEADING_INITIALIZATION_MODE == "Deferred"))
+            quaternion = self.ahrs.quaternion
+            orientation_wxyz = (
+                float(quaternion.w), float(quaternion.x),
+                float(quaternion.y), float(quaternion.z))
+            world_gyro_dps = _quaternion_rotate_vector_wxyz(
+                orientation_wxyz, gyro)
+            world_yaw_rate_dps = world_gyro_dps[2]
             mag_quality.update(direction)
             moving_yaw_bias = self.moving_yaw_bias_observer.update(
                 current_heading,
@@ -1961,6 +3282,8 @@ class V2AhrsShadow:
                 magnetic_direction_valid=bool(
                     direction.get("direction_valid", False)),
                 stationary_hint=bool(bias_state.get("stationary", False)),
+                gyro_world_yaw_rate_dps=world_yaw_rate_dps,
+                gyro_reference_heading_deg=closure_reference_heading_deg,
             )
             if direction["heading_initialised_this_frame"]:
                 self._reset_heading_correction_ramp()
@@ -2170,12 +3493,14 @@ def _compute_heading_correction(
     }
 
 
-def _quaternion_heading_deg(quaternion) -> float:
-    w = float(quaternion.w)
-    x = float(quaternion.x)
-    y = float(quaternion.y)
-    z = float(quaternion.z)
+def quaternion_heading_deg(quaternion_wxyz: Sequence[float]) -> float:
+    w, x, y, z = (float(value) for value in quaternion_wxyz)
     return math.degrees(math.atan2(w * z + x * y, 0.5 - y * y - z * z))
+
+
+def _quaternion_heading_deg(quaternion) -> float:
+    return quaternion_heading_deg((
+        quaternion.w, quaternion.x, quaternion.y, quaternion.z))
 
 
 def gyro_lsb_per_dps(*, is_pro_controller: bool) -> float:
@@ -2390,16 +3715,38 @@ def replay_sensor_frames(path) -> Iterator[dict]:
 class GyroPhase0Recorder:
     """Bounded, non-blocking JSONL recorder for the input notification hot path."""
 
+    MAG_TESTER_COLUMNS = (
+        "Time_s", "Controller", "Controller_Type", "Mag_Calibration",
+        "Mag_Status", "Magnitude", "Reference_Magnitude", "Magnitude_Ratio",
+        "Direction_Valid", "Motion_State", "Gyro_Yaw_Rate_dps",
+        "Correction_Law", "Model_Confidence", "Effective_Authority",
+        "Correction_Eligible", "Robust_Estimate_dps",
+        "Candidate_Correction_dps",
+        "Pass_Applied_Correction_dps", "Pass_Session_Accumulated_deg",
+        "Blocked_Reason",
+    )
+    MAG_TESTER_COLUMN_WIDTHS = (
+        12, 18, 16, 18, 22, 12, 20, 17, 16, 20, 20, 18, 18, 20, 22, 22,
+        26, 32, 30, None,
+    )
+
     def __init__(self, enabled: bool = False, output_path=None, queue_size: int = 8192):
         self.enabled = bool(enabled)
+        self.monitoring_enabled = False
         self.output_path = Path(output_path) if output_path else self._default_output_path()
-        self._queue = queue.Queue(maxsize=max(16, int(queue_size)))
+        self._queue_size = max(16, int(queue_size))
+        self._queue = queue.Queue(maxsize=self._queue_size)
         self._sequence = itertools.count(1)
         self._thread = None
         self._thread_lock = threading.Lock()
         self._closed = False
         self._dropped = 0
         self._writer_error = None
+        self._text_mode = False
+        self._recording_metadata = {}
+        self._recording_started_ns = None
+        self._latest_lock = threading.Lock()
+        self._latest_snapshots = {}
 
     @staticmethod
     def _default_output_path() -> Path:
@@ -2416,6 +3763,62 @@ class GyroPhase0Recorder:
     @property
     def writer_error(self):
         return self._writer_error
+
+    @property
+    def is_recording(self) -> bool:
+        return bool(self.enabled and not self._closed)
+
+    def set_monitoring(self, enabled: bool) -> None:
+        if not self._closed:
+            self.monitoring_enabled = bool(enabled)
+
+    def latest_snapshots(self) -> dict:
+        with self._latest_lock:
+            return {key: dict(value)
+                    for key, value in self._latest_snapshots.items()}
+
+    def start_recording(self, output_path, *, text_mode: bool = False,
+                        metadata: Mapping | None = None) -> bool:
+        """Start a new runtime recording session without blocking sensor input."""
+        with self._thread_lock:
+            if self._closed or self.enabled or (
+                    self._thread is not None and self._thread.is_alive()):
+                return False
+            self.output_path = Path(output_path)
+            self._queue = queue.Queue(maxsize=self._queue_size)
+            self._sequence = itertools.count(1)
+            self._dropped = 0
+            self._writer_error = None
+            self._text_mode = bool(text_mode)
+            self._recording_metadata = dict(metadata or {})
+            self._recording_started_ns = time.perf_counter_ns()
+            self.enabled = True
+        if not self._ensure_writer():
+            self.enabled = False
+            return False
+        return True
+
+    def stop_recording(self, timeout: float = 5.0):
+        """Stop accepting records, flush the writer, and return the output path."""
+        self.enabled = False
+        thread = self._thread
+        if thread is None:
+            return self.output_path
+        try:
+            self._queue.put(_STOP, timeout=max(0.0, timeout))
+        except queue.Full:
+            self._writer_error = RuntimeError(
+                "Unable to stop Mag Tester writer because its queue is full")
+            return self.output_path
+        thread.join(timeout=max(0.0, timeout))
+        if thread.is_alive():
+            self._writer_error = RuntimeError(
+                "Mag Tester writer did not finish before timeout")
+        else:
+            with self._thread_lock:
+                if self._thread is thread:
+                    self._thread = None
+        return self.output_path
 
     def _ensure_writer(self) -> bool:
         if not self.enabled or self._closed:
@@ -2441,9 +3844,9 @@ class GyroPhase0Recorder:
         return True
 
     def begin_sample(self, controller, input_data):
-        if not self.enabled or self._closed:
+        if (not self.enabled and not self.monitoring_enabled) or self._closed:
             return None
-        if not self._ensure_writer():
+        if self.enabled and not self._ensure_writer():
             return None
         started_ns = time.perf_counter_ns()
         return {
@@ -2584,29 +3987,317 @@ class GyroPhase0Recorder:
         processing["status"] = str(status)
         queued_record = dict(trace)
         queued_record.pop("_finished", None)
+        snapshot = self._mag_tester_snapshot(queued_record)
+        controller_id = snapshot["controller_id"]
+        with self._latest_lock:
+            self._latest_snapshots[controller_id] = snapshot
+        if not self.enabled:
+            return
         try:
             self._queue.put_nowait(queued_record)
         except queue.Full:
             self._dropped += 1
 
+    @staticmethod
+    def _number(value, default=0.0) -> float:
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _mag_tester_snapshot(self, record: Mapping) -> dict:
+        controller = dict(record.get("controller") or {})
+        fusion = dict(record.get("v2_fusion") or {})
+        quality = dict(fusion.get("magnetometer_quality") or {})
+        closure = dict(fusion.get("motion_magnetic_closure") or {})
+        pass_closure = dict(
+            (record.get("v2_output") or {}).get(
+                "motion_magnetic_closure") or {})
+        in_app = dict(
+            (record.get("pre_horizon") or {}).get("in_app_horizon") or {})
+        in_app_closure = dict(in_app.get("motion_magnetic_closure") or {})
+        calibration_accepted = bool(
+            quality.get("calibration_valid")
+            and quality.get("baseline_magnitude") is not None)
+        magnitude_valid = bool(quality.get("magnitude_valid"))
+        direction_valid = bool(quality.get("direction_valid"))
+        recovering = bool(quality.get("recovering"))
+        if not calibration_accepted:
+            mag_status = "Calibration Missing"
+        elif not magnitude_valid:
+            mag_status = "Interference Detected"
+        elif recovering:
+            mag_status = "Recovering"
+        elif not direction_valid:
+            mag_status = "Direction Rejected"
+        else:
+            mag_status = "Valid"
+        blocked = [str(value) for value in
+                   (closure.get("blocked_reasons") or [])]
+        controller_id = str(controller.get("id") or "Unknown")
+        return {
+            "host_monotonic_ns": int(record.get("host_monotonic_ns") or 0),
+            "controller_id": controller_id,
+            "controller_type": str(controller.get("family") or "unknown"),
+            "calibration_accepted": calibration_accepted,
+            "mag_status": mag_status,
+            "calibration_model": quality.get("calibration_model"),
+            "magnitude": self._number(quality.get("magnitude")),
+            "reference_magnitude": self._number(
+                quality.get("reference_magnitude_lsb"),
+                quality.get("baseline_magnitude") or 0.0),
+            "magnitude_ratio": self._number(quality.get("magnitude_ratio")),
+            "direction_valid": direction_valid,
+            "heading_error_deg": self._number(
+                closure.get("relative_closure_error_deg")),
+            "gyro_relative_heading_deg": self._number(
+                closure.get("gyro_relative_heading_deg")),
+            "magnetic_relative_heading_deg": self._number(
+                closure.get("magnetic_relative_heading_deg")),
+            "raw_magnetic_heading_delta_deg": self._number(
+                closure.get("raw_magnetic_heading_delta_deg")),
+            "normalized_magnetic_heading_delta_deg": self._number(
+                closure.get("normalized_magnetic_heading_delta_deg")),
+            "gyro_world_yaw_delta_deg": self._number(
+                closure.get("gyro_world_yaw_delta_deg")),
+            "gyro_reference_heading_delta_deg": self._number(
+                closure.get("gyro_reference_heading_delta_deg")),
+            "heading_delta_direction_agreement": bool(
+                closure.get("heading_delta_direction_agreement", True)),
+            "absolute_heading_innovation_deg": self._number(
+                quality.get("aligned_heading_innovation_deg")),
+            "motion_state": str(closure.get("motion_state") or "Unavailable"),
+            "gyro_yaw_rate_dps": self._number(
+                closure.get("filtered_rate_dps")),
+            "confidence": self._number(
+                closure.get("effective_confidence")),
+            "correction_eligible": bool(closure.get("correction_eligible")),
+            "correction_law": str(
+                closure.get("correction_law") or "Unavailable"),
+            "raw_correction_demand_dps": self._number(
+                closure.get("raw_proportional_target_dps")),
+            "confidence_target_dps": self._number(
+                closure.get("confidence_weighted_target_dps")),
+            "dynamic_safety_cap_dps": self._number(
+                closure.get("dynamic_safety_cap_dps")),
+            "attack_slew_dps_per_second": self._number(
+                closure.get("attack_slew_dps_per_second")),
+            "limiting_reason": str(
+                closure.get("limiting_reason") or "Unavailable"),
+            "candidate_correction_dps": self._number(
+                closure.get("candidate_rate_dps")),
+            "pass_applied_correction_dps": self._number(
+                pass_closure.get("applied_rate_dps")),
+            "in_app_applied_correction_dps": self._number(
+                in_app_closure.get("applied_rate_dps")),
+            "pass_consumer_residual_deg": self._number(
+                pass_closure.get("consumer_residual_deg")),
+            "pass_accumulated_correction_deg": self._number(
+                pass_closure.get("accumulated_applied_correction_deg")),
+            "pass_reentry_ramp_progress": self._number(
+                pass_closure.get("consumer_reentry_ramp_progress")),
+            "in_app_consumer_residual_deg": self._number(
+                in_app_closure.get("consumer_residual_deg")),
+            "in_app_accumulated_correction_deg": self._number(
+                in_app_closure.get("accumulated_applied_correction_deg")),
+            "pass_session_accumulated_correction_deg": self._number(
+                pass_closure.get(
+                    "session_accumulated_applied_correction_deg")),
+            "in_app_session_accumulated_correction_deg": self._number(
+                in_app_closure.get(
+                    "session_accumulated_applied_correction_deg")),
+            "in_app_reentry_ramp_progress": self._number(
+                in_app_closure.get("consumer_reentry_ramp_progress")),
+            "raw_relative_closure_error_deg": self._number(
+                closure.get("raw_relative_closure_error_deg")),
+            "filtered_relative_closure_error_deg": self._number(
+                closure.get("filtered_relative_closure_error_deg")),
+            "consumer_measurement_deg": self._number(
+                closure.get("consumer_measurement_deg")),
+            "relative_delta_innovation_deg": self._number(
+                closure.get("relative_delta_innovation_deg")),
+            "relative_delta_rejected": bool(
+                closure.get("relative_delta_rejected", False)),
+            "pass_invariant_error_deg": self._number(
+                pass_closure.get("consumer_feedback_invariant_error_deg")),
+            "pass_invariant_valid": bool(
+                pass_closure.get("consumer_feedback_invariant_valid", True)),
+            "in_app_invariant_error_deg": self._number(
+                in_app_closure.get("consumer_feedback_invariant_error_deg")),
+            "in_app_invariant_valid": bool(
+                in_app_closure.get("consumer_feedback_invariant_valid", True)),
+            "measurement_epoch": int(closure.get("measurement_epoch", 0) or 0),
+            "consistency_correlation": self._number(
+                closure.get("consistency_correlation")),
+            "consistency_scale": self._number(
+                closure.get("consistency_scale")),
+            "consistency_confidence": self._number(
+                closure.get("consistency_confidence")),
+            "confidence_state": str(
+                closure.get("confidence_state") or "Unavailable"),
+            "authority_suspended": bool(
+                closure.get("authority_suspended", False)),
+            "observed_bias_rate_dps": self._number(
+                closure.get("observed_bias_rate_dps")),
+            "bias_rate_valid": bool(
+                closure.get("bias_rate_valid", False)),
+            "commit_scale_valid": bool(
+                closure.get("commit_scale_valid", False)),
+            "committed_error_increment_deg": self._number(
+                closure.get("committed_error_increment_deg")),
+            "invalid_confidence_debt_seconds": self._number(
+                closure.get("invalid_confidence_debt_seconds")),
+            "frozen_correction_blocked": bool(
+                closure.get("frozen_correction_blocked", False)),
+            "pass_repayment_budget_remaining_deg": self._number(
+                pass_closure.get("repayment_budget_remaining_deg")),
+            "pass_repayment_budget_used_deg": self._number(
+                pass_closure.get("repayment_budget_used_deg")),
+            "in_app_repayment_budget_remaining_deg": self._number(
+                in_app_closure.get("repayment_budget_remaining_deg")),
+            "in_app_repayment_budget_used_deg": self._number(
+                in_app_closure.get("repayment_budget_used_deg")),
+            "robust_bias_raw_observation_dps": self._number(
+                closure.get("robust_bias_raw_observation_dps")),
+            "robust_bias_bounded_observation_dps": self._number(
+                closure.get("robust_bias_bounded_observation_dps")),
+            "robust_bias_estimate_dps": self._number(
+                closure.get("robust_bias_estimate_dps")),
+            "robust_bias_valid_buckets": int(
+                closure.get("robust_bias_valid_buckets", 0) or 0),
+            "robust_bias_observation_age_seconds": self._number(
+                closure.get("robust_bias_observation_age_seconds")),
+            "robust_bias_confidence": self._number(
+                closure.get("robust_bias_confidence")),
+            "robust_bias_observation_clipped": bool(
+                closure.get("robust_bias_observation_clipped", False)),
+            "robust_bias_decay_active": bool(
+                closure.get("robust_bias_decay_active", False)),
+            "transient_event_active": bool(
+                closure.get("transient_event_active", False)),
+            "transient_event_error_deg": self._number(
+                closure.get("transient_event_error_deg")),
+            "transient_validation_elapsed_seconds": self._number(
+                closure.get("transient_validation_elapsed_seconds")),
+            "transient_confidence": self._number(
+                closure.get("transient_confidence")),
+            "transient_commit_increment_deg": self._number(
+                closure.get("transient_commit_increment_deg")),
+            "pass_transient_debt_remaining_deg": self._number(
+                pass_closure.get("transient_debt_remaining_deg")),
+            "pass_transient_debt_used_deg": self._number(
+                pass_closure.get("transient_debt_used_deg")),
+            "in_app_transient_debt_remaining_deg": self._number(
+                in_app_closure.get("transient_debt_remaining_deg")),
+            "in_app_transient_debt_used_deg": self._number(
+                in_app_closure.get("transient_debt_used_deg")),
+            "rolling_consistency_confidence": self._number(
+                closure.get("rolling_consistency_confidence")),
+            "aggregate_consistency_confidence": self._number(
+                closure.get("aggregate_consistency_confidence")),
+            "consistency_samples": int(
+                closure.get("consistency_samples", 0) or 0),
+            "heading_gravity_source": str(
+                quality.get("heading_gravity_source") or "Unavailable"),
+            "residual_state": str(
+                closure.get("residual_state") or "Unavailable"),
+            "window_accepted": bool(
+                closure.get("window_accepted", False)),
+            "window_magnetic_delta_deg": self._number(
+                closure.get("window_magnetic_delta_deg")),
+            "window_gyro_delta_deg": self._number(
+                closure.get("window_gyro_delta_deg")),
+            "committed_heading_error_deg": self._number(
+                closure.get("committed_heading_error_deg")),
+            "pass_epoch_changed": bool(
+                pass_closure.get("consumer_epoch_changed", False)),
+            "in_app_epoch_changed": bool(
+                in_app_closure.get("consumer_epoch_changed", False)),
+            "blocked_reasons": blocked,
+        }
+
+    @staticmethod
+    def _text_value(value) -> str:
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, float):
+            return f"{value:.6f}"
+        return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+    @classmethod
+    def _fixed_width_text_line(cls, values) -> str:
+        cells = []
+        for value, width in zip(values, cls.MAG_TESTER_COLUMN_WIDTHS):
+            text = cls._text_value(value)
+            if width is None:
+                cells.append(text)
+                continue
+            if len(text) > width:
+                text = text[:max(0, width - 3)] + "..."
+            cells.append(text.ljust(width))
+        return "  ".join(cells).rstrip()
+
+    def _mag_tester_row(self, record: Mapping) -> str:
+        item = self._mag_tester_snapshot(record)
+        start_ns = self._recording_started_ns or item["host_monotonic_ns"]
+        values = (
+            max(0.0, (item["host_monotonic_ns"] - start_ns) / 1e9),
+            item["controller_id"], item["controller_type"],
+            "Accepted" if item["calibration_accepted"] else "Not Available",
+            item["mag_status"], item["magnitude"], item["reference_magnitude"],
+            item["magnitude_ratio"], item["direction_valid"],
+            item["motion_state"], item["gyro_yaw_rate_dps"],
+            item["correction_law"],
+            (item["robust_bias_confidence"]
+             if item["correction_law"] == "RobustBiasRate"
+             else item["consistency_confidence"]),
+            item["confidence"], item["correction_eligible"],
+            item["robust_bias_estimate_dps"],
+            item["candidate_correction_dps"],
+            item["pass_applied_correction_dps"],
+            item["pass_session_accumulated_correction_deg"],
+            ",".join(item["blocked_reasons"]) or "None",
+        )
+        return self._fixed_width_text_line(values)
+
     def _writer_loop(self) -> None:
         try:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             with self.output_path.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(make_header(), separators=(",", ":"), ensure_ascii=False) + "\n")
+                if self._text_mode:
+                    handle.write("# Switch2Connect Mag Tester Recording\n")
+                    for key, value in self._recording_metadata.items():
+                        handle.write(
+                            f"# {self._text_value(key)}: {self._text_value(value)}\n")
+                    handle.write(
+                        self._fixed_width_text_line(self.MAG_TESTER_COLUMNS)
+                        + "\n")
+                else:
+                    handle.write(json.dumps(make_header(), separators=(",", ":"), ensure_ascii=False) + "\n")
                 pending_flush = 0
                 last_flush = time.monotonic()
+                written = 0
                 while True:
                     item = self._queue.get()
                     if item is _STOP:
                         break
-                    handle.write(json.dumps(item, separators=(",", ":"), ensure_ascii=False) + "\n")
+                    if self._text_mode:
+                        handle.write(self._mag_tester_row(item) + "\n")
+                    else:
+                        handle.write(json.dumps(item, separators=(",", ":"), ensure_ascii=False) + "\n")
+                    written += 1
                     pending_flush += 1
                     now = time.monotonic()
                     if pending_flush >= 128 or now - last_flush >= 1.0:
                         handle.flush()
                         pending_flush = 0
                         last_flush = now
+                if self._text_mode:
+                    handle.write(f"# Samples: {written}\n")
+                    handle.write(f"# Dropped_Records: {self._dropped}\n")
+                    handle.write(
+                        f"# Recording_Stopped_UTC: {_datetime.datetime.now(_datetime.timezone.utc).isoformat()}\n")
                 handle.flush()
         except Exception as exc:
             self._writer_error = exc
@@ -2615,15 +4306,9 @@ class GyroPhase0Recorder:
     def close(self, timeout: float = 2.0) -> None:
         if self._closed:
             return
+        self.stop_recording(timeout)
+        self.monitoring_enabled = False
         self._closed = True
-        thread = self._thread
-        if thread is None:
-            return
-        try:
-            self._queue.put(_STOP, timeout=max(0.0, timeout))
-        except queue.Full:
-            return
-        thread.join(timeout=max(0.0, timeout))
 
 
 def _recorder_from_environment() -> GyroPhase0Recorder:
@@ -2644,9 +4329,13 @@ __all__ = [
     "S2_GYRO_LSB_PER_DPS_PRO", "StationaryRuntimeBias", "V2AhrsShadow",
     "V2Timing", "V2_OUTPUT_MODES", "PASSTHROUGH_HEADING_OUTPUT_MODES",
     "PASSTHROUGH_MOVING_YAW_BIAS_MODES", "MovingYawBiasObserver",
-    "MOTION_MAG_CLOSURE_MODES", "INAPP_MOTION_MAG_CLOSURE_MODE",
+    "MOTION_MAG_CLOSURE_MODES", "MOTION_MAG_CORRECTION_LAWS",
+    "PRODUCTION_MOTION_MAG_CORRECTION_LAW",
+    "PRODUCTION_INAPP_MOTION_MAG_CLOSURE_MODE",
+    "PRODUCTION_PASSTHROUGH_MOTION_MAG_CLOSURE_MODE",
+    "MOTION_MAG_CORRECTION_LAW", "INAPP_MOTION_MAG_CLOSURE_MODE",
     "PASSTHROUGH_MOTION_MAG_CLOSURE_MODE",
-    "MotionMagneticClosureEstimator",
+    "MotionMagneticClosureEstimator", "MotionMagneticClosureConsumer",
     "PassthroughHeadingOutputFilter", "PassthroughMovingYawBiasConsumer",
     "apply_passthrough_heading_correction", "build_v2_accelerometer_output",
     "apply_world_yaw_bias_correction",
@@ -2655,5 +4344,5 @@ __all__ = [
     "build_v2_gyro_output", "canonical_timing", "canonicalize_replay_frame",
     "canonicalize_sensor_frame", "gyro_lsb_per_dps", "iter_replay_records",
     "make_header", "replay_sensor_frames", "validate_replay_record",
-    "validate_soft_iron_matrix",
+    "validate_soft_iron_matrix", "quaternion_heading_deg",
 ]
