@@ -1,11 +1,11 @@
 # Switch 2 Connect
 ### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
- <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.2.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
+ <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.3.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
 <p align="center">
   <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
-  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.2.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.3.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
   <br>
   <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
@@ -148,8 +148,8 @@ If WinUHid is not installed or the installation is incomplete:
   * Auto Change Profile: Automatically switches to the selected checked profile in the Change Profile List after 2 seconds of trigger inactivity.
   * Manual Change Profile: Opens a selection notification. Navigate through the checked profiles using the L/R joysticks or Dpad Up/Down, and use the current Xbox/Switch layout A to confirm or B to cancel.
     * Auto/Manual Mode Setting: Toggle between Auto and Manual modes via the pop-up window by clicking the "Change Profile" button.
-  * Configuration Import and Export: Selected profiles can be exported to or imported from `.yaml` files. Imports can retain existing profiles and resolve duplicate application assignments.
-  * Controller Data Transfer: Controller-specific settings, including calibration data, can be included when importing or exporting configurations. Machine-specific information such as driver status, window placement, and device caches remains local to each installation.
+  * Configuration Import and Export: Selected profiles can be exported to or imported from `.yaml` files. Imports can retain existing profiles and resolve duplicate application assignments. Machine-specific information such as Power Saving settings, driver status, window placement, and device caches remains local to each installation.
+  * Controller Data Transfer: Controller-specific settings, including calibration data, can be included when importing or exporting configurations.
 * **Assign Profile To Application:** Featuring profile auto-switching based on active foreground application. Bind one or more executable files (.exe) to a profile; when any of those applications become the focused window, the profile automatically activates.
 * **Dynamic Split & Merge System:** The  **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Featuring V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
@@ -171,6 +171,10 @@ If WinUHid is not installed or the installation is incomplete:
   * Absolute: tracks the overall time each controller is connected to the app and disconnects the ones that reach the time limit.
 * **Driver Management Controls:** Provides Install, Repair, and Uninstall actions for the selected WinUHid, ViGEmBus, or USBIP backend. Driver status is determined from the active device, Driver Store package, service registration, and runtime availability instead of saved configuration alone.
 * **ESP32-S3 Bridge Firmware Management:** Provides firmware installation and repair, BOOT-mode detection, reconnection handling, and flash diagnostics. When flashing fails, the application records esptool output in a diagnostic log.
+* **Power Saving Modes:** In-app Power Saving control with Off, Auto, and Full modes.
+  * **Off:** Keeps all controller input, motion, vibration, scanning, and background status functions enabled.
+  * **Auto:** Reduces idle CPU activity while retaining buttons, sticks, triggers, motion controls, and controller scanning. HD Rumble, Audio Haptics, and Impulse Trigger feedback may be delayed, interrupted, or occasionally lost.
+  * **Full:** Retains buttons, sticks, triggers, and non-motion mappings while disabling vibration output, Gyro Pass-Through, In-app Gyro, DJG, IR Mouse, and Joystick Mouse movement. Periodic ESP32 and Wired/HidHide status checks are suspended. Automatic controller scanning pauses after 1 Pro/NSO GameCube Controller or 2 Joy-Con controllers are connected.
 * **Run at Startup:** Automatically launches the application with Windows.
 * **Start Minimized:** Starts the application in the system tray.
 * **Hide to System Tray:** Minimizes the application to the Windows system tray.
