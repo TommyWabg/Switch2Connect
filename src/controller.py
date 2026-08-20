@@ -1072,6 +1072,62 @@ def set_calibration_entry(store, controller, value):
     for key in controller_calibration_keys(controller):
         store[key] = value
 
+
+def apply_magnetometer_calibration_entry(controller, entry) -> bool:
+    """Apply legacy or Mag V2 calibration data to any controller transport."""
+    if entry is None:
+        return False
+
+    if isinstance(entry, dict):
+        bias = entry.get("bias", (0.0, 0.0, 0.0))
+        try:
+            bias = tuple(float(value) for value in bias)
+        except (TypeError, ValueError):
+            return False
+        if len(bias) != 3 or not all(math.isfinite(value) for value in bias):
+            return False
+
+        matrix = entry.get("soft_iron_matrix")
+        matrix_valid, _matrix_quality = validate_soft_iron_matrix(matrix)
+        reference = entry.get("reference_magnitude_lsb")
+        if not isinstance(reference, (int, float)):
+            fit_quality = entry.get("full_ellipsoid_fit_quality") or {}
+            reference = fit_quality.get("reference_magnitude_lsb")
+        if not isinstance(reference, (int, float)):
+            radii = entry.get("axis_radii") or []
+            try:
+                finite_radii = [
+                    float(value) for value in radii
+                    if math.isfinite(float(value)) and float(value) > 1e-6]
+                reference = (
+                    sum(finite_radii) / len(finite_radii)
+                    if len(finite_radii) == 3 else None)
+            except (TypeError, ValueError):
+                reference = None
+
+        controller.mag_bias = bias
+        controller.mag_soft_iron_matrix = matrix if matrix_valid else None
+        controller.mag_soft_iron_model = entry.get("soft_iron_model")
+        controller.mag_reference_magnitude = (
+            float(reference)
+            if isinstance(reference, (int, float))
+            and math.isfinite(float(reference)) and float(reference) > 1e-6
+            else None)
+    else:
+        try:
+            bias = tuple(float(value) for value in entry)
+        except (TypeError, ValueError):
+            return False
+        if len(bias) != 3 or not all(math.isfinite(value) for value in bias):
+            return False
+        controller.mag_bias = bias
+        controller.mag_soft_iron_matrix = None
+        controller.mag_soft_iron_model = None
+        controller.mag_reference_magnitude = None
+
+    controller.mag_calibration_valid = True
+    return True
+
 def ensure_wired_controller_calibration_alias(controller):
     if not getattr(controller, "is_wired_usb", False):
         return
@@ -2389,41 +2445,7 @@ class Controller:
                 
             mag_cal_data = getattr(CONFIG, "mag_calibration_data", {}) or {}
             mag_entry = get_calibration_entry(mag_cal_data, self)
-            if mag_entry is not None:
-                if isinstance(mag_entry, dict):
-                    self.mag_bias = tuple(mag_entry.get("bias", (0.0, 0.0, 0.0)))
-                    matrix = mag_entry.get("soft_iron_matrix")
-                    matrix_valid, _matrix_quality = validate_soft_iron_matrix(matrix)
-                    self.mag_soft_iron_matrix = matrix if matrix_valid else None
-                    self.mag_soft_iron_model = mag_entry.get("soft_iron_model")
-                    reference = mag_entry.get("reference_magnitude_lsb")
-                    if not isinstance(reference, (int, float)):
-                        fit_quality = mag_entry.get(
-                            "full_ellipsoid_fit_quality") or {}
-                        reference = fit_quality.get("reference_magnitude_lsb")
-                    if not isinstance(reference, (int, float)):
-                        radii = mag_entry.get("axis_radii") or []
-                        try:
-                            finite_radii = [
-                                float(value) for value in radii
-                                if math.isfinite(float(value))
-                                and float(value) > 1e-6]
-                            reference = (
-                                sum(finite_radii) / len(finite_radii)
-                                if len(finite_radii) == 3 else None)
-                        except (TypeError, ValueError):
-                            reference = None
-                    self.mag_reference_magnitude = (
-                        float(reference)
-                        if isinstance(reference, (int, float))
-                        and math.isfinite(float(reference))
-                        and float(reference) > 1e-6 else None)
-                else:
-                    self.mag_bias = tuple(mag_entry)
-                    self.mag_soft_iron_matrix = None
-                    self.mag_soft_iron_model = None
-                    self.mag_reference_magnitude = None
-                self.mag_calibration_valid = True
+            if apply_magnetometer_calibration_entry(self, mag_entry):
                 logger.info(f"Loaded per-device mag calibration for {addr}")
 
             if not cache_hit:

@@ -78,6 +78,7 @@ from controller import (
     StickCalibrationData,
     normalize_calibration_key,
     get_calibration_entry,
+    apply_magnetometer_calibration_entry,
     ensure_wired_controller_calibration_alias,
     INPUT_REPORT_UUID,
     COMMAND_RESPONSE_UUID,
@@ -126,10 +127,16 @@ USB_INIT_COMMAND = bytes([0x03, 0x91, 0x00, 0x0D, 0x00, 0x08,
 USB_SET_LED_COMMAND = bytes([0x09, 0x91, 0x00, 0x07, 0x00, 0x08,
                              0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
                              0x00, 0x00])
-USB_SET_FEATURE_MASK_COMMAND = bytes([0x0C, 0x91, 0x00, 0x02, 0x00, 0x04,
-                                      0x00, 0x00, 0x27, 0x00, 0x00, 0x00])
-USB_ENABLE_FEATURES_COMMAND = bytes([0x0C, 0x91, 0x00, 0x04, 0x00, 0x04,
-                                     0x00, 0x00, 0x27, 0x00, 0x00, 0x00])
+USB_GAMECUBE_FEATURE_MASK = 0x27
+# Preserve the established wired Pro feature set (0x27, including rumble) and
+# add the controller protocol's magnetometer bit (0x80).  Using GameCube's
+# unmodified mask left bytes 25:31 of report 0x05 permanently zero.
+USB_PRO2_FEATURE_MASK = USB_GAMECUBE_FEATURE_MASK | 0x80
+
+
+def _usb_feature_command(subcommand: int, feature_mask: int) -> bytes:
+    return bytes([0x0C, 0x91, 0x00, subcommand, 0x00, 0x04,
+                  0x00, 0x00, feature_mask, 0x00, 0x00, 0x00])
 USB_SELECT_COMMON_REPORT_COMMAND = bytes([0x03, 0x91, 0x00, 0x0A, 0x00, 0x04,
                                           0x00, 0x00, REPORT_ID_COMMON, 0x00, 0x00, 0x00])
 # GameCube keeps its native report 0x0A rather than switching to the common 0x05: only
@@ -148,22 +155,24 @@ def _output_report_id(product_id: int) -> int:
 def _startup_commands(product_id: int) -> tuple:
     """Startup command sequence for a wired pad.
 
-    Identical for both pads except the final report selection: the Pro Controller 2
-    switches to the common report 0x05 (its own 0x09 has an undocumented motion block),
-    while GameCube stays on 0x0A (documented-equivalent to its Bluetooth report, and the
-    only one carrying the analog triggers).
+    The Pro Controller 2 switches to common report 0x05 (its own 0x09 has an
+    undocumented motion block), while GameCube stays on 0x0A (documented-equivalent
+    to its Bluetooth report and the only one carrying the analog triggers).  Their
+    feature masks also differ because GameCube has no usable magnetometer stream.
 
-    The 0x27 feature mask is what the official GameCube init uses (buttons + sticks +
-    IMU + rumble); it is also what the Pro Controller 2 path here has always sent.
+    GameCube uses its official 0x27 mask.  Pro Controller 2 retains those wired
+    features and adds the 0x80 magnetometer bit, producing 0xA7.
     """
-    select = (USB_SELECT_GC_REPORT_COMMAND
-              if product_id == NSO_GAMECUBE_CONTROLLER_PID
+    is_gamecube = product_id == NSO_GAMECUBE_CONTROLLER_PID
+    select = (USB_SELECT_GC_REPORT_COMMAND if is_gamecube
               else USB_SELECT_COMMON_REPORT_COMMAND)
+    feature_mask = (USB_GAMECUBE_FEATURE_MASK if is_gamecube
+                    else USB_PRO2_FEATURE_MASK)
     return (
         USB_INIT_COMMAND,
         USB_SET_LED_COMMAND,
-        USB_SET_FEATURE_MASK_COMMAND,
-        USB_ENABLE_FEATURES_COMMAND,
+        _usb_feature_command(0x02, feature_mask),
+        _usb_feature_command(0x04, feature_mask),
         select,
     )
 
@@ -2859,8 +2868,7 @@ class USBHidController(Controller):
             self.gyro_bias = tuple(getattr(CONFIG, "gyro_bias_r", [0.0, 0.0, 0.0]))
 
         mag_cal_data = get_calibration_entry(getattr(CONFIG, "mag_calibration_data", {}) or {}, self)
-        if mag_cal_data is not None:
-            self.mag_bias = tuple(mag_cal_data)
+        if apply_magnetometer_calibration_entry(self, mag_cal_data):
             logger.info("Loaded wired USB mag calibration for %s", self.device.address)
         self.apply_in_app_joystick_calibration()
 
@@ -2937,12 +2945,17 @@ class USBHidController(Controller):
         )
         logger.info(
             "Wired USB diagnostics (%s): mi01_state=%s mi01_service=%s "
-            "ms_comp_winusb=%s iface_guids=%s | command=%s input=%s rumble=%s bulk_ok=%s",
+            "ms_comp_winusb=%s iface_guids=%s | command=%s input=%s "
+            "feature_mask=0x%02X expected_report=0x%02X rumble=%s bulk_ok=%s",
             self.device.address,
             binding["state"], binding["service"], binding["ms_comp"],
             binding["has_guids"],
             self.command_transport,
             self.input_transport,
+            (USB_GAMECUBE_FEATURE_MASK
+             if self.usb_product_id == NSO_GAMECUBE_CONTROLLER_PID
+             else USB_PRO2_FEATURE_MASK),
+            self.expected_input_report_id,
             getattr(self.client, "rumble_transport", "none") if self.client else "none",
             self.client.bulk_rumble_available() if self.client else False,
         )
@@ -2967,8 +2980,8 @@ class USBHidController(Controller):
                 # expected report id was arriving, on the theory that the commands had
                 # demonstrably taken -- but the report id only proves the *report
                 # selection* command landed (0x03/0x0A). It says nothing about the
-                # feature-enable pair (0x0C/0x02 + 0x0C/0x04, mask 0x27) whose bit 5 is
-                # rumble, and that is precisely what the first startup pass tends to
+                # feature-enable pair (0x0C/0x02 + 0x0C/0x04) whose bit 5 is rumble,
+                # and that is precisely what the first startup pass tends to
                 # miss. Skipping here silently killed wired Pro Controller 2 rumble and
                 # battery reporting, because the pad streams report 0x05 within
                 # milliseconds and the re-send never happened.
