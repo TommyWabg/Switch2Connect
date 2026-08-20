@@ -55,7 +55,7 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "2.2"
+#define APP_FIRMWARE_VERSION      "2.4"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_3"
 #define CDC_LINE_STATE_DTR        0x01
@@ -123,7 +123,10 @@ typedef struct {
     uint16_t notify_handles[8];
     uint8_t  notify_count;
     uint8_t  cccd_idx;
+    uint8_t  cccd_retry;
     bool     cccd_draining;
+    bool     cccd_input_ready;
+    bool     cccd_ack_ready;
 } channel_t;
 static channel_t s_ch[MAX_CH];
 
@@ -369,7 +372,7 @@ static void send_status_response(void) {
     char b[256];
     snprintf(b, sizeof(b),
         "{\"cmd\":\"status\",\"version\":\"%s\",\"profile\":\"%s\",\"build\":\"%s\","
-        "\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1,\"shadow_latest\":1,\"direct_rumble\":1}}\n",
+        "\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1,\"shadow_latest\":1,\"direct_rumble\":1,\"gatt_ready\":1}}\n",
         APP_FIRMWARE_VERSION, EXPECTED_FIRMWARE_PROFILE, EXPECTED_FIRMWARE_BUILD,
         (unsigned)ch_active_mask(), s_own_mac);
     send_json(b);
@@ -481,7 +484,10 @@ static void do_conn(char *args) {
     s_ch[ch].prefer_legacy = false;
     s_ch[ch].notify_count = 0;      // fresh discovery — clear the GCN notify list / drain state
     s_ch[ch].cccd_idx = 0;
+    s_ch[ch].cccd_retry = 0;
     s_ch[ch].cccd_draining = false;
+    s_ch[ch].cccd_input_ready = false;
+    s_ch[ch].cccd_ack_ready = false;
     {   // Diagnostic: which channel + how many links already live when this starts.
         char dbg[110];
         snprintf(dbg, sizeof(dbg),
@@ -905,6 +911,23 @@ static void note_notify_handle(int ch, uint16_t handle) {
     if (s_ch[ch].notify_count >= cap) { out_debug("notify_handles full; SW2 notify char dropped"); return; }
     s_ch[ch].notify_handles[s_ch[ch].notify_count++] = handle;
 }
+
+static bool gcn_required_cccd(int ch, uint16_t handle) {
+    return handle == s_ch[ch].input_handle || handle == s_ch[ch].ack_handle;
+}
+
+static void fail_gcn_ready(int ch, uint16_t handle, const char *reason) {
+    char dbg[112];
+    snprintf(dbg, sizeof(dbg),
+             "GCN GATT ready failed ch=%d handle=0x%04x reason=%s",
+             ch, handle, reason);
+    out_debug(dbg);
+    s_ch[ch].cccd_draining = false;
+    portENTER_CRITICAL(&s_disc_mux);
+    s_disc_mask |= (1u << ch);
+    portEXIT_CRITICAL(&s_disc_mux);
+    kick_disc_queue();
+}
 static void scan_service_chars(int ch, uint16_t start, uint16_t end, bool is_sw2) {
     uint16_t count = 0;
     if (esp_ble_gattc_get_attr_count(s_ch[ch].gattc_if, s_ch[ch].conn_id, ESP_GATT_DB_CHARACTERISTIC,
@@ -945,11 +968,18 @@ static void cccd_drain_step(int ch) {
         uint16_t handle = s_ch[ch].notify_handles[s_ch[ch].cccd_idx];
         if (write_cccd_value(ch, handle, true)) return;
 
+        if (gcn_required_cccd(ch, handle)) {
+            if (++s_ch[ch].cccd_retry < 3) continue;
+            fail_gcn_ready(ch, handle, "cccd_write_not_queued");
+            return;
+        }
+
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "GCN CCCD drain skipped ch=%d handle=0x%04x idx=%u/%u",
                  ch, handle, s_ch[ch].cccd_idx, s_ch[ch].notify_count);
         out_debug(dbg);
         s_ch[ch].cccd_idx++;
+        s_ch[ch].cccd_retry = 0;
     }
     s_ch[ch].cccd_draining = false;
 }
@@ -965,6 +995,7 @@ static void start_cccd_drain(int ch) {
         }
     }
     s_ch[ch].cccd_idx = 0;
+    s_ch[ch].cccd_retry = 0;
     s_ch[ch].cccd_draining = true;
     cccd_drain_step(ch);
 }
@@ -974,6 +1005,15 @@ static inline bool ch_uses_notify_all(int ch) {
 }
 static void enable_notifications(int ch) {
     if (ch_uses_notify_all(ch)) {
+        bool input_found = false, ack_found = false;
+        for (int i = 0; i < s_ch[ch].notify_count; i++) {
+            input_found |= s_ch[ch].notify_handles[i] == s_ch[ch].input_handle;
+            ack_found |= s_ch[ch].notify_handles[i] == s_ch[ch].ack_handle;
+        }
+        if (!s_ch[ch].input_handle || !s_ch[ch].ack_handle || !input_found || !ack_found) {
+            fail_gcn_ready(ch, 0, "required_notify_missing");
+            return;
+        }
         // GameCube: register for notify on EVERY SW2 notify char (input, ack, and any
         // model-specific/extra input chars), matching the WinRT GCN subscription.  Then the
         // sequential drain writes each CCCD in turn.  NOTIFY_EVT still forwards only
@@ -985,6 +1025,26 @@ static void enable_notifications(int ch) {
     }
     if (s_ch[ch].ack_handle)   esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, s_ch[ch].ack_handle);
     if (s_ch[ch].input_handle) esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, s_ch[ch].input_handle);
+}
+
+static void publish_channel_ready(int ch, const char *event_name) {
+    if (s_ch[ch].ready) return;
+    s_ch[ch].ready = true;
+    {   // Update interval only after the required notification path is usable.
+        uint16_t itvl = s_ch[ch].itvl ? s_ch[ch].itvl : 6;
+        esp_ble_conn_update_params_t cp = {0};
+        memcpy(cp.bda, s_ch[ch].bda, sizeof(esp_bd_addr_t));
+        cp.min_int = itvl; cp.max_int = itvl; cp.latency = 0; cp.timeout = 400;
+        esp_ble_gap_update_conn_params(&cp);
+    }
+    char b[112];
+    snprintf(b, sizeof(b),
+        "{\"cmd\":\"%s\",\"channel\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}\n",
+        event_name, ch, s_ch[ch].bda[0],s_ch[ch].bda[1],s_ch[ch].bda[2],
+        s_ch[ch].bda[3],s_ch[ch].bda[4],s_ch[ch].bda[5]);
+    out_json(b);
+    restore_widened_links();
+    if (s_scan_mode) s_resume_scan = true;
 }
 
 static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
@@ -1149,28 +1209,11 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                                ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
             }
         }
-        if (h == s_ch[ch].input_handle && !s_ch[ch].ready) {
-            s_ch[ch].ready = true;
-            {   // Update interval AFTER GATT discovery, overriding controller's defaults.
-                // Doing this too early (in OPEN_EVT) collides with the Nintendo
-                // controller's own initial parameter update request.
-                uint16_t itvl = s_ch[ch].itvl ? s_ch[ch].itvl : 6;
-                esp_ble_conn_update_params_t cp = {0};
-                memcpy(cp.bda, s_ch[ch].bda, sizeof(esp_bd_addr_t));
-                cp.min_int = itvl; cp.max_int = itvl; cp.latency = 0; cp.timeout = 400;
-                esp_ble_gap_update_conn_params(&cp);
-            }
-            char b[96]; snprintf(b, sizeof(b),
-                "{\"cmd\":\"connected\",\"channel\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}\n",
-                ch, s_ch[ch].bda[0],s_ch[ch].bda[1],s_ch[ch].bda[2],
-                    s_ch[ch].bda[3],s_ch[ch].bda[4],s_ch[ch].bda[5]);
-            out_json(b);
-            // The 3rd link is now established — restore any links we temporarily widened
-            // to 15ms back to 7.5ms.  Maintaining 2x7.5ms + 1x15ms is feasible; it was
-            // only ESTABLISHING the 3rd alongside two 7.5ms anchors that failed.
-            restore_widened_links();
-            if (s_scan_mode) s_resume_scan = true;  // resume scan (deferred) to find the next one
-        }
+        // Non-GCN controllers keep the established readiness contract. GameCube uses
+        // a multi-CCCD drain, so REG_FOR_NOTIFY is too early: its command ACK CCCD may
+        // still be disabled. WRITE_DESCR_EVT publishes true gatt_ready for that path.
+        if (!ch_uses_notify_all(ch) && h == s_ch[ch].input_handle)
+            publish_channel_ready(ch, "connected");
         break;
     }
 
@@ -1196,9 +1239,24 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     }
 
     case ESP_GATTC_WRITE_DESCR_EVT:
-        // GCN CCCD drain: one descriptor write completed (ok or not) -> enable the next.
-        if (s_ch[ch].cccd_draining) {
+        if (s_ch[ch].cccd_draining && s_ch[ch].cccd_idx < s_ch[ch].notify_count) {
+            uint16_t completed = s_ch[ch].notify_handles[s_ch[ch].cccd_idx];
+            if (param->write.status != ESP_GATT_OK && gcn_required_cccd(ch, completed)) {
+                if (++s_ch[ch].cccd_retry < 3) {
+                    cccd_drain_step(ch);
+                } else {
+                    fail_gcn_ready(ch, completed, "cccd_write_failed");
+                }
+                break;
+            }
+            if (param->write.status == ESP_GATT_OK) {
+                if (completed == s_ch[ch].input_handle) s_ch[ch].cccd_input_ready = true;
+                if (completed == s_ch[ch].ack_handle) s_ch[ch].cccd_ack_ready = true;
+            }
             s_ch[ch].cccd_idx++;
+            s_ch[ch].cccd_retry = 0;
+            if (s_ch[ch].cccd_input_ready && s_ch[ch].cccd_ack_ready)
+                publish_channel_ready(ch, "gatt_ready");
             cccd_drain_step(ch);
         }
         break;
