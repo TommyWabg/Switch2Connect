@@ -59,6 +59,8 @@ from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
 from utils import set_startup, disable_power_throttling
 import utils
+import keyboard_output
+import raw_input_mouse
 from gyro import GYRO_PHASE0_RECORDER
 from mag_tester import export_recorded_file, mag_tester_build_enabled
 import pystray
@@ -94,7 +96,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.3"
+APP_VERSION = "v2.4"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -962,6 +964,10 @@ MACHINE_LOCAL_CONFIG_KEYS = frozenset({
     "power_saving_mode",
     "power_saving_auto_warning_suppressed",
     "power_saving_full_warning_suppressed",
+    "esp32_serial_port_mode",
+    "esp32_serial_port",
+    "esp32_serial_device_id",
+    "esp32_serial_number",
 })
 
 # Everything bound to a specific physical controller (calibration blobs plus every
@@ -3253,14 +3259,17 @@ class ControllerWindow:
             firmware_text = "Not installed"
         port_text = status.serial_port.port if status and status.serial_port else "CH343/COM not detected"
 
-        dialog_w = int(480 * scaling_factor)
-        dialog_h = int(290 * scaling_factor)
+        dialog_w = int(560 * scaling_factor)
+        dialog_h = int(330 * scaling_factor)
         dialog = tk.Toplevel(self.root)
+        # Keep the native toplevel hidden until every child widget and the first
+        # serial-port list are ready.  WMI enumeration can otherwise expose a
+        # short-lived empty window while this function is still constructing it.
+        dialog.withdraw()
         dialog.title(ESP32S3_LABEL)
         dialog.resizable(False, False)
         dialog.config(bg="#1E1E1E")
         dialog.transient(self.root)
-        dialog.grab_set()
         # Center on main window
         self.root.update_idletasks()
         rx = self.root.winfo_x()
@@ -3273,12 +3282,79 @@ class ControllerWindow:
 
         info_label = tk.Label(
             dialog,
-            text=f"{ESP32S3_LABEL}\nFirmware: {firmware_text}\nFlashing port: {port_text}",
+            text=f"{ESP32S3_LABEL}\nFirmware: {firmware_text}",
             fg="white", bg="#1E1E1E",
             font=scale_font(("Arial", 11, "bold")),
             justify=tk.LEFT,
         )
         info_label.pack(pady=(int(16 * scaling_factor), int(4 * scaling_factor)), padx=int(16 * scaling_factor), anchor=tk.W)
+
+        port_frame = tk.Frame(dialog, bg="#1E1E1E")
+        port_frame.pack(fill=tk.X, padx=int(16 * scaling_factor), pady=(0, int(4 * scaling_factor)))
+        tk.Label(port_frame, text="Flashing Port:", fg="white", bg="#1E1E1E",
+                 font=scale_font(("Arial", 10, "bold"))).pack(side=tk.LEFT)
+        port_choice = tk.StringVar()
+        port_combo = ttk.Combobox(port_frame, textvariable=port_choice, state="readonly",
+                                  width=40, font=scale_font(("Arial", 9)))
+        port_combo.pack(side=tk.LEFT, padx=(int(8 * scaling_factor), 0), fill=tk.X, expand=True)
+        port_lookup = {}
+
+        def refresh_port_choices():
+            try:
+                from usb_serial_bridge import list_bridge_port_candidates, format_port_label
+                ports = list_bridge_port_candidates()
+            except Exception as e:
+                logger.debug(f"ESP32-S3 port list refresh failed: {e}")
+                ports = []
+            values = ["Auto"]
+            port_lookup.clear()
+            for item in ports:
+                verified = bool(status and status.serial_port
+                                and status.serial_port.port.upper() == item.port.upper()
+                                and getattr(status, "firmware_installed", False))
+                label = format_port_label(item, verified=verified)
+                values.append(label)
+                port_lookup[label] = item.port
+            port_combo["values"] = values
+            configured = str(getattr(CONFIG, "esp32_serial_port", "") or "").upper()
+            if getattr(CONFIG, "esp32_serial_port_mode", "auto") == "manual":
+                selected = next((label for label, port in port_lookup.items()
+                                 if port.upper() == configured), "Auto")
+            else:
+                selected = "Auto"
+            port_choice.set(selected)
+
+        def select_port(_event=None):
+            label = port_choice.get()
+            selected_port = port_lookup.get(label, "")
+            CONFIG.esp32_serial_port_mode = "manual" if selected_port else "auto"
+            CONFIG.esp32_serial_port = selected_port.upper()
+            CONFIG.save_config()
+            dialog_state["probe_running"] = True
+
+            def worker():
+                try:
+                    from usb_serial_bridge import detect_bridge
+                    selected_status = detect_bridge(selected_port or None)
+                except Exception as e:
+                    logger.debug(f"ESP32-S3 selected port probe failed: {e}")
+                    selected_status = None
+                def apply():
+                    dialog_state["probe_running"] = False
+                    if not dialog.winfo_exists():
+                        return
+                    self.esp32s3_bridge_status = selected_status
+                    self.esp32s3_detected = bool(
+                        selected_status and getattr(selected_status, "board_present", False))
+                    render_status(selected_status)
+                dialog.after(0, apply)
+            threading.Thread(target=worker, daemon=True).start()
+
+        port_combo.bind("<<ComboboxSelected>>", select_port)
+        tk.Button(port_frame, text="Refresh", bg=button_gray, fg=text_color,
+                  bd=0, relief=tk.FLAT, font=scale_font(("Arial", 9, "bold")),
+                  command=refresh_port_choices).pack(side=tk.LEFT, padx=(int(6 * scaling_factor), 0))
+        refresh_port_choices()
 
         boot_status_label = tk.Label(
             dialog, text="", fg="white", bg="#1E1E1E",
@@ -3335,13 +3411,17 @@ class ControllerWindow:
                 expected = getattr(new_status, "expected_version", "") or "bundled"
                 firmware = f"Update required ({current} -> {expected})"
             elif new_status and getattr(new_status, "board_present", False):
-                firmware = "Boot mode" if current_boot else "Detected, waiting for status"
+                if (getattr(CONFIG, "esp32_serial_port_mode", "auto") == "manual"
+                        and not getattr(new_status, "firmware_installed", False)
+                        and not current_boot):
+                    firmware = "Selected port did not answer ESP32-S3 firmware status"
+                else:
+                    firmware = "Boot mode" if current_boot else "Detected, waiting for status"
             else:
                 firmware = "Not installed"
             port = (new_status.serial_port.port
                     if new_status and new_status.serial_port else "CH343/COM not detected")
-            info_label.config(
-                text=f"{ESP32S3_LABEL}\nFirmware: {firmware}\nFlashing port: {port}")
+            info_label.config(text=f"{ESP32S3_LABEL}\nFirmware: {firmware}")
             if current_boot:
                 boot_status_label.config(
                     text="OTG Boot mode detected — ready to install firmware.", fg="#55CC55")
@@ -3359,8 +3439,12 @@ class ControllerWindow:
                     button.config(state=flash_button_state)
 
         def poll_boot_status():
-            if (not dialog.winfo_exists() or dialog_state["operation_started"]
-                    or dialog_state["probe_running"]):
+            if not dialog.winfo_exists() or dialog_state["operation_started"]:
+                return
+            if dialog_state["probe_running"]:
+                # A manual selection/refresh may overlap this tick.  Do not let
+                # that one overlap permanently stop the live OTG/Boot monitor.
+                dialog.after(100, poll_boot_status)
                 return
             dialog_state["probe_running"] = True
 
@@ -3477,6 +3561,10 @@ class ControllerWindow:
         ).pack(padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
 
         render_status(status)
+        dialog.update_idletasks()
+        dialog.deiconify()
+        dialog.lift()
+        dialog.grab_set()
         dialog.after(500, poll_boot_status)
 
     def _show_boot_mode_prompt(self, label="ESP32-S3 CDC"):
@@ -3819,6 +3907,9 @@ class ControllerWindow:
             return
 
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if (driver_type != "WinUHid"
+                or (utils.is_packaged() and not packaged_winuhid_available())):
+            self.close_winuhid_driver_manager()
         if driver_type == "ViGEmBus":
             self.check_vigembus_installation(save=save)
             return
@@ -4254,7 +4345,12 @@ class ControllerWindow:
                 driver_installed_ok = proc_exit_code[0] == 0 and runtime_ok
                 if driver_installed_ok:
                     CONFIG.driver_installed = True
+                    # Device creation follows the active Profile, never Driver Mode.
+                    keyboard_output.initialize()
+                    CONFIG._bump_settings_generation()
                     CONFIG.save_config()
+                    self.wake_controller_mouse_output_reconcile()
+                    self.refresh_profile_switching_combo_trigger_ui()
                     if show_success_msg:
                         self.show_centered_message("Success", "WinUHid driver installed successfully.")
                 else:
@@ -4264,6 +4360,8 @@ class ControllerWindow:
                         f"Exit code: {proc_exit_code[0]}\nRuntime smoke test: {runtime_ok}\n"
                         f"{driver_status.describe()}"
                     )
+                    if getattr(CONFIG, "keyboard_output_mode", None) == keyboard_output.RAW_INPUT:
+                        keyboard_output.activate_raw_input(save=False)
                 self.update_driver_button()
             except Exception as e:
                 self.show_centered_message("Error", f"Failed to start the installer: {e}")
@@ -4354,7 +4452,15 @@ class ControllerWindow:
                     driver_status, verify_winuhid_runtime)
                 if driver_removed_ok:
                     CONFIG.driver_installed = False
+                    keyboard_output.activate_standard(save=False)
+                    raw_input_mouse.shutdown()
+                    # Preserve each Profile's requested modes.  With the driver
+                    # absent their effective output is Win32 API; reinstalling
+                    # restores the saved Profile preference.
+                    CONFIG._bump_settings_generation()
                     CONFIG.save_config()
+                    self.wake_controller_mouse_output_reconcile()
+                    self.refresh_profile_switching_combo_trigger_ui()
                     if utils.is_packaged():
                         refresh_packaged_winuhid_capability()
                         # A removed active WinUHid cannot keep virtual devices
@@ -4372,6 +4478,8 @@ class ControllerWindow:
                         f"Exit code: {proc_exit_code[0]}\n{driver_status.describe()}"
                         f"\n\nUninstaller details:\n{uninstall_log}"
                     )
+                    if getattr(CONFIG, "keyboard_output_mode", None) == keyboard_output.RAW_INPUT:
+                        keyboard_output.activate_raw_input(save=False)
                 self.update_driver_button()
             except Exception as e:
                 self.show_centered_message("Error", f"Failed to start the uninstaller: {e}")
@@ -4524,20 +4632,191 @@ class ControllerWindow:
                     CONFIG.save_config()
                 self.update_driver_button()
         else:
-            winuhid_status = get_winuhid_status()
-            if winuhid_status.state == WINUHID_HEALTHY:
-                if self.ask_centered_yes_no("Uninstall Driver", "Are you sure you want to uninstall the WinUHid driver?\n(Requires administrator privileges.)"):
-                    self.run_driver_uninstall()
-            elif winuhid_status.state == WINUHID_PARTIAL:
-                if self.ask_centered_yes_no(
-                    "Repair Driver",
-                    "WinUHid is partially installed. Clean up the broken installation and reinstall it?\n\n"
-                    f"{winuhid_status.describe()}\n\n(Requires administrator privileges.)"
-                ):
-                    if self.run_driver_uninstall():
-                        self.run_driver_install()
+            self.on_winuhid_manager_driver_action()
+
+    def close_winuhid_driver_manager(self):
+        popup = getattr(self, "winuhid_manager_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.destroy()
+        self.winuhid_manager_popup = None
+        self.winuhid_manager_popup_anchor = None
+        bind_id = getattr(self, "winuhid_manager_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+            self.winuhid_manager_popup_bind_id = None
+
+    def bind_winuhid_driver_manager_outside_click(self):
+        popup = getattr(self, "winuhid_manager_popup", None)
+        if popup is None or not popup.winfo_exists():
+            return
+        bind_id = getattr(self, "winuhid_manager_popup_bind_id", None)
+        if bind_id:
+            try:
+                self.root.unbind("<ButtonPress>", bind_id)
+            except Exception:
+                pass
+
+        def close_if_outside(event):
+            current = getattr(self, "winuhid_manager_popup", None)
+            if current is None or not current.winfo_exists():
+                self.close_winuhid_driver_manager()
+                return
+            if self._event_in_widget(current, event):
+                return
+            if self._event_in_widget(getattr(self, "winuhid_manager_popup_anchor", None), event):
+                return
+            self.close_winuhid_driver_manager()
+
+        self.winuhid_manager_popup_bind_id = self.root.bind(
+            "<ButtonPress>", close_if_outside, add="+")
+
+    def open_winuhid_driver_manager(self, anchor_widget=None):
+        anchor_widget = anchor_widget or getattr(self, "driver_frame", None)
+        existing = getattr(self, "winuhid_manager_popup", None)
+        if (existing is not None and existing.winfo_exists()
+                and getattr(self, "winuhid_manager_popup_anchor", None) is anchor_widget):
+            self.close_winuhid_driver_manager()
+            return
+        self.close_winuhid_driver_manager()
+
+        spacing = int(8 * scaling_factor)
+        popup = tk.Frame(
+            self.root, bg=background_color, bd=1, relief=tk.SOLID,
+            padx=spacing, pady=spacing)
+        self.winuhid_manager_popup = popup
+        self.winuhid_manager_popup_anchor = anchor_widget
+
+        self.winuhid_manager_keyboard_button = tk.Button(
+            popup, text="", bg=button_gray, fg=text_color,
+            activebackground=button_gray, activeforeground=text_color,
+            bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")),
+            command=self.toggle_winuhid_keyboard_output,
+        )
+        self.winuhid_manager_keyboard_button.pack(
+            fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
+
+        self.winuhid_manager_mouse_button = tk.Button(
+            popup, text="", bg=button_gray, fg=text_color,
+            activebackground=button_gray, activeforeground=text_color,
+            bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")),
+            command=self.toggle_winuhid_mouse_output,
+        )
+        self.winuhid_manager_mouse_button.pack(
+            fill=tk.X, padx=int(2 * scaling_factor), pady=(spacing, int(2 * scaling_factor)))
+
+        self.winuhid_manager_driver_button = tk.Button(
+            popup, text="", bg=button_gray, fg=text_color,
+            activebackground=button_gray, activeforeground=text_color,
+            bd=0, relief=tk.FLAT, font=scale_font(("Arial", 11, "bold")),
+            command=self.on_winuhid_manager_driver_action,
+        )
+        self.winuhid_manager_driver_button.pack(
+            fill=tk.X, padx=int(2 * scaling_factor), pady=(spacing, int(2 * scaling_factor)))
+
+        popup.place(in_=self.root, x=-10000, y=-10000)
+        popup.update_idletasks()
+        self._place_popup_within_root_bounds(
+            popup, anchor_widget, position_adjust=(2, -2))
+        self.root.after(100, self.bind_winuhid_driver_manager_outside_click)
+        self.refresh_winuhid_driver_manager(initialize_keyboard=True)
+
+    def refresh_winuhid_driver_manager(self, initialize_keyboard=False):
+        popup = getattr(self, "winuhid_manager_popup", None)
+        if popup is None or not popup.winfo_exists():
+            return
+        invalidate_driver_status_cache("winuhid")
+        status = get_winuhid_status(use_cache=False)
+        self._winuhid_manager_status = status
+        if status.state == WINUHID_HEALTHY:
+            action_text = "Uninstall WinUHid Driver"
+        else:
+            action_text = "Install WinUHid Driver"
+        if initialize_keyboard:
+            keyboard_output.initialize()
+        self.winuhid_manager_driver_button.config(text=action_text, state=tk.NORMAL)
+        keyboard_label = ("WinUHid Virtual HID"
+                          if keyboard_output.effective_mode() == keyboard_output.RAW_INPUT
+                          else "Win32 API")
+        mouse_raw = (raw_input_mouse.requested_mode() == "Raw Input"
+                     and status.state == WINUHID_HEALTHY)
+        self.winuhid_manager_keyboard_button.config(
+            text=f"Keyboard: {keyboard_label}", state=tk.NORMAL)
+        self.winuhid_manager_mouse_button.config(
+            text=f"Mouse: {'WinUHid Virtual HID' if mouse_raw else 'Win32 API'}", state=tk.NORMAL)
+
+    def on_winuhid_manager_driver_action(self):
+        status = get_winuhid_status(use_cache=False)
+        if status.state == WINUHID_HEALTHY:
+            if self.ask_centered_yes_no(
+                    "Uninstall WinUHid Driver",
+                    "Uninstall WinUHid and use Win32 API output until it is reinstalled?\n"
+                    "(Requires administrator privileges.)"):
+                self.run_driver_uninstall()
+        elif status.state == WINUHID_PARTIAL:
+            if self.ask_centered_yes_no(
+                    "Repair WinUHid Driver",
+                    "WinUHid is partially installed. Clean up the broken installation "
+                    "and reinstall it?\n\n" + status.describe()
+                    + "\n\n(Requires administrator privileges.)"):
+                if self.run_driver_uninstall():
+                    self.run_driver_install()
+        else:
+            self.run_driver_install()
+        self.refresh_winuhid_driver_manager()
+
+    def toggle_winuhid_keyboard_output(self):
+        button = getattr(self, "profile_keyboard_output_btn", None)
+        if button is not None:
+            button.config(state=tk.DISABLED)
+        try:
+            if keyboard_output.effective_mode() == keyboard_output.RAW_INPUT:
+                keyboard_output.activate_standard(save=True)
             else:
-                self.run_driver_install()
+                status = get_winuhid_status(use_cache=False)
+                if status.state != WINUHID_HEALTHY:
+                    return
+                if not keyboard_output.activate_raw_input(save=True):
+                    self.show_centered_message(
+                        "Keyboard Raw Input Error",
+                        "The WinUHid driver is present, but the virtual keyboard could not "
+                        "be created. Keyboard output remains Standard.")
+        finally:
+            self.refresh_profile_switching_combo_trigger_ui()
+
+    def toggle_winuhid_mouse_output(self):
+        button = getattr(self, "profile_mouse_output_btn", None)
+        if button is not None:
+            button.config(state=tk.DISABLED)
+        try:
+            status = get_winuhid_status(use_cache=False)
+            effective_raw = (raw_input_mouse.requested_mode() == "Raw Input"
+                             and status.state == WINUHID_HEALTHY)
+            if effective_raw:
+                CONFIG.mouse_output_mode = "Standard"
+            else:
+                if status.state != WINUHID_HEALTHY:
+                    return
+                CONFIG.mouse_output_mode = "Raw Input"
+            CONFIG.save_config()
+            self.wake_controller_mouse_output_reconcile()
+        finally:
+            self.refresh_profile_switching_combo_trigger_ui()
+
+    def wake_controller_mouse_output_reconcile(self):
+        """Wake every physical controller, including Full power-saving sleepers."""
+        seen = set()
+        for vc in VIRTUAL_CONTROLLERS:
+            for controller in (getattr(vc, "controllers", ()) or ()):
+                identity = id(controller)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                wake = getattr(controller, "_interp_wake_event", None)
+                if wake is not None:
+                    wake.set()
 
     def wired_controller_label(self, sentence=False):
         """UI name for the wired pad(s) currently connected."""
@@ -4561,6 +4840,9 @@ class ControllerWindow:
         if hasattr(self, 'hide_frame'): self.hide_frame.pack_forget()
         
         driver_type = getattr(CONFIG, "driver_type", "WinUHid")
+        if (driver_type != "WinUHid"
+                or (utils.is_packaged() and not packaged_winuhid_available())):
+            self.close_winuhid_driver_manager()
         
         # Pack the active driver button.  MSIX exposes WinUHid's uninstall
         # operation only when a healthy external copy is present; installation
@@ -5475,7 +5757,6 @@ class ControllerWindow:
         else:
             winuhid_state = get_winuhid_status(use_cache=True).state
             text = ("Uninstall WinUHid Driver" if winuhid_state == WINUHID_HEALTHY
-                    else "Repair WinUHid Driver" if winuhid_state == WINUHID_PARTIAL
                     else "Install WinUHid Driver")
         self.driver_btn.config(text=text)
         self.update_driver_buttons_visibility()
@@ -9206,12 +9487,14 @@ bg_color=panel_bg, widths=[8, 10])
         if not isinstance(w, tk.Entry):
             return False
         try:
+            if not w.winfo_exists():
+                return False
             t = (w.get() or "").strip()
             if t == "":
                 return True
             float(t)
             return True
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, tk.TclError):
             return False
 
     def _nav_numeric_hold_should_step(self, entry, up, now):
@@ -11779,47 +12062,6 @@ bg_color=panel_bg, widths=[8, 10])
         popup.joycon_ir_context = (side, profile_name, category, mapping_scope)
         settings = CONFIG.get_joycon_ir_sensor_settings_scoped(side, profile_name, category, mapping_scope)["ir_mouse"]
 
-        # Raw Input toggle, styled after the wired Pro Controller's "Auto Scan: On/Off".
-        # Packed into the popup itself (not the two-column content grid) and before
-        # _joycon_ir_popup_layout packs `content`, so it spans the popup's full width
-        # inside the existing padding and sits at the very top.
-        # "Raw Input" routes IR mouse motion through a WinUHid virtual HID mouse.
-        # It is available in MSIX only when a healthy external WinUHid exists.
-        if not utils.is_packaged() or packaged_winuhid_available():
-            raw_input_frame = tk.Frame(popup, bg=button_gray)
-            raw_input_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, int(8 * scaling_factor)))
-
-            def raw_input_enabled():
-                # Deliberately the unscoped getter: raw_input is one value per side that
-                # Mode Shift / In-app Gyro layers do not override, because toggling it
-                # creates or destroys a real virtual HID mouse device.
-                return bool(CONFIG.get_joycon_ir_sensor_settings(
-                    side, profile_name, category)["ir_mouse"].get("raw_input", False))
-
-            def refresh_raw_input_button():
-                raw_input_btn.config(text=f"Raw Input: {'On' if raw_input_enabled() else 'Off'}")
-
-            def toggle_raw_input():
-                CONFIG.set_joycon_ir_mouse_setting(side, "raw_input", not raw_input_enabled(),
-                                                   profile_name, category)
-                CONFIG.save_config()
-                refresh_raw_input_button()
-
-            raw_input_btn = tk.Button(
-                raw_input_frame,
-                text="",
-                bg=button_gray,
-                fg=text_color,
-                bd=0,
-                relief=tk.FLAT,
-                font=scale_font(("Arial", 11, "bold")),
-                command=toggle_raw_input,
-            )
-            raw_input_btn.pack(fill=tk.X, padx=int(2 * scaling_factor), pady=int(2 * scaling_factor))
-            refresh_raw_input_button()
-            Tooltip(raw_input_btn, lambda: "Send IR Mouse movement through a virtual HID mouse\n"
-                                           "so games that read Raw Input can see it.")
-
         create_row, finalize, control_font, control_width, _control_height = self._joycon_ir_popup_layout(popup)
         sensitivity_cell = create_row("Sensitivity:")
         sensitivity = tk.Scale(sensitivity_cell, from_=1, to=10, resolution=.2, orient=tk.HORIZONTAL,
@@ -13435,6 +13677,34 @@ bg_color=panel_bg, widths=[8, 10])
         )
         trigger_widget.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
 
+        self.profile_keyboard_output_btn = None
+        self.profile_mouse_output_btn = None
+        # These Profile controls are independent of virtual-controller Driver
+        # Mode.  They exist whenever the separate WinUHid input stack is healthy.
+        status = get_winuhid_status(use_cache=True)
+        if status.state == WINUHID_HEALTHY:
+            keyboard_label = ("WinUHid Virtual HID"
+                              if keyboard_output.effective_mode() == keyboard_output.RAW_INPUT
+                              else "Win32 API")
+            mouse_label = ("WinUHid Virtual HID"
+                           if raw_input_mouse.requested_mode() == "Raw Input"
+                           else "Win32 API")
+            self.profile_keyboard_output_btn = tk.Button(
+                self.profile_switch_trigger_frame,
+                text=f"Keyboard: {keyboard_label}",
+                font=scale_font(("Arial", 10, "bold")), bg=button_gray, fg="white",
+                relief=tk.FLAT, bd=0, command=self.toggle_winuhid_keyboard_output,
+            )
+            self.profile_keyboard_output_btn.pack(
+                side=tk.LEFT, padx=(int(12 * scaling_factor), int(2 * scaling_factor)))
+            self.profile_mouse_output_btn = tk.Button(
+                self.profile_switch_trigger_frame,
+                text=f"Mouse: {mouse_label}",
+                font=scale_font(("Arial", 10, "bold")), bg=button_gray, fg="white",
+                relief=tk.FLAT, bd=0, command=self.toggle_winuhid_mouse_output,
+            )
+            self.profile_mouse_output_btn.pack(side=tk.LEFT, padx=int(2 * scaling_factor))
+
     def set_profile_switching_combo_trigger(self, value):
         CONFIG.profile_switching_combo_trigger = value
         CONFIG.save_config()
@@ -13896,6 +14166,15 @@ bg_color=panel_bg, widths=[8, 10])
         elif getattr(self, 'sim_mode_switch', None):
             self.sim_mode_switch.set_value(new_emu)
 
+        # Reconcile the Profile-scoped keyboard backend immediately. Controller
+        # workers observe settings_generation and reconcile their mouse devices.
+        keyboard_output.initialize()
+        self.wake_controller_mouse_output_reconcile()
+        self.refresh_profile_switching_combo_trigger_ui()
+        if (getattr(self, "winuhid_manager_popup", None) is not None
+                and self.winuhid_manager_popup.winfo_exists()):
+            self.refresh_winuhid_driver_manager()
+
         # 4. ???單?rofile?ustom buttons?隞身摰?
         self.refresh_ui_for_profile()
         self.cancel_all_calibration_after_profile_switch()
@@ -13965,6 +14244,22 @@ bg_color=panel_bg, widths=[8, 10])
         normalized = CONFIG.get_default_profile_dict()
         if isinstance(profile_data, dict):
             normalized.update(copy.deepcopy(profile_data))
+            # Profile exports from older versions have only the per-category,
+            # per-side IR Mouse flag.  Preserve an enabled flag when importing
+            # them into the unified WinUHid Manager setting.
+            if "mouse_output_mode" not in profile_data:
+                legacy_raw = False
+                for cat in ("xbox", "ps4", "ps5_winuhid", "ps5_usbip", "switch1", "switch2"):
+                    cat_data = profile_data.get(cat, {})
+                    sensor = cat_data.get("joycon_ir_sensor", {}) if isinstance(cat_data, dict) else {}
+                    for side in ("left", "right"):
+                        side_data = sensor.get(side, {}) if isinstance(sensor, dict) else {}
+                        mouse = side_data.get("ir_mouse", {}) if isinstance(side_data, dict) else {}
+                        value = mouse.get("raw_input", False) if isinstance(mouse, dict) else False
+                        if isinstance(value, str):
+                            value = value.strip().lower() in ("true", "1", "yes", "on")
+                        legacy_raw = legacy_raw or bool(value)
+                normalized["mouse_output_mode"] = "Raw Input" if legacy_raw else None
         if not isinstance(normalized.get("assigned_apps"), list):
             normalized["assigned_apps"] = []
         normalized["change_profile_list"] = bool(normalized.get("change_profile_list", False))
@@ -14611,6 +14906,10 @@ bg_color=panel_bg, widths=[8, 10])
         if wparam == win32con.PBT_APMSUSPEND:
             logger.info(f"[{current_time}] System Suspend detected (PBT_APMSUSPEND). Starting cleanup...")
             set_suspending(True)
+            # Release the shared virtual/standard keyboard before controller
+            # threads stop producing edges; otherwise a held mapping can remain
+            # logically down across sleep until the next physical transition.
+            keyboard_output.release_all()
 
             # Match the proven 2.1 suspend path.  Do not touch CDC here: once the
             # host sleeps, heartbeat stops naturally and firmware releases BLE via
@@ -14624,7 +14923,12 @@ bg_color=panel_bg, widths=[8, 10])
                             c.interp_running = False
                             c.suspended = True
                             c._is_suspending = True
+                            c._interp_wake_event.set()
+                            c._release_standard_mouse_buttons()
                         vc.force_close()
+            # VMouse devices represent live physical connections; do not leave
+            # their handles or latched buttons alive across system sleep.
+            raw_input_mouse.shutdown()
             
             # CRITICAL: Reset the ViGEm bus singleton to release the driver handle entirely
             from virtual_controller import reset_vigem_bus
@@ -14766,6 +15070,8 @@ bg_color=panel_bg, widths=[8, 10])
         def start_driver_check_and_discovery(startup_bridge_context=None):
             try:
                 self.check_driver_installation()
+                keyboard_output.initialize()
+                self.root.after(0, self.refresh_profile_switching_combo_trigger_ui)
             except Exception as e:
                 logger.debug(f"Startup driver check failed: {e}")
             self.start_discoverer_thread(startup_bridge_context)

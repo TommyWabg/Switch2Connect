@@ -32,6 +32,7 @@ import bluetooth
 import yaml
 from utils import to_hex, convert_mac_string_to_value, decodeu, show_notification
 import time
+import os
 from controller import Controller, ControllerInputData, NINTENDO_VENDOR_ID, CONTROLER_NAMES, VibrationData, NSO_GAMECUBE_CONTROLLER_PID
 from virtual_controller import VirtualController
 from config import CONFIG
@@ -52,6 +53,53 @@ CONNECTION_LOCK = None
 # Set to False while the BLE scanner is in the error-retry loop (Bluetooth off/unavailable).
 # The GUI header reads this to show "Disconnect" instead of "Ready" for the system BLE route.
 _SYSTEM_BT_AVAILABLE = True
+
+# Opt-in terminal diagnostics for the System Bluetooth route only.  Keep this
+# independent of the root log level so normal users and every other transport
+# retain their current logging volume and timing.
+_SYSTEM_BT_DIAGNOSTICS = os.environ.get("SWITCH2_SYSTEM_BT_DIAGNOSTICS", "0") == "1"
+_SYSTEM_BT_DIAG_SESSION = os.urandom(2).hex().upper()
+_SYSTEM_BT_DIAG_LAST = {}
+
+
+def _sysbt_device_id(address):
+    text = str(address or "unknown").replace("-", ":")
+    parts = text.split(":")
+    return "JC-" + "".join(parts[-3:]).upper() if len(parts) >= 3 else text
+
+
+def _sysbt_device_ids(addresses):
+    return [_sysbt_device_id(address) for address in addresses]
+
+
+def _sysbt_diag(message, *args, rate_key=None, rate_seconds=0.0):
+    if not _SYSTEM_BT_DIAGNOSTICS:
+        return
+    if rate_key:
+        now = time.monotonic()
+        if now - _SYSTEM_BT_DIAG_LAST.get(rate_key, 0.0) < rate_seconds:
+            return
+        _SYSTEM_BT_DIAG_LAST[rate_key] = now
+    logger.info("[SYSBT-DIAG session=%s] " + message,
+                _SYSTEM_BT_DIAG_SESSION, *args)
+
+
+def _sysbt_error_class(stage, error, peer_dropped=False):
+    text = f"{type(error).__name__}: {error}".lower()
+    if peer_dropped:
+        return "FIRST_SIDE_DROPPED_DURING_SECOND_CONNECT"
+    if "service" in text or "characteristic" in text:
+        return "GATT_SERVICE_MISSING"
+    if "notify" in text:
+        return "NOTIFICATION_SETUP_FAILED"
+    if "timeout" in text:
+        return ("CONTROLLER_INITIALIZATION_TIMEOUT" if stage == "initialize_started"
+                else "SECOND_GATT_LINK_REJECTED")
+    if stage in ("merge_started", "virtual_device_setup_started"):
+        return "VIRTUAL_MERGE_FAILED"
+    if stage == "pair_started":
+        return "PAIRING_FAILED"
+    return "SYSTEM_BT_CONNECTION_FAILED"
 WIRED_RESCAN_EVENT = None
 WIRED_RESCAN_REQUESTS = []
 WIRED_RESCAN_LOCK = threading.Lock()
@@ -650,10 +698,18 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                                 bridge_connecting_macs.discard(mac)
                                 bridge_retry_counts.pop(mac, None)
                                 if DISCOVERER_LOOP and DISCOVERER_LOOP.is_running():
-                                    async def handle_connected(ch=channel, m=mac):
+                                    async def handle_connected(ch=channel, m=mac, ready_event=cmd):
                                         if ch not in controllers_by_channel:
                                             bridge_init_since.setdefault(m, time.time())
                                             try:
+                                                # Firmware before 2.4 reports GCN connected when
+                                                # notify registration starts, before its input and
+                                                # ACK CCCDs finish draining. Preserve v1.1's settle
+                                                # only for that legacy ESP32 GameCube route.
+                                                if (ready_event == "connected"
+                                                        and shared_client.channel_is_gamecube(ch)
+                                                        and not shared_client.firmware_features.get("gatt_ready")):
+                                                    await asyncio.sleep(0.5)
                                                 ctrl = await add_esp32_channel(ch, m)
                                                 if ctrl is not None:
                                                     controllers_by_channel[ch] = ctrl
@@ -1321,6 +1377,39 @@ async def run_discovery(quit_event, startup_bridge_context=None):
         if quit_event.is_set():
             return
         pending_connections_count = 0
+        sysbt_diag_states = {}
+        sysbt_diag_seen = {}
+        sysbt_diag_last_snapshot = 0.0
+
+        def sysbt_side(product_id):
+            name = str(CONTROLER_NAMES.get(product_id, "Controller"))
+            upper = name.upper()
+            if "LEFT" in upper or upper.endswith(" L"):
+                return "L"
+            if "RIGHT" in upper or upper.endswith(" R"):
+                return "R"
+            return name
+
+        def sysbt_stage(address, stage, advertised_pid=None, **extra):
+            if not _SYSTEM_BT_DIAGNOSTICS:
+                return
+            now = time.monotonic()
+            state = sysbt_diag_states.setdefault(address, {
+                "start": now, "stage_started": now, "stage": "created",
+                "side": sysbt_side(advertised_pid) if advertised_pid is not None else "unknown",
+            })
+            previous = state.get("stage")
+            elapsed = now - state["start"]
+            stage_elapsed = now - state.get("stage_started", now)
+            state.update(stage=stage, stage_started=now)
+            if advertised_pid is not None:
+                state["side"] = sysbt_side(advertised_pid)
+            details = " ".join(f"{key}={value}" for key, value in extra.items())
+            _sysbt_diag(
+                "device=%s side=%s stage=%s previous=%s stage_ms=%d total_ms=%d%s%s",
+                _sysbt_device_id(address), state["side"], stage, previous,
+                int(stage_elapsed * 1000), int(elapsed * 1000),
+                " " if details else "", details)
 
         async def start_all_pending_virtual_usb():
             logger.info("Initializing virtual USB/device setup for all pending controllers in parallel...")
@@ -1339,6 +1428,16 @@ async def run_discovery(quit_event, startup_bridge_context=None):
 
         async def disconnected_controller(controller: Controller):
             logger.info(f"Controller disconected {controller.client.address}")
+            address = getattr(getattr(controller, "client", None), "address", None)
+            state = sysbt_diag_states.get(address, {})
+            _sysbt_diag(
+                "device=%s side=%s event=disconnect stage=%s lifetime_ms=%d "
+                "connected=%s connecting=%s",
+                _sysbt_device_id(address), state.get("side", "unknown"),
+                state.get("stage", "unknown"),
+                int((time.monotonic() - state.get("start", time.monotonic())) * 1000),
+                _sysbt_device_ids(connected_mac_addresses),
+                _sysbt_device_ids(sorted(_connecting_macs)))
         
             if controller.client.address in connected_mac_addresses:
                 connected_mac_addresses.remove(controller.client.address)
@@ -1365,24 +1464,45 @@ async def run_discovery(quit_event, startup_bridge_context=None):
         async def add_controller(device: BLEDevice, paired: bool, advertised_product_id=None):
             nonlocal pending_connections_count
             controller = None
+            peers_at_start = set(connected_mac_addresses)
+            stage = "task_created"
+            sysbt_stage(device.address, stage, advertised_product_id, paired=paired)
             try:
                 controller = Controller(device, advertised_product_id=advertised_product_id,
                                         paired_connection=paired)
+                if _SYSTEM_BT_DIAGNOSTICS:
+                    controller._system_bt_diag_callback = (
+                        lambda detail_stage, **detail: sysbt_stage(
+                            device.address, detail_stage, advertised_product_id, **detail))
                 # Serialize only native link establishment. Initialization uses
                 # this controller's independent GATT characteristics and may run
                 # while the peer starts connecting.
+                stage = "waiting_connection_lock"
+                sysbt_stage(device.address, stage, advertised_product_id,
+                            lock_waiters=len(_connecting_macs))
                 async with CONNECTION_LOCK:
+                    stage = "winrt_connect_started"
+                    sysbt_stage(device.address, stage, advertised_product_id)
                     await controller.connect_ble()
+                    sysbt_stage(device.address, "winrt_connect_succeeded", advertised_product_id,
+                                is_connected=getattr(controller.client, "is_connected", False))
                 logger.info(f"Controller connected via system bluetooth: {device.address}")
                 controller.disconnected_callback = disconnected_controller
 
+                stage = "initialize_started"
+                sysbt_stage(device.address, stage, advertised_product_id)
                 await controller.initialize()
+                sysbt_stage(device.address, "initialize_succeeded", advertised_product_id,
+                            product_id=getattr(getattr(controller, "controller_info", None), "product_id", None))
 
                 if not paired:
                     # Pairing changes shared Windows bonding/radio state and
                     # therefore remains serialized.
+                    stage = "pair_started"
+                    sysbt_stage(device.address, stage, advertised_product_id)
                     async with CONNECTION_LOCK:
                         await controller.pair()
+                    sysbt_stage(device.address, "pair_completed", advertised_product_id)
                     logger.info(f"Paired successfully to {device.address}")
                 # BLE connection confirmed -- promote to connected so scanner won't retry
                 _connecting_macs.discard(device.address)
@@ -1390,6 +1510,10 @@ async def run_discovery(quit_event, startup_bridge_context=None):
             
                 # 4. Integrate the controller into VIRTUAL_CONTROLLERS under the global lock to prevent race conditions
                 async with GLOBAL_LOCK:
+                    stage = "merge_started"
+                    sysbt_stage(device.address, stage, advertised_product_id,
+                                combine=CONFIG.combine_joycons,
+                                side_buttons=controller.side_buttons_pressed)
                     virtual_controller = None
                     if CONFIG.combine_joycons and not controller.side_buttons_pressed:
                         if controller.is_joycon_left():
@@ -1403,6 +1527,9 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                         VIRTUAL_CONTROLLERS[slot_index] = virtual_controller
                     else:
                         virtual_controller.add_controller(controller)
+                    sysbt_stage(device.address, "merge_completed", advertised_product_id,
+                                player=virtual_controller.player_number,
+                                members=len(virtual_controller.controllers))
                 
                     # LED writes are non-critical and used to run twice here
                     # (init_added_controller + update_all_player_leds), delaying
@@ -1434,7 +1561,10 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                 # A controller must become usable as soon as its own input path is
                 # initialized.  Do not make it wait for another pending BLE attempt
                 # (which may still be in WinRT's 20-second connect timeout).
+                stage = "virtual_device_setup_started"
+                sysbt_stage(device.address, stage, advertised_product_id)
                 await asyncio.to_thread(virtual_controller.setup_virtual_device)
+                sysbt_stage(device.address, "virtual_device_ready", advertised_product_id)
                 async def _refresh_leds_after_virtual_ready():
                     try:
                         await update_all_player_leds()
@@ -1442,7 +1572,18 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                         logger.debug(f"Deferred player LED refresh failed: {e}")
                 asyncio.create_task(_refresh_leds_after_virtual_ready())
                 asyncio.create_task(trigger_connection_haptics(controller))
-            except Exception:
+            except Exception as error:
+                peer_dropped = bool(peers_at_start - set(connected_mac_addresses))
+                classification = _sysbt_error_class(stage, error, peer_dropped=peer_dropped)
+                hresult = getattr(error, "hresult", getattr(error, "winerror", ""))
+                _sysbt_diag(
+                    "device=%s side=%s result=failed stage=%s classification=%s "
+                    "exception=%s hresult=%s connected=%s connecting=%s pending=%d",
+                    _sysbt_device_id(device.address), sysbt_side(advertised_product_id),
+                    stage, classification, f"{type(error).__name__}: {error}", hresult,
+                    _sysbt_device_ids(connected_mac_addresses),
+                    _sysbt_device_ids(sorted(_connecting_macs)),
+                    pending_connections_count)
                 logger.exception(f"Unable to initialize device {device.address}")
                 if device.address in connected_mac_addresses:
                     connected_mac_addresses.remove(device.address)
@@ -1462,29 +1603,61 @@ async def run_discovery(quit_event, startup_bridge_context=None):
 
         async def callback(device: BLEDevice, advertising_data: AdvertisementData):
             nonlocal pending_connections_count
-            if full_capacity_reached():
-                return
-            if device.address in connected_mac_addresses or device.address in _connecting_macs:
-                return
             nintendo_manufacturer_data = advertising_data.manufacturer_data.get(NINTENDO_BLUETOOTH_MANUFACTURER_ID)
             if nintendo_manufacturer_data:
+                if len(nintendo_manufacturer_data) < 16:
+                    _sysbt_diag("device=%s decision=ignored_malformed_advertisement length=%d",
+                                _sysbt_device_id(device.address), len(nintendo_manufacturer_data),
+                                rate_key=(device.address, "malformed"), rate_seconds=5.0)
+                    return
                 vendor_id = decodeu(nintendo_manufacturer_data[3:5])
                 product_id = decodeu(nintendo_manufacturer_data[5:7])
                 reconnect_mac = decodeu(nintendo_manufacturer_data[10:16])
                 if vendor_id == NINTENDO_VENDOR_ID and product_id in CONTROLER_NAMES:
+                    side = sysbt_side(product_id)
+                    sysbt_diag_seen[side] = time.monotonic()
+                    if full_capacity_reached():
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_capacity power_mode=%s",
+                            _sysbt_device_id(device.address), side, power_saving.mode(),
+                            rate_key=(device.address, "capacity"), rate_seconds=5.0)
+                        return
+                    if device.address in connected_mac_addresses:
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_already_connected",
+                            _sysbt_device_id(device.address), side,
+                            rate_key=(device.address, "connected"), rate_seconds=5.0)
+                        return
+                    if device.address in _connecting_macs:
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_already_connecting stage=%s",
+                            _sysbt_device_id(device.address), side,
+                            sysbt_diag_states.get(device.address, {}).get("stage", "queued"),
+                            rate_key=(device.address, "connecting"), rate_seconds=5.0)
+                        return
                     logger.debug(f"Manufacturer data: {to_hex(nintendo_manufacturer_data)}")
                     if reconnect_mac == 0:
+                        _sysbt_diag("device=%s side=%s decision=connect_pairing reconnect=zero",
+                                    _sysbt_device_id(device.address), side)
                         logger.info(f"Found pairing device {CONTROLER_NAMES[product_id]} {device.address}")
                         _connecting_macs.add(device.address)
                         async with GLOBAL_LOCK:
                             pending_connections_count += 1
                         asyncio.create_task(add_controller(device, False, product_id))
                     elif reconnect_mac == host_mac_value:
+                        _sysbt_diag("device=%s side=%s decision=connect_paired reconnect=local",
+                                    _sysbt_device_id(device.address), side)
                         logger.info(f"Found already paired device {CONTROLER_NAMES[product_id]} {device.address}")
                         _connecting_macs.add(device.address)
                         async with GLOBAL_LOCK:
                             pending_connections_count += 1
                         asyncio.create_task(add_controller(device, True, product_id))
+                    else:
+                        _sysbt_diag(
+                            "device=%s side=%s decision=ignored_paired_to_different_host "
+                            "classification=PAIRED_TO_DIFFERENT_HOST reconnect=other local_match=false",
+                            _sysbt_device_id(device.address), side,
+                            rate_key=(device.address, "other_host"), rate_seconds=5.0)
 
         def full_capacity_reached():
             controllers = [c for vc in VIRTUAL_CONTROLLERS
@@ -1498,9 +1671,36 @@ async def run_discovery(quit_event, startup_bridge_context=None):
             try:
                 async with BleakScanner(callback) as scanner:
                     _SYSTEM_BT_AVAILABLE = True
+                    _sysbt_diag(
+                        "scanner=started combine_joycons=%s power_mode=%s "
+                        "cached_services=%s",
+                        CONFIG.combine_joycons, power_saving.mode(),
+                        getattr(CONFIG, "winrt_cached_services", True))
                     print("Press a button on a paired controller, or hold sync button on an unpaired controller")
                     while not quit_event.is_set():
                         await asyncio.sleep(1.0)
+                        if (_SYSTEM_BT_DIAGNOSTICS
+                                and time.monotonic() - sysbt_diag_last_snapshot >= 5.0
+                                and (connected_mac_addresses or _connecting_macs)):
+                            sysbt_diag_last_snapshot = time.monotonic()
+                            active = {
+                                _sysbt_device_id(address): state.get("stage", "unknown")
+                                for address, state in sysbt_diag_states.items()
+                                if address in _connecting_macs or address in connected_mac_addresses
+                            }
+                            seen_age = {
+                                side: round(sysbt_diag_last_snapshot - seen, 1)
+                                for side, seen in sysbt_diag_seen.items()
+                            }
+                            watcher_status = "unknown"
+                            if hasattr(scanner, '_backend') and hasattr(scanner._backend, 'watcher'):
+                                watcher_status = getattr(scanner._backend.watcher, 'status', "unknown")
+                            _sysbt_diag(
+                                "snapshot scanner=%s connected=%s connecting=%s pending=%d "
+                                "stages=%s last_advertisement_age_s=%s",
+                                watcher_status, _sysbt_device_ids(connected_mac_addresses),
+                                _sysbt_device_ids(sorted(_connecting_macs)), pending_connections_count,
+                                active, seen_age)
                         if full_capacity_reached():
                             logger.info("Full power-saving capacity reached; pausing automatic BLE scan")
                             break
@@ -2027,6 +2227,12 @@ def emergency_cleanup():
         raw_input_mouse.shutdown()
     except Exception as e:
         logger.debug(f"Raw Input mouse shutdown in emergency_cleanup failed: {e}")
+
+    try:
+        import keyboard_output
+        keyboard_output.shutdown()
+    except Exception as e:
+        logger.debug(f"Raw Input keyboard shutdown in emergency_cleanup failed: {e}")
 
 
     if UPDATE_CALLBACK:

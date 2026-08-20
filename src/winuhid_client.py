@@ -353,6 +353,11 @@ class WINUHID_PS5_GAMEPAD_INFO(ctypes.Structure):
 # Function prototypes configuration helper
 def setup_prototypes():
     if _winuhid is not None:
+        get_interface_version = getattr(_winuhid, "WinUHidGetDriverInterfaceVersion", None)
+        if get_interface_version is not None:
+            get_interface_version.argtypes = []
+            get_interface_version.restype = ctypes.c_ulong
+
         _winuhid.WinUHidCreateDevice.argtypes = [ctypes.POINTER(WINUHID_DEVICE_CONFIG)]
         _winuhid.WinUHidCreateDevice.restype = ctypes.c_void_p
 
@@ -493,6 +498,17 @@ def setup_prototypes():
     _winuhid_devs.WinUHidMouseDestroy.restype = None
 
 setup_prototypes()
+
+
+def driver_interface_version():
+    """Return the live WinUHid interface version, or zero when unavailable."""
+    if _winuhid is None:
+        return 0
+    try:
+        get_interface_version = getattr(_winuhid, "WinUHidGetDriverInterfaceVersion", None)
+        return int(get_interface_version()) if get_interface_version is not None else 0
+    except Exception:
+        return 0
 
 
 class VDS4Gamepad:
@@ -914,6 +930,128 @@ class VMouse:
             self.device = None
         if device and _winuhid_devs:
             _winuhid_devs.WinUHidMouseDestroy(device)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class VKeyboard:
+    """Standard six-key-rollover virtual HID keyboard backed by WinUHid.dll.
+
+    State aggregation and per-controller ownership intentionally live in
+    keyboard_output.py.  This class owns only the HID device and submits one
+    complete keyboard state report at a time.
+    """
+
+    # Generic Desktop / Keyboard top-level collection with the conventional
+    # modifier byte, reserved byte and six Keyboard/Keypad usage slots.
+    _REPORT_DESCRIPTOR_BYTES = bytes((
+        0x05, 0x01,       # Usage Page (Generic Desktop)
+        0x09, 0x06,       # Usage (Keyboard)
+        0xA1, 0x01,       # Collection (Application)
+        0x05, 0x07,       #   Usage Page (Keyboard/Keypad)
+        0x19, 0xE0,       #   Usage Minimum (Left Control)
+        0x29, 0xE7,       #   Usage Maximum (Right GUI)
+        0x15, 0x00,       #   Logical Minimum (0)
+        0x25, 0x01,       #   Logical Maximum (1)
+        0x75, 0x01,       #   Report Size (1)
+        0x95, 0x08,       #   Report Count (8)
+        0x81, 0x02,       #   Input (Data, Variable, Absolute)
+        0x95, 0x01,       #   Report Count (1)
+        0x75, 0x08,       #   Report Size (8)
+        0x81, 0x01,       #   Input (Constant)
+        0x95, 0x06,       #   Report Count (6)
+        0x75, 0x08,       #   Report Size (8)
+        0x15, 0x00,       #   Logical Minimum (0)
+        0x26, 0xFF, 0x00, #   Logical Maximum (255)
+        0x05, 0x07,       #   Usage Page (Keyboard/Keypad)
+        0x19, 0x00,       #   Usage Minimum (Reserved)
+        0x2A, 0xFF, 0x00, #   Usage Maximum (255)
+        0x81, 0x00,       #   Input (Data, Array, Absolute)
+        0xC0,             # End Collection
+    ))
+
+    REPORT_SIZE = 8
+    MAX_KEYS = 6
+
+    def __init__(self, vendor_id=0x057E, product_id=0xF002,
+                 version=0x0100, instance_id="SWITCH2CONNECT_KEYBOARD"):
+        self.device = None
+        self._lock = threading.Lock()
+        self._descriptor = None
+        if _winuhid is None:
+            logger.error("Cannot create WinUHid virtual keyboard: WinUHid DLL not loaded")
+            return
+
+        descriptor_type = ctypes.c_ubyte * len(self._REPORT_DESCRIPTOR_BYTES)
+        self._descriptor = descriptor_type.from_buffer_copy(self._REPORT_DESCRIPTOR_BYTES)
+        config = WINUHID_DEVICE_CONFIG()
+        config.SupportedEvents = WINUHID_EVENT_NONE
+        config.VendorID = int(vendor_id)
+        config.ProductID = int(product_id)
+        config.VersionNumber = int(version)
+        config.ReportDescriptorLength = len(self._REPORT_DESCRIPTOR_BYTES)
+        config.ReportDescriptor = ctypes.cast(self._descriptor, ctypes.c_void_p)
+        config.ContainerId = GUID()
+        config.InstanceID = instance_id
+        config.HardwareIDs = None
+        config.ReadReportPeriodUs = 0
+
+        device = _winuhid.WinUHidCreateDevice(ctypes.byref(config))
+        if not device:
+            logger.error("Failed to create WinUHid virtual keyboard: error %s",
+                         ctypes.GetLastError())
+            return
+        self.device = device
+        try:
+            null_callback = ctypes.cast(ctypes.c_void_p(), WINUHID_EVENT_CALLBACK)
+            if not _winuhid.WinUHidStartDevice(device, null_callback, None):
+                logger.error("Failed to start WinUHid virtual keyboard: error %s",
+                             ctypes.GetLastError())
+                self.close()
+                return
+            if not self.report_state(0, ()):
+                logger.error("Failed to submit initial WinUHid keyboard report")
+                self.close()
+        except Exception:
+            self.close()
+            raise
+
+    def report_state(self, modifiers, usages):
+        if not self.device or _winuhid is None:
+            return False
+        keys = sorted({int(usage) for usage in usages if 0 < int(usage) < 0xE0})
+        if len(keys) > self.MAX_KEYS:
+            # HID ErrorRollOver in every array slot is the conventional 6KRO
+            # response. It lets valid reporting resume once the chord is smaller.
+            keys = [0x01] * self.MAX_KEYS
+        report = (ctypes.c_ubyte * self.REPORT_SIZE)()
+        report[0] = int(modifiers) & 0xFF
+        for index, usage in enumerate(keys):
+            report[index + 2] = usage & 0xFF
+        with self._lock:
+            if not self.device:
+                return False
+            return bool(_winuhid.WinUHidSubmitInputReport(
+                self.device, ctypes.byref(report), ctypes.sizeof(report)))
+
+    def close(self):
+        with self._lock:
+            device = getattr(self, "device", None)
+            self.device = None
+        if device and _winuhid is not None:
+            # Best effort only: callers normally submit the all-up report before
+            # close, but device destruction must still proceed after a failed send.
+            try:
+                report = (ctypes.c_ubyte * self.REPORT_SIZE)()
+                _winuhid.WinUHidSubmitInputReport(
+                    device, ctypes.byref(report), ctypes.sizeof(report))
+            except Exception:
+                pass
+            _winuhid.WinUHidDestroyDevice(device)
 
     def __del__(self):
         try:

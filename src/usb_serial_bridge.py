@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import win32com.client
 import serial
+import keyboard_output
 
 from config import get_driver_path, CONFIG
 _PERF_DIAGNOSTICS = os.environ.get('SWITCH2_PERF_DIAGNOSTICS', '0') == '1'
@@ -76,7 +77,7 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "2.2"
+APP_FIRMWARE_VERSION = "2.4"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_3"
 MAX_ESP32S3_CHANNELS = 8
@@ -86,6 +87,7 @@ NINTENDO_REPORT_SIZE = 64
 # responses (channel byte high bit set) are routed away from this characteristic's
 # callback so they aren't misparsed as controller input.
 INPUT_UUID_PREFIX = "ab7de9be"
+NSO_GAMECUBE_INPUT_UUID = "8261cba1-9435-420c-84d6-f0c75a2c8e4d"
 DEFAULT_STICK_CALIBRATION = bytes.fromhex("00 08 80 dc c5 5d dc c5 5d")
 
 @dataclass
@@ -96,6 +98,8 @@ class PortInfo:
     device_id: str
     likely_ch343: bool
     is_otg: bool = False
+    confidence: int = 0
+    serial_number: str = ""
 
 @dataclass
 class BridgeStatus:
@@ -501,6 +505,12 @@ class ESP32S3SerialClient:
         with self._gatt_lock:
             char = (self._gatt_chars.get(int(channel)) or {}).get(int(handle))
         return char.get("uuid") if char else None
+
+    def channel_is_gamecube(self, channel):
+        """Identify only the bridged NSO GameCube path from discovered GATT metadata."""
+        with self._gatt_lock:
+            chars = (self._gatt_chars.get(int(channel)) or {}).values()
+            return any(char.get("uuid") == NSO_GAMECUBE_INPUT_UUID for char in chars)
 
     async def start_channel_notify(self, channel, uuid, callback):
         self.open()
@@ -1154,6 +1164,9 @@ class ESP32S3ChannelClient:
     def is_connected(self):
         return self.shared_client.is_connected
 
+    def is_gamecube_channel(self):
+        return self.shared_client.channel_is_gamecube(self.channel)
+
     async def disconnect(self):
         return
 
@@ -1178,21 +1191,24 @@ class ESP32S3ChannelClient:
 def scan_serial_ports():
     ports_by_name = {}
 
-    def is_likely_esp32s3(name: str, manufacturer: str, device_id: str):
+    def port_confidence(name: str, manufacturer: str, device_id: str):
         haystack = " ".join([name, manufacturer, device_id]).upper()
-        return (
-            "CH343" in haystack
-            or "WCH" in haystack
-            or "ESP32" in haystack
-            or "USB JTAG" in haystack
-            or "VID_1A86&PID_55D3" in haystack
-            or "VID_303A&PID_1001" in haystack
-            or "VID_303A&PID_4001" in haystack
-            or "VID:PID=303A:1001" in haystack
-            or "VID:PID=303A:4001" in haystack
-            or "303A:1001" in haystack
-            or "303A:4001" in haystack
-        )
+        if any(marker in haystack for marker in (
+                "VID_303A&PID_1001", "VID_303A&PID_4001",
+                "VID:PID=303A:1001", "VID:PID=303A:4001",
+                "303A:1001", "303A:4001")):
+            return 90
+        if "ESP32" in haystack or "USB JTAG" in haystack:
+            return 85
+        if "CH343" in haystack or "VID_1A86&PID_55D3" in haystack:
+            return 80
+        # WCH makes many unrelated UART chips.  In particular, CH340 LED
+        # controllers must not be treated as ESP32-S3 boards.
+        if "CH340" in haystack:
+            return 0
+        if "USB SERIAL DEVICE" in haystack or "USB-SERIAL" in haystack:
+            return 20
+        return 10
 
     def is_otg_port(name: str, manufacturer: str, device_id: str):
         # Native USB/OTG port (ESP32-S3 built-in, VID 303A) — cannot be auto-flash via esptool DTR/RTS
@@ -1207,24 +1223,38 @@ def scan_serial_ports():
             or ("USB JTAG" in haystack and "CH343" not in haystack)
         )
 
-    def add_port(port: str, name: str, manufacturer: str, device_id: str):
+    def add_port(port: str, name: str, manufacturer: str, device_id: str,
+                 serial_number: str = ""):
         if not port:
             return
         port = port.upper()
-        likely = is_likely_esp32s3(name, manufacturer, device_id)
+        confidence = port_confidence(name, manufacturer, device_id)
+        likely = confidence >= 80
         otg = is_otg_port(name, manufacturer, device_id)
         existing = ports_by_name.get(port)
         if existing:
+            merged_name = existing.name or name
+            merged_manufacturer = existing.manufacturer or manufacturer
+            merged_device_id = existing.device_id or device_id
+            merged_confidence = port_confidence(
+                " ".join(filter(None, (existing.name, name))),
+                " ".join(filter(None, (existing.manufacturer, manufacturer))),
+                " ".join(filter(None, (existing.device_id, device_id))),
+            )
             ports_by_name[port] = PortInfo(
                 port,
-                existing.name or name,
-                existing.manufacturer or manufacturer,
-                existing.device_id or device_id,
-                existing.likely_ch343 or likely,
+                merged_name,
+                merged_manufacturer,
+                merged_device_id,
+                merged_confidence >= 80,
                 existing.is_otg or otg,
+                merged_confidence,
+                existing.serial_number or serial_number,
             )
         else:
-            ports_by_name[port] = PortInfo(port, name, manufacturer, device_id, likely, otg)
+            ports_by_name[port] = PortInfo(
+                port, name, manufacturer, device_id, likely, otg,
+                confidence, serial_number)
 
     # pyserial provides the COM path and hardware ID for normal CDC/CH343 boards.
     # Prefer it at startup: WMI's full PnP traversal is comparatively expensive.
@@ -1235,13 +1265,12 @@ def scan_serial_ports():
             name = str(getattr(item, "description", "") or port)
             manufacturer = str(getattr(item, "manufacturer", "") or "")
             device_id = str(getattr(item, "hwid", "") or "")
-            add_port(port, name, manufacturer, device_id)
+            serial_number = str(getattr(item, "serial_number", "") or "")
+            add_port(port, name, manufacturer, device_id, serial_number)
     except Exception as e:
         logger.debug(f"ESP32-S3 pyserial port scan failed: {e}")
-    likely_count = sum(p.likely_ch343 for p in ports_by_name.values())
-    if likely_count:
-        return sorted(ports_by_name.values(), key=lambda p: int(re.sub(r"\D", "", p.port) or "9999"))
-
+    # Always enrich pyserial results with WMI.  A low-numbered WCH peripheral
+    # must not prevent a generic "USB Serial Device" ESP32 port being seen.
     try:
         wmi = win32com.client.GetObject("winmgmts://./root/cimv2")
         for item in wmi.ExecQuery("SELECT Name,Manufacturer,DeviceID FROM Win32_PnPEntity"):
@@ -1254,17 +1283,17 @@ def scan_serial_ports():
             add_port(match.group(1), name, manufacturer, device_id)
     except Exception as e:
         logger.debug(f"ESP32-S3 serial scan failed: {e}")
-    try:
-        from serial.tools import list_ports
-        for item in list_ports.comports():
-            port = str(getattr(item, "device", "") or getattr(item, "name", "") or "")
-            name = str(getattr(item, "description", "") or port)
-            manufacturer = str(getattr(item, "manufacturer", "") or "")
-            device_id = str(getattr(item, "hwid", "") or "")
-            add_port(port, name, manufacturer, device_id)
-    except Exception as e:
-        logger.debug(f"ESP32-S3 pyserial port scan failed: {e}")
-    return sorted(ports_by_name.values(), key=lambda p: int(re.sub(r"\D", "", p.port) or "9999"))
+    saved_id = str(getattr(CONFIG, "esp32_serial_device_id", "") or "").upper()
+    saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+
+    def sort_key(info):
+        identity_match = bool(
+            (saved_id and saved_id == info.device_id.upper())
+            or (saved_serial and saved_serial == info.serial_number.upper()))
+        return (-int(identity_match), -info.confidence,
+                int(re.sub(r"\D", "", info.port) or "9999"))
+
+    return sorted(ports_by_name.values(), key=sort_key)
 
 def close_all_clients():
     """Close all active ESP32-S3 serial clients so COM port is released for reflashing or replug."""
@@ -1429,27 +1458,105 @@ def is_expected_firmware(status_text: str, expected_version: str | None = None):
         and identity["build"] == EXPECTED_FIRMWARE_BUILD
     )
 
-def detect_bridge():
+
+def is_bridge_firmware(status_text: str):
+    """Accept this application's bridge builds, including an older version."""
+    identity = parse_firmware_identity(status_text)
+    return bool(
+        _read_json_string(status_text, "cmd").lower() == "status"
+        and identity["profile"] == EXPECTED_FIRMWARE_PROFILE
+        and identity["build"] == EXPECTED_FIRMWARE_BUILD
+    )
+
+def format_port_label(port_info: PortInfo, verified=False):
+    details = port_info.name or port_info.manufacturer or "Serial device"
+    suffix = " - Verified ESP32-S3" if verified else ""
+    return f"{port_info.port} - {details}{suffix}"
+
+
+def list_bridge_port_candidates():
+    """Return every detected COM port in ESP32-likelihood order for the UI."""
+    return scan_serial_ports()
+
+
+def _configured_port(serials, preferred_port=None):
+    requested = str(preferred_port or "").upper()
+    if not requested and getattr(CONFIG, "esp32_serial_port_mode", "auto") == "manual":
+        requested = str(getattr(CONFIG, "esp32_serial_port", "") or "").upper()
+    if requested:
+        exact = next((item for item in serials if item.port.upper() == requested), None)
+        if exact:
+            return exact, True
+        # Native USB can receive a new COM number while switching between the
+        # running CDC firmware and ROM Boot mode.  Follow only the same saved
+        # physical USB serial identity; never fall through to an unrelated port.
+        saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+        same_device = next((item for item in serials
+                            if saved_serial and item.serial_number.upper() == saved_serial), None)
+        return same_device, True
+
+    saved_id = str(getattr(CONFIG, "esp32_serial_device_id", "") or "").upper()
+    saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+    saved = next((item for item in serials if
+                  (saved_id and item.device_id.upper() == saved_id)
+                  or (saved_serial and item.serial_number.upper() == saved_serial)), None)
+    return saved, False
+
+
+def _remember_verified_port(port_info):
+    if port_info is None:
+        return
+    changed = False
+    for key, value in (
+            ("esp32_serial_port", port_info.port.upper()),
+            ("esp32_serial_device_id", port_info.device_id),
+            ("esp32_serial_number", port_info.serial_number)):
+        if getattr(CONFIG, key, "") != value:
+            setattr(CONFIG, key, value)
+            changed = True
+    if changed:
+        CONFIG.save_config()
+
+
+def detect_bridge(preferred_port=None):
     serials = scan_serial_ports()
-    candidates = [p for p in serials if p.likely_ch343]
+    configured, manual = _configured_port(serials, preferred_port)
+    # Manual selection probes exactly one port.  Auto mode probes the remembered
+    # device first, then high-confidence boards and finally generic USB serial
+    # devices.  Explicit CH340 peripherals are never auto-probed.
+    if manual:
+        candidates = [configured] if configured else []
+    else:
+        candidates = []
+        if configured:
+            candidates.append(configured)
+        candidates.extend(p for p in serials
+                          if p not in candidates and p.confidence >= 20)
     # Prefer CH343P (UART) ports for flashing; OTG ports cannot be auto-flashed via DTR/RTS
     ch343_candidates = [p for p in candidates if not p.is_otg]
     otg_candidates = [p for p in candidates if p.is_otg]
     otg_only = bool(otg_candidates and not ch343_candidates)
 
-    flash_candidates = ch343_candidates if ch343_candidates else candidates
+    flash_candidates = ch343_candidates + [p for p in candidates if p not in ch343_candidates]
     serial_port = None
     serial_status_text = ""
 
     for candidate in flash_candidates:
         status_text = get_serial_status(candidate)
-        if status_text:
+        if status_text and is_bridge_firmware(status_text):
             serial_port = candidate
             serial_status_text = status_text
+            _remember_verified_port(candidate)
             break
 
-    if serial_port is None and flash_candidates:
-        serial_port = flash_candidates[0]
+    if serial_port is None:
+        # A manually selected port or a high-confidence ESP32/CH343 may be in
+        # bootloader mode and therefore unable to answer the firmware status command.
+        # Never use a generic/CH340 lowest-COM fallback in Auto mode.
+        if manual and configured:
+            serial_port = configured
+        else:
+            serial_port = next((p for p in flash_candidates if p.confidence >= 80), None)
 
     expected_version = get_expected_firmware_version()
     identity = parse_firmware_identity(serial_status_text)
@@ -1557,8 +1664,13 @@ class ESP32S3Controller(Controller):
         # can hold an IR Mouse Raw Input device, so release it here too.
         try:
             self._release_raw_input_device()
+            self._release_standard_mouse_buttons()
         except Exception:
             logger.exception("Failed to release the Raw Input virtual mouse")
+        try:
+            keyboard_output.release_source(self._keyboard_source_prefix)
+        except Exception:
+            logger.exception("Failed to release virtual keyboard inputs")
         if self.client:
             try:
                 if self._owns_client:

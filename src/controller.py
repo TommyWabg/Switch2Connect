@@ -147,6 +147,7 @@ from utils import (
 )
 import utils
 import raw_input_mouse
+import keyboard_output
 from gyro import (
     GYRO_PHASE0_RECORDER,
     IN_APP_HORIZON_PIPELINE_MODE,
@@ -1561,6 +1562,8 @@ class Controller:
         
         self.prev_screenshot = False
         self.prev_key_c = False
+        self._keyboard_source_prefix = str(getattr(device, "address", id(self)))
+        self._mouse_device_key = f"{self._keyboard_source_prefix}:{id(self):x}"
         self.last_click_event_time = 0.0
         
         self.gyro_target_vx = 0.0
@@ -1592,13 +1595,15 @@ class Controller:
         self._interp_wake_event = threading.Event()
         self.virtual_controller = None
 
-        # IR Mouse "Raw Input" mode: when enabled for this Joy-Con's side, motion,
-        # clicks and scroll are submitted through a virtual HID mouse instead of
-        # win32api.mouse_event, so games reading Raw Input (WM_INPUT) receive them.
+        # Profile-wide Mouse Raw Input: every connected controller owns a distinct
+        # WinUHid virtual mouse used by gyro, joystick, IR and mapped mouse actions.
         self._raw_mouse = None
-        self._raw_mouse_side = None
+        self._raw_mouse_key = None
         self._raw_mouse_generation = -1
         self._raw_mouse_buttons = (False, False, False)
+        self._raw_mouse_button_owners = {}
+        self._standard_mouse_button_owners = {}
+        self._raw_mouse_lock = threading.RLock()
         
         self.is_calibrating = False
         self.calibration_end_time = 0
@@ -1899,6 +1904,15 @@ class Controller:
         self.prev_calibration = False
         self.last_remaining_sec = None
     
+    def _system_bt_diag(self, stage, **details):
+        """Emit opt-in diagnostics only when the System-Bluetooth discoverer attached one."""
+        callback = getattr(self, "_system_bt_diag_callback", None)
+        if callable(callback):
+            try:
+                callback(stage, **details)
+            except Exception:
+                pass
+
     async def connect_ble(self):
         try:
             if (self.client is not None):
@@ -1955,15 +1969,26 @@ class Controller:
                 and getattr(CONFIG, "winrt_cached_services", True)
             )
             try:
+                self._system_bt_diag(
+                    "connect_variant_started", filtered=bool(requested_services),
+                    cached=use_cached_services)
                 cached_services_active = await connect_variant(requested_services, use_cached_services)
             except Exception as initial_error:
+                self._system_bt_diag(
+                    "connect_variant_failed", variant="cached_filtered",
+                    error=f"{type(initial_error).__name__}: {initial_error}")
                 if not requested_services:
                     raise
                 await release_client()
                 try:
+                    self._system_bt_diag("connect_variant_started", filtered=True, cached=False)
                     cached_services_active = await connect_variant(requested_services, False)
                 except Exception as filtered_error:
+                    self._system_bt_diag(
+                        "connect_variant_failed", variant="uncached_filtered",
+                        error=f"{type(filtered_error).__name__}: {filtered_error}")
                     await release_client()
+                    self._system_bt_diag("connect_variant_started", filtered=False, cached=False)
                     cached_services_active = await connect_variant(None, False)
 
             services = getattr(self.client, "services", None)
@@ -1971,6 +1996,8 @@ class Controller:
             # does not implement __len__(). Materialize it once for the SW2-service
             # presence check.
             service_list = list(services) if services else []
+            self._system_bt_diag("gatt_services_ready", count=len(service_list),
+                                 cached=cached_services_active)
 
             def has_sw2_service():
                 return any(SW2_SERVICE_UUID in str(getattr(service, "uuid", "")).lower()
@@ -2244,11 +2271,13 @@ class Controller:
                     break
 
             logger.info(f"Starting command response notification for {self.device.address} on {self.command_response_uuid}...")
+            self._system_bt_diag("command_notify_started", uuid=self.command_response_uuid)
             for notify_attempt in range(3):
                 if not self.client.is_connected:
                     raise BleakError("Connection lost during notify retry")
                 try:
                     await self.client.start_notify(self.command_response_uuid, command_response_callback)
+                    self._system_bt_diag("command_notify_ready", attempt=notify_attempt + 1)
                     break
                 except Exception as e:
                     if notify_attempt == 2: raise
@@ -2289,6 +2318,11 @@ class Controller:
                         command for command in sw2_init_commands
                         if command[:2] != (0x01, 0x01)
                     ]
+                is_esp32_gamecube_init = bool(
+                    getattr(self, "is_esp32s3_bridge", False)
+                    and callable(getattr(self.client, "is_gamecube_channel", None))
+                    and self.client.is_gamecube_channel()
+                )
                 _sw2_consec_fail = 0
                 for cmd_id, subcmd_id, data in sw2_init_commands:
                     try:
@@ -2297,7 +2331,8 @@ class Controller:
                         # Commands remain strictly serialised by write_command().
                         # The old post-ACK 10 ms sleep added ~120 ms to every SW2
                         # reconnect without providing a protocol completion signal.
-                        if not getattr(CONFIG, "sw2_zero_command_pacing", True):
+                        if (is_esp32_gamecube_init
+                                or not getattr(CONFIG, "sw2_zero_command_pacing", True)):
                             await asyncio.sleep(0.01)
                     except Exception as e:
                         logger.warning(f"SW2 Init command {cmd_id:02x}:{subcmd_id:02x} failed: {e}")
@@ -2313,6 +2348,9 @@ class Controller:
                 for _ri_attempt in range(3):
                     try:
                         self.controller_info = await self.read_controller_info()
+                        self._system_bt_diag(
+                            "controller_info_ready",
+                            product_id=f"{self.controller_info.product_id:04x}")
                         break
                     except Exception as e:
                         if _ri_attempt == 2:
@@ -2404,6 +2442,7 @@ class Controller:
             self.apply_in_app_joystick_calibration()
 
             await self.enable_input_notify_callback()
+            self._system_bt_diag("input_notify_ready", uuid=INPUT_REPORT_UUID)
             
             # Arm the connection settle gate (see input_report_callback): suppress input
             # until the first neutral frame or this deadline, so connect-moment garbage /
@@ -2415,6 +2454,7 @@ class Controller:
                 await self.enableFeatures(0x27)
             elif not is_sw2_device:
                 await self.enableFeatures(FEATURE_MOTION | FEATURE_MOUSE | FEATURE_MAGNOMETER)
+            self._system_bt_diag("features_ready")
 
             self.interp_running = True
             self.interp_thread = threading.Thread(target=self._interpolation_thread_loop, daemon=True)
@@ -2517,7 +2557,9 @@ class Controller:
         thread = getattr(self, "interp_thread", None)
         thread_alive = bool(thread and thread.is_alive())
         if new_mode == "Full":
-            self._power_saving_release_raw_mouse = True
+            # A Profile-selected Raw Input device represents a connected physical
+            # controller and stays enumerated even while motion processing sleeps.
+            self._power_saving_release_raw_mouse = False
         elif previous_mode == "Full":
             # Recover controllers whose worker was killed by the former event-name bug.
             if not thread_alive:
@@ -2553,8 +2595,13 @@ class Controller:
         # _sync_raw_input_device) has stopped, so it cannot re-acquire behind us.
         try:
             self._release_raw_input_device()
+            self._release_standard_mouse_buttons()
         except Exception:
             logger.exception("Failed to release the Raw Input virtual mouse")
+        try:
+            keyboard_output.release_source(self._keyboard_source_prefix)
+        except Exception:
+            logger.exception("Failed to release virtual keyboard inputs")
 
 
         if self.client:
@@ -4800,16 +4847,16 @@ class Controller:
                                 self.physical_tap_held.add(btn_id)
                                 self.active_tap_keys[btn_id] = (seq, time.perf_counter())
                                 for k in seq:
-                                    self._trigger_custom_os_key(k, True)
+                                    self._trigger_custom_os_key(k, True, f"mapping:{btn_id}:{k}")
                             else:
                                 self.active_custom_keys[btn_id] = (seq, time.perf_counter(), time.perf_counter())
                                 for k in seq:
-                                    self._trigger_custom_os_key(k, True)
+                                    self._trigger_custom_os_key(k, True, f"mapping:{btn_id}:{k}")
                         elif not is_pressed and was_pressed:
                             if btn_id in self.active_custom_keys:
                                 seq, _, _ = self.active_custom_keys.pop(btn_id)
                                 for k in reversed(seq):
-                                    self._trigger_custom_os_key(k, False)
+                                    self._trigger_custom_os_key(k, False, f"mapping:{btn_id}:{k}")
                             # For Tap mode, we release after timeout, but we clear the physical held state here
                             if hasattr(self, 'physical_tap_held') and btn_id in self.physical_tap_held:
                                 self.physical_tap_held.remove(btn_id)
@@ -4818,7 +4865,7 @@ class Controller:
                     if btn_id in self.active_custom_keys:
                         seq, _, _ = self.active_custom_keys.pop(btn_id)
                         for k in reversed(seq):
-                            self._trigger_custom_os_key(k, False)
+                            self._trigger_custom_os_key(k, False, f"mapping:{btn_id}:{k}")
                     if hasattr(self, 'physical_tap_held') and btn_id in self.physical_tap_held:
                         self.physical_tap_held.remove(btn_id)
                 
@@ -4857,7 +4904,7 @@ class Controller:
                 for btn_id, (seq, trigger_time) in self.active_tap_keys.items():
                     if now - trigger_time >= 0.05: # 50ms tap duration
                         for k in reversed(seq):
-                            self._trigger_custom_os_key(k, False)
+                            self._trigger_custom_os_key(k, False, f"mapping:{btn_id}:{k}")
                         expired_taps.append(btn_id)
                 for btn_id in expired_taps:
                     del self.active_tap_keys[btn_id]
@@ -4867,8 +4914,9 @@ class Controller:
                 if now - initial_time >= 0.5:
                     if now - last_repeat >= 0.03:
                         for k in seq:
-                            if k.startswith("VK_"): # Only auto-repeat keyboard keys
-                                self._trigger_custom_os_key(k, True)
+                            if (k.startswith("VK_")
+                                    and keyboard_output.effective_mode() == keyboard_output.STANDARD):
+                                self._trigger_custom_os_key(k, True, f"mapping:{btn_id}:{k}")
                         self.active_custom_keys[btn_id] = (seq, initial_time, now)
             
             # Combine both hold and tap keys for continuous hardware button injection (so console doesn't drop 1-frame taps)
@@ -4895,7 +4943,7 @@ class Controller:
                         last_scroll = self.active_custom_mouse_wheel.get(btn_id, 0)
                         if now - last_scroll > 0.05: # 20 ticks per second
                             delta = 120 if k[3:] == "UP" else -120
-                            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+                            self._emit_mouse_scroll(delta)
                             self.active_custom_mouse_wheel[btn_id] = now
 
             if profile_switch_input_suppressed:
@@ -5004,46 +5052,33 @@ class Controller:
             inputData.buttons |= getattr(inputData, 'custom_buttons_mask', 0)
 
             if trigger_screenshot and not getattr(self, 'prev_screenshot', False):
-                win32api.keybd_event(0x5B, 0, 0, 0)
-                win32api.keybd_event(0x2C, 0, 0, 0)
+                self._trigger_custom_os_key("VK_LWIN", True, "screenshot")
+                self._trigger_custom_os_key("VK_SNAPSHOT", True, "screenshot")
             elif not trigger_screenshot and getattr(self, 'prev_screenshot', False):
-                win32api.keybd_event(0x2C, 0, win32con.KEYEVENTF_KEYUP, 0)
-                win32api.keybd_event(0x5B, 0, win32con.KEYEVENTF_KEYUP, 0)
+                self._trigger_custom_os_key("VK_SNAPSHOT", False, "screenshot")
+                self._trigger_custom_os_key("VK_LWIN", False, "screenshot")
             self.prev_screenshot = trigger_screenshot
 
             if trigger_key_c and not getattr(self, 'prev_key_c', False):
-                win32api.keybd_event(0x43, 0, 0, 0)
+                self._trigger_custom_os_key("VK_C", True, "chat")
             elif not trigger_key_c and getattr(self, 'prev_key_c', False):
-                win32api.keybd_event(0x43, 0, win32con.KEYEVENTF_KEYUP, 0)
+                self._trigger_custom_os_key("VK_C", False, "chat")
             self.prev_key_c = trigger_key_c
 
             if trigger_game_bar and not getattr(self, 'prev_game_bar', False):
-                win32api.keybd_event(0x5B, 0, 0, 0) # Win down
-                win32api.keybd_event(0x47, 0, 0, 0) # G down
-                win32api.keybd_event(0x47, 0, win32con.KEYEVENTF_KEYUP, 0) # G up
-                win32api.keybd_event(0x5B, 0, win32con.KEYEVENTF_KEYUP, 0) # Win up
+                self._tap_os_tokens("game_bar", "VK_LWIN", "VK_G")
             self.prev_game_bar = trigger_game_bar
 
             if trigger_hdr_toggle and not getattr(self, 'prev_hdr_toggle', False):
-                win32api.keybd_event(0x5B, 0, 0, 0) # Win down
-                win32api.keybd_event(0x12, 0, 0, 0) # Alt down
-                win32api.keybd_event(0x42, 0, 0, 0) # B down
-                win32api.keybd_event(0x42, 0, win32con.KEYEVENTF_KEYUP, 0) # B up
-                win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0) # Alt up
-                win32api.keybd_event(0x5B, 0, win32con.KEYEVENTF_KEYUP, 0) # Win up
+                self._tap_os_tokens("hdr_toggle", "VK_LWIN", "VK_MENU", "VK_B")
             self.prev_hdr_toggle = trigger_hdr_toggle
 
             if trigger_sys_manager and not getattr(self, 'prev_sys_manager', False):
-                win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0) # Ctrl down
-                win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0) # Shift down
-                win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0) # Esc down
-                win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0) # Esc up
-                win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0) # Shift up
-                win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0) # Ctrl up
+                self._tap_os_tokens("task_manager", "VK_CONTROL", "VK_SHIFT", "VK_ESCAPE")
             self.prev_sys_manager = trigger_sys_manager
 
             if trigger_on_screen_keyboard and not getattr(self, 'prev_on_screen_keyboard', False):
-                self._tap_os_keys(0x5B, win32con.VK_CONTROL, 0x4F)
+                self._tap_os_tokens("on_screen_keyboard", "VK_LWIN", "VK_CONTROL", "VK_O")
             self.prev_on_screen_keyboard = trigger_on_screen_keyboard
 
             if trigger_media_action and trigger_media_action != getattr(self, 'prev_media_action', None):
@@ -5856,10 +5891,7 @@ class Controller:
                     # WinUHidMouseReportScroll counts in 1/120ths of a detent, the same
                     # scale as WHEEL_DELTA, so the magnitude carries over unchanged.
                     scroll_amount = int(scroll_value * 60 * mouse_config.scroll_sensitivity)
-                    if raw_mouse is not None:
-                        raw_mouse.report_scroll(scroll_amount)
-                    else:
-                        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, scroll_amount, 0)
+                    self._emit_mouse_scroll(scroll_amount)
 
                 self.previous_mouse_state = MouseState(x, y, lb, mb, rb, ir_active)
             else:
@@ -5960,7 +5992,7 @@ class Controller:
         self.previous_mouse_state = None
 
     def _report_raw_mouse_buttons(self, raw_mouse, lb, mb, rb):
-        """Edge-detect the three IR Mouse buttons onto the virtual HID mouse.
+        """Edge-detect the three IR Mouse buttons onto this controller's VMouse.
 
         previous_mouse_state cannot be used for this: it is cleared on every exit
         from IR Mouse mode and is not updated when Raw Input is toggled mid-press,
@@ -5968,11 +6000,11 @@ class Controller:
         """
         prev_lb, prev_mb, prev_rb = self._raw_mouse_buttons
         if lb != prev_lb:
-            raw_mouse.report_button(raw_mouse.BTN_LEFT, lb)
+            self._mouse_button_event(raw_mouse.BTN_LEFT, lb, "ir:left")
         if mb != prev_mb:
-            raw_mouse.report_button(raw_mouse.BTN_MIDDLE, mb)
+            self._mouse_button_event(raw_mouse.BTN_MIDDLE, mb, "ir:middle")
         if rb != prev_rb:
-            raw_mouse.report_button(raw_mouse.BTN_RIGHT, rb)
+            self._mouse_button_event(raw_mouse.BTN_RIGHT, rb, "ir:right")
         self._raw_mouse_buttons = (lb, mb, rb)
 
     # How long a matched In-App Gyro modifier button keeps counting as "pressed" after it
@@ -6589,8 +6621,8 @@ class Controller:
             self._own_steer_value = 0.0
             self._gyro_lock_toggle = False
             self.gyro_steering_origin_accel = None
-            if getattr(self, 'prev_l_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-            if getattr(self, 'prev_r_click', False): win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+            if getattr(self, 'prev_l_click', False): self._mouse_button_event(0, False, "gyro:left")
+            if getattr(self, 'prev_r_click', False): self._mouse_button_event(1, False, "gyro:right")
             self.prev_l_click = self.prev_r_click = False
             self.gyro_residual_x = self.gyro_residual_y = 0.0
 
@@ -6858,12 +6890,12 @@ class Controller:
         new_tokens = set(hold_tokens)
         for token in old_tokens - new_tokens:
             if token.startswith("VK_") or token.startswith("MB_"):
-                self._trigger_custom_os_key(token, False)
+                self._trigger_custom_os_key(token, False, f"joystick:{key}:{token}")
             elif token.startswith("MW_"):
                 self.active_joystick_mouse_wheel.pop((key, token), None)
         for token in new_tokens - old_tokens:
             if token.startswith("VK_") or token.startswith("MB_"):
-                self._trigger_custom_os_key(token, True)
+                self._trigger_custom_os_key(token, True, f"joystick:{key}:{token}")
         self.active_joystick_tokens[key] = new_tokens
         for token in new_tokens:
             if token.startswith("MW_"):
@@ -6900,7 +6932,8 @@ class Controller:
             for direction in trigger_directions:
                 for token in tap_tokens_by_direction.get(direction, []):
                     if token.startswith("VK_") or token.startswith("MB_"):
-                        self._trigger_custom_os_key(token, True)
+                        self._trigger_custom_os_key(
+                            token, True, f"joystick-tap:{key}:{input_state}:{direction}:{token}")
                     elif token.startswith("BTN_"):
                         btn_name = token[4:]
                         if btn_name in SWITCH_BUTTONS:
@@ -6918,9 +6951,10 @@ class Controller:
             token = tap_key[-1]
             if now >= release_time:
                 if token.startswith("VK_") or token.startswith("MB_"):
-                    still_held = any(token in tokens for tokens in self.active_joystick_tokens.values())
-                    if not still_held:
-                        self._trigger_custom_os_key(token, False)
+                    direction = tap_key[-2]
+                    input_name = tap_key[1]
+                    self._trigger_custom_os_key(
+                        token, False, f"joystick-tap:{tap_owner}:{input_name}:{direction}:{token}")
                 expired_taps.append(tap_key)
                 continue
             if token.startswith("BTN_"):
@@ -6943,7 +6977,7 @@ class Controller:
             self.active_joystick_tokens = {}
         for token in self.active_joystick_tokens.pop(key, set()):
             if token.startswith("VK_") or token.startswith("MB_"):
-                self._trigger_custom_os_key(token, False)
+                self._trigger_custom_os_key(token, False, f"joystick:{key}:{token}")
         if hasattr(self, "joystick_tap_armed_inputs"):
             self.joystick_tap_armed_inputs.pop(key, None)
         if hasattr(self, "joystick_tap_armed_triggered_dirs"):
@@ -6953,7 +6987,9 @@ class Controller:
                 if tap_key[0] == key:
                     token = tap_key[-1]
                     if token.startswith("VK_") or token.startswith("MB_"):
-                        self._trigger_custom_os_key(token, False)
+                        self._trigger_custom_os_key(
+                            token, False,
+                            f"joystick-tap:{key}:{tap_key[1]}:{tap_key[-2]}:{token}")
                     self.joystick_tap_releases.pop(tap_key, None)
         if hasattr(self, "active_joystick_mouse_wheel"):
             for wheel_key in list(self.active_joystick_mouse_wheel.keys()):
@@ -7032,23 +7068,23 @@ class Controller:
             elif "left" in directions:
                 horizontal = -step
         if vertical:
-            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, vertical, 0)
+            self._emit_mouse_scroll(vertical)
         if horizontal:
-            win32api.mouse_event(getattr(win32con, "MOUSEEVENTF_HWHEEL", 0x01000), 0, 0, horizontal, 0)
+            self._emit_mouse_scroll(horizontal, horizontal=True)
         if vertical or horizontal:
             self.joystick_scroll_last_time[key] = now
 
     def _trigger_mouse_wheel_token(self, token):
         if token == "MW_UP":
-            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, 120, 0)
+            self._emit_mouse_scroll(120)
         elif token == "MW_DOWN":
-            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
+            self._emit_mouse_scroll(-120)
 
-    def _tap_os_keys(self, *vk_codes):
-        for vk in vk_codes:
-            win32api.keybd_event(vk, 0, 0, 0)
-        for vk in reversed(vk_codes):
-            win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    def _tap_os_tokens(self, source, *tokens):
+        for token in tokens:
+            self._trigger_custom_os_key(token, True, source)
+        for token in reversed(tokens):
+            self._trigger_custom_os_key(token, False, source)
 
     def _tap_media_action(self, action):
         vk_map = {
@@ -7062,7 +7098,16 @@ class Controller:
         }
         vk = vk_map.get(action)
         if vk:
-            self._tap_os_keys(vk)
+            token_map = {
+                getattr(win32con, "VK_MEDIA_PLAY_PAUSE", 0xB3): "VK_MEDIA_PLAY_PAUSE",
+                getattr(win32con, "VK_MEDIA_STOP", 0xB2): "VK_MEDIA_STOP",
+                getattr(win32con, "VK_MEDIA_NEXT_TRACK", 0xB0): "VK_MEDIA_NEXT_TRACK",
+                getattr(win32con, "VK_MEDIA_PREV_TRACK", 0xB1): "VK_MEDIA_PREV_TRACK",
+                win32con.VK_VOLUME_UP: "VK_VOLUME_UP",
+                win32con.VK_VOLUME_DOWN: "VK_VOLUME_DOWN",
+                win32con.VK_VOLUME_MUTE: "VK_VOLUME_MUTE",
+            }
+            self._tap_os_tokens("media_action", token_map[vk])
 
     def _apply_shared_joystick_mapping(self, inputData):
         left_mode = CONFIG.get_mapping_setting_scoped("l_joystick", "Default", self._in_app_gyro_mapping_scope())
@@ -7162,125 +7207,148 @@ class Controller:
         inputData.left_stick = output_left
         inputData.right_stick = output_right
 
-    def _trigger_custom_os_key(self, k, is_down):
+    def _trigger_custom_os_key(self, k, is_down, source_id=None):
         if k.startswith("VK_"):
-            vk_name = k[3:]
-            import win32con
-            import win32api
-            vk_code = getattr(win32con, f"VK_{vk_name}", None)
-            if vk_code is None:
-                if len(vk_name) == 1:
-                    vk_code = ord(vk_name)
-                elif vk_name in ("CONTROL", "CONTROL_L", "CONTROL_R"): vk_code = win32con.VK_CONTROL
-                elif vk_name in ("SHIFT", "SHIFT_L", "SHIFT_R"): vk_code = win32con.VK_SHIFT
-                elif vk_name in ("ALT_L", "ALT_R"): vk_code = win32con.VK_MENU
-                elif vk_name == "MENU": vk_code = win32con.VK_MENU
-                elif vk_name == "SPACE": vk_code = win32con.VK_SPACE
-                elif vk_name == "RETURN": vk_code = win32con.VK_RETURN
-                elif vk_name == "TAB": vk_code = win32con.VK_TAB
-                elif vk_name == "ESCAPE": vk_code = win32con.VK_ESCAPE
-                elif vk_name == "BACKSPACE": vk_code = win32con.VK_BACK
-                elif vk_name == "UP": vk_code = win32con.VK_UP
-                elif vk_name == "DOWN": vk_code = win32con.VK_DOWN
-                elif vk_name == "LEFT": vk_code = win32con.VK_LEFT
-                elif vk_name == "RIGHT": vk_code = win32con.VK_RIGHT
-                elif vk_name == "MEDIA_PLAY_PAUSE": vk_code = 0xB3
-                elif vk_name == "MEDIA_STOP": vk_code = 0xB2
-                elif vk_name == "MEDIA_NEXT_TRACK": vk_code = 0xB0
-                elif vk_name == "MEDIA_PREV_TRACK": vk_code = 0xB1
-                elif vk_name == "VOLUME_UP": vk_code = win32con.VK_VOLUME_UP
-                elif vk_name == "VOLUME_DOWN": vk_code = win32con.VK_VOLUME_DOWN
-                elif vk_name == "VOLUME_MUTE": vk_code = win32con.VK_VOLUME_MUTE
-            if vk_code:
-                if is_down:
-                    win32api.keybd_event(vk_code, 0, 0, 0)
-                else:
-                    win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+            suffix = source_id if source_id is not None else f"direct:{k}"
+            owner = f"{self._keyboard_source_prefix}:{suffix}"
+            keyboard_output.key_event(k, is_down, owner)
         elif k.startswith("MB_"):
             btn = k[3:]
-            import win32con
-            import win32api
-            flags = 0
-            mouse_data = 0
-            if btn == "1": flags = win32con.MOUSEEVENTF_LEFTDOWN if is_down else win32con.MOUSEEVENTF_LEFTUP
-            elif btn == "2": flags = win32con.MOUSEEVENTF_MIDDLEDOWN if is_down else win32con.MOUSEEVENTF_MIDDLEUP
-            elif btn == "3": flags = win32con.MOUSEEVENTF_RIGHTDOWN if is_down else win32con.MOUSEEVENTF_RIGHTUP
-            elif btn in ("4", "5"):
-                # XBUTTON1/XBUTTON2 (back/forward). mouse_event needs the button in mouse_data.
-                MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP = 0x0080, 0x0100
-                flags = MOUSEEVENTF_XDOWN if is_down else MOUSEEVENTF_XUP
-                mouse_data = 1 if btn == "4" else 2
-            if flags:
-                win32api.mouse_event(flags, 0, 0, mouse_data, 0)
+            try:
+                button_index = {1: 0, 2: 2, 3: 1, 4: 3, 5: 4}.get(int(btn), -1)
+            except ValueError:
+                return
+            if 0 <= button_index <= 4:
+                source = source_id if source_id is not None else f"direct:{k}"
+                self._mouse_button_event(button_index, is_down, source)
+
+    @staticmethod
+    def _win32_mouse_button_args(button_index, down):
+        if button_index == 0:
+            return (win32con.MOUSEEVENTF_LEFTDOWN if down else win32con.MOUSEEVENTF_LEFTUP, 0)
+        if button_index == 1:
+            return (win32con.MOUSEEVENTF_RIGHTDOWN if down else win32con.MOUSEEVENTF_RIGHTUP, 0)
+        if button_index == 2:
+            return (win32con.MOUSEEVENTF_MIDDLEDOWN if down else win32con.MOUSEEVENTF_MIDDLEUP, 0)
+        if button_index in (3, 4):
+            return (0x0080 if down else 0x0100, 1 if button_index == 3 else 2)
+        return (0, 0)
+
+    def _mouse_button_event(self, button_index, down, source_id):
+        """Submit one owned mouse-button transition through this controller's sink."""
+        with self._raw_mouse_lock:
+            return self._mouse_button_event_locked(button_index, down, source_id)
+
+    def _mouse_button_event_locked(self, button_index, down, source_id):
+        if (raw_input_mouse.requested_mode() == "Raw Input"
+                and self._raw_mouse is None):
+            self._sync_raw_input_device()
+        raw_mouse = self._raw_mouse
+        if raw_mouse is not None:
+            owners = self._raw_mouse_button_owners.setdefault(button_index, set())
+            was_down = bool(owners)
+            if down:
+                owners.add(str(source_id))
+            else:
+                owners.discard(str(source_id))
+                if not owners:
+                    self._raw_mouse_button_owners.pop(button_index, None)
+            now_down = bool(self._raw_mouse_button_owners.get(button_index))
+            if was_down == now_down:
+                return True
+            return bool(raw_mouse.report_button(button_index, now_down))
+
+        owners = self._standard_mouse_button_owners.setdefault(button_index, set())
+        was_down = bool(owners)
+        if down:
+            owners.add(str(source_id))
+        else:
+            owners.discard(str(source_id))
+            if not owners:
+                self._standard_mouse_button_owners.pop(button_index, None)
+        now_down = bool(self._standard_mouse_button_owners.get(button_index))
+        if was_down == now_down:
+            return True
+        flags, mouse_data = self._win32_mouse_button_args(button_index, now_down)
+        if flags:
+            win32api.mouse_event(flags, 0, 0, mouse_data, 0)
+            return True
+        return False
+
+    def _emit_mouse_scroll(self, value, horizontal=False):
+        with self._raw_mouse_lock:
+            return self._emit_mouse_scroll_locked(value, horizontal)
+
+    def _emit_mouse_scroll_locked(self, value, horizontal=False):
+        if (raw_input_mouse.requested_mode() == "Raw Input"
+                and self._raw_mouse is None):
+            self._sync_raw_input_device()
+        if self._raw_mouse is not None:
+            return bool(self._raw_mouse.report_scroll(value, horizontal))
+        flag = getattr(win32con, "MOUSEEVENTF_HWHEEL", 0x01000) if horizontal else win32con.MOUSEEVENTF_WHEEL
+        win32api.mouse_event(flag, 0, 0, int(value), 0)
+        return True
 
     def _sync_raw_input_device(self):
-        """Create or destroy this Joy-Con's Raw Input virtual mouse to match settings.
+        """Create or destroy this controller's dedicated Raw Input virtual mouse.
 
-        Deliberately reads the *base* IR settings rather than the scope-resolved ones:
-        raw_input is a single per-side switch, so engaging a Mode Shift layer must not
-        make Windows re-enumerate the HID device mid-game.
+        Mouse output is a Profile-wide preference managed by WinUHid Manager, so
+        engaging a Mode Shift layer never re-enumerates the HID device mid-game.
 
         Cheap to call every loop iteration - it returns immediately unless the config
         generation moved, mirroring the _get_ir_sensor_snapshot caching pattern.
         """
-        generation = int(getattr(CONFIG, "settings_generation", 0))
-        if generation == self._raw_mouse_generation:
-            return
-        self._raw_mouse_generation = generation
+        with self._raw_mouse_lock:
+            generation = int(getattr(CONFIG, "settings_generation", 0))
+            if generation == self._raw_mouse_generation:
+                return
+            self._raw_mouse_generation = generation
 
-        wanted_side = None
-        # disconnect() releases the device after joining this thread, but the join has
-        # a timeout - never re-acquire once teardown has begun.
-        if (not utils.is_packaged()) and self.interp_running and self.is_joycon():
-            side = "left" if self.is_joycon_left() else "right"
-            try:
-                enabled = bool(self._get_ir_sensor_snapshot(side)["base"]["ir_mouse"].get("raw_input", False))
-            except Exception:
-                enabled = False
-            if enabled:
-                wanted_side = side
+            wanted_key = None
+            # disconnect() releases the device after joining this thread, but the join
+            # has a timeout - never re-acquire once teardown has begun.
+            if (getattr(self, "interp_running", False)
+                    and raw_input_mouse.requested_mode() == "Raw Input"
+                    and raw_input_mouse.available()):
+                wanted_key = self._mouse_device_key
 
-        if wanted_side == self._raw_mouse_side:
-            return
+            if wanted_key == self._raw_mouse_key:
+                return
 
-        # The output sink is about to change under a possibly-held click.
-        # _release_raw_input_device lifts anything latched on the virtual device;
-        # this lifts anything latched on the legacy mouse_event path, which the raw
-        # branch of simulate_mouse would otherwise never get to release.
-        prev = getattr(self, 'previous_mouse_state', None)
-        if prev is not None and self._raw_mouse is None and (prev.lb or prev.mb or prev.rb):
-            mx, my = win32api.GetCursorPos()
-            press_or_release_mouse_button(False, prev.lb, win32con.MOUSEEVENTF_LEFTDOWN, mx, my)
-            press_or_release_mouse_button(False, prev.mb, win32con.MOUSEEVENTF_MIDDLEDOWN, mx, my)
-            press_or_release_mouse_button(False, prev.rb, win32con.MOUSEEVENTF_RIGHTDOWN, mx, my)
-            self.previous_mouse_state = None
-
-        self._release_raw_input_device()
-        if wanted_side is not None:
-            mouse = raw_input_mouse.acquire(wanted_side)
-            if mouse is not None:
-                self._raw_mouse = mouse
-                self._raw_mouse_side = wanted_side
+            if wanted_key is not None:
+                self._release_standard_mouse_buttons()
+            self._release_raw_input_device()
+            if wanted_key is not None:
+                mouse = raw_input_mouse.acquire(wanted_key)
+                if mouse is not None:
+                    self._raw_mouse = mouse
+                    self._raw_mouse_key = wanted_key
 
     def _release_raw_input_device(self):
-        """Release this controller's reference to the shared per-side virtual mouse."""
-        side = self._raw_mouse_side
-        mouse = self._raw_mouse
-        if mouse is not None:
-            # The device is shared, so leaving a button latched down would strand it
-            # for whoever else holds a reference.
-            lb, mb, rb = self._raw_mouse_buttons
-            if lb:
-                mouse.report_button(mouse.BTN_LEFT, False)
-            if mb:
-                mouse.report_button(mouse.BTN_MIDDLE, False)
-            if rb:
-                mouse.report_button(mouse.BTN_RIGHT, False)
-        self._raw_mouse_buttons = (False, False, False)
-        self._raw_mouse = None
-        self._raw_mouse_side = None
-        if side is not None:
-            raw_input_mouse.release(side)
+        """Release this controller's dedicated virtual mouse and held buttons."""
+        with self._raw_mouse_lock:
+            device_key = self._raw_mouse_key
+            mouse = self._raw_mouse
+            if mouse is not None:
+                for button_index, owners in list(self._raw_mouse_button_owners.items()):
+                    if owners:
+                        mouse.report_button(button_index, False)
+            self._raw_mouse_button_owners.clear()
+            self._raw_mouse_buttons = (False, False, False)
+            self._raw_mouse = None
+            self._raw_mouse_key = None
+            self._raw_mouse_generation = -1
+            if device_key is not None:
+                raw_input_mouse.release(device_key)
+
+    def _release_standard_mouse_buttons(self):
+        for button_index, owners in list(self._standard_mouse_button_owners.items()):
+            if not owners:
+                continue
+            flags, mouse_data = self._win32_mouse_button_args(button_index, False)
+            if flags:
+                win32api.mouse_event(flags, 0, 0, mouse_data, 0)
+        self._standard_mouse_button_owners.clear()
 
     def _wake_interpolation_output(self):
         """Wake this controller's output worker, or the merged pair owner."""
@@ -7304,24 +7372,17 @@ class Controller:
                 self.current_vy = 0.0
                 self.interp_residual_x = 0.0
                 self.interp_residual_y = 0.0
+            # Device enumeration follows connection/Profile state, not mouse
+            # activity or power-saving mode: every connected controller gets one.
+            self._sync_raw_input_device()
             if power_saving.is_full():
                 if timer_acquired:
                     timer_resolution.release()
                     timer_acquired = False
-                if getattr(self, "_power_saving_release_raw_mouse", False):
-                    self._power_saving_release_raw_mouse = False
-                    try:
-                        self._release_raw_input_device()
-                    except Exception:
-                        logger.debug("Failed to release Raw Input mouse for Full mode", exc_info=True)
                 last_time = time.perf_counter()
                 self._interp_wake_event.wait()
                 self._interp_wake_event.clear()
                 continue
-            # Kept above the activity check: the idle branch below continues the loop,
-            # so syncing inside it would never create the device until the IR mouse
-            # first became active.
-            self._sync_raw_input_device()
             self._power_saving_resync_raw_mouse = False
             (gyro_output_active, other_mouse_active,
              gyro_vx, gyro_vy, other_vx, other_vy,

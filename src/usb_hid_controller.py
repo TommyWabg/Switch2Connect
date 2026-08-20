@@ -69,6 +69,7 @@ import json
 from collections import deque
 import timer_resolution
 import power_saving
+import keyboard_output
 
 from config import CONFIG
 from controller import (
@@ -3021,11 +3022,17 @@ class USBHidController(Controller):
         # This class overrides Controller.disconnect() entirely, so the base class never
         # gets to stop the threads it starts in __init__. Do it here.
         self._stop_worker_threads()
+        keyboard_output.release_source(self._keyboard_source_prefix)
         # Off the event loop: these are blocking joins, and the discoverer's wired watcher
         # runs on this same loop. Blocking it here left WIRED_RESCAN_EVENT unserviced, so
         # pressing manual scan during a teardown appeared to do nothing.
         if hasattr(self, "interp_thread") and self.interp_thread.is_alive():
             await asyncio.to_thread(self.interp_thread.join, 0.5)
+        try:
+            self._release_raw_input_device()
+            self._release_standard_mouse_buttons()
+        except Exception:
+            logger.exception("Failed to release mouse output devices")
         if self.client:
             try:
                 await self.client.disconnect()

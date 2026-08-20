@@ -245,12 +245,8 @@ IR_SENSOR_IN_APP_GYRO_DEFAULTS = {
     "dampening_effect_after_released_ms": 200,
 }
 IR_SENSOR_DEFAULTS = {
-    # NOTE: raw_input is deliberately a single per-side value read from the base layer
-    # only (see Config.get_joycon_ir_sensor_settings). It is never resolved per mapping
-    # scope: flipping it creates or destroys a real virtual HID mouse device, and doing
-    # that every time a Mode Shift layer engages would make Windows re-enumerate the
-    # device mid-game. It still lives under ir_mouse so the existing setter whitelist
-    # and normalization apply to it.
+    # `raw_input` is retained only for one-time migration from older config/profile
+    # exports.  Runtime selection now lives in the Profile's mouse_output_mode.
     "left": {"function": "Default", "activate_threshold": 1,
              "ir_mouse": {"sensitivity": 4.0, "raw_input": False, "left_click": ["L"], "right_click": ["ZL"], "middle_click": []},
              "in_app_gyro": IR_SENSOR_IN_APP_GYRO_DEFAULTS.copy()},
@@ -775,6 +771,33 @@ class Config:
                         prof_data[cat][key] = val
                 self._normalize_joystick_deadzone_settings(prof_data[cat])
                 self.ensure_mapping_scope(cat, MAPPING_SCOPE_IN_APP_GYRO)
+
+        # WinUHid keyboard/mouse output is a Profile preference.  Older builds
+        # stored keyboard output globally and IR Mouse Raw Input independently
+        # under every controller category/side.  Migrate once per Profile:
+        # any legacy left/right Raw Input switch enables the unified mouse mode.
+        legacy_keyboard_mode = config.get("keyboard_output_mode")
+        if legacy_keyboard_mode not in ("Standard", "Raw Input"):
+            legacy_keyboard_mode = None
+        for prof_data in self.profiles.values():
+            if not isinstance(prof_data, dict):
+                continue
+            if "keyboard_output_mode" not in prof_data:
+                prof_data["keyboard_output_mode"] = legacy_keyboard_mode
+            if "mouse_output_mode" not in prof_data:
+                legacy_mouse_raw = False
+                for cat in categories:
+                    cat_data = prof_data.get(cat, {})
+                    ir_sensor = cat_data.get("joycon_ir_sensor", {}) if isinstance(cat_data, dict) else {}
+                    for side in ("left", "right"):
+                        side_data = ir_sensor.get(side, {}) if isinstance(ir_sensor, dict) else {}
+                        ir_mouse = side_data.get("ir_mouse", {}) if isinstance(side_data, dict) else {}
+                        raw_value = ir_mouse.get("raw_input", False) if isinstance(ir_mouse, dict) else False
+                        if isinstance(raw_value, str):
+                            raw_value = raw_value.strip().lower() in ("true", "1", "yes", "on")
+                        legacy_mouse_raw = legacy_mouse_raw or bool(raw_value)
+                prof_data["mouse_output_mode"] = "Raw Input" if legacy_mouse_raw else None
+            prof_data["winuhid_output_modes_migrated"] = True
         
         self.gyro_smoothing = 0.0 
         
@@ -802,6 +825,13 @@ class Config:
         self.power_saving_auto_warning_suppressed = bool(config.get("power_saving_auto_warning_suppressed", False))
         self.power_saving_full_warning_suppressed = bool(config.get("power_saving_full_warning_suppressed", False))
         self.driver_installed = config.get("driver_installed", False)
+        # Machine-local ESP32-S3 serial selection.  These defaults keep older
+        # config.yaml files fully compatible.
+        port_mode = str(config.get("esp32_serial_port_mode", "auto") or "auto").lower()
+        self.esp32_serial_port_mode = port_mode if port_mode in ("auto", "manual") else "auto"
+        self.esp32_serial_port = str(config.get("esp32_serial_port", "") or "").upper()
+        self.esp32_serial_device_id = str(config.get("esp32_serial_device_id", "") or "")
+        self.esp32_serial_number = str(config.get("esp32_serial_number", "") or "")
         if _packaged_build():
             # The persisted value is not trusted as a capability grant.  Refresh
             # it from the live system so a separately installed WinUHid can
@@ -1232,14 +1262,13 @@ class Config:
         elif _sens > 10.0:
             _sens = 10.0
         values["ir_mouse"]["sensitivity"] = _sens
-        # raw_input drives virtual-HID-device creation, so a stray value from a
-        # hand-edited config must not reach the hot path as a truthy non-bool.
+        # Legacy migration data is still normalized so imported/hand-edited
+        # profiles cannot turn a string such as "false" into truthy state.
         # bool("false") is True, so strings are resolved by name rather than truthiness.
         _raw_input = values["ir_mouse"].get("raw_input", False)
         if isinstance(_raw_input, str):
             _raw_input = _raw_input.strip().lower() in ("true", "1", "yes", "on")
-        # IR Mouse "Raw Input" creates a WinUHid virtual mouse.  In MSIX it is
-        # available only when the separately installed driver is healthy.
+        # In MSIX, preserve the former capability rule while migration consumes it.
         values["ir_mouse"]["raw_input"] = bool(_raw_input) and packaged_winuhid_available()
         for click_key in ("left_click", "right_click", "middle_click"):
             values["ir_mouse"][click_key] = normalize_ir_mouse_switch_inputs(values["ir_mouse"].get(click_key))
@@ -1409,6 +1438,13 @@ class Config:
             "assigned_apps": [],
             "change_profile_list": False,
             "profile_switching_combo": "",
+            # None preserves the existing capability-derived keyboard default:
+            # Raw Input with a healthy WinUHid stack, Win32 API otherwise.
+            "keyboard_output_mode": None,
+            # Same capability-derived default as keyboard: Raw Input with a
+            # healthy WinUHid installation, Win32 API otherwise.
+            "mouse_output_mode": None,
+            "winuhid_output_modes_migrated": True,
             "mode_shift_enabled": dict(MODE_SHIFT_ENABLED_DEFAULTS),
             MODE_SHIFT_ENABLED_MIGRATION_KEY: True,
         }
@@ -1539,6 +1575,28 @@ class Config:
     def _set_profile_setting(self, key, value):
         if self.active_profile in self.profiles:
             self.profiles[self.active_profile][key] = value
+
+    @property
+    def keyboard_output_mode(self):
+        mode = self._get_profile_setting("keyboard_output_mode")
+        return mode if mode in ("Standard", "Raw Input") else None
+
+    @keyboard_output_mode.setter
+    def keyboard_output_mode(self, value):
+        mode = value if value in ("Standard", "Raw Input") else None
+        self._set_profile_setting("keyboard_output_mode", mode)
+        self._bump_settings_generation()
+
+    @property
+    def mouse_output_mode(self):
+        mode = self._get_profile_setting("mouse_output_mode")
+        return mode if mode in ("Standard", "Raw Input") else None
+
+    @mouse_output_mode.setter
+    def mouse_output_mode(self, value):
+        mode = value if value in ("Standard", "Raw Input") else None
+        self._set_profile_setting("mouse_output_mode", mode)
+        self._bump_settings_generation()
 
     @property
     def gyro_mode(self):
@@ -1749,6 +1807,10 @@ class Config:
         # Snapshot config values in the calling thread
         data = {
             'driver_installed': self.driver_installed,
+            'esp32_serial_port_mode': self.esp32_serial_port_mode,
+            'esp32_serial_port': self.esp32_serial_port,
+            'esp32_serial_device_id': self.esp32_serial_device_id,
+            'esp32_serial_number': self.esp32_serial_number,
             'wired_auto_scan_enabled': self.wired_auto_scan_enabled,
             'wired_usb_enabled': self.wired_auto_scan_enabled,
             'hidhide_installed': self.hidhide_installed,
@@ -1852,6 +1914,10 @@ class Config:
                             pass
 
                     existing_data.update(data)
+                    # This preference moved into each Profile.  Remove the old
+                    # global key after it has been migrated so it cannot become
+                    # a second source of truth in future versions.
+                    existing_data.pop("keyboard_output_mode", None)
 
                     with open(self.config_file_path, 'w', encoding='utf-8') as f:
                         yaml.dump(existing_data, f, Dumper=_YamlDumper, default_flow_style=False)
