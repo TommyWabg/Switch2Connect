@@ -96,7 +96,12 @@ button_remaps:
     vibration_strength_switch: 5
     vibration_strength_xbox: 5
 c_mapping: Default
-calibration_data: {}
+calibration_data:
+  '00': &id001
+  - 5.8153357531760435
+  - -16.58076225045372
+  - 0.2132486388384755
+  849896F74C2D: *id001
 capt_mapping: Default
 cemuhook_mac_to_pad: {}
 cemuhook_pad_overwrite_idx: 0
@@ -130,9 +135,9 @@ gyro_bias_l:
 - 0.0
 - 0.0
 gyro_bias_r:
-- 0.0
-- 0.0
-- 0.0
+- 5.8153357531760435
+- -16.58076225045372
+- 0.2132486388384755
 gyro_mode: World
 gyro_passthrough_9axis_enabled: true
 gyro_passthrough_mode: Cemuhook
@@ -143,9 +148,60 @@ hidhide_installed: false
 home_mapping: Default
 horizon_lock_v2_enabled: false
 in_app_gyro_soft_deadzone: 0.0
-joycon_hold_mode: &id009 {}
+joycon_hold_mode: &id011 {}
 joystick_calibration_data: {}
-mag_calibration_data: {}
+mag_calibration_data:
+  '00': &id002
+    axis_radii:
+    - 239.0
+    - 204.0
+    - 279.0
+    bias:
+    - 100.0
+    - -40.0
+    - -121.0
+    full_ellipsoid_fit_quality:
+      axis_radii:
+      - 239.0
+      - 204.0
+      - 279.0
+      matrix_condition: 1.804244634446753
+      model: full-ellipsoid-v1
+      octant_count: 6
+      p95_relative_residual: 0.1578849422218057
+      reason: insufficient-orientation-coverage
+      reference_magnitude_lsb: 240.59915057486975
+      rms_relative_residual: 0.08775091692947241
+      sample_count: 3346
+      valid: false
+    reference_magnitude_lsb: 240.66666666666666
+    soft_iron_matrix:
+    - - 1.00697350069735
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 1.1797385620915033
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.8626045400238949
+    soft_iron_model: diagonal-minmax-v1
+    soft_iron_quality:
+      condition_proxy: 1.3676470588235294
+      determinant: 1.0247444076212067
+      inverse_condition_proxy: 1.032944744009481
+      matrix:
+      - - 1.00697350069735
+        - 0.0
+        - 0.0
+      - - 0.0
+        - 1.1797385620915033
+        - 0.0
+      - - 0.0
+        - 0.0
+        - 0.8626045400238949
+      reason: null
+  849896F74C2D: *id002
 merged_gyro_side: {}
 mouse:
   enabled: false
@@ -1341,7 +1397,7 @@ profiles:
       Mouse: true
       R Joystick: false
       Steering: false
-    mouse_output_mode: Raw Input
+    mouse_output_mode: null
     profile_switching_combo: ''
     ps4:
       a_mapping: Default
@@ -1375,10 +1431,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id001 []
+              dampening_mode: &id003 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id002 []
+              deadzone_mode: &id004 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1396,10 +1452,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id001
+              dampening_mode: *id003
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id002
+              deadzone_mode: *id004
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1454,10 +1510,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id003 []
+            dampening_mode: &id005 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id004 []
+            deadzone_mode: &id006 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1475,10 +1531,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id003
+            dampening_mode: *id005
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id004
+            deadzone_mode: *id006
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1575,10 +1631,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id005 []
+              dampening_mode: &id007 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id006 []
+              deadzone_mode: &id008 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1596,10 +1652,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id005
+              dampening_mode: *id007
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id006
+              deadzone_mode: *id008
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -1654,10 +1710,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id007 []
+            dampening_mode: &id009 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id008 []
+            deadzone_mode: &id010 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1675,10 +1731,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id007
+            dampening_mode: *id009
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id008
+            deadzone_mode: *id010
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -1847,7 +1903,7 @@ profiles:
         y_mapping: Default
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
-      joycon_hold_mode: *id009
+      joycon_hold_mode: *id011
       joycon_ir_sensor:
         left:
           activate_threshold: 1
@@ -1982,10 +2038,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: []
+              dampening_mode: &id012 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: []
+              deadzone_mode: &id013 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2003,10 +2059,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: []
+              dampening_mode: *id012
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: []
+              deadzone_mode: *id013
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2061,10 +2117,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: []
+            dampening_mode: &id014 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: []
+            deadzone_mode: &id015 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2082,10 +2138,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: []
+            dampening_mode: *id014
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: []
+            deadzone_mode: *id015
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2181,10 +2237,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id010 []
+              dampening_mode: &id016 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id011 []
+              deadzone_mode: &id017 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2202,10 +2258,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id010
+              dampening_mode: *id016
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id011
+              deadzone_mode: *id017
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2260,10 +2316,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id012 []
+            dampening_mode: &id018 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id013 []
+            deadzone_mode: &id019 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2281,10 +2337,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id012
+            dampening_mode: *id018
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id013
+            deadzone_mode: *id019
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2383,10 +2439,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: []
+              dampening_mode: &id020 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: []
+              deadzone_mode: &id021 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2404,10 +2460,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: []
+              dampening_mode: *id020
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: []
+              deadzone_mode: *id021
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2462,10 +2518,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: []
+            dampening_mode: &id022 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: []
+            deadzone_mode: &id023 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2483,10 +2539,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: []
+            dampening_mode: *id022
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: []
+            deadzone_mode: *id023
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -4381,8 +4437,8 @@ virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1250
 window_width: 1270
-window_x: 1247
-window_y: 71
+window_x: 1244
+window_y: 61
 winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5
