@@ -107,14 +107,7 @@ cemuhook_mac_to_pad: {}
 cemuhook_pad_overwrite_idx: 0
 change_profile_mode: Auto
 controller_calibration_aliases: {}
-controller_fast_cache: true
-controller_fast_cache_entries: {}
-driver_installed: false
 driver_type: WinUHid
-esp32_serial_device_id: USB VID:PID=303A:4001 SER=123456
-esp32_serial_number: '123456'
-esp32_serial_port: COM3
-esp32_serial_port_mode: auto
 experimental_9axis_v2_mode: V2
 gc_l_click_mapping: Default
 gc_r_click_mapping: Default
@@ -143,12 +136,10 @@ gyro_passthrough_9axis_enabled: true
 gyro_passthrough_mode: Cemuhook
 gyro_sensitivity: 4.0
 hidhide_hide_enabled: true
-hidhide_install_prompt_suppressed: false
-hidhide_installed: false
 home_mapping: Default
 horizon_lock_v2_enabled: false
 in_app_gyro_soft_deadzone: 0.0
-joycon_hold_mode: &id011 {}
+joycon_hold_mode: {}
 joystick_calibration_data: {}
 mag_calibration_data:
   '00': &id002
@@ -208,9 +199,6 @@ mouse:
   ir_activate_threshold: 2
   sensitivity: 4.0
 open_when_startup: false
-power_saving_auto_warning_suppressed: false
-power_saving_full_warning_suppressed: false
-power_saving_mode: Off
 profile_defaults:
   adaptive_triggers_enabled: true
   audio_haptics_enabled: true
@@ -419,17 +407,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -618,17 +606,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -828,17 +816,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -986,17 +974,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -1115,17 +1103,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: false
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -1316,17 +1304,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
-          linked: false
-          right: 3
+          left: 10
+          linked: true
+          right: 10
         nso_gamecube_controller:
-          left: 3
-          linked: false
-          right: 3
+          left: 10
+          linked: true
+          right: 10
         pro_controller:
-          left: 3
-          linked: false
-          right: 3
+          left: 10
+          linked: true
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -1548,17 +1536,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -1748,17 +1736,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -1903,7 +1891,7 @@ profiles:
         y_mapping: Default
         zl_mapping: Custom[Hold]:MB_3
         zr_mapping: Custom[Hold]:MB_1
-      joycon_hold_mode: *id011
+      joycon_hold_mode: {}
       joycon_ir_sensor:
         left:
           activate_threshold: 1
@@ -1949,17 +1937,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -2038,10 +2026,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id012 []
+              dampening_mode: &id011 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id013 []
+              deadzone_mode: &id012 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2059,10 +2047,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id012
+              dampening_mode: *id011
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id013
+              deadzone_mode: *id012
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2117,10 +2105,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id014 []
+            dampening_mode: &id013 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id015 []
+            deadzone_mode: &id014 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2138,10 +2126,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id014
+            dampening_mode: *id013
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id015
+            deadzone_mode: *id014
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2155,17 +2143,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -2237,10 +2225,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id016 []
+              dampening_mode: &id015 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id017 []
+              deadzone_mode: &id016 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2258,10 +2246,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id016
+              dampening_mode: *id015
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id017
+              deadzone_mode: *id016
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2316,10 +2304,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id018 []
+            dampening_mode: &id017 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id019 []
+            deadzone_mode: &id018 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2337,10 +2325,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id018
+            dampening_mode: *id017
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id019
+            deadzone_mode: *id018
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2354,17 +2342,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -2439,10 +2427,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: &id020 []
+              dampening_mode: &id019 []
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: &id021 []
+              deadzone_mode: &id020 []
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2460,10 +2448,10 @@ profiles:
             in_app_gyro:
               dampening_amount: 90
               dampening_effect_after_released_ms: 200
-              dampening_mode: *id020
+              dampening_mode: *id019
               deadzone_amount: 15.0
               deadzone_effect_after_released_ms: 200
-              deadzone_mode: *id021
+              deadzone_mode: *id020
               deadzone_pause_after_pressed_ms: 100
               deadzone_pause_after_released_ms: 100
               simul: None
@@ -2518,10 +2506,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: &id022 []
+            dampening_mode: &id021 []
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: &id023 []
+            deadzone_mode: &id022 []
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2539,10 +2527,10 @@ profiles:
           in_app_gyro:
             dampening_amount: 90
             dampening_effect_after_released_ms: 200
-            dampening_mode: *id022
+            dampening_mode: *id021
             deadzone_amount: 15.0
             deadzone_effect_after_released_ms: 200
-            deadzone_mode: *id023
+            deadzone_mode: *id022
             deadzone_pause_after_pressed_ms: 100
             deadzone_pause_after_released_ms: 100
             simul: None
@@ -2556,17 +2544,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -2719,17 +2707,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -2919,17 +2907,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3051,17 +3039,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3188,17 +3176,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3318,17 +3306,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3451,17 +3439,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3614,17 +3602,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3745,17 +3733,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -3877,17 +3865,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -4083,17 +4071,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -4213,17 +4201,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -4346,17 +4334,17 @@ profiles:
             sensitivity: 4.0
       joystick_deadzone_settings:
         joycon:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         nso_gamecube_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
         pro_controller:
-          left: 3
+          left: 10
           linked: true
-          right: 3
+          right: 10
       l_joystick_custom:
         down: Default
         left: Default
@@ -4424,22 +4412,15 @@ system_bt_rumble_pacing: false
 system_bt_rumble_trace_dry_run: false
 system_bt_rumble_trace_enabled: false
 system_bt_rumble_trace_path: logs/system_bt_rumble_trace.jsonl
-ui_scale: 1.0
 usbip_sim_mode: Switch1
 vibration_frequency: 10
 vibration_strength: 5
 vibration_strength_ps5: 10
 vibration_strength_switch: 5
 vibration_strength_xbox: 5
-vigembus_installed: false
 vigembus_sim_mode: Xbox360
 virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
-window_height: 1250
-window_width: 1270
-window_x: 1244
-window_y: 61
-winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5
 wired_auto_scan_enabled: true
