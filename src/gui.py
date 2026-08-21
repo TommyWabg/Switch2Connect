@@ -96,7 +96,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.5"
+APP_VERSION = "v2.6"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -6078,7 +6078,7 @@ class ControllerWindow:
             "blocked", "rejected", "missing", "not available",
             "unavailable", "interference", "recovering", "suspended",
             "invalid", "waiting", "collecting", "frozen", "reset",
-            "mismatch", "noise", "error", "failed",
+            "mismatch", "noise", "error", "failed", "adapting",
         )
         if any(term in normalized for term in blocking_terms):
             return "#ff9f0a"

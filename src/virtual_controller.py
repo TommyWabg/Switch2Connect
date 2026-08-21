@@ -1219,21 +1219,28 @@ class VirtualController:
         started_ns = time.perf_counter_ns()
         self._last_submit_phase_ms = None
         submitted = False
-        if self.mode == "PS4":
-            submitted = self.update_as_ps4(inputData, buttons, controller)
-        elif self.mode == "PS5":
-            submitted = self.update_as_ps5(inputData, buttons, controller)
-        elif self.mode == "Switch2":
-            submitted = self.update_as_switch2_pro(inputData, buttons, controller)
-        elif self.mode == "Switch1":
-            if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
-                submitted = self.update_as_switch1_pro(inputData, buttons, controller)
-            elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
-                submitted = self.update_as_switch1_joycon_l(inputData, buttons, controller)
-            elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
-                submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
-        else:
-            submitted = self.update_as_xbox(inputData, buttons, controller, buttonsConfig)
+        # Keep mode selection and report submission in the same state epoch.
+        # Without this lock, set_mode() can replace a PS5 report with an Xbox
+        # report after this thread reads self.mode but before update_as_ps5()
+        # acquires its own lock. state_lock is an RLock, so update methods that
+        # also lock it remain safe.
+        with self.state_lock:
+            if self.mode == "PS4":
+                submitted = self.update_as_ps4(inputData, buttons, controller)
+            elif self.mode == "PS5":
+                submitted = self.update_as_ps5(inputData, buttons, controller)
+            elif self.mode == "Switch2":
+                submitted = self.update_as_switch2_pro(inputData, buttons, controller)
+            elif self.mode == "Switch1":
+                if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
+                    submitted = self.update_as_switch1_pro(inputData, buttons, controller)
+                elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
+                    submitted = self.update_as_switch1_joycon_l(inputData, buttons, controller)
+                elif controller.is_joycon_right() and getattr(self, 'usbip_server_r', None) is not None:
+                    submitted = self.update_as_switch1_joycon_r(inputData, buttons, controller)
+            else:
+                submitted = self.update_as_xbox(
+                    inputData, buttons, controller, buttonsConfig)
 
         elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
         now = time.perf_counter()

@@ -64,6 +64,18 @@ V2_MAG_MOTION_AWARE_DIRECTION_ENABLED = True
 V2_MAG_DIRECTION_CHECK_MAX_RATE_DPS = 3.0
 V2_MAG_DIRECTION_MOTION_EXIT_RATE_DPS = 1.5
 V2_MAG_DIRECTION_SETTLING_SECONDS = 0.2
+MAG_REFERENCE_MODELS = ("Legacy", "Shadow", "Adaptive")
+PRODUCTION_MAG_REFERENCE_MODEL = "Adaptive"
+MAG_REFERENCE_MODEL = os.environ.get(
+    "SWITCH2_MAG_REFERENCE_MODEL",
+    PRODUCTION_MAG_REFERENCE_MODEL).strip()
+if MAG_REFERENCE_MODEL not in MAG_REFERENCE_MODELS:
+    MAG_REFERENCE_MODEL = PRODUCTION_MAG_REFERENCE_MODEL
+V2_MAG_ADAPTIVE_CANDIDATE_SECONDS = 0.25
+V2_MAG_ADAPTIVE_TRACK_SECONDS = 20.0
+V2_MAG_ADAPTIVE_STABLE_STEP_RATIO = 0.05
+V2_MAG_ADAPTIVE_DIRECTION_SECONDS = 0.5
+V2_MAG_ADAPTIVE_DIRECTION_STABILITY_DEG = 2.0
 MOTION_MAG_CLOSURE_REVALIDATION_SECONDS = 0.5
 MOTION_MAG_CLOSURE_REVALIDATION_MAX_INNOVATION_DEG = 20.0
 V2_HEADING_CORRECTION_LEGACY_MAX_DPS = 0.25
@@ -741,9 +753,55 @@ class MotionMagneticClosureEstimator:
         state.update(values)
         return state
 
-    def suspend(self, *reasons: str) -> dict:
+    def _robust_bias_snapshot(self) -> dict:
+        return {
+            "estimate": self.robust_bias_estimate_dps,
+            "valid_buckets": self.robust_bias_valid_buckets,
+            "age": self.robust_bias_observation_age_seconds,
+            "confidence": self.robust_bias_confidence,
+            "raw": self.robust_bias_raw_observation_dps,
+            "bounded": self.robust_bias_bounded_observation_dps,
+            "clipped": self.robust_bias_observation_clipped,
+            "decay": self.robust_bias_decay_active,
+        }
+
+    def _restore_robust_bias_snapshot(self, state: dict,
+                                      dt_seconds: float = 0.0) -> None:
+        self.robust_bias_estimate_dps = state["estimate"]
+        self.robust_bias_valid_buckets = state["valid_buckets"]
+        self.robust_bias_observation_age_seconds = state["age"]
+        self.robust_bias_confidence = state["confidence"]
+        self.robust_bias_raw_observation_dps = state["raw"]
+        self.robust_bias_bounded_observation_dps = state["bounded"]
+        self.robust_bias_observation_clipped = state["clipped"]
+        self.robust_bias_decay_active = state["decay"]
+        dt_value = max(0.0, float(dt_seconds))
+        if math.isfinite(self.robust_bias_observation_age_seconds):
+            self.robust_bias_observation_age_seconds += dt_value
+            if (self.robust_bias_observation_age_seconds
+                    > ROBUST_BIAS_DECAY_DELAY_SECONDS):
+                self.robust_bias_decay_active = True
+                decay = math.exp(-dt_value / ROBUST_BIAS_ESTIMATE_SECONDS)
+                self.robust_bias_estimate_dps *= decay
+                self.robust_bias_confidence *= decay
+
+    def reanchor(self) -> None:
+        """Clear heading debt without discarding the verified gyro-bias model."""
+        self.suspend("reference-reanchored", preserve_bias=True)
+        self._revalidation_required = False
+        self._revalidation_elapsed = MOTION_MAG_CLOSURE_REVALIDATION_SECONDS
+        self.confidence_state = (
+            "Ready" if self.robust_bias_confidence > 0.0
+            else "Collecting")
+
+    def suspend(self, *reasons: str, preserve_bias: bool = False,
+                dt_seconds: float = 0.0) -> dict:
         # Output authority is revoked in the same frame.  The low-frequency
         # estimate remains continuous so recovery cannot create a heading snap.
+        preserved_robust = (
+            self._robust_bias_snapshot()
+            if preserve_bias and self.correction_law == "RobustBiasRate"
+            else None)
         self._output_rate_dps = 0.0
         if not self._relative_anchor_required:
             self.measurement_epoch += 1
@@ -820,6 +878,9 @@ class MotionMagneticClosureEstimator:
         self._bin_elapsed = 0.0
         self._bin_pause_elapsed = 0.0
         self._bin_sample_key = None
+        if preserved_robust is not None:
+            self._restore_robust_bias_snapshot(
+                preserved_robust, dt_seconds)
         suspended_reasons = list(reasons or ("suspended",))
         self._last_state = self._state(
             suspended_reasons,
@@ -877,6 +938,13 @@ class MotionMagneticClosureEstimator:
             self._revalidation_elapsed = 0.0
             self.filtered_innovation_deg = 0.0
             self._last_raw_innovation = None
+        preserved_robust = (
+            self._robust_bias_snapshot()
+            if (MAG_REFERENCE_MODEL == "Adaptive"
+                and self.correction_law == "RobustBiasRate"
+                and (not magnetic_quality_valid
+                     or not magnetic_direction_valid))
+            else None)
         if not magnetic_quality_valid or not magnetic_direction_valid:
             if not self._relative_anchor_required:
                 self.measurement_epoch += 1
@@ -945,6 +1013,9 @@ class MotionMagneticClosureEstimator:
             self._consistency_bucket_mag_delta = 0.0
             self._consistency_bucket_gyro_delta = 0.0
             self.confidence_state = "Magnetic Interference"
+            if preserved_robust is not None:
+                self._restore_robust_bias_snapshot(
+                    preserved_robust, timing.dt_seconds)
         accel_error = abs(math.sqrt(sum(value * value for value in accel)) - 1.0)
         if accel_error > 0.03:
             blocked.append("linear-acceleration")
@@ -2765,6 +2836,13 @@ class MagnetometerQualityGate:
     def __init__(self):
         self.baseline_magnitude = None
         self.baseline_source = None
+        self.candidate_baseline_magnitude = None
+        self.candidate_stability_confidence = 0.0
+        self.magnitude_stability_confidence = 0.0
+        self.baseline_epoch = 0
+        self._baseline_reanchor_pending = False
+        self._direction_candidate_innovation_deg = None
+        self._direction_candidate_seconds = 0.0
         self._baseline_samples = []
         self._baseline_seconds = 0.0
         self._last_magnitude = None
@@ -2782,6 +2860,50 @@ class MagnetometerQualityGate:
         self._post_motion_innovations = []
         self._last_magnetic_heading = None
         self._last_current_heading = None
+
+    @staticmethod
+    def _alpha(dt_seconds: float, time_constant: float) -> float:
+        if time_constant <= 0.0:
+            return 1.0
+        return 1.0 - math.exp(-max(0.0, dt_seconds) / time_constant)
+
+    def _observe_adaptive_candidate(self, magnitude: float,
+                                    timing: V2Timing) -> bool:
+        """Track stable field strength independently from correction gates."""
+        if timing.status != "valid" or not timing.integrate:
+            self.candidate_stability_confidence = 0.0
+            return False
+        if self.candidate_baseline_magnitude is None:
+            self.candidate_baseline_magnitude = magnitude
+            self.candidate_stability_confidence = 1.0
+            return True
+        previous = self.candidate_baseline_magnitude
+        relative_step = abs(magnitude - previous) / max(1e-6, previous)
+        stable = relative_step <= V2_MAG_ADAPTIVE_STABLE_STEP_RATIO
+        if stable:
+            alpha = self._alpha(
+                timing.dt_seconds, V2_MAG_ADAPTIVE_CANDIDATE_SECONDS)
+            self.candidate_baseline_magnitude += alpha * (
+                magnitude - self.candidate_baseline_magnitude)
+            self.candidate_stability_confidence = min(
+                1.0,
+                self.candidate_stability_confidence
+                + timing.dt_seconds / V2_MAG_ADAPTIVE_CANDIDATE_SECONDS)
+        else:
+            self.candidate_baseline_magnitude = magnitude
+            self.candidate_stability_confidence = 0.0
+        return stable
+
+    def _promote_adaptive_baseline(self, source: str) -> None:
+        candidate = self.candidate_baseline_magnitude
+        if candidate is None or candidate <= 1e-6:
+            return
+        self.baseline_magnitude = float(candidate)
+        self.baseline_source = source
+        self.baseline_epoch += 1
+        self._baseline_reanchor_pending = True
+        self._recovery_seconds = V2_MAG_RECOVERY_SECONDS
+        self._last_magnitude = float(candidate)
 
     def reset(self) -> None:
         self.__init__()
@@ -2811,7 +2933,22 @@ class MagnetometerQualityGate:
         reference_valid = bool(
             calibration_valid and math.isfinite(reference_magnitude)
             and reference_magnitude > 1e-6)
-        if self.baseline_magnitude is None and reference_valid:
+        adaptive_observing = MAG_REFERENCE_MODEL in ("Shadow", "Adaptive")
+        adaptive_active = MAG_REFERENCE_MODEL == "Adaptive"
+        basic_valid = not reasons
+        candidate_stable = False
+        if basic_valid and adaptive_observing:
+            candidate_stable = self._observe_adaptive_candidate(
+                magnitude, timing)
+
+        # Adaptive sessions use the first calibrated, non-zero measurement as
+        # their local reference. Figure-8 data calibrates the sensor; it is not
+        # treated as an immutable environmental field-strength baseline.
+        if (adaptive_active and basic_valid
+                and self.baseline_magnitude is None):
+            self._promote_adaptive_baseline("session-bootstrap")
+            self.magnitude_stability_confidence = 1.0
+        elif self.baseline_magnitude is None and reference_valid:
             self.baseline_magnitude = reference_magnitude
             self.baseline_source = "figure-8-calibration"
             self._baseline_samples.clear()
@@ -2832,10 +2969,46 @@ class MagnetometerQualityGate:
         ratio = None
         if self.baseline_magnitude:
             ratio = magnitude / self.baseline_magnitude
-            if ratio < V2_MAG_RATIO_MIN or ratio > V2_MAG_RATIO_MAX:
-                reasons.append("magnitude-ratio")
-            if self._last_magnitude and abs(magnitude - self._last_magnitude) / self._last_magnitude > V2_MAG_JUMP_RATIO:
-                reasons.append("magnitude-jump")
+            magnitude_jump = bool(
+                self._last_magnitude
+                and abs(magnitude - self._last_magnitude)
+                / self._last_magnitude > V2_MAG_JUMP_RATIO)
+            ratio_outside = ratio < V2_MAG_RATIO_MIN or ratio > V2_MAG_RATIO_MAX
+            if adaptive_active and basic_valid:
+                baseline_promoted = False
+                if magnitude_jump:
+                    if (candidate_stable
+                            and self.candidate_stability_confidence >= 1.0):
+                        self._promote_adaptive_baseline(
+                            "adaptive-environment")
+                        ratio = magnitude / self.baseline_magnitude
+                        baseline_promoted = True
+                    else:
+                        reasons.extend((
+                            "magnitude-jump", "baseline-adapting"))
+                if ratio_outside and not baseline_promoted:
+                    if (candidate_stable
+                            and self.candidate_stability_confidence >= 1.0):
+                        self._promote_adaptive_baseline(
+                            "adaptive-environment")
+                        ratio = magnitude / self.baseline_magnitude
+                        baseline_promoted = True
+                    else:
+                        if "baseline-adapting" not in reasons:
+                            reasons.append("baseline-adapting")
+                elif not magnitude_jump and not baseline_promoted:
+                    alpha = self._alpha(
+                        timing.dt_seconds, V2_MAG_ADAPTIVE_TRACK_SECONDS)
+                    self.baseline_magnitude += alpha * (
+                        magnitude - self.baseline_magnitude)
+                    ratio = magnitude / self.baseline_magnitude
+                self.magnitude_stability_confidence = (
+                    self.candidate_stability_confidence)
+            else:
+                if ratio_outside:
+                    reasons.append("magnitude-ratio")
+                if magnitude_jump:
+                    reasons.append("magnitude-jump")
 
         magnitude_valid = not reasons
         if magnitude_valid:
@@ -2846,7 +3019,9 @@ class MagnetometerQualityGate:
                 self.disturbance_count += 1
             self._recovery_seconds = 0.0
 
-        recovering = bool(self.baseline_magnitude) and self._recovery_seconds < V2_MAG_RECOVERY_SECONDS
+        recovering = bool(
+            not adaptive_active and self.baseline_magnitude
+            and self._recovery_seconds < V2_MAG_RECOVERY_SECONDS)
         use_magnetometer = magnitude_valid and not recovering
         if not use_magnetometer:
             self.fallback_count += 1
@@ -2856,6 +3031,14 @@ class MagnetometerQualityGate:
             "calibration_valid": bool(calibration_valid),
             "baseline_magnitude": self.baseline_magnitude,
             "baseline_source": self.baseline_source,
+            "reference_model": MAG_REFERENCE_MODEL,
+            "candidate_baseline_magnitude": self.candidate_baseline_magnitude,
+            "candidate_stability_confidence": (
+                self.candidate_stability_confidence),
+            "magnitude_stability_confidence": (
+                self.magnitude_stability_confidence),
+            "baseline_epoch": self.baseline_epoch,
+            "baseline_reanchor_pending": self._baseline_reanchor_pending,
             "reference_magnitude_lsb": (
                 reference_magnitude if reference_valid else None),
             "baseline_samples": len(self._baseline_samples),
@@ -2911,12 +3094,31 @@ class MagnetometerQualityGate:
         # magnetic north into that frame once, then keep the offset fixed.  This
         # prevents an initial north snap while preserving relative low-frequency
         # magnetic drift correction.
-        initialise = not self.heading_initialized and not self._direction_motion_active
+        reference_reanchored = bool(
+            MAG_REFERENCE_MODEL == "Adaptive"
+            and self._baseline_reanchor_pending
+            and self.heading_initialized)
+        if reference_reanchored:
+            self._baseline_reanchor_pending = False
+            self.heading_reference_offset_deg = _wrap_degrees(
+                current_heading_deg - magnetic_heading_deg)
+            self.direction_valid = True
+            self._direction_recovery_seconds = V2_MAG_RECOVERY_SECONDS
+            self._post_motion_active = False
+            self._post_motion_elapsed = 0.0
+            self._post_motion_innovations.clear()
+            self._last_magnetic_heading = float(magnetic_heading_deg)
+            self._last_current_heading = float(current_heading_deg)
+        initialise = bool(
+            not self.heading_initialized
+            and (MAG_REFERENCE_MODEL == "Adaptive"
+                 or not self._direction_motion_active))
         initialization_method = None
         if initialise:
             self.heading_initialized = True
             self.direction_valid = True
             self._direction_recovery_seconds = V2_MAG_RECOVERY_SECONDS
+            self._baseline_reanchor_pending = False
             if defer_initialization:
                 self.heading_reference_offset_deg = _wrap_degrees(
                     current_heading_deg - magnetic_heading_deg)
@@ -2968,7 +3170,7 @@ class MagnetometerQualityGate:
             post_motion_mean = None
             post_motion_sd = None
         motion_suspended = self._direction_motion_active or self._post_motion_active
-        if initialise:
+        if initialise or reference_reanchored:
             # Do not reject the pre-snap innovation on the same frame.  A
             # reference-offset initialization already has zero aligned error;
             # Legacy snap applies its alignment immediately after this gate.
@@ -2991,6 +3193,48 @@ class MagnetometerQualityGate:
                 self._direction_recovery_seconds = 0.0
             if self._direction_recovery_seconds >= V2_MAG_RECOVERY_SECONDS:
                 self.direction_valid = True
+
+        # A valid field-strength sample can remain direction-rejected forever
+        # when the local magnetic frame changed while the old offset stayed
+        # frozen. In Adaptive mode, accept a new local heading epoch only after
+        # the rejected direction itself is stable during a low-motion period.
+        # Reanchoring maps the current magnetic heading onto the current gyro
+        # heading, so this operation applies zero correction and creates no
+        # stored heading debt.
+        direction_candidate_ready = False
+        if (MAG_REFERENCE_MODEL == "Adaptive"
+                and not self.direction_valid
+                and not motion_suspended
+                and timing.status == "valid"
+                and timing.integrate
+                and angular_rate_dps <= V2_MAG_DIRECTION_MOTION_EXIT_RATE_DPS):
+            candidate = self._direction_candidate_innovation_deg
+            if (candidate is None
+                    or abs(_wrap_degrees(innovation - candidate))
+                    > V2_MAG_ADAPTIVE_DIRECTION_STABILITY_DEG):
+                self._direction_candidate_innovation_deg = innovation
+                self._direction_candidate_seconds = 0.0
+            else:
+                alpha = min(1.0, max(0.0, timing.dt_seconds) / 0.25)
+                self._direction_candidate_innovation_deg = _wrap_degrees(
+                    candidate + alpha * _wrap_degrees(innovation - candidate))
+                self._direction_candidate_seconds += max(
+                    0.0, timing.dt_seconds)
+            if (self._direction_candidate_seconds
+                    >= V2_MAG_ADAPTIVE_DIRECTION_SECONDS):
+                self.heading_reference_offset_deg = _wrap_degrees(
+                    current_heading_deg - magnetic_heading_deg)
+                aligned_magnetic_heading = float(current_heading_deg)
+                innovation = 0.0
+                self.direction_valid = True
+                self._direction_recovery_seconds = V2_MAG_RECOVERY_SECONDS
+                self._direction_candidate_innovation_deg = None
+                self._direction_candidate_seconds = 0.0
+                reference_reanchored = True
+                direction_candidate_ready = True
+        else:
+            self._direction_candidate_innovation_deg = None
+            self._direction_candidate_seconds = 0.0
         return {
             "magnetic_heading_deg": float(magnetic_heading_deg),
             "raw_magnetic_heading_deg": float(magnetic_heading_deg),
@@ -3001,10 +3245,13 @@ class MagnetometerQualityGate:
             "raw_heading_innovation_deg": raw_innovation,
             "aligned_heading_innovation_deg": innovation,
             "heading_initialised_this_frame": initialise,
+            "heading_reference_reanchored": reference_reanchored,
             "heading_initialization_method": initialization_method,
             "heading_initialized": self.heading_initialized,
             "direction_valid": self.direction_valid,
             "direction_recovery_seconds": self._direction_recovery_seconds,
+            "direction_candidate_seconds": self._direction_candidate_seconds,
+            "direction_candidate_ready": direction_candidate_ready,
             "direction_check_suspended": motion_suspended,
             "direction_angular_rate_dps": float(angular_rate_dps),
             "magnetic_heading_rate_dps": magnetic_heading_rate,
@@ -3269,6 +3516,13 @@ class V2AhrsShadow:
                     mag_quality.get("magnitude_valid", False)
                     and not mag_quality.get("recovering", False)),
             )
+            if (MAG_REFERENCE_MODEL == "Adaptive"
+                    and (direction.get("heading_initialised_this_frame", False)
+                         or direction.get(
+                             "heading_reference_reanchored", False))):
+                # Establish a zero-error local epoch immediately. This clears
+                # old heading debt without waiting for deliberate yaw motion.
+                self.motion_magnetic_closure.reanchor()
             motion_closure = self.motion_magnetic_closure.update(
                 current_heading,
                 direction["aligned_magnetic_heading_deg"],
@@ -3347,7 +3601,11 @@ class V2AhrsShadow:
                 else "six-axis-selected")
             motion_closure = self.motion_magnetic_closure.suspend(
                 "magnetic-quality" if magnetometer_enabled
-                else "six-axis-selected")
+                else "six-axis-selected",
+                preserve_bias=bool(
+                    magnetometer_enabled
+                    and MAG_REFERENCE_MODEL == "Adaptive"),
+                dt_seconds=timing.dt_seconds)
             self._reset_heading_correction_ramp()
             self.ahrs.update_no_magnetometer(
                 gyro_array, accel_array, timing.dt_seconds)
@@ -4023,8 +4281,12 @@ class GyroPhase0Recorder:
         magnitude_valid = bool(quality.get("magnitude_valid"))
         direction_valid = bool(quality.get("direction_valid"))
         recovering = bool(quality.get("recovering"))
+        quality_reasons = [str(value) for value in
+                           (quality.get("reasons") or [])]
         if not calibration_accepted:
             mag_status = "Calibration Missing"
+        elif "baseline-adapting" in quality_reasons:
+            mag_status = "Adapting Baseline"
         elif not magnitude_valid:
             mag_status = "Interference Detected"
         elif recovering:
@@ -4045,8 +4307,8 @@ class GyroPhase0Recorder:
             "calibration_model": quality.get("calibration_model"),
             "magnitude": self._number(quality.get("magnitude")),
             "reference_magnitude": self._number(
-                quality.get("reference_magnitude_lsb"),
-                quality.get("baseline_magnitude") or 0.0),
+                quality.get("baseline_magnitude"),
+                quality.get("reference_magnitude_lsb") or 0.0),
             "magnitude_ratio": self._number(quality.get("magnitude_ratio")),
             "direction_valid": direction_valid,
             "heading_error_deg": self._number(
@@ -4134,8 +4396,12 @@ class GyroPhase0Recorder:
                 closure.get("consistency_scale")),
             "consistency_confidence": self._number(
                 closure.get("consistency_confidence")),
-            "confidence_state": str(
-                closure.get("confidence_state") or "Unavailable"),
+            "confidence_state": (
+                "Reference Ready"
+                if (quality.get("reference_model") == "Adaptive"
+                    and str(closure.get("confidence_state"))
+                    == "Waiting for Motion")
+                else str(closure.get("confidence_state") or "Unavailable")),
             "authority_suspended": bool(
                 closure.get("authority_suspended", False)),
             "observed_bias_rate_dps": self._number(
@@ -4324,6 +4590,8 @@ GYRO_PHASE0_RECORDER = _recorder_from_environment()
 atexit.register(GYRO_PHASE0_RECORDER.close)
 __all__ = [
     "CanonicalSensorFrame", "GYRO_PHASE0_RECORDER", "GyroPhase0Recorder",
+    "MAG_REFERENCE_MODEL", "MAG_REFERENCE_MODELS",
+    "PRODUCTION_MAG_REFERENCE_MODEL",
     "MagnetometerQualityGate", "REPLAY_FORMAT", "REPLAY_SCHEMA_VERSION",
     "ReplayFormatError", "S2_ACCEL_LSB_PER_G", "S2_GYRO_LSB_PER_DPS_JOYCON",
     "S2_GYRO_LSB_PER_DPS_PRO", "StationaryRuntimeBias", "V2AhrsShadow",
