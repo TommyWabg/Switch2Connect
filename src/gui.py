@@ -53,7 +53,7 @@ from discoverer import (
     request_wired_rescan,
     set_wired_auto_scan_enabled,
 )
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, packaged_winuhid_available, refresh_packaged_winuhid_capability
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, packaged_winuhid_available, refresh_packaged_winuhid_capability, confirm_packaged_winuhid_capability
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -3871,14 +3871,43 @@ class ControllerWindow:
         if utils.is_packaged():
             previous = bool(getattr(CONFIG, "driver_installed", False))
             available = bool(refresh_packaged_winuhid_capability())
+            preferred = getattr(
+                CONFIG, "preferred_driver_type",
+                getattr(CONFIG, "driver_type", "WinUHid"))
+            # PnP enumeration can transiently miss WinUHid during startup. A
+            # successful native report submission is definitive and prevents a
+            # false early downgrade from becoming the session's driver choice.
+            if (not available and preferred == "WinUHid"
+                    and verify_winuhid_runtime(
+                        attempts=4, delay_seconds=0.25)):
+                available = bool(
+                    confirm_packaged_winuhid_capability(True))
             CONFIG.driver_installed = available
-            if save and previous != available:
-                CONFIG.save_config()
-            if not available and getattr(CONFIG, "driver_type", "WinUHid") == "WinUHid":
+            if available and preferred == "WinUHid":
+                CONFIG.driver_type = "WinUHid"
+                CONFIG.simulation_mode = getattr(
+                    CONFIG, "winuhid_sim_mode", "PS5")
+                CONFIG.driver_fallback_active = False
+            elif (not available
+                  and getattr(CONFIG, "driver_type", "WinUHid") == "WinUHid"):
+                # Effective fallback for this process only. save_config()
+                # serializes preferred_driver_type while this flag is active.
                 CONFIG.driver_type = "ViGEmBus"
                 CONFIG.simulation_mode = getattr(CONFIG, "vigembus_sim_mode", "Xbox360")
-                if save:
-                    CONFIG.save_config()
+                CONFIG.driver_fallback_active = True
+            if save and previous != available:
+                CONFIG.save_config()
+            if hasattr(self, "driver_switch"):
+                options = (["WinUHid", "ViGEmBus", "USBIP"]
+                           if available else ["ViGEmBus", "USBIP"])
+                self.root.after(
+                    0, lambda opts=options: self.driver_switch.update_options(
+                        opts, opts, getattr(CONFIG, "driver_type", opts[0])))
+            if available and CONFIG.driver_type == "WinUHid":
+                # The refreshed stack check or native smoke test already proved
+                # this packaged-session path. Do not immediately reinterpret a
+                # stale PnP cache below as a missing installation.
+                return
         # If driver type is USBIP, check USBIP driver instead
         if getattr(CONFIG, "driver_type", "") == "USBIP":
             usbip_status = get_usbip_status()
@@ -12255,6 +12284,8 @@ bg_color=panel_bg, widths=[8, 10])
 
         # If we got here, checking was successful! Apply the mode switch in memory:
         CONFIG.driver_type = val
+        CONFIG.preferred_driver_type = val
+        CONFIG.driver_fallback_active = False
         self.update_driver_button()
         
         # Load the remembered simulation mode for the target driver

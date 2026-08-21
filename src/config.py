@@ -229,7 +229,7 @@ JOYSTICK_OPTIONS = ["Default", "R Joystick", "L Joystick", "WASD", "KB Arrow Key
 # Physical-stick deadzones are stored at the Profile × Emu Mode category root,
 # deliberately outside the Mode Shift mapping stores.  Both mapping layers then
 # use the same physical-stick threshold.
-JOYSTICK_DEADZONE_DEFAULT_PERCENT = 3
+JOYSTICK_DEADZONE_DEFAULT_PERCENT = 10
 JOYSTICK_DEADZONE_FAMILIES = ("pro_controller", "joycon", "nso_gamecube_controller")
 
 IR_SENSOR_SIDES = ("left", "right")
@@ -532,6 +532,18 @@ def refresh_packaged_winuhid_capability():
     """Re-probe the external WinUHid capability and persist its UI cache."""
     global _PACKAGED_WINUHID_CACHE
     _PACKAGED_WINUHID_CACHE = packaged_winuhid_available(refresh=True)
+    return _PACKAGED_WINUHID_CACHE
+
+
+def confirm_packaged_winuhid_capability(available=True):
+    """Record a definitive runtime probe result for the current process.
+
+    A native virtual-device smoke test is stronger evidence than an early PnP
+    enumeration, which can temporarily report no device while Windows finishes
+    bringing up the driver stack during application startup.
+    """
+    global _PACKAGED_WINUHID_CACHE
+    _PACKAGED_WINUHID_CACHE = bool(available)
     return _PACKAGED_WINUHID_CACHE
 
 def get_app_root():
@@ -857,10 +869,13 @@ class Config:
         self.driver_type = config.get("driver_type", "WinUHid")
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
-        # The MSIX/Store build may use WinUHid only when a healthy copy was
-        # installed separately; it never installs one itself.
-        if _packaged_build() and self.driver_type == "WinUHid" and not packaged_winuhid_available():
-            self.driver_type = "ViGEmBus"
+        # Keep the configured choice intact during module import. Windows may
+        # still be enumerating WinUHid at this point; treating one early miss as
+        # a preference change permanently selected ViGEmBus before the later
+        # runtime probe succeeded. The GUI chooses a temporary effective
+        # fallback after its startup revalidation instead.
+        self.preferred_driver_type = self.driver_type
+        self.driver_fallback_active = False
         # Connection-speed changes are independently reversible.  These defaults
         # enable the ready-driven path while keeping the former waits/pacing as a
         # per-flag fallback for model or adapter regressions.
@@ -1816,7 +1831,12 @@ class Config:
             'hidhide_installed': self.hidhide_installed,
             'hidhide_install_prompt_suppressed': self.hidhide_install_prompt_suppressed,
             'hidhide_hide_enabled': self.hidhide_hide_enabled,
-            'driver_type': self.driver_type,
+            # A startup capability fallback is runtime-only. Never persist it
+            # over the user's selected driver.
+            'driver_type': (
+                self.preferred_driver_type
+                if getattr(self, 'driver_fallback_active', False)
+                else self.driver_type),
             'ready_driven_controller_init': self.ready_driven_controller_init,
             'virtual_driver_ready_probe': self.virtual_driver_ready_probe,
             'sw2_zero_command_pacing': self.sw2_zero_command_pacing,
