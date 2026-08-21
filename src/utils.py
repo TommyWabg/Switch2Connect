@@ -220,6 +220,15 @@ def quaternion_rotate_vector(q, v):
 
 _IS_PACKAGED_CACHE = None
 
+
+def _package_identity_result_has_identity(result):
+    """Interpret the first GetCurrentPackageFullName probe conservatively."""
+    # With a zero-length output buffer, ERROR_INSUFFICIENT_BUFFER is the only
+    # success-shaped result proving that a package full name exists. Treating
+    # access errors or other transient failures as package identity made normal
+    # one-file executables enter the MSIX-only driver fallback path.
+    return int(result) == 122
+
 def is_packaged():
     """Return True when running from inside an MSIX package (has package identity).
 
@@ -236,9 +245,11 @@ def is_packaged():
         import ctypes
         from ctypes import wintypes
         length = ctypes.c_uint32(0)
-        # ERROR_INSUFFICIENT_BUFFER (122) means we have identity; APPMODEL_ERROR_NO_PACKAGE (15700) means none.
+        # ERROR_INSUFFICIENT_BUFFER (122) means we have identity;
+        # APPMODEL_ERROR_NO_PACKAGE (15700), and every other error, do not prove
+        # that this process has package identity.
         rc = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(length), None)
-        packaged = (rc != 15700)
+        packaged = _package_identity_result_has_identity(rc)
     except Exception:
         packaged = False
     _IS_PACKAGED_CACHE = packaged

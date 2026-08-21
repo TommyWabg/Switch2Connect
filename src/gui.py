@@ -3884,10 +3884,15 @@ class ControllerWindow:
                     confirm_packaged_winuhid_capability(True))
             CONFIG.driver_installed = available
             if available and preferred == "WinUHid":
+                was_fallback = bool(getattr(
+                    CONFIG, "driver_fallback_active", False))
                 CONFIG.driver_type = "WinUHid"
                 CONFIG.simulation_mode = getattr(
                     CONFIG, "winuhid_sim_mode", "PS5")
                 CONFIG.driver_fallback_active = False
+                if was_fallback:
+                    logger.info(
+                        "WinUHid startup revalidation succeeded; restored configured driver")
             elif (not available
                   and getattr(CONFIG, "driver_type", "WinUHid") == "WinUHid"):
                 # Effective fallback for this process only. save_config()
@@ -3895,6 +3900,8 @@ class ControllerWindow:
                 CONFIG.driver_type = "ViGEmBus"
                 CONFIG.simulation_mode = getattr(CONFIG, "vigembus_sim_mode", "Xbox360")
                 CONFIG.driver_fallback_active = True
+                logger.warning(
+                    "WinUHid startup revalidation failed; using temporary ViGEmBus fallback")
             if save and previous != available:
                 CONFIG.save_config()
             if hasattr(self, "driver_switch"):
@@ -11152,10 +11159,16 @@ bg_color=panel_bg, widths=[8, 10])
         # MSIX can expose WinUHid only when a healthy copy was installed
         # separately.  It never bundles or installs the driver itself.
         _winuhid_available = packaged_winuhid_available()
-        _driver_opts = (["WinUHid", "ViGEmBus", "USBIP"]
-                        if (not utils.is_packaged() or _winuhid_available)
-                        else ["ViGEmBus", "USBIP"])
         _driver_current = getattr(CONFIG, "driver_type", "WinUHid")
+        _driver_preferred = getattr(
+            CONFIG, "preferred_driver_type", _driver_current)
+        # The first UI build happens before startup revalidation. Preserve a
+        # configured WinUHid choice in the controls until that definitive check
+        # completes; an early cached miss must not visually select ViGEmBus.
+        _driver_opts = (["WinUHid", "ViGEmBus", "USBIP"]
+                        if (not utils.is_packaged() or _winuhid_available
+                            or _driver_preferred == "WinUHid")
+                        else ["ViGEmBus", "USBIP"])
         if _driver_current not in _driver_opts:
             _driver_current = _driver_opts[0]
         self.driver_switch = ToggleSwitch(row_global, _driver_opts, _driver_opts, _driver_current, self.update_driver_type_setting, background_color)
@@ -12192,18 +12205,21 @@ bg_color=panel_bg, widths=[8, 10])
 
         GCTriggerCalibrationWizard(self.root, gc_controller)
 
-    def update_driver_type_setting(self, val):
+    def update_driver_type_setting(self, val, persist_preference=True):
         self.close_joystick_custom_popup()
         # Redirect a saved/manual WinUHid selection only when the external driver
         # is actually unavailable.  MSIX never installs it from inside the app.
-        if utils.is_packaged() and not packaged_winuhid_available() and val == "WinUHid":
+        if (utils.is_packaged()
+                and getattr(CONFIG, "driver_fallback_active", False)
+                and val == "WinUHid"):
             val = "ViGEmBus"
         # 1. 霈??(Removed load_config to prevent async save race condition)
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
         old_sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
         
-        if hasattr(CONFIG, 'active_profile') and CONFIG.active_profile in CONFIG.profiles:
+        if (persist_preference and hasattr(CONFIG, 'active_profile')
+                and CONFIG.active_profile in CONFIG.profiles):
             CONFIG.profiles[CONFIG.active_profile]["driver_type"] = val
             
         if old_driver == val:
@@ -12284,8 +12300,9 @@ bg_color=panel_bg, widths=[8, 10])
 
         # If we got here, checking was successful! Apply the mode switch in memory:
         CONFIG.driver_type = val
-        CONFIG.preferred_driver_type = val
-        CONFIG.driver_fallback_active = False
+        if persist_preference:
+            CONFIG.preferred_driver_type = val
+            CONFIG.driver_fallback_active = False
         self.update_driver_button()
         
         # Load the remembered simulation mode for the target driver
@@ -14160,9 +14177,12 @@ bg_color=panel_bg, widths=[8, 10])
         if not new_driver:
             new_driver = getattr(CONFIG, "driver_type", "WinUHid")
             CONFIG.profiles[new_profile_name]["driver_type"] = new_driver
-        # A WinUHid profile maps to ViGEmBus only when MSIX cannot observe an
-        # externally installed healthy WinUHid stack.
-        if utils.is_packaged() and not packaged_winuhid_available() and new_driver == "WinUHid":
+        # Only a completed startup check may activate the runtime-only fallback.
+        # Do not turn an early cached capability miss into a profile change.
+        temporary_driver_fallback = bool(
+            new_driver == "WinUHid"
+            and getattr(CONFIG, "driver_fallback_active", False))
+        if temporary_driver_fallback:
             new_driver = "ViGEmBus"
             
         new_emu = CONFIG.profiles[new_profile_name].get("simulation_mode")
@@ -14187,7 +14207,9 @@ bg_color=panel_bg, widths=[8, 10])
         if driver_changed:
             if getattr(self, 'driver_switch', None):
                 self.driver_switch.set_value(new_driver)
-            self.update_driver_type_setting(new_driver)
+            self.update_driver_type_setting(
+                new_driver,
+                persist_preference=not temporary_driver_fallback)
             
         # 3. ???單?rofile?mu Mode (If driver changed, it was already applied, but we ensure UI is updated)
         if not driver_changed and emu_changed:

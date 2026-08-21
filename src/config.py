@@ -491,6 +491,7 @@ class MouseConfig:
 
 _PACKAGED_CACHE = None
 _PACKAGED_WINUHID_CACHE = None
+PRODUCTION_DEFAULT_DRIVER_TYPE = "WinUHid"
 def _packaged_build():
     """True when running from the MSIX/Store package (drivers differ there)."""
     global _PACKAGED_CACHE
@@ -565,6 +566,8 @@ def get_resource(resource_path: str):
 class Config:
     def __init__(self, config_file_path: str):
         self.settings_generation = 0
+        self.created_from_bundled_config = False
+        self._first_run_driver_default_pending = False
         if hasattr(sys, 'frozen'):
             base_dir = os.path.dirname(sys.executable)
         else:
@@ -625,6 +628,8 @@ class Config:
                     if os.path.exists(bundled_config):
                         import shutil
                         shutil.copy(bundled_config, self.config_file_path)
+                        self.created_from_bundled_config = True
+                        self._first_run_driver_default_pending = True
         else:
             self.config_file_path = local_config
             if not os.path.exists(self.config_file_path):
@@ -632,6 +637,8 @@ class Config:
                 if os.path.exists(bundled_config):
                     import shutil
                     shutil.copy(bundled_config, self.config_file_path)
+                    self.created_from_bundled_config = True
+                    self._first_run_driver_default_pending = True
 
         self._save_lock = threading.Lock()
         self.load_config()
@@ -869,6 +876,15 @@ class Config:
         self.driver_type = config.get("driver_type", "WinUHid")
         if self.driver_type not in ["WinUHid", "ViGEmBus", "USBIP"]:
             self.driver_type = "WinUHid"
+        if self._first_run_driver_default_pending:
+            # A machine with no external config is a genuine first run. Do not
+            # let machine-local state captured in a build seed become the new
+            # user's persistent driver choice.
+            self.driver_type = PRODUCTION_DEFAULT_DRIVER_TYPE
+            active = self.profiles.get(self.active_profile)
+            if isinstance(active, dict):
+                active["driver_type"] = PRODUCTION_DEFAULT_DRIVER_TYPE
+            self._first_run_driver_default_pending = False
         # Keep the configured choice intact during module import. Windows may
         # still be enumerating WinUHid at this point; treating one early miss as
         # a preference change permanently selected ViGEmBus before the later
