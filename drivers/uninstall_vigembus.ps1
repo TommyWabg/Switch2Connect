@@ -254,6 +254,27 @@ function Get-ViGEmMsiEntries {
     })
 }
 
+function Invoke-MsiUninstall {
+    param([Parameter(Mandatory = $true)][string]$ProductCode)
+    try {
+        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList "/X$ProductCode /qn /norestart" -Wait -PassThru
+        return [int]$process.ExitCode
+    }
+    catch {
+        # Depending on the Windows Installer / PowerShell combination, MSI errors
+        # can be surfaced either as the process exit code or as a Win32Exception.
+        $nativeCode = 0
+        if ($_.Exception.PSObject.Properties.Name -contains "NativeErrorCode") {
+            $nativeCode = [int]$_.Exception.NativeErrorCode
+        }
+        if ($nativeCode -eq 0) {
+            $nativeCode = [int]($_.Exception.HResult -band 0xFFFF)
+        }
+        if (@(1612, 1624) -contains $nativeCode) { return $nativeCode }
+        throw
+    }
+}
+
 function ConvertTo-PackedProductCode {
     param([Parameter(Mandatory = $true)][string]$ProductCode)
     $hex = ([guid]$ProductCode).ToString("N").ToUpperInvariant()
@@ -278,7 +299,10 @@ function Remove-OrphanedMsiRegistration {
         [Parameter(Mandatory = $true)][string]$ProductCode,
         [Parameter(Mandatory = $true)][string]$DisplayName
     )
-    if ($DisplayName -notmatch '(?i)^ViGEm( Bus Driver|Bus| Virtual Gamepad Emulation)') {
+    $knownViGEmDisplayName =
+        $DisplayName -match '(?i)^ViGEm( Bus Driver|Bus| Virtual Gamepad Emulation)' -or
+        $DisplayName -match '(?i)^Nefarius Virtual Gamepad Emulation Bus Driver$'
+    if (-not $knownViGEmDisplayName) {
         throw "Refusing to remove unexpected MSI registration: $DisplayName ($ProductCode)"
     }
 
@@ -306,7 +330,7 @@ function Remove-OrphanedMsiRegistration {
 }
 
 try {
-    $sourceMissingProducts = @()
+    $orphanedMsiProducts = @()
     Write-CleanupLog "Removing ViGEmBus PnP nodes..."
     foreach ($instance in @(Get-ViGEmDeviceInstances)) {
         try {
@@ -323,19 +347,21 @@ try {
         if ($app.PSChildName -match '^\{[-0-9a-fA-F]+\}$') { $guid = $app.PSChildName }
         elseif ($app.UninstallString -match '\{[-0-9a-fA-F]+\}') { $guid = $Matches[0] }
         if (-not $guid) { throw "Cannot determine MSI product code for $($app.DisplayName)" }
-        $process = Start-Process -FilePath "msiexec.exe" -ArgumentList "/X$guid /qn /norestart" -Wait -PassThru
-        if ($process.ExitCode -eq 1612) {
+        $msiExitCode = Invoke-MsiUninstall -ProductCode $guid
+        if (@(1612, 1624) -contains $msiExitCode) {
             # Windows Installer still knows the ProductCode, but its cached/source
-            # MSI is gone. Defer exact registration cleanup until we have proved
-            # that no ViGEm device, package, or service remains.
-            $sourceMissingProducts += [pscustomobject]@{
+            # MSI is gone or its registered transform is invalid. Defer exact
+            # registration cleanup until we have proved that no ViGEm device,
+            # package, or service remains.
+            $orphanedMsiProducts += [pscustomobject]@{
                 ProductCode = $guid
                 DisplayName = [string]$app.DisplayName
             }
-            Write-CleanupLog "MSI source is missing for $guid (1612); deferring orphan registration cleanup."
+            $reason = if ($msiExitCode -eq 1612) { "source is missing" } else { "transform is invalid" }
+            Write-CleanupLog "MSI $reason for $guid ($msiExitCode); deferring orphan registration cleanup."
         }
-        elseif (@(0, 1605, 1641, 3010) -notcontains $process.ExitCode) {
-            throw "MSI uninstall for $guid failed with exit code $($process.ExitCode)"
+        elseif (@(0, 1605, 1641, 3010) -notcontains $msiExitCode) {
+            throw "MSI uninstall for $guid failed with exit code $msiExitCode"
         }
     }
 
@@ -366,7 +392,7 @@ try {
         throw "ViGEmBus cleanup incomplete; refusing orphan MSI cleanup. Nodes=[$($remainingNodes -join ', ')] Packages=[$($remainingPackages -join ', ')] Service=$serviceRemaining"
     }
 
-    foreach ($orphan in $sourceMissingProducts) {
+    foreach ($orphan in $orphanedMsiProducts) {
         Remove-OrphanedMsiRegistration -ProductCode $orphan.ProductCode -DisplayName $orphan.DisplayName
     }
 
