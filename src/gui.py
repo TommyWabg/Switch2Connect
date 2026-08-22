@@ -96,7 +96,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.6"
+APP_VERSION = "v2.6.1"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -3917,6 +3917,8 @@ class ControllerWindow:
                 return
         # If driver type is USBIP, check USBIP driver instead
         if getattr(CONFIG, "driver_type", "") == "USBIP":
+            if getattr(self, "_usbip_restart_pending", False):
+                return
             usbip_status = get_usbip_status()
             if usbip_status.unknown:
                 # Undetermined is not "missing": fall back to the executable the
@@ -3930,14 +3932,16 @@ class ControllerWindow:
                 answer = self.ask_centered_yes_no(
                     "Repair USBIP Driver" if partial else "Install USBIP Driver",
                     (("USBIP is partially installed and cannot be used reliably.\n\n"
-                      f"{usbip_status.describe()}\n\nDo you want to clean it up and reinstall it now?\n")
+                      f"{usbip_status.describe()}\n\nDo you want to remove it now? "
+                      "Restart Windows before installing USBIP again.\n")
                      if partial else
                      "Switch emulation is selected, but the USBIP driver is not installed.\n\n"
                      "Do you want to install it now?\n") +
                     "(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
-                    if partial and not self.run_usbip_uninstall():
+                    if partial:
+                        self.run_usbip_uninstall()
                         return
                     self.run_usbip_install(show_success_msg=False)
             return
@@ -5800,6 +5804,10 @@ class ControllerWindow:
     def update_usbip_button(self):
         if not hasattr(self, 'usbip_btn') or not self.usbip_btn:
             return
+        if getattr(self, "_usbip_restart_pending", False):
+            self.usbip_btn.config(text="Restart Required")
+            self.update_driver_buttons_visibility()
+            return
         # Only a genuinely half-installed driver offers "Repair"; USBIP_UNKNOWN
         # falls through to "Install", which cleans up first and cannot dead-end.
         usbip_state = get_usbip_status(use_cache=True).state
@@ -5810,6 +5818,9 @@ class ControllerWindow:
         self.update_driver_buttons_visibility()
 
     def on_usbip_btn_clicked(self):
+        if getattr(self, "_usbip_restart_pending", False):
+            self._prompt_usbip_restart_required()
+            return
         install_warning = (
             "WARNING: During the installation of USBIP-win2, Windows USB hubs will restart briefly, "
             "which will temporarily disconnect other USB peripherals (mice, keyboards, etc.).\n\n"
@@ -5822,11 +5833,11 @@ class ControllerWindow:
         elif status.state == USBIP_PARTIAL:
             if self.ask_centered_yes_no(
                 "Repair USBIP Driver",
-                "USBIP is partially installed. Clean up the broken installation and reinstall it?\n\n"
-                f"{status.describe()}\n\n{install_warning}"
+                "USBIP is partially installed. Remove the broken installation now?\n\n"
+                f"{status.describe()}\n\nWindows must be restarted before USBIP can be installed again.\n\n"
+                "Removing USBIP requires administrator privileges."
             ):
-                if self.run_usbip_uninstall():
-                    self.run_usbip_install()
+                self.run_usbip_uninstall()
         else:
             if status.unknown:
                 logger.warning("USBIP status undetermined: %s", status.describe())
@@ -5838,9 +5849,7 @@ class ControllerWindow:
 
     def run_usbip_install(self, show_success_msg=True):
         # Install USBIP from the bundled installer (both builds); nothing downloaded.
-        import sys
         import os
-        from tkinter import messagebox
 
         # Stop discoverer before installation
         discoverer_was_running = False
@@ -5852,8 +5861,10 @@ class ControllerWindow:
         from discoverer import emergency_cleanup
         emergency_cleanup()
 
-        install_ps1 = get_driver_path("install_usbip.ps1")
-        if os.path.exists(install_ps1):
+        packaged_install = utils.is_packaged()
+        install_payload = get_driver_path(
+            "USBip-0.9.7.7-x64.exe" if packaged_install else "install_usbip.ps1")
+        if os.path.exists(install_payload):
             try:
                 progress_win = tk.Toplevel(self.root)
                 progress_win.title("USBIP Driver Installation")
@@ -5873,8 +5884,27 @@ class ControllerWindow:
                 )
                 label.pack(pady=int(40 * scaling_factor))
                 
-                # Bypassing CMD and launching powershell directly via ShellExecuteExW (runas verb)
-                hProcess = self._launch_elevated("powershell.exe", self._ps_hidden_args(install_ps1), progress_win=progress_win)
+                if packaged_install:
+                    # Match the packaged ViGEmBus path: elevate the installer itself.
+                    # The former PowerShell -> Start-Process nesting could fail when
+                    # its payload lived under the protected WindowsApps directory.
+                    usbip_args = (
+                        '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART '
+                        '/MERGETASKS="!desktopicon"'
+                    )
+                    hProcess = self._launch_elevated(
+                        install_payload,
+                        usbip_args,
+                        progress_win=progress_win,
+                        lp_dir=os.path.dirname(install_payload),
+                    )
+                else:
+                    # Preserve the established standalone .exe installation path.
+                    hProcess = self._launch_elevated(
+                        "powershell.exe",
+                        self._ps_hidden_args(install_payload),
+                        progress_win=progress_win,
+                    )
                 if not hProcess:
                     # User cancelled the UAC prompt or it failed
                     progress_win.grab_release()
@@ -5885,6 +5915,32 @@ class ControllerWindow:
                     return
 
                 proc_exit_code = [0]
+                verified_status = [None]
+                verify_delays_ms = (0, 1000, 1000, 2000, 4000)  # cumulative 0, 1, 2, 4, 8 s
+
+                def finish_verification(attempt=0):
+                    installed = False
+                    try:
+                        invalidate_driver_status_cache("usbip")
+                        status = get_usbip_status()
+                        verified_status[0] = status
+                        installed = status.installed or (
+                            status.unknown
+                            and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
+                    except Exception as exc:
+                        logger.warning(
+                            "USBIP post-install verification attempt %s failed: %s",
+                            attempt + 1,
+                            exc,
+                        )
+                    if installed or attempt >= len(verify_delays_ms) - 1:
+                        progress_win.grab_release()
+                        progress_win.destroy()
+                        return
+                    progress_win.after(
+                        verify_delays_ms[attempt + 1],
+                        lambda: finish_verification(attempt + 1),
+                    )
 
                 def check_process():
                     if hProcess:
@@ -5896,8 +5952,8 @@ class ControllerWindow:
                             ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
                             ctypes.windll.kernel32.CloseHandle(hProcess)
                             proc_exit_code[0] = exit_code.value
-                            progress_win.grab_release()
-                            progress_win.destroy()
+                            label.config(text="Finalizing USBIP-win2 Driver installation...")
+                            finish_verification()
                     else:
                         progress_win.grab_release()
                         progress_win.destroy()
@@ -5907,12 +5963,20 @@ class ControllerWindow:
                 
                 logger.info(f"USBIP driver installer process exited with code: {proc_exit_code[0]}")
                 
-                invalidate_driver_status_cache("usbip")
-                usbip_status = get_usbip_status()
+                usbip_status = verified_status[0]
+                if usbip_status is None:
+                    invalidate_driver_status_cache("usbip")
+                    usbip_status = get_usbip_status()
                 usbip_installed_ok = usbip_status.installed or (
                     usbip_status.unknown
                     and os.path.exists("C:\\Program Files\\USBip\\usbip.exe"))
                 if usbip_installed_ok:
+                    self._usbip_restart_pending = False
+                    if proc_exit_code[0] != 0:
+                        logger.warning(
+                            "USBIP installer returned code %s but final verification succeeded",
+                            proc_exit_code[0],
+                        )
                     if show_success_msg:
                         self.show_centered_message("Success", "USBIP-win2 driver installed successfully.")
                 else:
@@ -5925,89 +5989,36 @@ class ControllerWindow:
             except Exception as e:
                 self.show_centered_message("Error", f"Failed to start the USBIP installer: {e}")
         else:
-            self.show_centered_message("Error", "Could not find install_usbip.ps1. Please verify the integrity of the application files.")
+            self.show_centered_message(
+                "Error",
+                f"Could not find {os.path.basename(install_payload)}. "
+                "Please verify the integrity of the application files.",
+            )
 
         if discoverer_was_running:
             self.start_discoverer_thread()
 
-    def _run_usbip_cleanup_script(self):
-        """Run the bundled uninstall_usbip.ps1 elevated. Returns its exit code or None.
-
-        This is the manual-cleanup path (detach, device node, Driver Store, files).
-        It used to be unreachable in the standalone build, which meant a USBIP
-        install whose unins000.exe had gone missing could never be removed.
-        """
-        cleanup_ps1 = get_driver_path("uninstall_usbip.ps1")
-        if not os.path.exists(cleanup_ps1):
-            return None
-        progress_win = tk.Toplevel(self.root)
-        progress_win.title("USBIP Driver Cleanup")
-        progress_win.resizable(False, False)
-        progress_win.config(bg="#1E1E1E")
-        progress_win.transient(self.root)
-        progress_win.grab_set()
-        self.center_window_on_root(
-            progress_win, int(450 * scaling_factor), int(130 * scaling_factor))
-        tk.Label(
-            progress_win,
-            text="Cleaning up USBIP driver components...\nPlease authorize the UAC prompt if asked.",
-            fg="white", bg="#1E1E1E", font=scale_font(("Arial", 11, "bold"))
-        ).pack(pady=int(40 * scaling_factor))
-
-        hProcess = self._launch_elevated(
-            "powershell.exe", self._ps_hidden_args(cleanup_ps1), progress_win=progress_win)
-        if not hProcess:
-            progress_win.grab_release()
-            progress_win.destroy()
-            return None
-
-        proc_exit_code = [None]
-
-        def check_process():
-            res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
-            if res == WAIT_TIMEOUT:
-                progress_win.after(200, check_process)
-            else:
-                exit_code = wintypes.DWORD()
-                ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
-                ctypes.windll.kernel32.CloseHandle(hProcess)
-                proc_exit_code[0] = exit_code.value
-                progress_win.grab_release()
-                progress_win.destroy()
-
-        progress_win.after(200, check_process)
-        self.root.wait_window(progress_win)
-        logger.info("USBIP cleanup script exited with code: %s", proc_exit_code[0])
-        return proc_exit_code[0]
-
-    @staticmethod
-    def _read_usbip_uninstall_log():
-        log_path = os.path.join(os.environ.get("TEMP", ""), "Switch2Connect_USBIP_uninstall.log")
+    def _prompt_usbip_restart_required(self):
+        """Remind the user that USBIP remains pending removal until reboot."""
+        if not self.ask_centered_yes_no(
+            "Restart Required",
+            "A restart is required to finish removing USBIP.\n\nRestart now?",
+        ):
+            return
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as stream:
-                lines = stream.read().strip().splitlines()
-            keywords = ("error", "failed", "incomplete", "unavailable", "verification")
-            important = [line for line in lines if any(word in line.lower() for word in keywords)]
-            summary = important[-12:] if important else lines[-12:]
-            return "\n".join(summary)[-1400:]
-        except Exception:
-            return "Cleanup log was not available."
-
-    def _usbip_removal_verified(self):
-        invalidate_driver_status_cache("usbip")
-        status = get_usbip_status()
-        if status.absent:
-            return True, status
-        if status.unknown:
-            # Fall back to the executable the rest of the app actually invokes.
-            return not os.path.exists("C:\\Program Files\\USBip\\usbip.exe"), status
-        return False, status
+            import subprocess
+            subprocess.Popen(["shutdown", "/r", "/t", "0"])
+        except Exception as exc:
+            self.show_centered_message(
+                "Error",
+                f"Could not restart automatically: {exc}\nPlease restart manually.",
+            )
 
     def run_usbip_uninstall(self):
-        # Uninstall from the bundled uninstaller/script (both builds); nothing downloaded.
-        import sys
+        # Both builds invoke the registered Inno uninstaller directly. USBIP keeps
+        # driver components loaded until reboot, so do not inspect or clean them up
+        # synchronously after a successful uninstall.
         import os
-        from tkinter import messagebox
 
         # Stop discoverer before uninstallation
         discoverer_was_running = False
@@ -6020,92 +6031,97 @@ class ControllerWindow:
         emergency_cleanup()
 
         uninstaller_exe = "C:\\Program Files\\USBip\\unins000.exe"
-        if os.path.exists(uninstaller_exe):
-            try:
-                progress_win = tk.Toplevel(self.root)
-                progress_win.title("USBIP Driver Uninstallation")
-                progress_w = int(450 * scaling_factor)
-                progress_h = int(130 * scaling_factor)
-                progress_win.resizable(False, False)
-                progress_win.config(bg="#1E1E1E")
-                progress_win.transient(self.root)
-                progress_win.grab_set()
-                self.center_window_on_root(progress_win, progress_w, progress_h)
-                
-                label = tk.Label(
-                    progress_win,
-                    text="Running USBIP-win2 Uninstaller...\nPlease follow the uninstall wizard on the screen.",
-                    fg="white", bg="#1E1E1E",
-                    font=scale_font(("Arial", 11, "bold"))
-                )
-                label.pack(pady=int(40 * scaling_factor))
-                
-                # Run the Inno Setup uninstaller silently (no window) via the elevated helper.
-                hProcess = self._launch_elevated(
-                    uninstaller_exe, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
-                    progress_win=progress_win, lp_dir="C:\\Program Files\\USBip")
-                if not hProcess:
-                    # User cancelled the UAC prompt or it failed
-                    progress_win.grab_release()
-                    progress_win.destroy()
-                    self.show_centered_message("Error", "USBIP driver uninstallation was cancelled or failed to start (UAC prompt declined).")
-                    if discoverer_was_running:
-                        self.start_discoverer_thread()
-                    return
-
-                proc_exit_code = [0]
-
-                def check_process():
-                    if hProcess:
-                        res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
-                        if res == WAIT_TIMEOUT:
-                            progress_win.after(200, check_process)
-                        else:
-                            exit_code = wintypes.DWORD()
-                            ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
-                            ctypes.windll.kernel32.CloseHandle(hProcess)
-                            proc_exit_code[0] = exit_code.value
-                            progress_win.grab_release()
-                            progress_win.destroy()
-                    else:
-                        progress_win.grab_release()
-                        progress_win.destroy()
-                            
-                progress_win.after(200, check_process)
-                self.root.wait_window(progress_win)
-                
-                logger.info(f"USBIP driver uninstaller process exited with code: {proc_exit_code[0]}")
-            except Exception as e:
-                self.show_centered_message("Error", f"Failed to start the USBIP uninstaller: {e}")
-        else:
-            logger.warning("USBIP uninstaller missing at %s; using the cleanup script.", uninstaller_exe)
-
-        # The vendor uninstaller only removes what it installed, and it may be
-        # missing entirely on a broken install. Fall back to the cleanup script,
-        # which removes the device node, Driver Store packages and files itself.
-        usbip_removed_ok, status = self._usbip_removal_verified()
-        if not usbip_removed_ok:
-            cleanup_code = self._run_usbip_cleanup_script()
-            if cleanup_code is None:
-                self.show_centered_message(
-                    "Error",
-                    "Could not run the USBIP cleanup script.\n\n"
-                    f"{status.describe()}")
-            else:
-                usbip_removed_ok, status = self._usbip_removal_verified()
-
-        if usbip_removed_ok:
-            self.show_centered_message("Success", "USBIP driver uninstalled successfully.")
-        else:
+        if not os.path.exists(uninstaller_exe):
             self.show_centered_message(
                 "Error",
-                "USBIP uninstallation failed or left components behind.\n\n"
-                f"{status.describe()}\n\nCleanup details:\n{self._read_usbip_uninstall_log()}")
-        self.update_usbip_button()
+                "Could not find the USBIP uninstaller. Reinstall USBIP, then try "
+                "uninstalling it again.",
+            )
+            if discoverer_was_running:
+                self.start_discoverer_thread()
+            return False
+
+        proc_exit_code = [None]
+        try:
+            progress_win = tk.Toplevel(self.root)
+            progress_win.title("USBIP Driver Uninstallation")
+            progress_w = int(450 * scaling_factor)
+            progress_h = int(130 * scaling_factor)
+            progress_win.resizable(False, False)
+            progress_win.config(bg="#1E1E1E")
+            progress_win.transient(self.root)
+            progress_win.grab_set()
+            self.center_window_on_root(progress_win, progress_w, progress_h)
+
+            tk.Label(
+                progress_win,
+                text="Running USBIP-win2 Uninstaller...\nPlease authorize the UAC prompt if asked.",
+                fg="white", bg="#1E1E1E",
+                font=scale_font(("Arial", 11, "bold"))
+            ).pack(pady=int(40 * scaling_factor))
+
+            # Both MSIX and standalone builds elevate the Inno uninstaller itself.
+            hProcess = self._launch_elevated(
+                uninstaller_exe, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                progress_win=progress_win, lp_dir="C:\\Program Files\\USBip")
+            if not hProcess:
+                progress_win.grab_release()
+                progress_win.destroy()
+                self.show_centered_message("Error", "USBIP driver uninstallation was cancelled or failed to start (UAC prompt declined).")
+                if discoverer_was_running:
+                    self.start_discoverer_thread()
+                return False
+
+            def check_process():
+                if hProcess:
+                    res = ctypes.windll.kernel32.WaitForSingleObject(hProcess, 0)
+                    if res == WAIT_TIMEOUT:
+                        progress_win.after(200, check_process)
+                    else:
+                        exit_code = wintypes.DWORD()
+                        ctypes.windll.kernel32.GetExitCodeProcess(hProcess, ctypes.byref(exit_code))
+                        ctypes.windll.kernel32.CloseHandle(hProcess)
+                        proc_exit_code[0] = exit_code.value
+                        progress_win.grab_release()
+                        progress_win.destroy()
+                else:
+                    progress_win.grab_release()
+                    progress_win.destroy()
+
+            progress_win.after(200, check_process)
+            self.root.wait_window(progress_win)
+
+            logger.info(f"USBIP driver uninstaller process exited with code: {proc_exit_code[0]}")
+        except Exception as e:
+            self.show_centered_message("Error", f"Failed to start the USBIP uninstaller: {e}")
+            if discoverer_was_running:
+                self.start_discoverer_thread()
+            return False
+
+        if proc_exit_code[0] != 0:
+            self.show_centered_message(
+                "Error",
+                "USBIP uninstallation failed.\n\n"
+                f"Exit code: {proc_exit_code[0]}",
+            )
+            if discoverer_was_running:
+                self.start_discoverer_thread()
+            return False
+
+        # Do not call get_usbip_status/update_usbip_button here. The loaded USBIP
+        # driver, services and device node are expected to remain until reboot.
+        self._usbip_restart_pending = True
+        if hasattr(self, "usbip_btn") and self.usbip_btn:
+            self.usbip_btn.config(text="Restart Required")
 
         if discoverer_was_running:
             self.start_discoverer_thread()
-        return usbip_removed_ok
+        self.show_centered_message(
+            "Success",
+            "USBIP removal started. A restart is required to complete the uninstall.",
+        )
+        self._prompt_usbip_restart_required()
+        return True
 
     @staticmethod
     def _mag_tester_value_color(value):
@@ -12217,6 +12233,14 @@ bg_color=panel_bg, widths=[8, 10])
 
         old_driver = getattr(CONFIG, "driver_type", "WinUHid")
         old_sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
+
+        # A successful USBIP uninstall is not complete until Windows restarts.
+        # Block the selection before changing profile/config state and repeat the
+        # restart prompt even if the UI was switched to another driver meanwhile.
+        if val == "USBIP" and getattr(self, "_usbip_restart_pending", False):
+            self.driver_switch.set_value(old_driver)
+            self._prompt_usbip_restart_required()
+            return
         
         if (persist_preference and hasattr(CONFIG, 'active_profile')
                 and CONFIG.active_profile in CONFIG.profiles):
@@ -12247,14 +12271,16 @@ bg_color=panel_bg, widths=[8, 10])
                 answer = self.ask_centered_yes_no(
                     "Repair USBIP Driver" if partial else "Install USBIP Driver",
                     (("USBIP is partially installed.\n\n" + usbip_status.describe() + "\n\n"
-                      "Do you want to clean it up and reinstall it now?\n")
+                      "Do you want to remove it now? Restart Windows before "
+                      "installing USBIP again.\n")
                      if partial else
                      "The USBIP driver is required but is not installed.\n\n"
                      "Do you want to install it now?\n") +
                     "(Requires administrator privileges and will temporarily reset USB connections.)"
                 )
                 if answer:
-                    if partial and not self.run_usbip_uninstall():
+                    if partial:
+                        self.run_usbip_uninstall()
                         self.driver_switch.set_value(old_driver)
                         return
                     self.run_usbip_install(show_success_msg=True)
