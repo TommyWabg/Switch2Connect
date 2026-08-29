@@ -35,6 +35,17 @@ try:
     from config import get_driver_path, get_app_root
     winuhid_path = get_driver_path("WinUHid.dll")
     winuhid_devs_path = get_driver_path("WinUHidDevs.dll")
+    # Read-only A/B hook for isolating preset-library regressions without
+    # overwriting the installed/current DLL.  WinUHid.dll and the kernel driver
+    # are identical between the current tree and the 2.2 reference; only
+    # WinUHidDevs.dll differs.
+    winuhid_devs_override = os.environ.get("SWITCH2_WINUHID_DEVS_PATH")
+    if winuhid_devs_override:
+        winuhid_devs_override = os.path.abspath(winuhid_devs_override)
+        if not os.path.isfile(winuhid_devs_override):
+            raise FileNotFoundError(
+                f"SWITCH2_WINUHID_DEVS_PATH does not exist: {winuhid_devs_override}")
+        winuhid_devs_path = winuhid_devs_override
     
     if not os.path.exists(winuhid_path):
         # Try WinUHid-main build directory
@@ -48,7 +59,8 @@ try:
     _winuhid = ctypes.CDLL(winuhid_path)
     # Then load WinUHidDevs.dll
     _winuhid_devs = ctypes.CDLL(winuhid_devs_path)
-    logger.info("Successfully loaded WinUHid DLLs")
+    logger.info("Successfully loaded WinUHid DLLs (core=%s presets=%s)",
+                winuhid_path, winuhid_devs_path)
 except Exception as e:
     logger.error(f"Failed to load WinUHid DLLs: {e}")
     _winuhid = None

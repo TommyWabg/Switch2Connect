@@ -128,10 +128,20 @@ USB_SET_LED_COMMAND = bytes([0x09, 0x91, 0x00, 0x07, 0x00, 0x08,
                              0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
                              0x00, 0x00])
 USB_GAMECUBE_FEATURE_MASK = 0x27
-# Preserve the established wired Pro feature set (0x27, including rumble) and
-# add the controller protocol's magnetometer bit (0x80).  Using GameCube's
-# unmodified mask left bytes 25:31 of report 0x05 permanently zero.
-USB_PRO2_FEATURE_MASK = USB_GAMECUBE_FEATURE_MASK | 0x80
+# The Pro 2 changes its physical report cadence when the magnetometer bit is
+# enabled.  Keep the 2.2 feature set as the normal high-rate mode and request
+# magnetometer samples only while a consumer needs them.  This is a hardware
+# trade-off: leaving 0x80 enabled permanently limits every downstream virtual
+# backend before Python sees the report.
+USB_PRO2_FAST_FEATURE_MASK = USB_GAMECUBE_FEATURE_MASK
+USB_PRO2_MAG_FEATURE_MASK = USB_GAMECUBE_FEATURE_MASK | 0x80
+USB_PRO2_FEATURE_MASK = USB_PRO2_FAST_FEATURE_MASK
+# Temporary A/B diagnostic override.  It is intentionally environment-only:
+# nothing is persisted to config.yaml and the normal adaptive 0x27/0xA7 policy
+# returns on the next launch without this variable.
+_USB_PRO2_FORCE_0X27 = os.environ.get(
+    "SWITCH2_WIRED_PRO2_FORCE_0X27", "0").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _usb_feature_command(subcommand: int, feature_mask: int) -> bytes:
@@ -152,7 +162,7 @@ def _output_report_id(product_id: int) -> int:
             else OUTPUT_REPORT_ID_PRO2)
 
 
-def _startup_commands(product_id: int) -> tuple:
+def _startup_commands(product_id: int, pro2_feature_mask: int | None = None) -> tuple:
     """Startup command sequence for a wired pad.
 
     The Pro Controller 2 switches to common report 0x05 (its own 0x09 has an
@@ -160,14 +170,15 @@ def _startup_commands(product_id: int) -> tuple:
     to its Bluetooth report and the only one carrying the analog triggers).  Their
     feature masks also differ because GameCube has no usable magnetometer stream.
 
-    GameCube uses its official 0x27 mask.  Pro Controller 2 retains those wired
-    features and adds the 0x80 magnetometer bit, producing 0xA7.
+    GameCube uses its official 0x27 mask.  Pro Controller 2 starts in the same
+    high-rate mode; USBHidController's runtime policy adds 0x80 on demand.
     """
     is_gamecube = product_id == NSO_GAMECUBE_CONTROLLER_PID
     select = (USB_SELECT_GC_REPORT_COMMAND if is_gamecube
               else USB_SELECT_COMMON_REPORT_COMMAND)
-    feature_mask = (USB_GAMECUBE_FEATURE_MASK if is_gamecube
-                    else USB_PRO2_FEATURE_MASK)
+    feature_mask = (USB_GAMECUBE_FEATURE_MASK if is_gamecube else
+                    (USB_PRO2_FAST_FEATURE_MASK if pro2_feature_mask is None
+                     else int(pro2_feature_mask) & 0xFF))
     return (
         USB_INIT_COMMAND,
         USB_SET_LED_COMMAND,
@@ -1347,6 +1358,19 @@ class _UsbHidClient:
         self._notify = {}          # lowercased uuid -> callback
         self._read_thread = None
         self._read_stop = threading.Event()
+        # Keep the wired path identical to the proven 2.2 topology: the HID reader
+        # invokes the mapping callback directly.  VirtualController already owns a
+        # latest-frame submit boundary, so adding another single-slot worker here
+        # caused two independent coalescing stages and visibly reduced the effective
+        # polling rate in Power Saving modes.
+        self._input_received_count = 0
+        self._input_processed_count = 0
+        self._input_superseded_count = 0
+        self._input_callback_durations_ms = deque(maxlen=2048)
+        self._input_rate_window_start = time.perf_counter()
+        self._input_perf_diagnostics = os.environ.get(
+            "SWITCH2_INPUT_RATE_DIAGNOSTICS", "0").lower() in (
+                "1", "true", "yes", "on")
         self._write_lock = threading.Lock()
         self.is_high_speed_usb = False
         self._input_deltas = deque(maxlen=50)
@@ -2427,6 +2451,31 @@ class _UsbHidClient:
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
 
+    def _maybe_log_input_rates(self):
+        if not self._input_perf_diagnostics:
+            return
+        now = time.perf_counter()
+        elapsed = now - self._input_rate_window_start
+        if elapsed < 1.0:
+            return
+        durations = sorted(self._input_callback_durations_ms)
+        callback_avg_ms = (sum(durations) / len(durations)) if durations else 0.0
+        callback_p95_ms = (durations[min(len(durations) - 1,
+                                         int(len(durations) * 0.95))]
+                           if durations else 0.0)
+        logger.info(
+            "Wired input rates: received=%.0f/s callbacks=%.0f/s superseded=%d "
+            "callback_avg=%.3fms callback_p95=%.3fms mode=%s",
+            self._input_received_count / elapsed,
+            self._input_processed_count / elapsed,
+            self._input_superseded_count, callback_avg_ms, callback_p95_ms,
+            power_saving.mode())
+        self._input_received_count = 0
+        self._input_processed_count = 0
+        self._input_superseded_count = 0
+        self._input_callback_durations_ms.clear()
+        self._input_rate_window_start = now
+
     def _read_loop(self):
         # Marks the composite device as off limits to the libusb command path for as long
         # as we are reading interface 0. Reference-counted so a second wired pad does not
@@ -2535,16 +2584,28 @@ class _UsbHidClient:
                     continue
                 cb = self._notify.get(INPUT_REPORT_UUID.lower())
                 if cb:
+                    if self._input_perf_diagnostics:
+                        self._input_received_count += 1
+                    # Match the 2.2 wired fast path in every power mode.  The virtual
+                    # controller already provides the one allowed coalescing boundary;
+                    # a second latest-frame slot here discarded reports before mapping.
+                    callback_started_ns = (time.perf_counter_ns()
+                                           if self._input_perf_diagnostics else 0)
                     try:
-                        payload = (bytearray(translated) if power_saving.is_off()
-                                   else translated)
-                        cb(None, payload)
+                        cb(None, bytearray(translated))
+                        if self._input_perf_diagnostics:
+                            self._input_processed_count += 1
                     except Exception as e:
-                        # Throttle: this runs ~500x/s, so log at most once per second.
                         now = time.time()
                         if now - getattr(self, "_last_cb_err_log", 0) >= 1.0:
                             self._last_cb_err_log = now
                             logger.exception("USB HID input callback failed: %s", e)
+                    finally:
+                        if self._input_perf_diagnostics:
+                            self._input_callback_durations_ms.append(
+                                (time.perf_counter_ns() - callback_started_ns) /
+                                1_000_000.0)
+                    self._maybe_log_input_rates()
             else:
                 # Treat anything else as a command/ack response: strip the report-id so
                 # the body starts at the command id (write_command checks [0]==cmd,[1]==0x01).
@@ -2773,7 +2834,15 @@ class USBHidController(Controller):
         self.full_parity = False   # set True once command-based init/calibration succeeds
         self._loop = None
         self._disconnect_notified = False
+        self._active_feature_mask = USB_PRO2_FAST_FEATURE_MASK
+        self._feature_policy_task = None
+        self._magnetometer_last_required = 0.0
+        self._feature_policy_retry_at = 0.0
         self.client.on_disconnect_callback = self._on_usb_hid_disconnected
+        if self.usb_product_id == PRO_CONTROLLER2_PID and _USB_PRO2_FORCE_0X27:
+            logger.warning(
+                "Wired USB Pro 2 temporary A/B mode active: forcing pure 0x27; "
+                "live magnetometer data is disabled for this process only")
 
     # --- Output reports are restricted for the wired pad ---
     # Command/feature/LED output reports can stop the default 0x05 input stream on
@@ -2895,6 +2964,78 @@ class USBHidController(Controller):
         # via the interface-1 bulk endpoint so the interface-0 input stream is untouched)
         # a moment later, once the freshly-enumerated controller is fully booted.
         self._reinit_task = asyncio.create_task(self._delayed_reinit())
+        if self.usb_product_id == PRO_CONTROLLER2_PID:
+            self._feature_policy_task = asyncio.create_task(
+                self._wired_feature_policy_loop())
+
+    def _magnetometer_required(self) -> bool:
+        """Whether a live consumer currently needs wired magnetometer samples."""
+        if _USB_PRO2_FORCE_0X27:
+            return False
+        if (getattr(self, "is_mag_calibrating", False)
+                or getattr(self, "is_mag_calibration_waiting", False)):
+            return True
+        if bool(getattr(CONFIG, "gyro_passthrough_9axis_enabled", False)):
+            return True
+        if bool(getattr(CONFIG, "horizon_lock_v2_enabled", False)):
+            return True
+        return bool(
+            getattr(self, "gyro_mouse_enabled", False)
+            and str(getattr(CONFIG, "gyro_mode", "World")) == "World")
+
+    async def _set_runtime_feature_mask(self, feature_mask: int) -> bool:
+        """Apply only the feature pair, without reselecting/resetting input mode."""
+        feature_mask = int(feature_mask) & 0xFF
+        if feature_mask == self._active_feature_mask:
+            return True
+        commands = (_usb_feature_command(0x02, feature_mask),
+                    _usb_feature_command(0x04, feature_mask))
+        transport = getattr(self, "_init_transport", "none")
+
+        def send_pair():
+            if transport == "hid_fallback":
+                return all(self.client.write_command_report(command) > 0
+                           for command in commands)
+            return all(send_pro_controller2_usb_command(
+                command, self.usb_product_id, self.usb_transport,
+                require_unique=True) for command in commands)
+
+        ok = await asyncio.to_thread(send_pair)
+        if ok:
+            self._active_feature_mask = feature_mask
+            logger.info(
+                "Wired USB feature mode changed: mask=0x%02X magnetometer=%s (%s)",
+                feature_mask, bool(feature_mask & 0x80), self.device.address)
+        else:
+            logger.warning(
+                "Wired USB feature mode change to 0x%02X failed (%s)",
+                feature_mask, self.device.address)
+        return ok
+
+    async def _wired_feature_policy_loop(self):
+        """Keep fast input by default, enabling live magnetometer only on demand."""
+        try:
+            while self.interp_running and self.client is not None:
+                now = time.perf_counter()
+                required = self._magnetometer_required()
+                if required:
+                    self._magnetometer_last_required = now
+                # A short release hold prevents command churn at gyro trigger edges.
+                use_magnetometer = (not _USB_PRO2_FORCE_0X27) and (
+                    required or now - self._magnetometer_last_required < 1.0)
+                target = (USB_PRO2_MAG_FEATURE_MASK if use_magnetometer
+                          else USB_PRO2_FAST_FEATURE_MASK)
+                if (target != self._active_feature_mask
+                        and now >= self._feature_policy_retry_at):
+                    if not await self._set_runtime_feature_mask(target):
+                        self._feature_policy_retry_at = now + 1.0
+                    else:
+                        self._feature_policy_retry_at = 0.0
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Wired USB feature policy failed", exc_info=True)
 
     @property
     def expected_input_report_id(self) -> int:
@@ -2954,7 +3095,7 @@ class USBHidController(Controller):
             self.input_transport,
             (USB_GAMECUBE_FEATURE_MASK
              if self.usb_product_id == NSO_GAMECUBE_CONTROLLER_PID
-             else USB_PRO2_FEATURE_MASK),
+            else self._active_feature_mask),
             self.expected_input_report_id,
             getattr(self.client, "rumble_transport", "none") if self.client else "none",
             self.client.bulk_rumble_available() if self.client else False,
@@ -3004,6 +3145,11 @@ class USBHidController(Controller):
                         "reporting or motion may be unavailable",
                         transport, self.device.address)
                     return
+                # A full startup batch always restores the Pro 2 high-rate mask.
+                # Keep the software state honest so the policy loop can re-enable
+                # magnetometer mode immediately when a consumer is active.
+                if self.usb_product_id == PRO_CONTROLLER2_PID:
+                    self._active_feature_mask = USB_PRO2_FAST_FEATURE_MASK
             # Give the pad a moment to act on the last batch, then report what it is
             # actually doing rather than what we hoped it would do.
             await asyncio.sleep(0.5)
@@ -3032,6 +3178,9 @@ class USBHidController(Controller):
         task = getattr(self, "_reinit_task", None)
         if task is not None:
             task.cancel()
+        feature_task = getattr(self, "_feature_policy_task", None)
+        if feature_task is not None:
+            feature_task.cancel()
         # This class overrides Controller.disconnect() entirely, so the base class never
         # gets to stop the threads it starts in __init__. Do it here.
         self._stop_worker_threads()

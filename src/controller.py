@@ -1309,7 +1309,9 @@ class ControllerInputData:
     right_trigger_raw: int = 0
     custom_buttons_mask: int = 0
 
-    def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData, right_stick_calibration: StickCalibrationData, product_id: int = 0, gc_trigger_calib: list = None):
+    def __init__(self, data: bytes, left_stick_calibration: StickCalibrationData,
+                 right_stick_calibration: StickCalibrationData, product_id: int = 0,
+                 gc_trigger_calib: list = None, joystick_deadzones=None):
         self.raw_data = data
         
         if product_id == NSO_GAMECUBE_CONTROLLER_PID:
@@ -1435,16 +1437,21 @@ class ControllerInputData:
         self.raw_right_stick = self.right_stick
 
         joycon_gain = 1.05 if product_id in (JOYCON_L_PID, JOYCON_R_PID, JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID) else 1.0
+        if joystick_deadzones is None:
+            joystick_deadzones = (
+                resolve_joystick_deadzone(product_id, "l_joystick"),
+                resolve_joystick_deadzone(product_id, "r_joystick"),
+            )
         if left_stick_calibration:
             left_gain = 1.0 if getattr(left_stick_calibration, "in_app", False) else joycon_gain
             self.left_stick = left_stick_calibration.apply_calibration(
                 self.left_stick, gain=left_gain,
-                deadzone=resolve_joystick_deadzone(product_id, "l_joystick"))
+                deadzone=joystick_deadzones[0])
         if right_stick_calibration:
             right_gain = 1.0 if getattr(right_stick_calibration, "in_app", False) else joycon_gain
             self.right_stick = right_stick_calibration.apply_calibration(
                 self.right_stick, gain=right_gain,
-                deadzone=resolve_joystick_deadzone(product_id, "r_joystick"))
+                deadzone=joystick_deadzones[1])
             
     
 
@@ -1727,6 +1734,8 @@ class Controller:
         self._gyro_v2_6axis = None
         self._v2_fusion_9axis = None
         self._v2_fusion_6axis = None
+        self.latest_magnetometer_sample = (0, 0, 0)
+        self.latest_magnetometer_sample_time = 0.0
         self._pass_heading_output_filter = PassthroughHeadingOutputFilter()
         self._pass_moving_yaw_bias_consumer = PassthroughMovingYawBiasConsumer()
         self._pass_motion_mag_consumer = MotionMagneticClosureConsumer()
@@ -3992,10 +4001,20 @@ class Controller:
         # every wired report while leaving all live profile/config reads untouched.
         product_id = getattr(self.controller_info, 'product_id', 0)
         device_address = self.device.address
+        input_phase_diagnostics = os.environ.get(
+            "SWITCH2_INPUT_RATE_DIAGNOSTICS", "0").lower() in (
+                "1", "true", "yes", "on")
+        phase_stats = {
+            "start": time.perf_counter(), "count": 0,
+            "totals": [0.0, 0.0, 0.0, 0.0, 0.0],
+        }
+        deadzone_cache = {"generation": None, "values": (0.03, 0.03)}
 
         def input_report_callback(sender, data):
             if getattr(self, 'suspended', False) or getattr(self, '_is_suspending', False):
                 return
+
+            phase_t0 = time.perf_counter_ns() if input_phase_diagnostics else 0
 
             self._count_merged_pair_input_notification()
 
@@ -4006,7 +4025,17 @@ class Controller:
                 logger.debug(f"[{time.strftime('%H:%M:%S')}] Controller {device_address} pid=0x{product_id:04x} pkt#{self._packet_count} raw[0:16]={to_hex(data[0:16])}")
 
             gc_trigger_calib = getattr(CONFIG, 'gc_trigger_calibration_data', {}).get(device_address, [36, 190, 240, 36, 190, 240])
-            inputData = ControllerInputData(data, self.stick_calibration, self.second_stick_calibration, product_id, gc_trigger_calib)
+            settings_generation = int(getattr(CONFIG, "settings_generation", 0))
+            if deadzone_cache["generation"] != settings_generation:
+                deadzone_cache["values"] = (
+                    resolve_joystick_deadzone(product_id, "l_joystick"),
+                    resolve_joystick_deadzone(product_id, "r_joystick"),
+                )
+                deadzone_cache["generation"] = settings_generation
+            inputData = ControllerInputData(
+                data, self.stick_calibration, self.second_stick_calibration,
+                product_id, gc_trigger_calib, deadzone_cache["values"])
+            phase_t1 = time.perf_counter_ns() if input_phase_diagnostics else 0
 
             # Connection settle gate: right after (re)connection the controller can
             # emit transient/garbage frames (or the wake button is still held), which
@@ -4055,6 +4084,13 @@ class Controller:
 
             self._update_battery_voltage(inputData.battery_voltage)
             self.last_accel = inputData.accelerometer
+            # Preserve the newest real magnetic sample independently from report
+            # cadence.  Wired Pro 2 deliberately disables live magnetic reporting
+            # in its high-rate mode, so zero-filled frames must not erase the last
+            # sample or its acquisition time.
+            if any(inputData.magnometer):
+                self.latest_magnetometer_sample = tuple(inputData.magnometer)
+                self.latest_magnetometer_sample_time = time.perf_counter()
 
             is_left = self.is_joycon_left()
             is_right = self.is_joycon_right()
@@ -4082,6 +4118,7 @@ class Controller:
                 # Calibration suppresses simulate_mouse entirely, so explicitly
                 # tear down both activation stages and any held mouse buttons.
                 self._deactivate_ir_mouse(reset_activation=True)
+            phase_t2 = time.perf_counter_ns() if input_phase_diagnostics else 0
 
             # 9-Axis continuous sensor fusion and stabilized gyro synthesis
             if (not full_power_saving
@@ -4222,6 +4259,7 @@ class Controller:
                             "gyro_passthrough_mode": str(getattr(CONFIG, "gyro_passthrough_mode", "Default")),
                         },
                     )
+            phase_t3 = time.perf_counter_ns() if input_phase_diagnostics else 0
 
             btn_states = {
                 "GL": bool(inputData.buttons & 0x02000000) if is_pro else False,
@@ -5113,6 +5151,7 @@ class Controller:
 
             self._in_app_gyro_mapping_active_this_frame = mapping_scope_active
             self._apply_shared_joystick_mapping(inputData)
+            phase_t4 = time.perf_counter_ns() if input_phase_diagnostics else 0
 
             if inputData.buttons & (SWITCH_BUTTONS.get("SR_R", 0) | SWITCH_BUTTONS.get("SL_R", 0) | SWITCH_BUTTONS.get("SL_L", 0) | SWITCH_BUTTONS.get("SR_L", 0)):
                 self.side_buttons_pressed = True
@@ -5427,6 +5466,28 @@ class Controller:
 
             if power_saving.is_off():
                 self._poke_rumble_scheduler()
+
+            if input_phase_diagnostics:
+                phase_t5 = time.perf_counter_ns()
+                points = (phase_t0, phase_t1, phase_t2, phase_t3, phase_t4, phase_t5)
+                totals = phase_stats["totals"]
+                for index in range(5):
+                    totals[index] += (points[index + 1] - points[index]) / 1_000_000.0
+                phase_stats["count"] += 1
+                now = time.perf_counter()
+                elapsed = now - phase_stats["start"]
+                if elapsed >= 1.0:
+                    count = max(1, phase_stats["count"])
+                    averages = [value / count for value in totals]
+                    logger.info(
+                        "Controller callback phases: parse=%.3fms mouse=%.3fms "
+                        "fusion=%.3fms mapping=%.3fms motion_output=%.3fms "
+                        "total=%.3fms samples=%d",
+                        averages[0], averages[1], averages[2], averages[3],
+                        averages[4], sum(averages), phase_stats["count"])
+                    phase_stats["start"] = now
+                    phase_stats["count"] = 0
+                    phase_stats["totals"] = [0.0, 0.0, 0.0, 0.0, 0.0]
 
         if product_id == NSO_GAMECUBE_CONTROLLER_PID:
             # GCN input callback: filter out short packets (command acks, Format 0) and

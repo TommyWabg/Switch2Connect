@@ -23,6 +23,7 @@ from vigem_commons import DS4_REPORT_EX, DS4_BUTTONS, DS4_DPAD_DIRECTIONS, DS4_S
 import threading
 import os
 import math
+from collections import deque
 
 VIRTUAL_DEVICE_CREATION_LOCK = threading.Lock()
 import time
@@ -337,9 +338,6 @@ SUBMIT_SLOW_WARN_MS = 10.0
 # Seconds between submit warnings, so a struggling session reports the problem
 # without the logging itself adding to the load.
 SUBMIT_WARN_INTERVAL = 5.0
-# Yield only when the submit worker has continuously had another frame waiting.
-# This bounds one busy GIL-owning burst without adding work to low-rate input.
-SUBMIT_COOPERATIVE_BUDGET_S = 0.004
 AUDIO_HAPTIC_HOLD_MIN_AMPLITUDE = 5
 # DualSense 0x02 output-report bytes masked out of the traditional-rumble stop
 # signature: motors [3],[4] plus valid_flag0/1 [1],[2] and valid_flag2 [39].
@@ -516,6 +514,10 @@ class VirtualController:
         self._usbip_reconnect_lock = threading.Lock()
         self._usbip_reconnect_active = False
         self._usbip_reconnect_generation = 0
+        # Invalidates reports captured for a virtual device that is being replaced.
+        # The submit worker is independent from the GUI/mode-switching thread, so
+        # mode alone is not a safe discriminator while a native call is queued.
+        self._virtual_device_generation = 0
         self._suppress_usbip_reconnect = False
         if self.mode == "Switch1":
             self.hold_mode = "Vertical"
@@ -542,7 +544,7 @@ class VirtualController:
         # frozen at its last value until the rumble stopped. Producers now only
         # leave the newest frame in a slot and return.
         self._submit_lock = threading.Lock()
-        self._submit_pending = None      # (inputData, buttons, controller, buttonsConfig)
+        self._submit_pending = None      # (..., buttonsConfig, virtual-device generation)
         self._submit_sticky_buttons = 0  # presses from frames superseded before submit
         self._submit_wake = threading.Event()
         self._submit_stop = False
@@ -552,6 +554,16 @@ class VirtualController:
         self._last_slow_submit_warn = 0.0
         self._submit_superseded_count = 0
         self._submit_cooperative_yield_count = 0
+        self._input_rate_diagnostics = os.environ.get(
+            "SWITCH2_INPUT_RATE_DIAGNOSTICS", "0").lower() in (
+                "1", "true", "yes", "on")
+        self._submit_published_count = 0
+        self._submit_attempted_count = 0
+        self._submit_completed_count = 0
+        self._submit_rejected_count = 0
+        self._submit_durations_ms = deque(maxlen=2048)
+        self._submit_diag_superseded_start = 0
+        self._submit_rate_window_start = time.perf_counter()
         self._rumble_cb_count = 0
         self._rumble_cb_window_start = 0.0
         self._update_wake = threading.Event()
@@ -1122,6 +1134,8 @@ class VirtualController:
 
     def _publish_input_submit(self, inputData, buttons, controller, buttonsConfig):
         """Hand the newest input frame to the submit thread and return immediately."""
+        if self._input_rate_diagnostics:
+            self._submit_published_count += 1
         power_mode = power_saving.mode()
         if power_mode != self._last_submit_power_mode:
             self._full_submit_signatures.clear()
@@ -1152,7 +1166,9 @@ class VirtualController:
                 self._submit_sticky_buttons |= self._submit_pending[1]
                 self._submit_superseded_count = getattr(
                     self, "_submit_superseded_count", 0) + 1
-            self._submit_pending = (inputData, buttons, controller, buttonsConfig)
+            self._submit_pending = (
+                inputData, buttons, controller, buttonsConfig,
+                self._virtual_device_generation)
         if self._submit_thread is None or not self._submit_thread.is_alive():
             self._start_submit_thread()
         self._submit_wake.set()
@@ -1178,7 +1194,9 @@ class VirtualController:
             self._submit_sticky_buttons = 0
 
     def _input_submit_loop(self):
-        continuous_busy_started = None
+        # Keep producer and consumer at the same relative priority, as in 2.2.
+        # The process-wide 1 ms GIL hand-off interval provides the required
+        # fairness without making either side starve the other.
         while not self._submit_stop:
             self._submit_wake.wait(timeout=0.05)
             self._submit_wake.clear()
@@ -1189,49 +1207,39 @@ class VirtualController:
                     self._submit_pending = None
                     self._submit_sticky_buttons = 0
                 if pending is None:
-                    continuous_busy_started = None
                     break
-                if continuous_busy_started is None:
-                    continuous_busy_started = time.perf_counter()
-                inputData, buttons, controller, buttonsConfig = pending
+                inputData, buttons, controller, buttonsConfig, generation = pending
                 try:
                     self._run_input_submit(
-                        inputData, buttons | sticky, controller, buttonsConfig)
+                        inputData, buttons | sticky, controller, buttonsConfig,
+                        generation)
                 except Exception:
                     logger.exception("Virtual input submit failed")
-                if not power_saving.is_off():
-                    with self._submit_lock:
-                        backlog = self._submit_pending is not None
-                    if (backlog and time.perf_counter() - continuous_busy_started
-                            >= SUBMIT_COOPERATIVE_BUDGET_S):
-                        # Sleep(0) only yields the remainder of this thread's
-                        # quantum; it does not request precision timing.
-                        time.sleep(0)
-                        self._submit_cooperative_yield_count = getattr(
-                            self, "_submit_cooperative_yield_count", 0) + 1
-                        continuous_busy_started = time.perf_counter()
-                    elif not backlog:
-                        continuous_busy_started = None
-                else:
-                    continuous_busy_started = None
 
-    def _run_input_submit(self, inputData, buttons, controller, buttonsConfig):
+    def _run_input_submit(self, inputData, buttons, controller, buttonsConfig,
+                          generation=None):
         started_ns = time.perf_counter_ns()
         self._last_submit_phase_ms = None
         submitted = False
-        # Keep mode selection and report submission in the same state epoch.
-        # Without this lock, set_mode() can replace a PS5 report with an Xbox
-        # report after this thread reads self.mode but before update_as_ps5()
-        # acquires its own lock. state_lock is an RLock, so update methods that
-        # also lock it remain safe.
+        if generation is None:
+            generation = getattr(self, "_virtual_device_generation", 0)
+        # Read the mode and use its matching report under one lifetime lock.  The
+        # update_as_* locks are RLock re-entries, so this does not add another native
+        # critical section; it prevents a worker that observed PS5 just before a mode
+        # change from applying touch fields to the newly-created Xbox report.
         with self.state_lock:
-            if self.mode == "PS4":
+            if generation != getattr(self, "_virtual_device_generation", 0):
+                self._submit_rejected_count = getattr(
+                    self, "_submit_rejected_count", 0) + 1
+                return False
+            mode = self.mode
+            if mode == "PS4":
                 submitted = self.update_as_ps4(inputData, buttons, controller)
-            elif self.mode == "PS5":
+            elif mode == "PS5":
                 submitted = self.update_as_ps5(inputData, buttons, controller)
-            elif self.mode == "Switch2":
+            elif mode == "Switch2":
                 submitted = self.update_as_switch2_pro(inputData, buttons, controller)
-            elif self.mode == "Switch1":
+            elif mode == "Switch1":
                 if controller.is_pro_controller() and getattr(self, 'usbip_server_pro', None) is not None:
                     submitted = self.update_as_switch1_pro(inputData, buttons, controller)
                 elif controller.is_joycon_left() and getattr(self, 'usbip_server_l', None) is not None:
@@ -1276,9 +1284,44 @@ class VirtualController:
                     "Virtual controller rejected %d input update(s) (mode=%s driver=%s) -- "
                     "input is being dropped before it reaches the game",
                     self._submit_fail_count, self.mode, self.driver_type)
+        if self._input_rate_diagnostics:
+            self._submit_attempted_count += 1
+            self._submit_completed_count += int(bool(submitted))
+            self._submit_rejected_count += int(not submitted)
+            self._submit_durations_ms.append(elapsed_ms)
+            elapsed = now - self._submit_rate_window_start
+            if elapsed >= 1.0:
+                superseded = max(
+                    0, self._submit_superseded_count -
+                    self._submit_diag_superseded_start)
+                durations = sorted(self._submit_durations_ms)
+                submit_avg_ms = ((sum(durations) / len(durations))
+                                 if durations else 0.0)
+                submit_p95_ms = (durations[min(
+                    len(durations) - 1, int(len(durations) * 0.95))]
+                    if durations else 0.0)
+                logger.info(
+                    "Virtual input rates: published=%.0f/s attempted=%.0f/s "
+                    "submitted=%.0f/s rejected=%d superseded=%d "
+                    "submit_avg=%.3fms submit_p95=%.3fms mode=%s driver=%s power=%s",
+                    self._submit_published_count / elapsed,
+                    self._submit_attempted_count / elapsed,
+                    self._submit_completed_count / elapsed,
+                    self._submit_rejected_count, superseded,
+                    submit_avg_ms, submit_p95_ms, self.mode, self.driver_type,
+                    power_saving.mode())
+                self._submit_published_count = 0
+                self._submit_attempted_count = 0
+                self._submit_completed_count = 0
+                self._submit_rejected_count = 0
+                self._submit_durations_ms.clear()
+                self._submit_diag_superseded_start = self._submit_superseded_count
+                self._submit_rate_window_start = now
         return submitted
 
     def cleanup_vg_controller(self, detach_usbip=True):
+        self._virtual_device_generation = getattr(
+            self, "_virtual_device_generation", 0) + 1
         self._suppress_usbip_reconnect = True
         self._stop_submit_thread()
         self._stop_dualsense_audio_guard()
@@ -1366,6 +1409,8 @@ class VirtualController:
             return False
 
     def _setup_vg_controller(self):
+        self._virtual_device_generation = getattr(
+            self, "_virtual_device_generation", 0) + 1
         with VIRTUAL_DEVICE_CREATION_LOCK:
             import time
             if not getattr(CONFIG, "virtual_driver_ready_probe", True):
@@ -3523,7 +3568,7 @@ class VirtualController:
             else:
                 self._update_as_ps5_locked(inputData, buttons, controller)
                 mapped_ns = time.perf_counter_ns()
-                if (self.driver_type == "WinUHid" and not power_saving.is_off()
+                if (self.driver_type == "WinUHid" and power_saving.is_full()
                         and hasattr(self.vg_controller, "update_latest")):
                     result = self.vg_controller.update_latest()
                 else:

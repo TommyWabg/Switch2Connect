@@ -34,6 +34,7 @@ import time
 import json
 import webbrowser
 import threading
+import weakref
 import tkinter as tk
 from tkinter import filedialog, ttk
 import tkinter.font as tkFont
@@ -96,7 +97,8 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.6.1"
+APP_VERSION = "v2.7"
+UI_SCALING_REVISION = "2026-08-29-dynamic-window-01"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -403,6 +405,9 @@ def wired_controller_label(product_ids, sentence=False):
 # single implementation used for connection diagnostics.
 
 logger = logging.getLogger(__name__)
+logger.info(
+    "UI scaling revision=%s executable=%s frozen=%s",
+    UI_SCALING_REVISION, sys.executable, bool(getattr(sys, "frozen", False)))
 
 try:
     # Break out of Windows terminal DPI virtualization cache to get TRUE physical resolution
@@ -445,13 +450,99 @@ def _get_window_non_client_height():
     padded_border = ctypes.windll.user32.GetSystemMetrics(92)   # SM_CXPADDEDBORDER
     return caption_height + (2 * frame_height) + (2 * padded_border)
 
-def _get_effective_client_height(fallback_height):
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def _monitor_metrics(monitor):
+    """Return physical monitor/work-area metrics for an HMONITOR."""
+    if not monitor:
+        return None
+    try:
+        get_monitor_info = ctypes.windll.user32.GetMonitorInfoW
+        get_monitor_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+        get_monitor_info.restype = wintypes.BOOL
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not get_monitor_info(ctypes.c_void_p(int(monitor)), ctypes.byref(info)):
+            return None
+        return {
+            "handle": int(monitor),
+            "left": int(info.rcMonitor.left),
+            "top": int(info.rcMonitor.top),
+            "right": int(info.rcMonitor.right),
+            "bottom": int(info.rcMonitor.bottom),
+            "width": int(info.rcMonitor.right - info.rcMonitor.left),
+            "height": int(info.rcMonitor.bottom - info.rcMonitor.top),
+            "work_left": int(info.rcWork.left),
+            "work_top": int(info.rcWork.top),
+            "work_right": int(info.rcWork.right),
+            "work_bottom": int(info.rcWork.bottom),
+            "work_width": int(info.rcWork.right - info.rcWork.left),
+            "work_height": int(info.rcWork.bottom - info.rcWork.top),
+        }
+    except Exception:
+        return None
+
+
+def _monitor_metrics_from_point(x, y):
+    """Return the nearest display for a physical screen coordinate."""
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromPoint(
+            wintypes.POINT(int(x), int(y)), 2)  # MONITOR_DEFAULTTONEAREST
+        return _monitor_metrics(monitor)
+    except Exception:
+        return None
+
+
+def _monitor_metrics_from_window(hwnd):
+    """Return the display containing most of a top-level window."""
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromWindow(
+            ctypes.c_void_p(int(hwnd)), 2)  # MONITOR_DEFAULTTONEAREST
+        return _monitor_metrics(monitor)
+    except Exception:
+        return None
+
+
+def _top_level_hwnd(widget):
+    """Return Tk's actual outer/root HWND, including title bar and borders."""
+    try:
+        raw_hwnd = int(widget.winfo_id())
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        outer_hwnd = user32.GetAncestor(
+            ctypes.c_void_p(raw_hwnd), 2)  # GA_ROOT
+        return int(outer_hwnd or raw_hwnd)
+    except Exception:
+        return None
+
+
+def _get_effective_client_height(fallback_height, current_work_height=None):
     effective_height = fallback_height
     try:
-        work_area = wintypes.RECT()
-        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work_area), 0):
-            work_height = work_area.bottom - work_area.top
-            effective_height = min(effective_height, max(1, work_height - _get_window_non_client_height()))
+        work_height = current_work_height
+        if work_height is None:
+            work_area = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(work_area), 0):
+                work_height = work_area.bottom - work_area.top
+        if work_height:
+            effective_height = min(
+                effective_height,
+                max(1, work_height - _get_window_non_client_height()))
     except Exception:
         pass
     return effective_height
@@ -480,7 +571,7 @@ def _get_current_dpi_scale():
         pass
     return 120, 1.25
 
-def refresh_ui_scaling(current_screen_height=None):
+def refresh_ui_scaling(current_screen_height=None, current_work_height=None):
     global screen_height, resolution_ratio, window_resolution_ratio, scaling_factor
     global ui_dpi, ui_dpi_scale
     global controller_frame_size, battery_height, player_row_height
@@ -502,7 +593,8 @@ def refresh_ui_scaling(current_screen_height=None):
         # usable work area) never pushes content off-screen. The old 4K-specific branch tied
         # the ratio to ui_dpi_scale, which is exactly what caused the high-DPI overflow.
         window_resolution_ratio = (screen_height / 1440.0) * ui_scale
-        effective_height = _get_effective_client_height(screen_height)
+        effective_height = _get_effective_client_height(
+            screen_height, current_work_height)
         try:
             baseline_height = max(1, 1440 - _get_window_non_client_height())
         except Exception:
@@ -968,6 +1060,7 @@ MACHINE_LOCAL_CONFIG_KEYS = frozenset({
     "esp32_serial_port",
     "esp32_serial_device_id",
     "esp32_serial_number",
+    "esp32_serial_location",
 })
 
 # Everything bound to a specific physical controller (calibration blobs plus every
@@ -2363,6 +2456,11 @@ class ControllerWindow:
         self.last_height = CONFIG.window_height
         self.last_x = CONFIG.window_x
         self.last_y = CONFIG.window_y
+        self._ui_monitor_handle = None
+        self._ui_monitor_signature = None
+        self._monitor_check_after_id = None
+        self._dynamic_scale_in_progress = False
+        self._dynamic_widget_baselines = weakref.WeakKeyDictionary()
         self.last_foreground_app_path = None
         self.app_profile_poll_suspended = False
         self.app_profile_switching = False
@@ -2633,11 +2731,7 @@ class ControllerWindow:
             self.calibration_overlay.close()
 
     def get_root_hwnd(self):
-        try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            return hwnd or self.root.winfo_id()
-        except Exception:
-            return None
+        return _top_level_hwnd(self.root)
 
     def show_centered_dialog(self, title, message, buttons=("OK",), default=None):
         if threading.current_thread() != threading.main_thread():
@@ -3168,7 +3262,9 @@ class ControllerWindow:
                     _log_path = get_flash_log_path()
                 except Exception:
                     _log_path = ""
-                if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
+                if ("Could not communicate with ESP32-S3" in error_str
+                        or ("Could not put ESP32-S3" in error_str
+                            and "into flashing mode" in error_str)):
                     messagebox.showerror(ESP32S3_LABEL, (
                         "Could not enter flashing mode.\n\n"
                         "To enter Boot mode manually:\n"
@@ -3202,7 +3298,10 @@ class ControllerWindow:
                     percent = 25.0 + (max(0.0, min(100.0, float(match.group(1)))) * 0.70)
 
             if percent is None:
-                percent = min(95.0, current + 1.0)
+                # Plain esptool log lines are diagnostic text, not progress.  In
+                # particular, retries during bootloader synchronization must not
+                # appear as a misleading 16% partial flash.
+                percent = current
             percent = max(current, min(100.0, percent))
             progress_var.set(percent)
             percent_label.config(text=f"{int(percent)}%")
@@ -3239,7 +3338,15 @@ class ControllerWindow:
         except Exception:
             ESP32S3_LABEL = "ESP32-S3 CDC"
 
-        status = self.refresh_esp32s3_status()
+        # Normal discovery intentionally excludes blank/generic serial devices.
+        # The firmware dialog is the only scope allowed to expose an unverified
+        # candidate, and doing so must not mark the global bridge as detected.
+        self.refresh_esp32s3_status()
+        try:
+            from usb_serial_bridge import detect_bridge
+            status = detect_bridge(allow_unverified=True)
+        except Exception:
+            status = self.esp32s3_bridge_status
         dialog_state = {"status": status, "operation_started": False, "probe_running": False}
         otg_only = bool(status and getattr(status, "otg_only", False))
         # OTG in Boot mode: firmware_installed=False means ROM bootloader is running → can flash directly
@@ -3335,7 +3442,8 @@ class ControllerWindow:
             def worker():
                 try:
                     from usb_serial_bridge import detect_bridge
-                    selected_status = detect_bridge(selected_port or None)
+                    selected_status = detect_bridge(
+                        selected_port or None, allow_unverified=True)
                 except Exception as e:
                     logger.debug(f"ESP32-S3 selected port probe failed: {e}")
                     selected_status = None
@@ -3410,6 +3518,8 @@ class ControllerWindow:
                 current = getattr(new_status, "firmware_version", "") or "unknown"
                 expected = getattr(new_status, "expected_version", "") or "bundled"
                 firmware = f"Update required ({current} -> {expected})"
+            elif new_status and getattr(new_status, "unverified_candidate", False):
+                firmware = "Unverified flashing candidate"
             elif new_status and getattr(new_status, "board_present", False):
                 if (getattr(CONFIG, "esp32_serial_port_mode", "auto") == "manual"
                         and not getattr(new_status, "firmware_installed", False)
@@ -3453,7 +3563,7 @@ class ControllerWindow:
                 succeeded = False
                 try:
                     from usb_serial_bridge import detect_bridge
-                    detected_status = detect_bridge()
+                    detected_status = detect_bridge(allow_unverified=True)
                     succeeded = True
                 except Exception as e:
                     logger.debug(f"ESP32-S3 dialog status refresh failed: {e}")
@@ -3674,7 +3784,8 @@ class ControllerWindow:
                 if m:
                     percent = 25.0 + (max(0.0, min(100.0, float(m.group(1)))) * 0.70)
             if percent is None:
-                percent = min(95.0, current + 1.0)
+                # Plain esptool log lines are diagnostic text, not progress.
+                percent = current
             percent = max(current, min(100.0, percent))
             progress_var.set(percent)
             if dialog.winfo_exists():
@@ -3756,7 +3867,9 @@ class ControllerWindow:
                     _log_path = get_flash_log_path()
                 except Exception:
                     _log_path = ""
-                if "Could not put ESP32-S3" in error_str and "into flashing mode" in error_str:
+                if ("Could not communicate with ESP32-S3" in error_str
+                        or ("Could not put ESP32-S3" in error_str
+                            and "into flashing mode" in error_str)):
                     on_done(False, (
                         "Could not enter flashing mode.\n\n"
                         "To enter Boot mode manually:\n"
@@ -6532,10 +6645,23 @@ class ControllerWindow:
         self.root = tk.Tk()
         self.root.tk.call('tk', 'scaling', 1.3333333333333333)
         self.root.withdraw() # Hide while building the UI, then show from start().
-        
-        # 2. Re-apply global scaling factors using the actual Tk screen height.
+
+        # 2. Re-apply the existing resolution-based scaling rule for the display
+        # that owns the saved window position.  DPI deliberately does not enter
+        # this calculation: two displays with the same physical resolution must
+        # produce the same application scale regardless of Windows' DPI setting.
+        x = CONFIG.window_x if CONFIG.window_x is not None else 50
+        y = CONFIG.window_y if CONFIG.window_y is not None else 50
+        initial_monitor = _monitor_metrics_from_point(x, y)
         try:
-            refresh_ui_scaling(self.root.winfo_screenheight())
+            if initial_monitor:
+                refresh_ui_scaling(
+                    initial_monitor["height"], initial_monitor["work_height"])
+                self._ui_monitor_handle = initial_monitor["handle"]
+                self._ui_monitor_signature = (
+                    initial_monitor["height"], initial_monitor["work_height"])
+            else:
+                refresh_ui_scaling(self.root.winfo_screenheight())
         except Exception:
             refresh_ui_scaling()
 
@@ -6560,8 +6686,6 @@ class ControllerWindow:
         # 3. Handle window geometry & minsize (remembering position)
         default_w = int(1270 * window_resolution_ratio)
         default_h = int(1250 * window_resolution_ratio)
-        x = CONFIG.window_x if CONFIG.window_x is not None else 50
-        y = CONFIG.window_y if CONFIG.window_y is not None else 50
         self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
         self.root.minsize(default_w, default_h)
         self.root.config(bg=background_color, padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
@@ -6570,7 +6694,13 @@ class ControllerWindow:
         # Set title bar color to match background
         try:
             self.root.update()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            hwnd = _top_level_hwnd(self.root)
+            if not hwnd:
+                raise RuntimeError("Could not resolve Tk top-level HWND")
+            logger.info(
+                "Tk HWND resolved: widget=%s top_level=%s rect=%s state=%s",
+                self.root.winfo_id(), hwnd, win32gui.GetWindowRect(hwnd),
+                self.root.state())
             color = background_color.lstrip('#')
             r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
             color_int = (b << 16) | (g << 8) | r # BGR format
@@ -6578,69 +6708,13 @@ class ControllerWindow:
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(ctypes.c_int(0xFFFFFF)), 4)  # Title text color (White)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), 4)         # Immersive dark mode
             
-            # Get expected outer dimensions corresponding to client size
-            rect = win32gui.GetWindowRect(hwnd)
-            self.expected_outer_w = rect[2] - rect[0]
-            self.expected_outer_h = rect[3] - rect[1]
-
-            class POINT(ctypes.Structure):
-                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-            class MINMAXINFO(ctypes.Structure):
-                _fields_ = [
-                    ("ptReserved", POINT),
-                    ("ptMaxSize", POINT),
-                    ("ptMaxPosition", POINT),
-                    ("ptMinTrackSize", POINT),
-                    ("ptMaxTrackSize", POINT),
-                ]
-
-            class WINDOWPOS(ctypes.Structure):
-                _fields_ = [
-                    ("hwnd", ctypes.c_void_p),
-                    ("hwndInsertAfter", ctypes.c_void_p),
-                    ("x", ctypes.c_int),
-                    ("y", ctypes.c_int),
-                    ("cx", ctypes.c_int),
-                    ("cy", ctypes.c_int),
-                    ("flags", ctypes.c_uint),
-                ]
-
-            self._user_resizing = False
-
-            # Subclass to ignore WM_DPICHANGED (0x02E0) and prevent auto-resizing
-            def wndproc(hwnd_val, msg, wparam, lparam):
-                if msg == 0x0231: # WM_ENTERSIZEMOVE
-                    self._user_resizing = True
-                elif msg == 0x0232: # WM_EXITSIZEMOVE
-                    self._user_resizing = False
-                elif msg == 0x0024: # WM_GETMINMAXINFO
-                    res = win32gui.CallWindowProc(self.old_wndproc, hwnd_val, msg, wparam, lparam)
-                    if getattr(self, 'expected_outer_w', None) and getattr(self, 'expected_outer_h', None):
-                        mmi = MINMAXINFO.from_address(lparam)
-                        mmi.ptMinTrackSize.x = self.expected_outer_w
-                        mmi.ptMinTrackSize.y = self.expected_outer_h
-                    return res
-                elif msg == 0x0046: # WM_WINDOWPOSCHANGING
-                    wp = WINDOWPOS.from_address(lparam)
-                    if not (wp.flags & 0x0001): # Not SWP_NOSIZE
-                        if not getattr(self, '_user_resizing', False):
-                            if getattr(self, 'expected_outer_w', None) and getattr(self, 'expected_outer_h', None):
-                                wp.cx = self.expected_outer_w
-                                wp.cy = self.expected_outer_h
-                elif msg == 0x02E0: # WM_DPICHANGED
-                    return 0
-                return win32gui.CallWindowProc(self.old_wndproc, hwnd_val, msg, wparam, lparam)
-            self._wndproc_ref = wndproc
-            self.old_wndproc = win32gui.SetWindowLong(hwnd, win32con.GWL_WNDPROC, wndproc)
-            
             # Force the geometry, minsize, and scaling factor back to defaults to overwrite any initial scaling applied during update()
             self.root.tk.call('tk', 'scaling', 1.3333333333333333)
             self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
             self.root.minsize(default_w, default_h)
             self.root.update()
         except Exception as e:
-            logger.debug(f"Failed to set title bar color or subclass window: {e}")
+            logger.debug(f"Failed to initialize native window appearance: {e}")
 
         # Dropdown (Combobox) Styling
         style = ttk.Style()
@@ -7342,6 +7416,345 @@ class ControllerWindow:
             self.settings_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(int(5 * scaling_factor), 0))
 
 
+    @staticmethod
+    def _scaled_layout_value(base_value, target_scale, allow_negative=False):
+        values = tuple(int(round(value * target_scale))
+                       for value in base_value)
+        if not allow_negative:
+            values = tuple(max(0, value) for value in values)
+        return values[0] if len(values) == 1 else values
+
+    def _pixel_layout_value(self, widget, value, source_scale):
+        """Normalize a Tk distance (including two-sided padding) to scale 1.0."""
+        try:
+            parts = widget.tk.splitlist(value)
+        except Exception:
+            parts = (value,)
+        if not parts:
+            return None
+        pixels = []
+        for part in parts:
+            if part in (None, ""):
+                return None
+            try:
+                pixels.append(float(widget.winfo_pixels(part)) / source_scale)
+            except Exception:
+                try:
+                    pixels.append(float(part) / source_scale)
+                except (TypeError, ValueError):
+                    return None
+        return tuple(pixels)
+
+    def _rescale_widget_tree(self, old_scale, new_scale):
+        """Apply a new absolute scale to the already-created Tk widget tree.
+
+        Widget construction throughout this module deliberately uses physical
+        pixels.  Tk has no per-window transform for existing child widgets, so
+        retain each widget's first-seen scale-1.0 dimensions and reapply them.
+        Character-count widths on labels, buttons and entries are intentionally
+        excluded; their pixel size follows their font and geometry manager.
+        """
+        if old_scale <= 0 or new_scale <= 0:
+            return
+
+        common_options = (
+            "padx", "pady", "borderwidth", "highlightthickness",
+            "insertwidth", "selectborderwidth", "wraplength",
+        )
+        pixel_sized_classes = {
+            "Frame", "Labelframe", "TFrame", "TLabelframe", "Canvas",
+            "Scale", "Scrollbar", "TScrollbar", "Panedwindow",
+        }
+
+        def visit(widget):
+            try:
+                children = widget.winfo_children()
+            except tk.TclError:
+                return
+            try:
+                baseline = self._dynamic_widget_baselines.get(widget)
+                manager = widget.winfo_manager()
+                if baseline is None:
+                    baseline = {"options": {}, "manager": manager, "layout": {}}
+                    option_names = list(common_options)
+                    if widget.winfo_class() in pixel_sized_classes:
+                        option_names.extend(("width", "height"))
+                    if isinstance(widget, tk.Scale):
+                        option_names.extend(("length", "sliderlength"))
+                    # Some custom Tk subclasses in this module intentionally
+                    # override configure() as a write-only convenience method and
+                    # return None when called without options. Misc.keys() queries
+                    # Tcl directly and therefore remains reliable for introspection.
+                    available = set(widget.keys())
+                    for option in dict.fromkeys(option_names):
+                        if option not in available:
+                            continue
+                        normalized = self._pixel_layout_value(
+                            widget, widget.cget(option), old_scale)
+                        if normalized is not None:
+                            baseline["options"][option] = normalized
+
+                    if manager in ("pack", "grid", "place"):
+                        info = getattr(widget, manager + "_info")()
+                        layout_names = (
+                            ("padx", "pady", "ipadx", "ipady")
+                            if manager in ("pack", "grid")
+                            else ("x", "y", "width", "height")
+                        )
+                        for option in layout_names:
+                            value = info.get(option)
+                            if value in (None, ""):
+                                continue
+                            normalized = self._pixel_layout_value(
+                                widget, value, old_scale)
+                            if normalized is not None:
+                                baseline["layout"][option] = normalized
+
+                    if "font" in available:
+                        try:
+                            font_parts = list(widget.tk.splitlist(widget.cget("font")))
+                            if len(font_parts) >= 2:
+                                font_size = int(font_parts[1])
+                                baseline["font"] = (
+                                    font_parts,
+                                    abs(font_size) / old_scale,
+                                    -1 if font_size < 0 else 1,
+                                )
+                        except (tk.TclError, TypeError, ValueError):
+                            pass
+                    self._dynamic_widget_baselines[widget] = baseline
+
+                updates = {
+                    option: self._scaled_layout_value(value, new_scale)
+                    for option, value in baseline["options"].items()
+                }
+                if updates:
+                    widget.configure(**updates)
+
+                font_data = baseline.get("font")
+                if font_data:
+                    parts, base_size, sign = font_data
+                    parts = list(parts)
+                    parts[1] = sign * max(1, int(round(base_size * new_scale)))
+                    widget.configure(font=tuple(parts))
+
+                if baseline.get("manager") == manager and baseline["layout"]:
+                    layout = {
+                        option: self._scaled_layout_value(
+                            value, new_scale,
+                            allow_negative=manager == "place" and option in ("x", "y"))
+                        for option, value in baseline["layout"].items()
+                    }
+                    getattr(widget, manager + "_configure")(**layout)
+
+            except (tk.TclError, RuntimeError):
+                # One unsupported option must not prevent the rest of that
+                # container's descendants from being scaled.
+                pass
+            for child in children:
+                visit(child)
+
+        for child in self.root.winfo_children():
+            visit(child)
+
+        # This named font is shared by the main action buttons and therefore does
+        # not appear as a numeric font tuple on each individual widget.
+        try:
+            self.font.configure(size=max(1, int(15 * new_scale)))
+        except (AttributeError, tk.TclError):
+            pass
+
+        try:
+            style = ttk.Style(self.root)
+            style.configure(
+                "TCombobox", font=scale_font(("Arial", 11, "bold")))
+            self.root.option_add(
+                "*TCombobox*Listbox.font", scale_font(("Arial", 11, "bold")))
+        except tk.TclError:
+            pass
+
+    def _replace_widget_image(self, parent, old_image, new_image):
+        if old_image is None or new_image is None:
+            return
+        old_name = str(old_image)
+        for widget in parent.winfo_children():
+            try:
+                if "image" in widget.keys() and str(widget.cget("image")) == old_name:
+                    widget.configure(image=new_image)
+                self._replace_widget_image(widget, old_image, new_image)
+            except tk.TclError:
+                pass
+
+    def _refresh_resolution_scaled_images(self):
+        old_hint = getattr(self, "pairing_hint_image", None)
+        try:
+            hint_img = Image.open(get_resource("images/pairing_hint.png"))
+            width, height = hint_img.size
+            hint_img = hint_img.resize(
+                (max(1, int(width * scaling_factor)),
+                 max(1, int(height * scaling_factor))),
+                Image.Resampling.LANCZOS if hasattr(Image, "Resampling")
+                else Image.ANTIALIAS)
+            self.pairing_hint_image = ImageTk.PhotoImage(hint_img)
+            self._replace_widget_image(
+                self.root, old_hint, self.pairing_hint_image)
+        except Exception as exc:
+            logger.debug("Failed to refresh pairing image after display change: %s", exc)
+
+        if getattr(self, "kofi_button", None) is not None:
+            try:
+                image = Image.open(get_resource("images/support_me_on_kofi_dark.png"))
+                source_width, source_height = image.size
+                target_height = max(1, int(30 * scaling_factor))
+                target_width = max(
+                    1, int(round(source_width * target_height / source_height)))
+                image = image.resize(
+                    (target_width, target_height),
+                    Image.Resampling.LANCZOS if hasattr(Image, "Resampling")
+                    else Image.ANTIALIAS)
+                self.kofi_image = ImageTk.PhotoImage(image)
+                self.kofi_button.configure(image=self.kofi_image)
+            except Exception as exc:
+                logger.debug("Failed to refresh Ko-fi image after display change: %s", exc)
+
+    def _queue_monitor_scale_check(self, delay=80):
+        if not getattr(self, "root", None) or getattr(self, "is_quitting", False):
+            return
+        try:
+            if self._monitor_check_after_id is not None:
+                self.root.after_cancel(self._monitor_check_after_id)
+            self._monitor_check_after_id = self.root.after(
+                delay, self._apply_monitor_scaling_if_needed)
+        except tk.TclError:
+            self._monitor_check_after_id = None
+
+    def _commit_dynamic_window_size(self, monitor_handle, client_width,
+                                    client_height, outer_width, outer_height):
+        """Commit size once more after the monitor-change callback has unwound."""
+        if (getattr(self, "is_quitting", False)
+                or monitor_handle != self._ui_monitor_handle):
+            return
+        try:
+            if self.root.state() != "normal":
+                logger.info(
+                    "Deferred dynamic window resize skipped: state=%s",
+                    self.root.state())
+                return
+            hwnd = _top_level_hwnd(self.root)
+            if not hwnd:
+                raise RuntimeError("Could not resolve Tk top-level HWND")
+            rect = win32gui.GetWindowRect(hwnd)
+            self.root.geometry(f"{client_width}x{client_height}")
+            win32gui.MoveWindow(
+                hwnd, rect[0], rect[1], outer_width, outer_height, True)
+            self.root.update_idletasks()
+            applied = win32gui.GetWindowRect(hwnd)
+            logger.info(
+                "Deferred dynamic window resize committed: outer=%dx%d",
+                applied[2] - applied[0], applied[3] - applied[1])
+        except Exception:
+            logger.exception("Failed to commit deferred dynamic window size")
+
+    def _apply_monitor_scaling_if_needed(self):
+        global scaling_factor
+        self._monitor_check_after_id = None
+        if self._dynamic_scale_in_progress or getattr(self, "is_quitting", False):
+            return
+        try:
+            hwnd = _top_level_hwnd(self.root)
+            if not hwnd:
+                raise RuntimeError("Could not resolve Tk top-level HWND")
+            monitor = _monitor_metrics_from_window(hwnd)
+            if not monitor:
+                return
+            signature = (monitor["height"], monitor["work_height"])
+            scale_changed = signature != self._ui_monitor_signature
+            logger.info(
+                "Monitor scale check: widget_hwnd=%s top_hwnd=%s monitor=%s "
+                "signature=%s previous=%s rect=%s state=%s",
+                self.root.winfo_id(), hwnd, monitor["handle"], signature,
+                self._ui_monitor_signature, win32gui.GetWindowRect(hwnd),
+                self.root.state())
+            self._ui_monitor_handle = monitor["handle"]
+            self._ui_monitor_signature = signature
+            if not scale_changed:
+                return
+
+            old_scale = float(scaling_factor)
+            refresh_ui_scaling(monitor["height"], monitor["work_height"])
+            new_scale = float(scaling_factor)
+            if abs(new_scale - old_scale) < 0.0001:
+                return
+
+            self._dynamic_scale_in_progress = True
+            logger.info(
+                "Display change detected: %sp work area %sp; UI scale %.4f -> %.4f",
+                monitor["height"], monitor["work_height"], old_scale, new_scale)
+            self._rescale_widget_tree(old_scale, new_scale)
+            self._refresh_resolution_scaled_images()
+
+            width = int(1270 * window_resolution_ratio)
+            height = int(1250 * window_resolution_ratio)
+
+            # Tk may defer root.geometry() until after this callback returns, so
+            # synchronously resize the native top-level HWND as well.  The window
+            # procedure deliberately does not override WM_WINDOWPOSCHANGING; doing
+            # so would lock the window to its previous display's outer dimensions.
+            outer_rect = win32gui.GetWindowRect(int(hwnd))
+            client_rect = win32gui.GetClientRect(int(hwnd))
+            non_client_width = max(
+                0, (outer_rect[2] - outer_rect[0])
+                - (client_rect[2] - client_rect[0]))
+            non_client_height = max(
+                0, (outer_rect[3] - outer_rect[1])
+                - (client_rect[3] - client_rect[1]))
+            target_outer_width = width + non_client_width
+            target_outer_height = height + non_client_height
+            self.root.minsize(width, height)
+            self.root.geometry(f"{width}x{height}")
+            win32gui.SetWindowPos(
+                int(hwnd), 0,
+                outer_rect[0], outer_rect[1],
+                target_outer_width, target_outer_height,
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            self.root.configure(
+                padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+            self.root.update_idletasks()
+
+            applied_rect = win32gui.GetWindowRect(int(hwnd))
+            applied_width = applied_rect[2] - applied_rect[0]
+            applied_height = applied_rect[3] - applied_rect[1]
+            if (applied_width != target_outer_width
+                    or applied_height != target_outer_height):
+                # MoveWindow is a deliberately independent fallback for window
+                # managers/Tk builds that coalesce the preceding SetWindowPos.
+                win32gui.MoveWindow(
+                    int(hwnd), outer_rect[0], outer_rect[1],
+                    target_outer_width, target_outer_height, True)
+                self.root.update_idletasks()
+                applied_rect = win32gui.GetWindowRect(int(hwnd))
+                applied_width = applied_rect[2] - applied_rect[0]
+                applied_height = applied_rect[3] - applied_rect[1]
+            logger.info(
+                "Dynamic window resize: client=%dx%d outer_target=%dx%d "
+                "outer_applied=%dx%d state=%s",
+                width, height, target_outer_width, target_outer_height,
+                applied_width, applied_height, self.root.state())
+
+            # Player cards own resolution-scaled bitmap assets. Rebuilding only
+            # those cards keeps controller/runtime state intact and uses their
+            # existing construction path with the new global scale.
+            self.force_refresh_player_slots()
+            self.root.after(
+                0, self._commit_dynamic_window_size,
+                monitor["handle"], width, height,
+                target_outer_width, target_outer_height)
+        except Exception:
+            logger.exception("Failed to apply dynamic monitor UI scaling")
+        finally:
+            self._dynamic_scale_in_progress = False
+
+
     def on_configure(self, event):
         if event.widget == self.root:
             try:
@@ -7363,6 +7776,8 @@ class ControllerWindow:
                     self._reposition_kofi_window()
                 except Exception:
                     pass
+            if not getattr(self, "_dynamic_scale_in_progress", False):
+                self._queue_monitor_scale_check(120)
 
     def init_compensation_panel(self, parent=None):
         parent = parent or self.root
@@ -14904,20 +15319,6 @@ bg_color=panel_bg, widths=[8, 10])
         except Exception as e:
             logger.debug("Failed to stop wired device listener: %s", e)
         
-        # Restore window procedure
-        if hasattr(self, 'old_wndproc') and self.old_wndproc:
-            try:
-                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-                try:
-                    SetWindowLong = ctypes.windll.user32.SetWindowLongPtrW
-                except AttributeError:
-                    SetWindowLong = ctypes.windll.user32.SetWindowLongW
-                SetWindowLong.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-                SetWindowLong.restype = ctypes.c_void_p
-                SetWindowLong(hwnd, win32con.GWL_WNDPROC, self.old_wndproc)
-            except Exception as e:
-                logger.debug(f"Failed to restore old window proc: {e}")
-
         # Fallback query current root window geometry directly before saving
         try:
             if self.root and self.root.state() == 'normal':

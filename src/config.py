@@ -851,6 +851,7 @@ class Config:
         self.esp32_serial_port = str(config.get("esp32_serial_port", "") or "").upper()
         self.esp32_serial_device_id = str(config.get("esp32_serial_device_id", "") or "")
         self.esp32_serial_number = str(config.get("esp32_serial_number", "") or "")
+        self.esp32_serial_location = str(config.get("esp32_serial_location", "") or "")
         if _packaged_build():
             # The persisted value is not trusted as a capability grant.  Refresh
             # it from the live system so a separately installed WinUHid can
@@ -1842,6 +1843,7 @@ class Config:
             'esp32_serial_port': self.esp32_serial_port,
             'esp32_serial_device_id': self.esp32_serial_device_id,
             'esp32_serial_number': self.esp32_serial_number,
+            'esp32_serial_location': self.esp32_serial_location,
             'wired_auto_scan_enabled': self.wired_auto_scan_enabled,
             'wired_usb_enabled': self.wired_auto_scan_enabled,
             'hidhide_installed': self.hidhide_installed,

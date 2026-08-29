@@ -100,6 +100,7 @@ class PortInfo:
     is_otg: bool = False
     confidence: int = 0
     serial_number: str = ""
+    location: str = ""
 
 @dataclass
 class BridgeStatus:
@@ -116,9 +117,15 @@ class BridgeStatus:
     usb_present: bool = False
     hid_path: str | None = None # For compatibility with discoverer.py
     otg_only: bool = False  # True when only native OTG/VID-303A port detected, no CH343P
+    unverified_candidate: bool = False
 
     @property
     def board_present(self):
+        return bool((self.serial_port is not None or self.usb_present)
+                    and not self.unverified_candidate)
+
+    @property
+    def flash_candidate_present(self):
         return self.serial_port is not None or self.usb_present
 
 class DummyBleDevice:
@@ -1224,7 +1231,7 @@ def scan_serial_ports():
         )
 
     def add_port(port: str, name: str, manufacturer: str, device_id: str,
-                 serial_number: str = ""):
+                 serial_number: str = "", location: str = ""):
         if not port:
             return
         port = port.upper()
@@ -1250,6 +1257,7 @@ def scan_serial_ports():
                 existing.is_otg or otg,
                 merged_confidence,
                 existing.serial_number or serial_number,
+                existing.location or location,
             )
         else:
             ports_by_name[port] = PortInfo(
@@ -1266,7 +1274,8 @@ def scan_serial_ports():
             manufacturer = str(getattr(item, "manufacturer", "") or "")
             device_id = str(getattr(item, "hwid", "") or "")
             serial_number = str(getattr(item, "serial_number", "") or "")
-            add_port(port, name, manufacturer, device_id, serial_number)
+            location = str(getattr(item, "location", "") or "")
+            add_port(port, name, manufacturer, device_id, serial_number, location)
     except Exception as e:
         logger.debug(f"ESP32-S3 pyserial port scan failed: {e}")
     # Always enrich pyserial results with WMI.  A low-numbered WCH peripheral
@@ -1285,11 +1294,13 @@ def scan_serial_ports():
         logger.debug(f"ESP32-S3 serial scan failed: {e}")
     saved_id = str(getattr(CONFIG, "esp32_serial_device_id", "") or "").upper()
     saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+    saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
 
     def sort_key(info):
         identity_match = bool(
             (saved_id and saved_id == info.device_id.upper())
-            or (saved_serial and saved_serial == info.serial_number.upper()))
+            or (saved_serial and saved_serial == info.serial_number.upper())
+            or (saved_location and saved_location == info.location.upper()))
         return (-int(identity_match), -info.confidence,
                 int(re.sub(r"\D", "", info.port) or "9999"))
 
@@ -1470,7 +1481,14 @@ def is_bridge_firmware(status_text: str):
 
 def format_port_label(port_info: PortInfo, verified=False):
     details = port_info.name or port_info.manufacturer or "Serial device"
-    suffix = " - Verified ESP32-S3" if verified else ""
+    if verified:
+        suffix = " - Verified ESP32-S3"
+    elif port_info.confidence >= 80:
+        suffix = " - ESP32-S3 flashing candidate"
+    elif port_info.confidence >= 20:
+        suffix = " - Unverified flashing candidate"
+    else:
+        suffix = " - Not an automatic ESP32-S3 candidate"
     return f"{port_info.port} - {details}{suffix}"
 
 
@@ -1491,15 +1509,19 @@ def _configured_port(serials, preferred_port=None):
         # running CDC firmware and ROM Boot mode.  Follow only the same saved
         # physical USB serial identity; never fall through to an unrelated port.
         saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+        saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
         same_device = next((item for item in serials
-                            if saved_serial and item.serial_number.upper() == saved_serial), None)
+                            if ((saved_serial and item.serial_number.upper() == saved_serial)
+                                or (saved_location and item.location.upper() == saved_location))), None)
         return same_device, True
 
     saved_id = str(getattr(CONFIG, "esp32_serial_device_id", "") or "").upper()
     saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+    saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
     saved = next((item for item in serials if
                   (saved_id and item.device_id.upper() == saved_id)
-                  or (saved_serial and item.serial_number.upper() == saved_serial)), None)
+                  or (saved_serial and item.serial_number.upper() == saved_serial)
+                  or (saved_location and item.location.upper() == saved_location)), None)
     return saved, False
 
 
@@ -1510,7 +1532,8 @@ def _remember_verified_port(port_info):
     for key, value in (
             ("esp32_serial_port", port_info.port.upper()),
             ("esp32_serial_device_id", port_info.device_id),
-            ("esp32_serial_number", port_info.serial_number)):
+            ("esp32_serial_number", port_info.serial_number),
+            ("esp32_serial_location", port_info.location)):
         if getattr(CONFIG, key, "") != value:
             setattr(CONFIG, key, value)
             changed = True
@@ -1518,8 +1541,22 @@ def _remember_verified_port(port_info):
         CONFIG.save_config()
 
 
-def detect_bridge(preferred_port=None):
+def detect_bridge(preferred_port=None, allow_unverified=False):
+    """Detect a running bridge, optionally exposing blank-board flash candidates.
+
+    Normal discovery must leave ``allow_unverified`` false.  Generic serial
+    devices are only surfaced inside the user-initiated firmware UI and never
+    become controller transports merely because they are the only COM port.
+    """
     serials = scan_serial_ports()
+    logger.info(
+        "ESP32-S3 port candidates: %s",
+        ", ".join(
+            f"{item.port}[confidence={item.confidence}, otg={item.is_otg}, "
+            f"name={item.name or item.manufacturer or 'unknown'}]"
+            for item in serials
+        ) or "none",
+    )
     configured, manual = _configured_port(serials, preferred_port)
     # Manual selection probes exactly one port.  Auto mode probes the remembered
     # device first, then high-confidence boards and finally generic USB serial
@@ -1549,14 +1586,33 @@ def detect_bridge(preferred_port=None):
             _remember_verified_port(candidate)
             break
 
-    if serial_port is None:
+    unverified_candidate = False
+    if serial_port is None and allow_unverified:
         # A manually selected port or a high-confidence ESP32/CH343 may be in
         # bootloader mode and therefore unable to answer the firmware status command.
-        # Never use a generic/CH340 lowest-COM fallback in Auto mode.
+        # A factory-blank ESP32-S3 cannot answer our firmware status command.  When
+        # there is exactly one eligible generic USB serial device, retain it as an
+        # unverified flashing candidate.  This is intentionally uniqueness-based:
+        # explicit CH340 devices have confidence 0 and multiple generic devices
+        # require a manual selection, so an LED controller is never chosen merely
+        # because it has a lower COM number.
         if manual and configured:
             serial_port = configured
+            unverified_candidate = True
         else:
-            serial_port = next((p for p in flash_candidates if p.confidence >= 80), None)
+            high_confidence = [p for p in flash_candidates if p.confidence >= 80]
+            generic_candidates = [p for p in flash_candidates if 20 <= p.confidence < 80]
+            if high_confidence:
+                serial_port = high_confidence[0]
+                unverified_candidate = True
+            elif len(generic_candidates) == 1:
+                serial_port = generic_candidates[0]
+                unverified_candidate = True
+                logger.info(
+                    "Using unique unverified serial device %s as a factory-blank "
+                    "ESP32-S3 flashing candidate",
+                    serial_port.port,
+                )
 
     expected_version = get_expected_firmware_version()
     identity = parse_firmware_identity(serial_status_text)
@@ -1581,6 +1637,7 @@ def detect_bridge(preferred_port=None):
         usb_present,
         serial_port.port if serial_port else None,
         otg_only,
+        unverified_candidate,
     )
 
 class ESP32S3Controller(Controller):
@@ -1843,8 +1900,19 @@ def _common_esptool_args(port: str, baud: int, no_stub: bool, command: str, befo
     return args
 
 def _serial_recovery_hint(port: str, detail: str):
+    detail_upper = detail.upper()
+    if "WRITE TIMEOUT" in detail_upper:
+        reason = (
+            "The selected serial port did not respond. It may be the wrong device, "
+            "busy in another application, or still re-enumerating in Boot mode."
+        )
+    elif "ACCESS IS DENIED" in detail_upper or "PERMISSION" in detail_upper:
+        reason = "The selected serial port is in use by another application."
+    else:
+        reason = "The ESP32-S3 ROM bootloader did not answer on the selected port."
     return (
-        f"Could not put ESP32-S3 N16R8 on {port} into flashing mode.\n\n"
+        f"Could not communicate with ESP32-S3 N16R8 on {port}.\n\n"
+        f"{reason}\n\n"
         "Try these steps:\n"
         "1. Use the CH343P/UART Type-C port for flashing, not the native USB/OTG HID port.\n"
         "2. Unplug and reconnect the board, then try Repair.\n"
@@ -1937,6 +2005,13 @@ def release_port(port: str):
 
 
 def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFILE, progress=None):
+    # Snapshot identity before esptool resets/re-enumerates the USB device.  It is
+    # deliberately not trusted or persisted unless ROM validation and writing
+    # complete successfully below.
+    selected_port_info = next(
+        (item for item in scan_serial_ports() if item.port.upper() == port.upper()),
+        None,
+    )
     release_port(port)
     time.sleep(0.5) # Give the OS time to release the handle completely
     
@@ -1945,27 +2020,9 @@ def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFI
     baud = 115200 if mode == "repair" else 460800
     no_stub = mode == "repair"
 
-    if progress:
-        progress({"percent": 3, "message": f"Checking chip on {port}"})
-        progress(f"{ESP32S3_LABEL}: checking chip on {port}")
-    try:
-        chip_output = _run_esptool_attempts([
-            ("chip check using automatic reset", _common_esptool_args(port, baud, no_stub, "chip_id")),
-            ("chip check using 115200 baud recovery", _common_esptool_args(port, 115200, False, "chip_id")),
-            ("chip check using manual bootloader mode", _common_esptool_args(port, 115200, False, "chip_id", before="no_reset")),
-        ], progress=progress)
-    except Exception as e:
-        raise RuntimeError(_serial_recovery_hint(port, str(e))) from e
-    try:
-        chip_text = chip_output.upper().replace("_", "-")
-    except Exception:
-        chip_text = ""
-    if "ESP32-S3" not in chip_text:
-        raise RuntimeError("The selected serial port did not identify as ESP32-S3.")
-    if progress:
-        progress({"percent": 15, "message": "ESP32-S3 detected"})
-
     if mode in ("delete", "erase"):
+        if progress:
+            progress({"percent": 8, "message": f"Connecting to ESP32-S3 on {port}"})
         if progress:
             progress({"percent": 30, "message": "Erasing flash"})
             progress(f"{ESP32S3_LABEL}: erasing flash")
@@ -1987,8 +2044,12 @@ def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFI
     verified_assets = _validate_firmware_assets(manifest, firmware_root, profile)
 
     if progress:
-        progress({"percent": 25, "message": f"Flashing {profile.get('label', profile_id)}"})
+        progress({"percent": 8, "message": f"Connecting to ESP32-S3 on {port}"})
         progress(f"{ESP32S3_LABEL}: flashing {profile.get('label', profile_id)}")
+    # Do not run a separate chip_id command here.  --chip esp32s3 makes esptool
+    # verify the ROM target before writing, in the same process and bootloader
+    # session.  The former chip_id process hard-reset the board on exit and forced
+    # factory-blank/MSIX installs to find and enter Boot mode a second time.
     try:
         _run_esptool_attempts([
             ("write flash using automatic reset", _write_flash_args(manifest, firmware_root, profile, port, baud, no_stub, verified_assets=verified_assets)),
@@ -1997,6 +2058,15 @@ def flash_firmware(port: str, mode="install", profile_id=EXPECTED_FIRMWARE_PROFI
         ], progress=progress)
     except Exception as e:
         raise RuntimeError(_serial_recovery_hint(port, str(e))) from e
+    # A successful --chip esp32s3 write is authoritative ROM-level validation.
+    # Persist hardware identity only now (or when bridge firmware answered above),
+    # never when the user merely selected an unverified serial device.
+    verified_port = next(
+        (item for item in scan_serial_ports() if item.port.upper() == port.upper()),
+        selected_port_info,
+    )
+    if verified_port is not None:
+        _remember_verified_port(verified_port)
     if progress:
         # Deliberately match the 1.1 completion boundary: a successful esptool write
         # is installation success. CDC identity is checked after the user re-plugs,
