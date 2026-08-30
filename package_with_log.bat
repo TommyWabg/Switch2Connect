@@ -38,7 +38,9 @@ if exist "Switch2Connect_log.spec" del /q "Switch2Connect_log.spec"
 for %%f in ("Switch2Connect_v*_log.spec") do del /q "%%f"
 
 set "CONFIG_FILE=config.yaml"
-set "PACKAGE_CONFIG_DIR=package_temp"
+REM Keep diagnostic packaging isolated from package.bat and MSIX packaging.
+REM Those builds also recreate package_temp and may run at the same time.
+set "PACKAGE_CONFIG_DIR=package_temp_log"
 set "PACKAGE_CONFIG_FILE=%PACKAGE_CONFIG_DIR%\config.yaml"
 
 if not exist "%CONFIG_FILE%" (
