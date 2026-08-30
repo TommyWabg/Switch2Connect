@@ -1,11 +1,11 @@
 # Switch 2 Connect
 ### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
- <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.7.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
+ <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.8.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
 <p align="center">
   <a href="https://github.com/TommyWabg/Switch2Connect/releases"><img src="https://img.shields.io/github/v/release/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Release version"></a>
-  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.7.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
+  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v2.8.exe"><img src="https://img.shields.io/github/downloads/TommyWabg/Switch2Connect/total.svg?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Contributors"></a>
   <a href="https://github.com/TommyWabg/Switch2Connect/blob/main/LICENSE.md"><img src="https://img.shields.io/github/license/TommyWabg/Switch2Connect?style=flat-square&color=9be1e6&labelColor=e4896e" alt="License"></a>
   <br>
   <a href="https://github.com/TommyWabg/Switch2Connect#system-requirements"><img src="https://img.shields.io/badge/platform-Windows%2010/11%20App%20%7C%20ESP32--S3%20N16R8%20Firmware-287cff?style=flat-square&color=9be1e6&labelColor=e4896e" alt="Platform: Windows 10 & 11 app and ESP32-S3 R16N8 firmware">
@@ -97,9 +97,9 @@ If WinUHid is not installed or the installation is incomplete:
   * **Release Envelope:** When an Impulse Trigger stop command is received, the current output decays linearly to zero over 90 ms. A new command on the same side immediately replaces the pending release.
 * **Native Motion Support (PS4/PS5 Mode):** Switching to PS4 or PS5 mode enables native motion sensor reporting via the DS4 or DualSense protocol. This provides enhanced compatibility for Steam Input and games that support native DualShock 4 or DualSense gyro features.
 * **Cemuhook UDP Server:** Sends controller motion data to compatible applications through 127.0.0.1:26760. Select Cemuhook in the Gyro Pass-through settings to enable the server.
-* **Cemuhook Gyro Sensitivity Adjustment:** Featuring a Sensitivity slider (levels 1-5) to the "Gyro Passthrough" panel. The sensitivity specifically applies a linear multiplier only to the horizontal rotation (Yaw) axis sent via the Cemuhook UDP protocol.
-  * **levels 1:** Virtual Switch 1 Joy-cons turn 360 degrees when the physical Switch 2 Joy-cons turn 360 degrees.
-  * **levels 5:** Matches real Switch 1 Joycon sensitivity.
+* **Cemuhook Gyro Sensitivity Adjustment:** Featuring a Sensitivity slider (levels 1-5) in the "Gyro Passthrough" panel. The sensitivity specifically applies a linear multiplier only to the horizontal rotation (Yaw) axis sent via the Cemuhook UDP protocol.
+  * **Level 1:** Virtual Switch 1 Joy-cons turn 360 degrees when the physical Switch 2 Joy-cons turn 360 degrees.
+  * **Level 5:** Matches real Switch 1 Joy-Con sensitivity.
 * **On-the-Fly Layout Switching:** Toggle between **Nintendo Layout** (matching physical labels) and **Xbox Layout** (standard PC positioning) directly from the UI.
 * **NSO GameCube Controller Layout Mapping:** The NSO GameCube Controller uses consistent ABXY layout mapping across Xbox, PlayStation, and Switch emulation modes. Xbox Layout maps buttons by physical position, while Switch Layout maps buttons by input function.
 * **1000Hz Interpolation:** 1000Hz interpolation loop for ultra-smooth, jitter-free gyro motion rendering with both Switch 2 Right Joy-con and Pro Controller. **Gyro Mouse** and **Joy-con Mouse** output smoother and lag-free movement at 1000Hz. Gyro data handed off to other external applications (such as third-party emulators) is transmitted at a consistent, high-frequency 1000Hz rate. This transmission is purely non-interpolated; rather than generating synthetic intermediate frames, which could introduce latency, the app simply increases the packet delivery rate of real-time physical updates to ensure maximum accuracy and zero artificial delay.
@@ -107,7 +107,7 @@ If WinUHid is not installed or the installation is incomplete:
 * **9-Axis Mouse Mode (Magnetometer Support):** Uses gyroscope, accelerometer, and magnetometer data to reduce accumulated yaw drift and maintain a closer relationship between the controller’s physical orientation and mouse movement during extended play. Magnetic correction is applied gradually during suitable motion and is suspended when the surrounding magnetic field or calculated heading is unreliable.
 * **6-Axis Mouse Mode:** Uses gyroscope and accelerometer data without magnetic correction, providing motion control that is unaffected by nearby magnetic interference. Mouse movement remains horizon-aligned regardless of controller tilt, while long-term yaw drift remains dependent on gyro calibration and sensor accuracy.
 * **Gyro Racing Wheel Mode (Steering):** Reads the controller's absolute tilt (accelerometer) and maps it directly to the Left Analog Stick's X-axis.
-* **Stick Assist:** Allowing the right thumbstick to work alongside gyro aiming.
+* **Stick Assist:** Allows the right thumbstick to work alongside gyro aiming.
 * **In-App Gyro Trigger Deadzone:** Configurable within the In-App Gyro mapping pop-up window. Assign one or more buttons to apply a dedicated Trigger Deadzone while In-App Gyro is active. Users can customize the deadzone amount, gyro pause duration after button press and release, and how long the deadzone effect remains active after release. This helps reduce unintended gyro movement caused by button presses, releases, or controller vibration.
 * **In-App Gyro Trigger Dampening:** Configurable within the In-App Gyro mapping pop-up window. Assign one or more buttons to proportionally reduce gyro sensitivity by a customizable percentage. Users can also customize how long the dampening effect remains active after the assigned button is released, allowing smoother control during aiming, steering, or other gyro-based actions.
 * **In-app Gyro Lock:** A dedicated mapping option to pause gyro control while remaining in In-app Gyro mode, supporting both Hold and Tap activation logic.
@@ -121,7 +121,7 @@ If WinUHid is not installed or the installation is incomplete:
   * Navigate to the Dual Joy-Con Gyro (DJG) panel.
   * Click the DJG toggle to ON to enable the fusion engine.
   * Set the Dominant Side to Left or Right. The dominant side acts as the primary reference for direction and gravity, while the sub side provides acceleration.
-* **DJG Trigger Mapping:** Featuring a dedicated "DJG" option to the Extra Button Mapping settings.
+* **DJG Trigger Mapping:** Featuring a dedicated "DJG" option in the Extra Button Mapping settings.
   * Assign the "DJG" action to any available extra button to serve as the hardware trigger for DJG features.
   * Pressing this mapped button during gameplay will execute the action defined by the current DJG Control Mode and DJG Activation settings.
 * **DJG Control Modes:** Three modes to dictate how the mapped DJG trigger button behaves during gameplay.
@@ -154,14 +154,14 @@ If WinUHid is not installed or the installation is incomplete:
 * **Dynamic Split & Merge System:** The  **Split** and **Merge** features allow you to detach combined Joy-cons into two individual controllers or combine single Joy-cons into one unified virtual gamepad without restarting.
 * **Vertical & Horizontal Hold Modes Switch (V/H):** Featuring V/H switch buttons, allowing users to toggle between Vertical (standard upright) and Horizontal (sideways) hold modes for single Joy-cons.
 * **Per-Joy-Con V/H Mode Persistence:** The application records and remembers whether each single Joy-Con is held vertically or horizontally. Layout preferences (Vertical or Horizontal) are dynamically mapped to each controller's Bluetooth MAC address and saved in `config.yaml`.
-* **Dual-Controller Gyro Selection (L/R Gyro):** When using a pair of Joy-cons as a single virtual controller, you can manually select which Joy-con (Left or Right) provides the motion data. This allows for greater flexibility, letting you choose your preferred hand for gyro aiming or motion controls.
+* **Dual-Controller Gyro Selection (L/R Gyro):** When using a pair of Joy-Cons as a single virtual controller, you can manually select which Joy-con (Left or Right) provides the motion data. This allows for greater flexibility, letting you choose your preferred hand for gyro aiming or motion controls.
 * **Customizable Rumble Strength:** Adjusts vibration intensity from 0 to 10.
 * **Rumble Frequency Slider:** Selects the vibration frequency used for translated rumble output.
 * **Rumble Delay Configuration:** Adds a configurable delay in milliseconds for synchronizing vibration with game audio.
 * **Dual Rumble Mode Toggle:** Switches between Xbox-style translated rumble and Switch HD Rumble output.
   * Xbox Mode: Tailored for standard PC games to simulate dual-motor rumble by activating dynamic frequency scaling and high-frequency masking to mimic traditional gamepad motors.
-    * Strength 5 and Frequency 10 emulates the feel of a DualSense Edge controller.
-    * Strength 10 and Frequency 10 emulates the rumble of an Xbox Elite Series 1 Controller.
+    * Strength 5 + Frequency 10 emulates the feel of a DualSense Edge controller.
+    * Strength 10 + Frequency 10 emulates the rumble of an Xbox Elite Series 1 Controller.
   * Switch Mode: Mimics the native Switch HD Rumble (LRA) experience. It bypasses custom frequency scaling and masking, routing raw frequency data directly to the controller for a tighter, softer, and more detailed tactile feedback. Best suited for native Nintendo game emulations.
 * **Interactive Controller Identification:** Featuring a dedicated **Vibrate** button for each player slot. This allows for instant physical feedback, helping you quickly identify which Joy-Con belongs to which player in a multiplayer setup.
 * **Haptic & OS Integration:** Featuring rumble feedback (including a connection confirmation rumble) and mapping the Capture button to native Windows screenshots (`Win + PrtScn`).
@@ -184,6 +184,9 @@ If WinUHid is not installed or the installation is incomplete:
   * **Text Input Adjustment:** Text input fields support value adjustment with the right joystick or by holding A while using the left joystick. Continuous adjustment accelerates while the input is held.
   * **Slider and Time Input Adjustment:** Sliders can be adjusted with the right joystick or A plus the left joystick.
 * **Window Position Persistence:** Saves and restores the main window position.
+* **In-App UI Scale Control:** A slider for adjusting the application interface from 1.0× to 2.0× using the scale control at the bottom of the main window. The selected scale is saved and restored automatically.
+  * **Monitor-Aware Layout:** Automatically adjusts the window to the active monitor’s resolution and available work area.
+  * **Content Fitting:** Automatically expands the window width when required and provides scrolling when content exceeds the available height.
 * **Standalone Executable (.exe):** Includes the required Python runtime and application dependencies; a separate Python installation is not required.
 
 ## Known Limitations
