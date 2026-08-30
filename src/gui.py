@@ -97,8 +97,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.7"
-UI_SCALING_REVISION = "2026-08-29-dynamic-window-01"
+APP_VERSION = "v2.8"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -406,8 +405,8 @@ def wired_controller_label(product_ids, sentence=False):
 
 logger = logging.getLogger(__name__)
 logger.info(
-    "UI scaling revision=%s executable=%s frozen=%s",
-    UI_SCALING_REVISION, sys.executable, bool(getattr(sys, "frozen", False)))
+    "GUI executable=%s frozen=%s",
+    sys.executable, bool(getattr(sys, "frozen", False)))
 
 try:
     # Break out of Windows terminal DPI virtualization cache to get TRUE physical resolution
@@ -438,11 +437,32 @@ battery_height = 40
 player_row_height = 40
 player_led_width = 60
 player_led_height = 8
+BASE_WINDOW_WIDTH = 1270
+BASE_WINDOW_HEIGHT = 1270
 
 def _scaled_px(base_value, minimum=1, scale=None):
     if scale is None:
         scale = scaling_factor
     return max(minimum, int(base_value * scale))
+
+def _normalized_user_ui_scale(value=None):
+    """Return the persisted in-app scale on the slider's 0.1 grid."""
+    if value is None:
+        value = getattr(CONFIG, "ui_scale", 1.0)
+    try:
+        value = round(float(value) * 10.0) / 10.0
+    except (TypeError, ValueError):
+        value = 1.0
+    return min(2.0, max(1.0, value))
+
+def _monitor_content_ratio(current_screen_height, user_scale=1.0):
+    """Resolution-only UI ratio anchored at the proven 1440p layout."""
+    try:
+        height = max(1, int(current_screen_height))
+        scale = float(user_scale)
+    except (TypeError, ValueError):
+        height, scale = 1440, 1.0
+    return (height / 1440.0) * scale
 
 def _get_window_non_client_height():
     caption_height = ctypes.windll.user32.GetSystemMetrics(4)   # SM_CYCAPTION
@@ -516,6 +536,16 @@ def _monitor_metrics_from_window(hwnd):
         return None
 
 
+def _monitor_work_signature(monitor):
+    if not monitor:
+        return None
+    return (
+        monitor["width"], monitor["height"],
+        monitor["work_left"], monitor["work_top"],
+        monitor["work_right"], monitor["work_bottom"],
+    )
+
+
 def _top_level_hwnd(widget):
     """Return Tk's actual outer/root HWND, including title bar and borders."""
     try:
@@ -530,22 +560,73 @@ def _top_level_hwnd(widget):
         return None
 
 
-def _get_effective_client_height(fallback_height, current_work_height=None):
-    effective_height = fallback_height
+def _get_window_dpi(hwnd):
+    """Return a top-level window's live DPI without affecting UI scaling."""
     try:
-        work_height = current_work_height
-        if work_height is None:
-            work_area = wintypes.RECT()
-            if ctypes.windll.user32.SystemParametersInfoW(
-                    0x0030, 0, ctypes.byref(work_area), 0):
-                work_height = work_area.bottom - work_area.top
-        if work_height:
-            effective_height = min(
-                effective_height,
-                max(1, work_height - _get_window_non_client_height()))
+        get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
+        if get_dpi and hwnd:
+            get_dpi.argtypes = [wintypes.HWND]
+            get_dpi.restype = wintypes.UINT
+            dpi = int(get_dpi(wintypes.HWND(int(hwnd))))
+            return dpi if dpi > 0 else None
     except Exception:
         pass
-    return effective_height
+    return None
+
+
+def _fit_window_to_work_area(monitor, desired_client_width,
+                             desired_client_height, hwnd=None, x=None, y=None):
+    """Fit a decorated main window inside rcWork without changing its width rule."""
+    desired_client_width = max(1, int(desired_client_width))
+    desired_client_height = max(1, int(desired_client_height))
+    non_client_width = 0
+    non_client_height = 0
+    try:
+        if hwnd:
+            outer = win32gui.GetWindowRect(int(hwnd))
+            client = win32gui.GetClientRect(int(hwnd))
+            non_client_width = max(
+                0, (outer[2] - outer[0]) - (client[2] - client[0]))
+            non_client_height = max(
+                0, (outer[3] - outer[1]) - (client[3] - client[1]))
+        else:
+            user32 = ctypes.windll.user32
+            non_client_width = 2 * (
+                user32.GetSystemMetrics(32) + user32.GetSystemMetrics(92))
+            non_client_height = _get_window_non_client_height()
+    except Exception:
+        non_client_width = 0
+        non_client_height = 0
+
+    if monitor:
+        max_client_height = max(
+            1, int(monitor["work_height"]) - non_client_height)
+        client_height = min(desired_client_height, max_client_height)
+    else:
+        client_height = desired_client_height
+
+    outer_width = desired_client_width + non_client_width
+    outer_height = client_height + non_client_height
+    target_x = int(x if x is not None else (monitor["work_left"] if monitor else 0))
+    target_y = int(y if y is not None else (monitor["work_top"] if monitor else 0))
+    if monitor:
+        if outer_width <= monitor["work_width"]:
+            target_x = min(
+                max(target_x, monitor["work_left"]),
+                monitor["work_right"] - outer_width)
+        target_y = min(
+            max(target_y, monitor["work_top"]),
+            monitor["work_bottom"] - outer_height)
+
+    return {
+        "client_width": desired_client_width,
+        "client_height": client_height,
+        "outer_width": outer_width,
+        "outer_height": outer_height,
+        "x": target_x,
+        "y": target_y,
+    }
+
 
 def _get_current_dpi_scale():
     try:
@@ -580,26 +661,17 @@ def refresh_ui_scaling(current_screen_height=None, current_work_height=None):
     if current_screen_height:
         screen_height = current_screen_height
 
-    ui_scale = getattr(CONFIG, 'ui_scale', 1.0)
+    ui_scale = _normalized_user_ui_scale()
+    CONFIG.ui_scale = ui_scale
     ui_dpi, ui_dpi_scale = _get_current_dpi_scale()
-    if screen_height == 1440:
-        resolution_ratio = (screen_height / 1440.0) * ui_scale
-        window_resolution_ratio = (screen_height / 1440.0) * ui_scale
-    else:
-        # Everything other than exactly 1440p — including 4K/high-res — uses the SAME physical,
-        # DPI-independent logic: window size tracks the physical screen height, content scale
-        # tracks the usable client height against the 1440p baseline. This keeps a constant
-        # physical size regardless of the Windows DPI scaling %, and (because it respects the
-        # usable work area) never pushes content off-screen. The old 4K-specific branch tied
-        # the ratio to ui_dpi_scale, which is exactly what caused the high-DPI overflow.
-        window_resolution_ratio = (screen_height / 1440.0) * ui_scale
-        effective_height = _get_effective_client_height(
-            screen_height, current_work_height)
-        try:
-            baseline_height = max(1, 1440 - _get_window_non_client_height())
-        except Exception:
-            baseline_height = 1440
-        resolution_ratio = (effective_height / baseline_height) * ui_scale
+    # Content size depends only on physical display resolution and the in-app
+    # slider. rcWork/taskbar height is handled by the window fit + scroll
+    # viewport and must never make widgets smaller. This removes the old
+    # discontinuity where exactly 1440p used a different formula.
+    resolution_ratio = _monitor_content_ratio(screen_height, ui_scale)
+    # The monitor ratio owns window height. The in-app scale is applied only
+    # to width at the geometry call sites below.
+    window_resolution_ratio = screen_height / 1440.0
     scaling_factor = 1.2 * resolution_ratio
     controller_frame_size = _scaled_px(200)
     battery_height = _scaled_px(40)
@@ -2458,6 +2530,11 @@ class ControllerWindow:
         self.last_y = CONFIG.window_y
         self._ui_monitor_handle = None
         self._ui_monitor_signature = None
+        self._ui_window_dpi = None
+        self._dpi_independent_client_size = None
+        self._dpi_independent_outer_size = None
+        self._dpi_independent_outer_position = None
+        self._width_reconcile_after_id = None
         self._monitor_check_after_id = None
         self._dynamic_scale_in_progress = False
         self._dynamic_widget_baselines = weakref.WeakKeyDictionary()
@@ -6658,8 +6735,8 @@ class ControllerWindow:
                 refresh_ui_scaling(
                     initial_monitor["height"], initial_monitor["work_height"])
                 self._ui_monitor_handle = initial_monitor["handle"]
-                self._ui_monitor_signature = (
-                    initial_monitor["height"], initial_monitor["work_height"])
+                self._ui_monitor_signature = _monitor_work_signature(
+                    initial_monitor)
             else:
                 refresh_ui_scaling(self.root.winfo_screenheight())
         except Exception:
@@ -6684,8 +6761,15 @@ class ControllerWindow:
         self.root.title("Switch 2 Connect")
         
         # 3. Handle window geometry & minsize (remembering position)
-        default_w = int(1270 * window_resolution_ratio)
-        default_h = int(1250 * window_resolution_ratio)
+        desired_w = int(
+            BASE_WINDOW_WIDTH * window_resolution_ratio
+            * _normalized_user_ui_scale())
+        desired_h = int(BASE_WINDOW_HEIGHT * window_resolution_ratio)
+        initial_fit = _fit_window_to_work_area(
+            initial_monitor, desired_w, desired_h, x=x, y=y)
+        default_w = initial_fit["client_width"]
+        default_h = initial_fit["client_height"]
+        x, y = initial_fit["x"], initial_fit["y"]
         self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
         self.root.minsize(default_w, default_h)
         self.root.config(bg=background_color, padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
@@ -6713,6 +6797,28 @@ class ControllerWindow:
             self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
             self.root.minsize(default_w, default_h)
             self.root.update()
+            actual_monitor = _monitor_metrics_from_window(hwnd) or initial_monitor
+            actual_fit = _fit_window_to_work_area(
+                actual_monitor, desired_w, desired_h, hwnd=hwnd, x=x, y=y)
+            default_w = actual_fit["client_width"]
+            default_h = actual_fit["client_height"]
+            x, y = actual_fit["x"], actual_fit["y"]
+            self.root.minsize(default_w, default_h)
+            self.root.geometry(f"{default_w}x{default_h}+{x}+{y}")
+            win32gui.SetWindowPos(
+                int(hwnd), 0, x, y,
+                actual_fit["outer_width"], actual_fit["outer_height"],
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            self.root.update_idletasks()
+            stable_rect = win32gui.GetWindowRect(hwnd)
+            self._ui_window_dpi = _get_window_dpi(hwnd)
+            self._dpi_independent_client_size = (default_w, default_h)
+            self._dpi_independent_outer_size = (
+                stable_rect[2] - stable_rect[0],
+                stable_rect[3] - stable_rect[1],
+            )
+            self._dpi_independent_outer_position = (
+                stable_rect[0], stable_rect[1])
         except Exception as e:
             logger.debug(f"Failed to initialize native window appearance: {e}")
 
@@ -6846,6 +6952,11 @@ class ControllerWindow:
         self.main_frame.pack(side=tk.TOP, pady=(10, 5), fill=tk.Y)
         self.players_info = None
 
+        # Header and player slots remain root children.  Only the controls below
+        # them live in the canvas, while the scale footer is pinned at the bottom.
+        self._init_ui_scale_footer()
+        self._init_scrollable_content()
+
         # Keep the Ko-fi button on top so its slight overflow below the header
         # bar is not hidden behind subsequently-packed frames.
         if hasattr(self, 'kofi_button'):
@@ -6859,7 +6970,7 @@ class ControllerWindow:
         self.init_auto_disconnect_panel()
 
         # New centralized button row above Gyro Settings
-        self.top_btn_frame = tk.Frame(self.root, bg=background_color)
+        self.top_btn_frame = tk.Frame(self.scroll_content_frame, bg=background_color)
         self.top_btn_frame.pack(side=tk.BOTTOM, pady=(0, int(5 * scaling_factor)))
 
         # Driver Install/Uninstall Button
@@ -6998,6 +7109,9 @@ class ControllerWindow:
                     except Exception: pass
                 else:
                     target.focus_set()
+                if not in_dialog:
+                    self.root.after_idle(
+                        self._ensure_scrolled_widget_visible, target)
 
             if not current_widget or current_widget not in widgets:
                 # Resume at the position we exited from (change: re-entry starts where the
@@ -7400,7 +7514,375 @@ class ControllerWindow:
                         except:
                             pass
                             
+        # All lazy-independent panels now exist, so perform the first natural
+        # width measurement before the withdrawn window is revealed.
+        self._reconcile_main_window_width()
         poll_ui_navigation()
+        self.root.after(1000, self._poll_monitor_work_area)
+
+
+    def _init_ui_scale_footer(self):
+        """Create the pinned in-app scaling control."""
+        self.ui_scale_footer = tk.Frame(
+            self.root, bg=background_color,
+            padx=0, pady=0,
+            height=1)
+        self.ui_scale_footer.pack(
+            side=tk.BOTTOM, fill=tk.X, padx=0, pady=0, ipadx=0, ipady=0)
+        self.ui_scale_footer.pack_propagate(False)
+        row = tk.Frame(self.ui_scale_footer, bg=background_color, padx=0, pady=0)
+        row.pack(expand=True, padx=0, pady=0, ipadx=0, ipady=0)
+        tk.Label(
+            row, text="UI Scaling:", bg=background_color, fg=text_color,
+            font=scale_font(("Arial", 10, "bold"))).pack(
+                side=tk.LEFT, padx=0, pady=0)
+        self.ui_scale_value_label = tk.Label(
+            row, text=f"{_normalized_user_ui_scale():.1f}",
+            width=3, bg=background_color, fg=text_color,
+            font=scale_font(("Arial", 10, "bold")))
+        self._initializing_ui_scale = True
+        self.ui_scale_slider = tk.Scale(
+            row, from_=1.0, to=2.0, resolution=0.1,
+            orient=tk.HORIZONTAL, showvalue=False,
+            length=max(1, int(220 * scaling_factor)),
+            sliderlength=max(1, int(18 * scaling_factor)),
+            width=max(1, int(14 * scaling_factor)),
+            bg=background_color, fg=text_color, troughcolor=button_gray,
+            activebackground=highlight_color, highlightthickness=0, bd=0,
+            sliderrelief=tk.FLAT, command=self._on_ui_scale_slider)
+        self.ui_scale_slider.pack(side=tk.LEFT, padx=0, pady=0)
+        self.ui_scale_value_label.pack(side=tk.LEFT, padx=0, pady=0)
+        self.ui_scale_slider.set(_normalized_user_ui_scale())
+        self.ui_scale_slider.bind(
+            "<ButtonPress-1>", self._on_ui_scale_press, add="+")
+        self.ui_scale_slider.bind(
+            "<ButtonRelease-1>", self._on_ui_scale_release, add="+")
+        self._initializing_ui_scale = False
+        self._ui_scale_mouse_dragging = False
+        self._ui_scale_apply_after_id = None
+        self._ui_scale_save_after_id = None
+        self.root.after_idle(self._sync_ui_scale_footer_height)
+
+    def _sync_ui_scale_footer_height(self):
+        """Pin the footer to one physical pixel above/below its text.
+
+        A Tk Scale requests substantially more vertical space than its visible
+        trough.  Deliberately ignore that request so it cannot make the pinned
+        footer taller than its labels.
+        """
+        try:
+            font = tkFont.Font(
+                root=self.root, font=self.ui_scale_value_label.cget("font"))
+            text_height = max(1, int(font.metrics("linespace")))
+            self.ui_scale_footer.configure(height=text_height + 2)
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+
+    def _init_scrollable_content(self):
+        """Create the vertically scrolling middle area below the pinned slots."""
+        self.scroll_viewport = tk.Frame(self.root, bg=background_color)
+        self.scroll_viewport.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.content_scrollbar = ttk.Scrollbar(
+            self.scroll_viewport, orient=tk.VERTICAL)
+        self.content_canvas = tk.Canvas(
+            self.scroll_viewport, bg=background_color,
+            highlightthickness=0, bd=0,
+            yscrollcommand=self.content_scrollbar.set)
+        self.content_scrollbar.configure(command=self.content_canvas.yview)
+        self.content_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.content_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scroll_content_frame = tk.Frame(
+            self.content_canvas, bg=background_color)
+        self._scroll_content_window = self.content_canvas.create_window(
+            (0, 0), window=self.scroll_content_frame, anchor=tk.NW)
+        self.scroll_content_frame.bind(
+            "<Configure>", self._update_content_scrollregion, add="+")
+        self.content_canvas.bind(
+            "<Configure>", self._resize_scroll_content_width, add="+")
+        self.root.bind("<MouseWheel>", self._on_content_mousewheel, add="+")
+        self.root.bind("<Button-4>", self._on_content_mousewheel, add="+")
+        self.root.bind("<Button-5>", self._on_content_mousewheel, add="+")
+
+    def _update_content_scrollregion(self, _event=None):
+        try:
+            self.content_canvas.configure(
+                scrollregion=self.content_canvas.bbox("all"))
+            needed = (self.scroll_content_frame.winfo_reqheight()
+                      > self.content_canvas.winfo_height())
+            mapped = bool(self.content_scrollbar.winfo_manager())
+            if needed and not mapped:
+                self.content_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            elif not needed and mapped:
+                self.content_scrollbar.pack_forget()
+                self.content_canvas.yview_moveto(0.0)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _resize_scroll_content_width(self, event):
+        try:
+            required = self._measure_scroll_content_width()
+            self.content_canvas.itemconfigure(
+                self._scroll_content_window,
+                width=max(1, event.width, required))
+            self._update_content_scrollregion()
+        except tk.TclError:
+            pass
+
+    def _measure_scroll_content_width(self):
+        """Natural width of the widest middle-area panel in physical pixels."""
+        widths = []
+        try:
+            for child in self.scroll_content_frame.winfo_children():
+                widths.append(child.winfo_reqwidth())
+            # DJG can be hidden inside the selected tab, but it remains the
+            # widest supported row and must still participate in measurement.
+            for name in ("djg_frame", "gyro_frame", "comp_frame",
+                         "auto_disconnect_frame", "settings_frame"):
+                widget = getattr(self, name, None)
+                if widget is not None and widget.winfo_exists():
+                    widths.append(widget.winfo_reqwidth())
+        except (AttributeError, tk.TclError):
+            pass
+        return max([1, *widths])
+
+    def _measure_required_client_width(self):
+        """Minimum client width that keeps every fixed and scroll panel inside."""
+        try:
+            self.root.update_idletasks()
+            root_pad = self.root.winfo_pixels(self.root.cget("padx"))
+            scrollbar_width = self.content_scrollbar.winfo_reqwidth()
+            middle_width = (
+                self._measure_scroll_content_width() + scrollbar_width)
+            widths = [middle_width]
+            for name in ("header_frame", "main_frame", "ui_scale_footer"):
+                widget = getattr(self, name, None)
+                if widget is not None and widget.winfo_exists():
+                    widths.append(widget.winfo_reqwidth())
+            # Two root-side paddings plus a small border/rounding allowance.
+            return max(widths) + (2 * root_pad) + 4
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            return 1
+
+    def _queue_width_reconcile(self, delay=0):
+        try:
+            if self._width_reconcile_after_id is not None:
+                self.root.after_cancel(self._width_reconcile_after_id)
+            self._width_reconcile_after_id = self.root.after(
+                delay, self._reconcile_main_window_width)
+        except (AttributeError, tk.TclError):
+            self._width_reconcile_after_id = None
+
+    def _reconcile_main_window_width(self):
+        """Expand the main window only when real content requires more width."""
+        self._width_reconcile_after_id = None
+        if getattr(self, "is_quitting", False):
+            return
+        if getattr(self, "_dynamic_scale_in_progress", False):
+            self._queue_width_reconcile(100)
+            return
+        self._dynamic_scale_in_progress = True
+        try:
+            hwnd = _top_level_hwnd(self.root)
+            if not hwnd or self.root.state() not in ("normal", "withdrawn"):
+                return
+            monitor = _monitor_metrics_from_window(hwnd)
+            rect = win32gui.GetWindowRect(hwnd)
+            formula_width = int(
+                BASE_WINDOW_WIDTH * window_resolution_ratio
+                * _normalized_user_ui_scale())
+            required_width = self._measure_required_client_width()
+            width = max(formula_width, required_width)
+            desired_height = int(BASE_WINDOW_HEIGHT * window_resolution_ratio)
+            fitted = _fit_window_to_work_area(
+                monitor, width, desired_height, hwnd=hwnd,
+                x=rect[0], y=rect[1])
+            self.root.minsize(
+                fitted["client_width"], fitted["client_height"])
+            self.root.geometry(
+                f"{fitted['client_width']}x{fitted['client_height']}"
+                f"+{fitted['x']}+{fitted['y']}")
+            win32gui.SetWindowPos(
+                int(hwnd), 0, fitted["x"], fitted["y"],
+                fitted["outer_width"], fitted["outer_height"],
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            self.root.update_idletasks()
+            applied = win32gui.GetWindowRect(hwnd)
+            self._dpi_independent_client_size = (
+                fitted["client_width"], fitted["client_height"])
+            self._dpi_independent_outer_size = (
+                applied[2] - applied[0], applied[3] - applied[1])
+            self._dpi_independent_outer_position = (applied[0], applied[1])
+            self.content_canvas.itemconfigure(
+                self._scroll_content_window,
+                width=max(self.content_canvas.winfo_width(),
+                          self._measure_scroll_content_width()))
+            self._update_content_scrollregion()
+            logger.info(
+                "Main window width reconciled: formula=%d required=%d "
+                "applied_client=%d", formula_width, required_width,
+                fitted["client_width"])
+        except Exception:
+            logger.exception("Failed to reconcile main window content width")
+        finally:
+            self._dynamic_scale_in_progress = False
+
+    def _on_content_mousewheel(self, event):
+        try:
+            if not self.content_scrollbar.winfo_manager():
+                return
+            if getattr(event, "num", None) == 4:
+                units = -3
+            elif getattr(event, "num", None) == 5:
+                units = 3
+            else:
+                units = -int(event.delta / 120) * 3
+            if units:
+                self.content_canvas.yview_scroll(units, "units")
+                return "break"
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+
+    def _on_ui_scale_slider(self, value):
+        value = _normalized_user_ui_scale(value)
+        try:
+            self.ui_scale_value_label.configure(text=f"{value:.1f}")
+        except (AttributeError, tk.TclError):
+            pass
+        if getattr(self, "_initializing_ui_scale", False):
+            return
+        # A mouse drag is preview-only.  Applying here would rebuild the whole
+        # widget tree at every 0.1 step and make the thumb fight the resize.
+        if getattr(self, "_ui_scale_mouse_dragging", False):
+            return
+        self._schedule_user_ui_scale(value, apply_delay=120)
+
+    def _on_ui_scale_press(self, _event=None):
+        self._ui_scale_mouse_dragging = True
+        try:
+            if self._ui_scale_apply_after_id is not None:
+                self.root.after_cancel(self._ui_scale_apply_after_id)
+                self._ui_scale_apply_after_id = None
+        except tk.TclError:
+            pass
+
+    def _on_ui_scale_release(self, _event=None):
+        self._ui_scale_mouse_dragging = False
+        try:
+            value = _normalized_user_ui_scale(self.ui_scale_slider.get())
+            self.ui_scale_value_label.configure(text=f"{value:.1f}")
+            self._schedule_user_ui_scale(value, apply_delay=0)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _schedule_user_ui_scale(self, value, apply_delay=120):
+        value = _normalized_user_ui_scale(value)
+        try:
+            if self._ui_scale_apply_after_id is not None:
+                self.root.after_cancel(self._ui_scale_apply_after_id)
+            self._ui_scale_apply_after_id = self.root.after(
+                apply_delay, self._apply_user_ui_scale, value)
+            if self._ui_scale_save_after_id is not None:
+                self.root.after_cancel(self._ui_scale_save_after_id)
+            self._ui_scale_save_after_id = self.root.after(
+                450, self._save_user_ui_scale, value)
+        except tk.TclError:
+            pass
+
+    def _save_user_ui_scale(self, value):
+        self._ui_scale_save_after_id = None
+        CONFIG.ui_scale = _normalized_user_ui_scale(value)
+        CONFIG.save_config()
+
+    def _apply_user_ui_scale(self, value):
+        global scaling_factor
+        self._ui_scale_apply_after_id = None
+        value = _normalized_user_ui_scale(value)
+        if self._dynamic_scale_in_progress:
+            self._on_ui_scale_slider(value)
+            return
+        old_scale = float(scaling_factor)
+        if abs(value - _normalized_user_ui_scale()) < 0.0001:
+            return
+        self._dynamic_scale_in_progress = True
+        try:
+            CONFIG.ui_scale = value
+            hwnd = _top_level_hwnd(self.root)
+            monitor = _monitor_metrics_from_window(hwnd) if hwnd else None
+            if monitor:
+                refresh_ui_scaling(monitor["height"], monitor["work_height"])
+            else:
+                refresh_ui_scaling()
+            new_scale = float(scaling_factor)
+            self._rescale_widget_tree(old_scale, new_scale)
+            self._refresh_resolution_scaled_images()
+            self.force_refresh_player_slots()
+            self.root.update_idletasks()
+            formula_width = int(
+                BASE_WINDOW_WIDTH * window_resolution_ratio * value)
+            required_width = self._measure_required_client_width()
+            width = max(formula_width, required_width)
+            # User scaling deliberately never changes the monitor-owned height.
+            desired_height = int(BASE_WINDOW_HEIGHT * window_resolution_ratio)
+            rect = win32gui.GetWindowRect(hwnd) if hwnd else (0, 0, 0, 0)
+            fitted = _fit_window_to_work_area(
+                monitor, width, desired_height, hwnd=hwnd,
+                x=rect[0], y=rect[1])
+            width = fitted["client_width"]
+            height = fitted["client_height"]
+            self.root.minsize(width, height)
+            self.root.geometry(
+                f"{width}x{height}+{fitted['x']}+{fitted['y']}")
+            if hwnd:
+                win32gui.SetWindowPos(
+                    int(hwnd), 0, fitted["x"], fitted["y"],
+                    fitted["outer_width"], fitted["outer_height"],
+                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            self.root.update_idletasks()
+            if hwnd:
+                stable_rect = win32gui.GetWindowRect(hwnd)
+                self._dpi_independent_client_size = (width, height)
+                self._dpi_independent_outer_size = (
+                    stable_rect[2] - stable_rect[0],
+                    stable_rect[3] - stable_rect[1],
+                )
+                self._dpi_independent_outer_position = (
+                    stable_rect[0], stable_rect[1])
+                self._ui_window_dpi = _get_window_dpi(hwnd)
+            self.content_canvas.itemconfigure(
+                self._scroll_content_window,
+                width=max(self.content_canvas.winfo_width(),
+                          self._measure_scroll_content_width()))
+            self.root.after_idle(self._update_content_scrollregion)
+            logger.info(
+                "In-app UI scale applied: %.1f; content %.4f -> %.4f; "
+                "window=%dx%d formula_width=%d required_width=%d",
+                value, old_scale, new_scale, width, height,
+                formula_width, required_width)
+        except Exception:
+            logger.exception("Failed to apply in-app UI scaling")
+        finally:
+            self._dynamic_scale_in_progress = False
+
+    def _ensure_scrolled_widget_visible(self, widget):
+        try:
+            current = widget
+            while current is not None and current != self.scroll_content_frame:
+                current = current.master
+            if current != self.scroll_content_frame:
+                return
+            self.root.update_idletasks()
+            top = widget.winfo_rooty() - self.scroll_content_frame.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            visible_top = self.content_canvas.canvasy(0)
+            visible_bottom = visible_top + self.content_canvas.winfo_height()
+            total = max(1, self.scroll_content_frame.winfo_reqheight())
+            if top < visible_top:
+                self.content_canvas.yview_moveto(max(0.0, top / total))
+            elif bottom > visible_bottom:
+                self.content_canvas.yview_moveto(
+                    min(1.0, max(0.0, (bottom - self.content_canvas.winfo_height()) / total)))
+        except (AttributeError, tk.TclError):
+            pass
 
 
     def pack_controls_under_player(self):
@@ -7572,6 +8054,7 @@ class ControllerWindow:
                 "*TCombobox*Listbox.font", scale_font(("Arial", 11, "bold")))
         except tk.TclError:
             pass
+        self._sync_ui_scale_footer_height()
 
     def _replace_widget_image(self, parent, old_image, new_image):
         if old_image is None or new_image is None:
@@ -7628,6 +8111,22 @@ class ControllerWindow:
         except tk.TclError:
             self._monitor_check_after_id = None
 
+    def _poll_monitor_work_area(self):
+        """Notice taskbar/work-area changes even when Tk emits no Configure."""
+        if getattr(self, "is_quitting", False) or not getattr(self, "root", None):
+            return
+        try:
+            hwnd = _top_level_hwnd(self.root)
+            monitor = _monitor_metrics_from_window(hwnd) if hwnd else None
+            signature = _monitor_work_signature(monitor)
+            dpi = _get_window_dpi(hwnd) if hwnd else None
+            if (signature != self._ui_monitor_signature
+                    or (dpi is not None and dpi != self._ui_window_dpi)):
+                self._queue_monitor_scale_check(0)
+            self.root.after(1000, self._poll_monitor_work_area)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _commit_dynamic_window_size(self, monitor_handle, client_width,
                                     client_height, outer_width, outer_height):
         """Commit size once more after the monitor-change callback has unwound."""
@@ -7655,6 +8154,65 @@ class ControllerWindow:
         except Exception:
             logger.exception("Failed to commit deferred dynamic window size")
 
+    def _restore_dpi_independent_window_size(self, expected_dpi=None):
+        """Undo Windows' automatic WM_DPICHANGED top-level window resize."""
+        if getattr(self, "is_quitting", False):
+            return
+        try:
+            hwnd = _top_level_hwnd(self.root)
+            if not hwnd or self.root.state() != "normal":
+                return
+            if expected_dpi is not None and _get_window_dpi(hwnd) != expected_dpi:
+                return
+            client_size = self._dpi_independent_client_size
+            outer_size = self._dpi_independent_outer_size
+            outer_position = self._dpi_independent_outer_position
+            if not client_size or not outer_size or not outer_position:
+                return
+            monitor = _monitor_metrics_from_window(hwnd)
+            current_outer = win32gui.GetWindowRect(hwnd)
+            current_client = win32gui.GetClientRect(hwnd)
+            non_client_height = max(
+                0, (current_outer[3] - current_outer[1])
+                - (current_client[3] - current_client[1]))
+            target_outer_width = int(outer_size[0])
+            target_outer_height = int(outer_size[1])
+            target_x, target_y = outer_position
+            if monitor:
+                target_outer_height = min(
+                    target_outer_height, monitor["work_height"])
+                if target_outer_width <= monitor["work_width"]:
+                    target_x = min(
+                        max(target_x, monitor["work_left"]),
+                        monitor["work_right"] - target_outer_width)
+                target_y = min(
+                    max(target_y, monitor["work_top"]),
+                    monitor["work_bottom"] - target_outer_height)
+            target_client_height = max(
+                1, target_outer_height - non_client_height)
+            self.root.minsize(client_size[0], target_client_height)
+            self.root.geometry(
+                f"{client_size[0]}x{target_client_height}"
+                f"+{int(target_x)}+{int(target_y)}")
+            win32gui.SetWindowPos(
+                int(hwnd), 0, int(target_x), int(target_y),
+                target_outer_width, target_outer_height,
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            self.root.update_idletasks()
+            applied = win32gui.GetWindowRect(hwnd)
+            logger.info(
+                "DPI-only window size restored: dpi=%s client=%dx%d "
+                "outer=%dx%d", expected_dpi, client_size[0], target_client_height,
+                applied[2] - applied[0], applied[3] - applied[1])
+            self._dpi_independent_client_size = (
+                client_size[0], target_client_height)
+            self._dpi_independent_outer_size = (
+                applied[2] - applied[0], applied[3] - applied[1])
+            self._dpi_independent_outer_position = (
+                applied[0], applied[1])
+        except Exception:
+            logger.exception("Failed to restore DPI-independent window size")
+
     def _apply_monitor_scaling_if_needed(self):
         global scaling_factor
         self._monitor_check_after_id = None
@@ -7667,8 +8225,17 @@ class ControllerWindow:
             monitor = _monitor_metrics_from_window(hwnd)
             if not monitor:
                 return
-            signature = (monitor["height"], monitor["work_height"])
+            current_dpi = _get_window_dpi(hwnd)
+            previous_dpi = self._ui_window_dpi
+            signature = _monitor_work_signature(monitor)
             scale_changed = signature != self._ui_monitor_signature
+            dpi_only_changed = (
+                current_dpi is not None
+                and previous_dpi is not None
+                and current_dpi != previous_dpi
+                and self._ui_monitor_signature is not None
+                and monitor["height"] == self._ui_monitor_signature[1]
+            )
             logger.info(
                 "Monitor scale check: widget_hwnd=%s top_hwnd=%s monitor=%s "
                 "signature=%s previous=%s rect=%s state=%s",
@@ -7677,44 +8244,79 @@ class ControllerWindow:
                 self.root.state())
             self._ui_monitor_handle = monitor["handle"]
             self._ui_monitor_signature = signature
+            self._ui_window_dpi = current_dpi
+            if dpi_only_changed:
+                # A DPI change can also alter rcWork by changing the native
+                # taskbar thickness.  Resolution is still identical, so this
+                # must win over the work-area signature comparison.
+                logger.info(
+                    "DPI-only change detected: %s -> %s; preserving app size",
+                    previous_dpi, current_dpi)
+                self._dynamic_scale_in_progress = True
+                try:
+                    self._restore_dpi_independent_window_size(current_dpi)
+                    self.root.after(
+                        120, self._restore_dpi_independent_window_size,
+                        current_dpi)
+                finally:
+                    self._dynamic_scale_in_progress = False
+                return
             if not scale_changed:
+                # A normal user move (same monitor/DPI) becomes the next stable
+                # position.  This runs only after the DPI-only branch above, so
+                # Windows' suggested WM_DPICHANGED position is never accepted.
+                stable_rect = win32gui.GetWindowRect(hwnd)
+                self._dpi_independent_outer_position = (
+                    stable_rect[0], stable_rect[1])
                 return
 
             old_scale = float(scaling_factor)
             refresh_ui_scaling(monitor["height"], monitor["work_height"])
             new_scale = float(scaling_factor)
-            if abs(new_scale - old_scale) < 0.0001:
-                return
+            content_scale_changed = abs(new_scale - old_scale) >= 0.0001
 
             self._dynamic_scale_in_progress = True
-            logger.info(
-                "Display change detected: %sp work area %sp; UI scale %.4f -> %.4f",
-                monitor["height"], monitor["work_height"], old_scale, new_scale)
-            self._rescale_widget_tree(old_scale, new_scale)
-            self._refresh_resolution_scaled_images()
+            if content_scale_changed:
+                logger.info(
+                    "Display change detected: %sp work area %sp; "
+                    "UI scale %.4f -> %.4f",
+                    monitor["height"], monitor["work_height"],
+                    old_scale, new_scale)
+                self._rescale_widget_tree(old_scale, new_scale)
+                self._refresh_resolution_scaled_images()
+            else:
+                logger.info(
+                    "Monitor work area changed without content scaling: %s",
+                    signature)
 
-            width = int(1270 * window_resolution_ratio)
-            height = int(1250 * window_resolution_ratio)
+            if content_scale_changed:
+                self.force_refresh_player_slots()
+            self.root.update_idletasks()
+            formula_width = int(
+                BASE_WINDOW_WIDTH * window_resolution_ratio
+                * _normalized_user_ui_scale())
+            required_width = self._measure_required_client_width()
+            width = max(formula_width, required_width)
+            desired_height = int(BASE_WINDOW_HEIGHT * window_resolution_ratio)
 
             # Tk may defer root.geometry() until after this callback returns, so
             # synchronously resize the native top-level HWND as well.  The window
             # procedure deliberately does not override WM_WINDOWPOSCHANGING; doing
             # so would lock the window to its previous display's outer dimensions.
             outer_rect = win32gui.GetWindowRect(int(hwnd))
-            client_rect = win32gui.GetClientRect(int(hwnd))
-            non_client_width = max(
-                0, (outer_rect[2] - outer_rect[0])
-                - (client_rect[2] - client_rect[0]))
-            non_client_height = max(
-                0, (outer_rect[3] - outer_rect[1])
-                - (client_rect[3] - client_rect[1]))
-            target_outer_width = width + non_client_width
-            target_outer_height = height + non_client_height
+            fitted = _fit_window_to_work_area(
+                monitor, width, desired_height, hwnd=hwnd,
+                x=outer_rect[0], y=outer_rect[1])
+            width = fitted["client_width"]
+            height = fitted["client_height"]
+            target_outer_width = fitted["outer_width"]
+            target_outer_height = fitted["outer_height"]
             self.root.minsize(width, height)
-            self.root.geometry(f"{width}x{height}")
+            self.root.geometry(
+                f"{width}x{height}+{fitted['x']}+{fitted['y']}")
             win32gui.SetWindowPos(
                 int(hwnd), 0,
-                outer_rect[0], outer_rect[1],
+                fitted["x"], fitted["y"],
                 target_outer_width, target_outer_height,
                 win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
             self.root.configure(
@@ -7729,7 +8331,7 @@ class ControllerWindow:
                 # MoveWindow is a deliberately independent fallback for window
                 # managers/Tk builds that coalesce the preceding SetWindowPos.
                 win32gui.MoveWindow(
-                    int(hwnd), outer_rect[0], outer_rect[1],
+                    int(hwnd), fitted["x"], fitted["y"],
                     target_outer_width, target_outer_height, True)
                 self.root.update_idletasks()
                 applied_rect = win32gui.GetWindowRect(int(hwnd))
@@ -7740,11 +8342,18 @@ class ControllerWindow:
                 "outer_applied=%dx%d state=%s",
                 width, height, target_outer_width, target_outer_height,
                 applied_width, applied_height, self.root.state())
+            self._dpi_independent_client_size = (width, height)
+            self._dpi_independent_outer_size = (
+                applied_width, applied_height)
+            self._dpi_independent_outer_position = (
+                applied_rect[0], applied_rect[1])
+            self._ui_window_dpi = current_dpi
 
-            # Player cards own resolution-scaled bitmap assets. Rebuilding only
-            # those cards keeps controller/runtime state intact and uses their
-            # existing construction path with the new global scale.
-            self.force_refresh_player_slots()
+            self.content_canvas.itemconfigure(
+                self._scroll_content_window,
+                width=max(self.content_canvas.winfo_width(),
+                          self._measure_scroll_content_width()))
+            self.root.after_idle(self._update_content_scrollregion)
             self.root.after(
                 0, self._commit_dynamic_window_size,
                 monitor["handle"], width, height,
@@ -7938,6 +8547,8 @@ bg_color=panel_bg, widths=[8, 10])
                 dominant_switch.grid_remove()
             else:
                 dominant_switch.grid()
+        if getattr(self, "root", None) is not None:
+            self._queue_width_reconcile(0)
 
     def _update_djg_panel_visibility(self):
         if not hasattr(self, 'djg_frame'):
@@ -8114,7 +8725,8 @@ bg_color=panel_bg, widths=[8, 10])
 
 
     def init_auto_disconnect_panel(self):
-        self.auto_disconnect_frame = tk.LabelFrame(self.root, text=" Auto Disconnect ", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
+        parent = getattr(self, "scroll_content_frame", self.root)
+        self.auto_disconnect_frame = tk.LabelFrame(parent, text=" Auto Disconnect ", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold")), padx=int(10 * scaling_factor), pady=int(10 * scaling_factor))
         self.auto_disconnect_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=int(5 * scaling_factor))
         
         tk.Label(self.auto_disconnect_frame, text="Auto Disconnect:", bg=background_color, fg=text_color, font=scale_font(("Arial", 11, "bold"))).grid(row=0, column=0, padx=int(5 * scaling_factor), sticky="e")
@@ -11522,7 +12134,8 @@ bg_color=panel_bg, widths=[8, 10])
         return result["selected"], result["keep"], result["calibration"]
 
     def init_settings_panel(self):
-        self.settings_frame = tk.Frame(self.root, bg=background_color)
+        parent = getattr(self, "scroll_content_frame", self.root)
+        self.settings_frame = tk.Frame(parent, bg=background_color)
         self.settings_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(int(5 * scaling_factor), 0))
 
         def left_row(pady=None):
@@ -11927,6 +12540,7 @@ bg_color=panel_bg, widths=[8, 10])
             self.root.update_idletasks()
         except Exception:
             pass
+        self._queue_width_reconcile(0)
 
     def open_audio_haptics_settings(self, anchor_widget):
         if self._toggle_joystick_popup(anchor_widget):
