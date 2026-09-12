@@ -38,6 +38,26 @@ class DualSenseTouchReport(ctypes.Structure):
 
 class DualSenseInputReport01(ctypes.Structure):
     _pack_ = 1
+
+    @classmethod
+    def wired_without_headset(cls):
+        """Initial USB report for the virtual controller, which has no audio jack."""
+        report = cls()
+        report.ReportId = 0x01
+        report.LeftStickX = report.LeftStickY = 128
+        report.RightStickX = report.RightStickY = 128
+        report.Hat = 0x08
+        report.PowerPercent = 10
+        report.PowerState = 2
+        report.PluggedUsbData = 1
+        # Headphone/mic detection bits describe a physical jack connection, not
+        # USB audio support. Advertising a headset makes games route main audio
+        # to the controller even while Windows defaults remain on the speakers.
+        report.PluggedHeadphones = 0
+        report.PluggedMic = 0
+        report.MicMuted = 1
+        return report
+
     _fields_ = [
         ("ReportId", ctypes.c_uint8), # 0x01
         ("LeftStickX", ctypes.c_uint8),

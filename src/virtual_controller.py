@@ -1770,16 +1770,7 @@ class VirtualController:
                         pass
 
                 self.vg_controller = MockDualSenseGamepad(self)
-                self.vg_controller.report = DualSenseInputReport01()
-                self.vg_controller.report.ReportId = 0x01
-                self.vg_controller.report.LeftStickX = 128
-                self.vg_controller.report.LeftStickY = 128
-                self.vg_controller.report.RightStickX = 128
-                self.vg_controller.report.RightStickY = 128
-                self.vg_controller.report.PowerPercent = 10  # 100%
-                self.vg_controller.report.PowerState = 2     # Normal
-                self.vg_controller.report.PluggedHeadphones = 1
-                self.vg_controller.report.PluggedMic = 1
+                self.vg_controller.report = DualSenseInputReport01.wired_without_headset()
                 self.driver_type = "USBIP"
             elif driver_type == "ViGEmBus":
                 try:

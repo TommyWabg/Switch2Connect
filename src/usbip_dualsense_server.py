@@ -237,20 +237,7 @@ class USBIPDualSenseServer(USBIPServer):
         self._audio_out_warmup_hold = False
         self._native_timing = _load_native_timing()
         
-        self.last_state = DualSenseInputReport01()
-        self.last_state.ReportId = 0x01
-        self.last_state.LeftStickX = 128
-        self.last_state.LeftStickY = 128
-        self.last_state.RightStickX = 128
-        self.last_state.RightStickY = 128
-        self.last_state.Hat = 0x08
-        self.last_state.PowerPercent = 10
-        self.last_state.PowerState = 2
-        
-        self.last_state.PluggedUsbData = 1
-        self.last_state.PluggedMic = 0
-        self.last_state.PluggedHeadphones = 0
-        self.last_state.MicMuted = 1
+        self.last_state = DualSenseInputReport01.wired_without_headset()
         self.audio_active = False
         self.dualsense_haptics_blocked = False
         self._audio_host_mute = [0, 0, 0]  # speaker, mic, reserved/line
