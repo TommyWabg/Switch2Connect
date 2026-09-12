@@ -97,7 +97,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.9"
+APP_VERSION = "v2.9.1"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -3826,7 +3826,17 @@ class ControllerWindow:
             requested_port = ""
             if manual_port:
                 requested_port = str(getattr(CONFIG, "esp32_serial_port", "") or "")
-            selected_port = resolve_flash_port(requested_port, manual=manual_port)
+            # Keep the exact candidate already detected by the firmware dialog.
+            # Closing the active serial client can make Windows temporarily remove
+            # and recreate the COM device, so the resolver also follows this saved
+            # physical identity while it waits for re-enumeration.
+            selected_hint = getattr(status, "serial_port", None) if status else None
+            selected_port = resolve_flash_port(
+                requested_port,
+                manual=manual_port,
+                preferred_info=selected_hint,
+                timeout=3.0,
+            )
             selected_port = stabilize_flash_port(selected_port)
         except Exception as e:
             self._esp32s3_firmware_busy = False

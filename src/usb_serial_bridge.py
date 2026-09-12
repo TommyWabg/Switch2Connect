@@ -2045,59 +2045,120 @@ def release_port(port: str):
                 logger.debug(f"Failed to close client on {port}: {e}")
 
 
-def resolve_flash_port(preferred_port=None, manual=False):
-    """Resolve a flashing port from a fresh enumeration, without guessing among peers."""
-    all_serials = [item for item in scan_serial_ports() if not item.is_otg]
-    # Auto mode accepts only recognized ESP/CH343 identities or generic USB
-    # serial descriptions.  Low-confidence legacy COM devices stay available
-    # for an explicit manual choice, but are never selected automatically.
-    candidates = [item for item in all_serials if item.confidence >= 20]
-    preferred = (preferred_port or "").upper()
-    logger.info(
-        "ESP32-S3 flash-port resolution: mode=%s preferred=%s candidates=%s",
-        "manual" if manual else "auto", preferred or "<none>",
-        [(item.port, item.confidence, item.serial_number, item.location) for item in candidates],
-    )
-    if manual:
-        match = next((item for item in all_serials if item.port.upper() == preferred), None)
-        if match:
-            return match
-        saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
-        saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
-        same_device = [item for item in all_serials if (
-            (saved_serial and item.serial_number.upper() == saved_serial)
-            or (saved_location and item.location.upper() == saved_location)
-        )]
-        if len(same_device) == 1:
-            logger.info("ESP32-S3 selected device moved from %s to %s", preferred, same_device[0].port)
-            return same_device[0]
-        raise RuntimeError(
-            f"The selected flashing port {preferred or '<none>'} is no longer available. "
-            "Select its current COM port from Flashing Port."
+def _same_flash_device(candidate, reference):
+    """Match a re-enumerated COM port to a previously observed physical board."""
+    if candidate is None or reference is None:
+        return False
+    for field in ("serial_number", "location", "device_id"):
+        expected = str(getattr(reference, field, "") or "").upper()
+        actual = str(getattr(candidate, field, "") or "").upper()
+        if expected and actual and expected == actual:
+            return True
+    return False
+
+
+def resolve_flash_port(preferred_port=None, manual=False, preferred_info=None,
+                       timeout=2.5, poll_interval=0.15):
+    """Resolve a flash port while tolerating Windows USB re-enumeration.
+
+    ESP32-S3 native USB Serial/JTAG ports (VID 303A) are valid esptool ports in
+    ROM Boot mode and, on supported boards, can also be reset automatically.
+    ``is_otg`` therefore controls UI boot-mode guidance only; it must not remove
+    the port from the flashing candidate set.
+    """
+    preferred = str(preferred_port or getattr(preferred_info, "port", "") or "").upper()
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    final_error = "Could not find a CH343/USB serial flashing port."
+
+    while True:
+        all_serials = scan_serial_ports()
+        # Auto mode accepts recognized ESP/CH343 identities and generic USB
+        # serial descriptions. Explicit CH340/legacy ports remain available only
+        # when the user selected one manually; esptool then verifies ESP32-S3 ROM.
+        candidates = [item for item in all_serials if item.confidence >= 20]
+        snapshot = [
+            (item.port, item.confidence, item.is_otg, item.device_id,
+             item.serial_number, item.location)
+            for item in all_serials
+        ]
+        logger.info(
+            "ESP32-S3 flash-port resolution: mode=%s preferred=%s ports=%s",
+            "manual" if manual else "auto", preferred or "<none>", snapshot,
         )
+        try:
+            flash_log(
+                "flash-port resolution: "
+                f"mode={'manual' if manual else 'auto'} "
+                f"preferred={preferred or '<none>'} ports={snapshot}"
+            )
+        except Exception:
+            pass
 
-    saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
-    saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
-    identity_matches = [item for item in candidates if (
-        (saved_serial and item.serial_number.upper() == saved_serial)
-        or (saved_location and item.location.upper() == saved_location)
-    )]
-    if len(identity_matches) == 1:
-        return identity_matches[0]
+        # Preserve the candidate already shown in the firmware dialog. It is the
+        # strongest evidence available for a factory-blank board, which cannot
+        # answer the application firmware status command.
+        if preferred_info is not None:
+            exact = next(
+                (item for item in all_serials if item.port.upper() == preferred), None)
+            if exact is not None:
+                return exact
+            physical_matches = [
+                item for item in all_serials
+                if _same_flash_device(item, preferred_info)
+            ]
+            if len(physical_matches) == 1:
+                logger.info("ESP32-S3 candidate re-enumerated from %s to %s",
+                            preferred or "<unknown>", physical_matches[0].port)
+                return physical_matches[0]
 
-    high_confidence = [item for item in candidates if item.confidence >= 80]
-    if len(high_confidence) == 1:
-        return high_confidence[0]
-    if len(high_confidence) > 1 and high_confidence[0].confidence > high_confidence[1].confidence:
-        return high_confidence[0]
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates:
-        raise RuntimeError("Could not find a CH343/USB serial flashing port.")
-    raise RuntimeError(
-        "More than one possible flashing port was found. Select the ESP32-S3 port "
-        "manually from Flashing Port before continuing."
-    )
+        if manual:
+            match = next(
+                (item for item in all_serials if item.port.upper() == preferred), None)
+            if match is not None:
+                return match
+            saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+            saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
+            same_device = [item for item in all_serials if (
+                (saved_serial and item.serial_number.upper() == saved_serial)
+                or (saved_location and item.location.upper() == saved_location)
+            )]
+            if len(same_device) == 1:
+                logger.info("ESP32-S3 selected device moved from %s to %s",
+                            preferred, same_device[0].port)
+                return same_device[0]
+            final_error = (
+                f"The selected flashing port {preferred or '<none>'} is no longer available. "
+                "Select its current COM port from Flashing Port."
+            )
+        else:
+            saved_serial = str(getattr(CONFIG, "esp32_serial_number", "") or "").upper()
+            saved_location = str(getattr(CONFIG, "esp32_serial_location", "") or "").upper()
+            identity_matches = [item for item in candidates if (
+                (saved_serial and item.serial_number.upper() == saved_serial)
+                or (saved_location and item.location.upper() == saved_location)
+            )]
+            if len(identity_matches) == 1:
+                return identity_matches[0]
+
+            high_confidence = [item for item in candidates if item.confidence >= 80]
+            if len(high_confidence) == 1:
+                return high_confidence[0]
+            if (len(high_confidence) > 1
+                    and high_confidence[0].confidence > high_confidence[1].confidence):
+                return high_confidence[0]
+            if len(candidates) == 1:
+                return candidates[0]
+            if candidates:
+                final_error = (
+                    "More than one possible flashing port was found. Select the ESP32-S3 port "
+                    "manually from Flashing Port before continuing."
+                )
+            else:
+                final_error = "Could not find a CH343/USB serial flashing port."
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(final_error)
+        time.sleep(max(0.01, float(poll_interval)))
 
 
 def stabilize_flash_port(selected, timeout=2.5):
@@ -2106,7 +2167,9 @@ def stabilize_flash_port(selected, timeout=2.5):
     stable_port = None
     stable_count = 0
     while time.monotonic() < deadline:
-        candidates = [item for item in scan_serial_ports() if not item.is_otg and item.confidence > 0]
+        # Native USB Serial/JTAG is a valid esptool target in ROM Boot mode.
+        # Do not repeat the old resolver bug by filtering it out here.
+        candidates = [item for item in scan_serial_ports() if item.confidence > 0]
         match = None
         for field in ("serial_number", "location", "device_id"):
             value = str(getattr(selected, field, "") or "").upper()
