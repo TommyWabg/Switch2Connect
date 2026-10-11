@@ -143,6 +143,8 @@ def test_pair_and_merge_visibility():
     left, right = VC(Controller("left")), VC(Controller("right"), player=2)
     slots = build_slots([left, right], NS(), 0)
     assert slots[0].merge_available and slots[1].merge_available
+    assert slots[0].pending_merge_index == slots[1].pending_merge_index == 0
+    assert not slots[0].merge_target and slots[1].merge_target
     assert build_slots([left], NS(), 0)[0].merge_available
     assert not build_slots([left], NS())[0].merge_available
     pair = VC(Controller("right"), Controller("left"))

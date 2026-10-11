@@ -70,7 +70,7 @@ def test_undo_and_player_menu_routes(window, pump):
     card.open_menu(); pump()
     card.menu_actions["Calibrate magnetometer · Left"].trigger()
     card.menu_actions["Gyro side Right"].trigger()
-    card.menu_actions["Split Joy-Cons"].trigger()
+    card.merge.click()
     card.menu_actions["Disconnect"].trigger()
     pump()
     assert ("players.toggle_mag_calibration", (core.slots[1].slot_token, "Left"), {}) in core.calls

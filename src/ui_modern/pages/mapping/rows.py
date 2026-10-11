@@ -1,26 +1,35 @@
 from ...widgets.changes import apply_change
-from PySide6.QtWidgets import QHBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import DropDownPushButton, TransparentToolButton, PushButton, FluentIcon, BodyLabel, themeColor
-from ...widgets.common import SettingRow, Segments
+from ...widgets.common import Segments
 from ...widgets.recording import RecordDialog
 from ...widgets.pickers import OptionPicker
 from ...widgets.display import input_display, setting_title
 
 
-class MappingRow(SettingRow):
+class MappingRow(QWidget):
     def __init__(self, page, snapshot, scope=None, parent=None, *, writer=None, configure=None):
-        controls = QWidget(parent); controls.setFixedWidth(285)
-        box = QHBoxLayout(controls); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(6)
-        self.value = DropDownPushButton(controls); self.value.setFixedWidth(240)
+        super().__init__(parent)
+        self.setFixedWidth(178)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(1)
+        heading = QHBoxLayout(); heading.setContentsMargins(0, 0, 0, 0); heading.setSpacing(3)
+        self.titleLabel = BodyLabel(snapshot.label.rstrip(":"), self)
+        font = self.titleLabel.font(); font.setPixelSize(12); self.titleLabel.setFont(font)
+        controls = QWidget(self)
+        box = QHBoxLayout(controls); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(4)
+        self.value = DropDownPushButton(controls); self.value.setFixedWidth(150)
+        self.value.setFixedHeight(28)
         self.reset = TransparentToolButton(FluentIcon.CANCEL, controls)
+        self.reset.setFixedSize(24, 24)
         self.reset.setAccessibleName("Reset " + snapshot.label); self.reset.setToolTip("Restore Default")
         for widget in (self.value, self.reset):
             box.addWidget(widget)
         box.addStretch()
-        super().__init__(snapshot.label.rstrip(":"), control=controls, parent=parent)
         self.marker = BodyLabel("●", self)
         self.marker.setFixedWidth(8)
-        self.rowLayout.insertWidget(0, self.marker)
+        heading.addWidget(self.titleLabel); heading.addStretch(); heading.addWidget(self.marker)
+        outer.addLayout(heading); outer.addWidget(controls)
         self.page, self.scope, self.writer, self.configure_callback = page, scope, writer, configure
         self.value.clicked.connect(self.pick)
         self.reset.clicked.connect(self.restore_default)
@@ -32,7 +41,7 @@ class MappingRow(SettingRow):
         self.marker.setStyleSheet("color: " + themeColor().name() + ";")
         self.titleLabel.setText(setting_title(snapshot.label.rstrip(":")))
         display = input_display(snapshot.display_text)
-        self.value.setText(display)
+        self.value.setText(self.value.fontMetrics().elidedText(display, Qt.ElideRight, 115))
         self.value.setToolTip(display)
         self.value.setAccessibleName(snapshot.label + " " + display)
         self.can_configure = bool(self.configure_callback) or (not self.writer and snapshot.configurable)

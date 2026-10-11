@@ -57,6 +57,8 @@ class SlotInfo:
     kind: str | None = None
     split_available: bool = False
     merge_available: bool = False
+    pending_merge_index: int | None = None
+    merge_target: bool = False
     hold_mode_available: bool = False
     gyro_side_available: bool = False
     ping_available: bool = False

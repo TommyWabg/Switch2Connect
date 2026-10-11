@@ -282,6 +282,8 @@ def test_profile_mode_picker_and_recording(t9, pump):
     picker.open_record(); pump(); record = p._children[-1]
     if hasattr(record, "toggle"):
         record.toggle()
+    else:
+        QTest.mouseClick(record.capture, Qt.LeftButton)
     QTest.keyClick(getattr(record, "capture", record), Qt.Key_A)
     if hasattr(record, "add_tokens"):
         record.add_tokens(("BTN_L",))

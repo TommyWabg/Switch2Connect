@@ -106,7 +106,8 @@ def test_scopes_filters_gc_and_integration(mapping, pump, monkeypatch):
     page.rows[None, "a"].choose("B"); pump(); assert not page.rows[None, "a"].isHidden()
     page.scope_control.setCurrentItem("shift"); pump()
     assert page.scope == SHIFT_SCOPE and not page.shift_actions.isHidden()
-    page.gc_modes[SHIFT_SCOPE].setCurrentItem("100% at Max"); pump()
+    combo = page.gc_modes[SHIFT_SCOPE]
+    combo.setCurrentIndex(next(i for i in range(combo.count()) if combo.itemData(i) == "100% at Max")); pump()
     assert page.rows[SHIFT_SCOPE, "gc_l_click"].isHidden()
     assert page.rows[SHIFT_SCOPE, "gc_r_click"].isHidden()
     page.copy.click(); page.dialog.yesButton.click(); pump(timeout=.3)
@@ -116,6 +117,52 @@ def test_scopes_filters_gc_and_integration(mapping, pump, monkeypatch):
     page.reset_shift.click(); page.dialog.yesButton.click(); pump(timeout=.3)
     assert any(c[0] == "settings.reset_mode_shift_mapping" for c in core.calls)
     assert identities == {k: id(v) for k, v in page.rows.items()}
+
+
+@pytest.mark.parametrize("scope", [None, SHIFT_SCOPE])
+def test_compact_cells_search_label_value_and_visibility(mapping, pump, scope):
+    page, core, _ = mapping
+    page.resize(1000, 760); page.scope_control.setCurrentItem("shift" if scope else "base"); pump()
+    row = page.rows[scope, "a"]
+    row.choose("Custom[Hold]:VK_CONTROL+VK_SHIFT+VK_A+MB_3"); pump()
+    assert row.width() == 178 and row.value.width() == 150
+    assert row.value.toolTip() != row.value.text()
+    page.search.setText("ctrl"); pump()
+    assert not row.isHidden() and page.groups[scope]["rail"].isHidden()
+    page.search.setText("RIGHT SL"); pump()
+    assert not page.rows[scope, "slr"].isHidden() and row.isHidden()
+    page.search.setText("left joystick"); pump()
+    assert not page.rows[scope, "l_joystick"].isHidden() and page.rows[scope, "r_joystick"].isHidden()
+    page.search.setText("no matching mapping"); pump()
+    assert all(group.isHidden() for group in page.groups[scope].values())
+    page.search.clear(); page.changed_only.setChecked(True); pump()
+    assert not row.isHidden() and page.rows[scope, "b"].isHidden()
+
+
+def test_recording_restart_empty_stop_mouse_release_and_wheel(mapping, pump):
+    page, core, _ = mapping
+    dialog = RecordDialog(core, parent=page, initial="Custom[Hold]:VK_Z")
+    dialog.show(); pump()
+    assert not dialog.recording and dialog.tokens == ["VK_Z"]
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
+    assert dialog.recording and not dialog.tokens
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
+    assert not dialog.recording and not dialog.tokens
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
+    QTest.mousePress(dialog.capture, Qt.RightButton)
+    assert dialog.recording and dialog.tokens == ["MB_3"]
+    QTest.mouseRelease(dialog.capture, Qt.RightButton)
+    assert not dialog.recording and dialog.tokens == ["MB_3"]
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
+    wheel = QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120), Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+    dialog.eventFilter(dialog.capture, wheel)
+    assert dialog.recording and dialog.tokens == ["MW_DOWN"]
+    pump(timeout=.15)
+    assert not dialog.recording
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
+    core.profiles.callback(("BTN_X",)); pump()
+    assert not dialog.recording and dialog.tokens == ["BTN_X"]
+    dialog.reject()
 
 
 
@@ -141,18 +188,29 @@ def test_picker_categories_search_keyboard_and_modes(mapping, pump):
 def test_recording_keyboard_mouse_wheel_controller_save_and_stale_cancel(mapping, pump):
     page, core, _ = mapping
     dialog = RecordDialog(core, "a", SHIFT_SCOPE, page.toast, page); dialog.show(); pump()
+    assert core.profiles.callback is None
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
+    assert dialog.recording and not dialog.tokens
     callback = core.profiles.callback
-    QTest.keyClick(dialog.capture, Qt.Key_A, Qt.ControlModifier | Qt.ShiftModifier)
+    QTest.keyPress(dialog.capture, Qt.Key_Control)
+    QTest.keyPress(dialog.capture, Qt.Key_Shift)
+    QTest.keyPress(dialog.capture, Qt.Key_A, Qt.ControlModifier | Qt.ShiftModifier)
     QTest.mouseClick(dialog.capture, Qt.RightButton)
     wheel = QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, 120), Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
     dialog.eventFilter(dialog.capture, wheel)
     callback(("BTN_A", "BTN_A")); pump()
     assert dialog.tokens == ["VK_CONTROL", "VK_SHIFT", "VK_A", "MB_3", "MW_UP", "BTN_A"]
+    QTest.keyRelease(dialog.capture, Qt.Key_A)
+    QTest.keyRelease(dialog.capture, Qt.Key_Shift)
+    QTest.keyRelease(dialog.capture, Qt.Key_Control); pump(timeout=.15)
+    assert not dialog.recording and core.profiles.callback is None
     dialog.mode.setCurrentItem("Tap"); dialog.save.click(); pump()
     assert core.config_fake.maps[SHIFT_SCOPE, "a"] == "Custom[Tap]:VK_CONTROL+VK_SHIFT+VK_A+MB_3+MW_UP+BTN_A"
     dialog = RecordDialog(core, "b", None, page.toast, page); dialog.show(); pump()
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
     late_callback = core.profiles.callback; before = len(core.calls)
     dialog.clear.click(); late_callback(("BTN_X",)); pump(); assert not dialog.tokens
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
     late_callback = core.profiles.callback
     QTest.keyClick(dialog.capture, Qt.Key_Escape); pump()
     late_callback(("BTN_Y",)); dialog.save_recording(); pump()
@@ -237,6 +295,9 @@ def test_public_ir_recorder_empty_value_focus_loss_and_origin_cancel(mapping, pu
     dialog = RecordDialog(core, parent=page, toast=page.toast, mode="Tap", writer=writes.append,
                           keyboard_snapshot=lambda: ("VK_CONTROL", "VK_LWIN", "VK_A"))
     dialog.show(); pump()
+    dialog.eventFilter(dialog, QEvent(QEvent.WindowDeactivate))
+    assert dialog.value == "Default"
+    QTest.mouseClick(dialog.capture, Qt.LeftButton)
     dialog.eventFilter(dialog, QEvent(QEvent.WindowDeactivate))
     assert dialog.value == "Custom[Tap]:VK_CONTROL+VK_LWIN+VK_A"
     dialog.clear.click(); dialog.add_tab.click(); assert dialog.tokens == ["VK_TAB"]

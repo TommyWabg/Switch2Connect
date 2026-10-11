@@ -73,6 +73,9 @@ def build_slots(vcs, config, pending_merge_vc_index=None, *, registry=None):
             active_gyro_side=active if merged else None,
             djg_left_active=left, djg_right_active=right,
             split_available=merged, merge_available=bool(joycon and (selected or any(opposite(vc, other) for other in registry if other is not vc))),
+            pending_merge_index=pending_merge_vc_index,
+            merge_target=bool(joycon and pending_merge_vc_index is not None and
+                0 <= pending_merge_vc_index < len(registry) and opposite(vc, registry[pending_merge_vc_index])),
             hold_mode_available=bool(joycon and vc.mode != "Switch1"),
             gyro_side_available=bool(merged and vc.mode != "Switch1"),
             ping_available=bool(getattr(vc, "loop", None)),

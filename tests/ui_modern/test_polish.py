@@ -107,6 +107,6 @@ def test_theme_art_and_real_options(window, pump):
     for theme in (Theme.DARK, Theme.LIGHT):
         setTheme(theme); pump()
         assert not w.devices.pair_image.pixmap.isNull()
-        assert w.devices.cards[0].illustration.renderer().isValid()
+        assert not w.devices.cards[0].illustration.pixmap.isNull()
     w.devices.apply_slots((replace(core.slots[0], controllers=(replace(core.slots[0].controllers[0], battery_level=None),)),))
     assert w.devices.cards[0].battery.levels == (None,)

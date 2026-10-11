@@ -6,6 +6,7 @@ from app_core.models import SlotInfo
 from .rumble.support import int_spin
 from ..widgets.common import SettingsGroup, SettingRow, Segments, FitImage, WarningSettingRow
 from ..widgets.player_card import PlayerCard, CARD_HEIGHT, _ASSETS
+from ..widgets.support import FluentSurface
 
 EMPTY_HEIGHT = 340
 
@@ -15,8 +16,8 @@ class DevicesPage(ScrollArea):
         self.core, self.toast = core, toast
         self.setObjectName("devices")
         self.setWidgetResizable(True)
-        self.content = QWidget(self); self.setWidget(self.content)
         self.enableTransparentBackground()
+        self.content = FluentSurface(self); self.setWidget(self.content)
         box = QVBoxLayout(self.content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
         box.addWidget(TitleLabel("Devices", self))
         self.controller_stack = QStackedWidget(self.content)
