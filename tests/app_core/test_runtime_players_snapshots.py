@@ -16,6 +16,7 @@ from app_core.runtime import AppRuntime
 from app_core.services.players import PlayerService
 from app_core.snapshots import battery_level, build_slots, wired_state
 from app_core import events
+from virtual_controller import VirtualController
 
 
 class Controller:
@@ -250,7 +251,8 @@ def test_single_disconnect_publishes_empty_slot_after_completion(rig, vc_loop):
             pass
         vc.controllers.clear()
 
-    vc.trigger_disconnect = lambda: asyncio.run_coroutine_threadsafe(disconnect(), vc.loop)
+    vc.disconnect = disconnect
+    vc.trigger_disconnect = lambda: VirtualController.trigger_disconnect(vc)
     token = load(rig, [vc])[0]
 
     def observe(slots):
