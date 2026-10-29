@@ -169,11 +169,13 @@ def test_recording_restart_empty_stop_mouse_release_and_wheel(mapping, pump):
 def test_picker_categories_search_keyboard_and_modes(mapping, pump):
     page, core, _ = mapping; row = page.rows[None, "a"]
     row.pick(); picker = row.picker; pump()
-    assert picker.categories.count() == len(row.snapshot.options) + 1
-    default = next(picker.items.item(i) for i in range(picker.items.count()) if picker.items.item(i).data(Qt.UserRole) == "Default")
-    assert default.checkState() == Qt.Checked
-    picker.search.setText("Mode Shift"); pump(); assert picker.items.count() == 1
-    QTest.keyClick(picker.search, Qt.Key_Down); QTest.keyClick(picker.items, Qt.Key_Return); pump()
+    assert set(picker.blocks) == {cat.title for cat in row.snapshot.options}
+    assert picker.buttons["Default"].isChecked()
+    picker.search.setText("Mode Shift"); pump()
+    assert picker.visible_buttons() == [picker.buttons["Mode Shift"]]
+    QTest.keyClick(picker.search, Qt.Key_Down)
+    assert picker.buttons["Mode Shift"].hasFocus()
+    QTest.keyClick(picker.buttons["Mode Shift"], Qt.Key_Return); pump()
     assert row.snapshot.stored_value == "Custom[Hold]:MODE_SHIFT"
     row.open_picker(); row.picker.activation.setCurrentItem("Tap"); pump()
     assert ("settings.set_mapping_mode", ("a", "Tap", None), {}) in core.calls
@@ -350,3 +352,166 @@ def test_numeric_normalization_waits_for_core_completion(mapping, pump, monkeypa
     assert field.text() == ("42.5" if succeeds else "15.0") and not dialog.numeric_pending
     before = core.config_fake.saves; dialog.reject(); pump()
     assert core.config_fake.saves == before
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_picker_classic_grid_highlight_and_screen(mapping, pump, theme):
+    from qfluentwidgets import setTheme, Theme, TransparentTogglePushButton
+    from qfluentwidgets.components.widgets.flyout import Flyout, FlyoutAnimationManager, FlyoutAnimationType
+    from PySide6.QtWidgets import QWidget
+    from ui_modern.widgets.pickers import OptionPicker
+    setTheme(Theme.DARK if theme == "dark" else Theme.LIGHT)
+    page, _, _ = mapping
+    snapshot = replace(page.rows[None, "gl"].snapshot, selected_option="Mode Shift")
+    picker = OptionPicker(snapshot, parent=page)
+    try:
+        area = picker.screen().availableGeometry()
+        anchor = QWidget()
+        anchor.setGeometry(area.right() - 160, area.bottom() - 30, 150, 28)
+        anchor.show()
+        picker.show_at(anchor); pump(timeout=.25)
+        assert isinstance(picker.flyout, Flyout)
+        assert picker.flyout.view is picker
+        assert isinstance(picker.flyout.aniManager, FlyoutAnimationManager)
+        assert isinstance(picker.flyout.aniManager,
+                          FlyoutAnimationManager.managers[FlyoutAnimationType.PULL_UP])
+        assert picker.flyout.aniManager.slideAni.duration() == 187
+        assert area.contains(picker.flyout.frameGeometry())
+        assert picker.mapToGlobal(QPoint()).y() + picker.height() <= anchor.mapToGlobal(QPoint()).y()
+        assert picker.search.hasFocus()
+        position = lambda title: picker.blocks[title].mapTo(picker, QPoint())
+        assert position("General").y() < position("Switch Input").y()
+        assert position("General").x() < position("In-app Gyro").x()
+        grid = picker.blocks["Switch Input"].layout().itemAt(1).layout()
+        assert grid.columnCount() == 3 and grid.rowCount() == 7
+        assert grid.itemAtPosition(0, 0).widget() is picker.buttons["ZL"]
+        assert grid.itemAtPosition(6, 2).widget() is picker.buttons["GR"]
+        assert len({button.width() for button in picker.buttons.values()}) == 1
+        assert isinstance(picker.buttons["Mode Shift"], TransparentTogglePushButton)
+        assert picker.buttons["Mode Shift"].isChecked()
+        assert not picker.buttons["Default"].isChecked()
+        geometry = picker.flyout.geometry()
+        positions = {v: b.pos() for v, b in picker.buttons.items()}
+        picker.search.setText("vol"); pump()
+        assert picker.flyout.geometry() == geometry
+        assert {v: b.pos() for v, b in picker.buttons.items()} == positions
+        assert all(not b.isHidden() for b in picker.buttons.values())
+        assert not picker.blocks["General"].layout().itemAt(0).widget().isEnabled()
+        assert picker.blocks["Media Keys"].layout().itemAt(0).widget().isEnabled()
+        assert {v for v, b in picker.buttons.items() if b.isEnabled()} == {"Volume Up", "Volume Down"}
+        assert picker.search.hasFocus()
+        QTest.keyClick(picker.search, Qt.Key_Down)
+        assert picker.buttons["Volume Up"].hasFocus()
+        QTest.keyClick(picker.buttons["Volume Up"], Qt.Key_Down)
+        assert picker.buttons["Volume Down"].hasFocus()
+        picker.search.setFocus()
+        picker.search.clear(); pump()
+        assert picker.search.hasFocus()
+        assert all(b.isEnabled() for b in picker.buttons.values())
+    finally:
+        picker.flyout.close()
+        anchor.close()
+        setTheme(Theme.LIGHT)
+
+
+def test_picker_spatial_navigation_search_enter_and_escape(mapping, pump):
+    page, core, _ = mapping
+    row = page.rows[None, "a"]
+    row.open_picker(); picker = row.picker; pump()
+    QTest.keyClick(picker.search, Qt.Key_Down)
+    assert picker.buttons["Default"].hasFocus()
+    QTest.keyClick(picker.buttons["Default"], Qt.Key_Right)
+    assert picker.buttons["In-app Gyro"].hasFocus()
+    QTest.keyClick(picker.buttons["In-app Gyro"], Qt.Key_Down)
+    assert picker.buttons["Gyro Lock"].hasFocus()
+    QTest.keyClick(picker.buttons["Gyro Lock"], Qt.Key_Left)
+    assert picker.buttons["Custom"].hasFocus()
+    QTest.keyClick(picker.buttons["Custom"], Qt.Key_Up)
+    assert picker.buttons["Default"].hasFocus()
+    picker.search.setText("no matches"); pump()
+    assert not picker.visible_buttons() and all(not block.isHidden() for block in picker.blocks.values())
+    QTest.keyClick(picker.search, Qt.Key_Return); pump()
+    assert picker.isVisible() and picker.value is None
+    emitted, closed = [], []
+    picker.chosen.connect(emitted.append)
+    picker.closed.connect(lambda: closed.append(True))
+    picker.search.setText("vol"); pump()
+    QTest.keyClick(picker.search, Qt.Key_Return)
+    assert emitted == ["Volume Up"]
+    assert ("settings.set_mapping", ("a", "Volume Up", None), {}) in core.calls
+    assert picker.flyout.fadeOutAni.duration() == 120
+    pump(timeout=.25)
+    assert closed == [True]
+    assert picker.value == "Volume Up" and not picker.isVisible()
+    row.open_picker(); pump()
+    QTest.keyClick(row.picker.search, Qt.Key_Escape); pump(timeout=.25)
+    assert not row.picker.isVisible() and row.picker.value is None
+
+
+def test_joystick_picker_custom_and_record_hidden(mapping, pump):
+    page, core, _ = mapping
+    row = page.rows[None, "l_joystick"]
+    row.open_picker(); picker = row.picker; pump()
+    assert list(picker.blocks) == ["Joystick"]
+    assert picker.record_button.isHidden()
+    QTest.keyClick(picker.search, Qt.Key_Down)
+    QTest.keyClick(picker.buttons["Default"], Qt.Key_Space); pump()
+    assert picker.value == "Default"
+    row.open_picker(); pump()
+    row.picker.buttons["Custom"].click(); pump()
+    assert ("settings.set_mapping", ("l_joystick", "Custom", None), {}) in core.calls
+    assert not page.findChildren(RecordDialog)
+
+
+def test_picker_extra_catalogue_order_and_record_callbacks(app, pump):
+    from ui_modern.widgets.pickers import OptionPicker
+    from PySide6.QtWidgets import QWidget
+    option = lambda value: SimpleNamespace(value=value, label=value)
+    categories = [SimpleNamespace(title="IR functions", rows=((option("Custom"), option("IR Mouse")),)),
+                  SimpleNamespace(title="Other", rows=((option("Other value"),),))]
+    chosen, recorded, emitted = [], [], []
+    anchor = QWidget(); anchor.show()
+    picker = OptionPicker(categories, chosen.append, lambda: recorded.append(True))
+    picker.chosen.connect(emitted.append)
+    picker.show_at(anchor); pump(timeout=.25)
+    assert list(picker.blocks) == ["IR functions", "Other"]
+    assert picker.blocks["IR functions"].mapTo(picker, QPoint()).x() < picker.blocks["Other"].mapTo(picker, QPoint()).x()
+    picker.buttons["Custom"].click()
+    assert recorded == [True] and not chosen
+    assert emitted == ["Custom"]
+    pump(timeout=.25)
+    picker.show_at(anchor); pump(timeout=.25); picker.buttons["IR Mouse"].click()
+    assert chosen == ["IR Mouse"] and picker.value == "IR Mouse"
+    pump(timeout=.25)
+    picker.show_at(anchor); pump(timeout=.25); picker.open_record()
+    assert recorded == [True, True] and picker.value == "Custom"
+
+    pump(timeout=.25)
+    anchor.close()
+
+
+def test_picker_below_anchor_and_immediate_writer(mapping, pump):
+    from PySide6.QtWidgets import QWidget
+    from qfluentwidgets.components.widgets.flyout import FlyoutAnimationManager, FlyoutAnimationType
+    from ui_modern.pages.mapping.rows import MappingRow
+    page, _, _ = mapping
+    anchor = QWidget()
+    area = anchor.screen().availableGeometry()
+    anchor.setGeometry(area.left() + 40, area.top() + 30, 178, 80)
+    values, chosen = [], []
+    row = MappingRow(page, page.rows[None, "a"].snapshot, parent=anchor, writer=values.append)
+    anchor.show(); pump()
+    row.open_picker(); picker = row.picker
+    picker.chosen.connect(chosen.append)
+    pump(timeout=.25)
+    assert isinstance(picker.flyout.aniManager,
+                      FlyoutAnimationManager.managers[FlyoutAnimationType.DROP_DOWN])
+    assert picker.mapToGlobal(QPoint()).x() == row.value.mapToGlobal(QPoint()).x()
+    assert picker.mapToGlobal(QPoint()).y() == row.value.mapToGlobal(QPoint(0, row.value.height())).y()
+    assert area.contains(picker.flyout.frameGeometry())
+    picker.buttons["Mode Shift"].click()
+    assert values == chosen == ["Mode Shift"]
+    assert picker.flyout.isVisible()  # callback precedes completion of the fade
+    pump(timeout=.25)
+    assert not picker.flyout.isVisible()
+    anchor.close(); anchor.deleteLater()

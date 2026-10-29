@@ -147,8 +147,18 @@ class IrSensorDialog(ThemedDialog):
             self._children.remove(dialog); dialog.deleteLater()
         dialog.finished.connect(done); dialog.open()
 
+    def show_picker(self, options, target, on_choose):
+        picker = OptionPicker(options, parent=self)
+        self._children.append(picker)
+        picker.chosen.connect(on_choose)
+        def closed():
+            self._children.remove(picker)
+            picker.flyout.deleteLater()
+        picker.closed.connect(closed)
+        picker.show_at(target)
+
     def pick_function(self):
-        self.show_child(OptionPicker(self.view, parent=self), self.choose_function)
+        self.show_picker(self.view, self.function, self.choose_function)
 
     def choose_function(self, value):
         if value == "Custom":
@@ -224,7 +234,7 @@ class IrSensorDialog(ThemedDialog):
             old = self.gyro_values["simul"]
             apply_change(self, self.core.settings.set_ir_gyro_setting, self.side, "simul", value, self.scope, **self.context,
                 undo=lambda: apply_change(self, self.core.settings.set_ir_gyro_setting, self.side, "simul", old, self.scope, **self.context))
-        self.show_child(OptionPicker(options, parent=self), accepted)
+        self.show_picker(options, self.gyro_controls["simul"], accepted)
 
     def change_profile_mode(self, value):
         old = self.core.settings.state().app.change_profile_mode
@@ -238,7 +248,10 @@ class IrSensorDialog(ThemedDialog):
                 self.refresh()
     def cleanup(self, *_):
         for child in tuple(self._children):
-            child.reject()
+            if isinstance(child, OptionPicker):
+                child.flyout.close()
+            else:
+                child.reject()
         for widget in (*self.controls.values(), *self.gyro_controls.values()):
             if isinstance(widget, Numeric):
                 widget.finish()

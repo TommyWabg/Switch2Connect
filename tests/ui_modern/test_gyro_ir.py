@@ -275,10 +275,9 @@ def test_profile_mode_picker_and_recording(t9, pump):
     assert ("settings.set_change_profile_mode", ("Auto",), {}) in core.calls
     p.pick_function(); pump(); picker = p._children[-1]
     picker.search.setText("Gyro")
-    if hasattr(picker, "items"):
-        assert all("gyro" in picker.items.item(i).text().lower() for i in range(picker.items.count()))
-    else:
-        assert picker.lists[0].item(0).isHidden()
+    assert picker.visible_buttons()
+    assert all("gyro" in button.text().lower() for button in picker.visible_buttons())
+    assert not picker.buttons["Change Profile"].isEnabled()
     picker.open_record(); pump(); record = p._children[-1]
     if hasattr(record, "toggle"):
         record.toggle()
@@ -324,13 +323,24 @@ def test_gyro_undo_keeps_original_sensitivity_mode(t9, pump):
 def test_gyro_ir_origin_and_remaining_controls(t9, pump):
     core, _, _, dialog = t9; p = dialog()
     core.profiles_state = replace(core.profiles_state, active="Gaming")
-    p.set_function("In-app Gyro"); pump(timeout=.2)
+    p.pick_function(); pump(timeout=.25)
+    function_picker = p._children[-1]
+    from qfluentwidgets.components.widgets.flyout import Flyout
+    assert isinstance(function_picker.flyout, Flyout)
+    assert function_picker.flyout.aniManager is not None
+    function_picker.buttons["In-app Gyro"].click(); pump(timeout=.25)
+    assert ("settings.set_ir_function", ("left", "In-app Gyro", None), p.context) in core.calls
+    assert function_picker not in p._children
     assert "simul" in p.gyro_controls
     p.pick_inputs("dampening_mode", True); pump(); picker = p._children[-1]
     picker.listing.item(1).setCheckState(Qt.Checked); picker.save(); pump()
     assert ("settings.set_ir_gyro_setting", ("left", "dampening_mode", ["ZL"], None), p.context) in core.calls
     assert not p.gyro_rows["dampening_amount"].isHidden()
-    p.pick_simultaneous(CHOICES); pump(); p._children[-1].select(next(p._children[-1].items.item(i) for i in range(p._children[-1].items.count()) if p._children[-1].items.item(i).data(Qt.UserRole) == "R")); pump()
+    p.pick_simultaneous(CHOICES); pump(timeout=.25)
+    simultaneous_picker = p._children[-1]
+    assert isinstance(simultaneous_picker.flyout, Flyout)
+    simultaneous_picker.buttons["R"].click(); pump(timeout=.25)
+    assert simultaneous_picker not in p._children
     assert ("settings.set_ir_gyro_setting", ("left", "simul", "R", None), p.context) in core.calls
     assert core.settings.sensor("left", None, p.context)["gyro"]["dampening_mode"] == ["ZL"]
     p.reject(); pump()
@@ -342,7 +352,7 @@ def test_picker_keyboard_save_cancel_and_empty_record(t9, pump):
     picker.listing.setCurrentRow(0); QTest.keyClick(picker.listing, Qt.Key_Space)
     QTest.keyClick(picker, Qt.Key_Return); pump()
     assert core.settings.sensor("left", None)["mouse"]["middle_click"] == ["L"]
-    p.pick_function(); pump(); QTest.keyClick(p._children[-1], Qt.Key_Escape); pump()
+    p.pick_function(); pump(); QTest.keyClick(p._children[-1], Qt.Key_Escape); pump(timeout=.25)
     assert not p._children
     p.choose_function("Custom"); pump(); record = p._children[-1]
     if hasattr(record, "toggle"):

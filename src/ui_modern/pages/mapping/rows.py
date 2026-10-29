@@ -1,7 +1,7 @@
 from ...widgets.changes import apply_change
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
-from qfluentwidgets import DropDownPushButton, TransparentToolButton, PushButton, FluentIcon, BodyLabel, themeColor
+from qfluentwidgets import DropDownPushButton, TransparentToolButton, TransparentPushButton, FluentIcon, BodyLabel, themeColor
 from ...widgets.common import Segments
 from ...widgets.recording import RecordDialog
 from ...widgets.pickers import OptionPicker
@@ -82,19 +82,20 @@ class MappingRow(QWidget):
         self.open_picker()
 
     def open_picker(self):
+        if hasattr(self, "picker"):
+            self.picker.flyout.close()
+            self.picker.flyout.deleteLater()
         self.picker = OptionPicker(self.snapshot, self.choose, self.record, self)
-        self.picker.record_button.setVisible(self.snapshot.key not in ("l_joystick", "r_joystick"))
         if self.snapshot.mode is not None:
             activation = Segments(self.picker); activation.sync(("Hold", "Tap"), self.snapshot.mode)
             activation.currentItemChanged.connect(self.set_mode); self.picker.box.addWidget(activation)
             self.picker.activation = activation
         if self.can_configure:
-            configure = PushButton("Configure…", self.picker)
-            configure.clicked.connect(lambda: (self.picker.accept(), self.configure()))
+            configure = TransparentPushButton(FluentIcon.SETTING, "Configure…", self.picker)
+            configure.clicked.connect(lambda: (self.picker.dismiss(), self.configure()))
             self.picker.box.addWidget(configure)
             self.picker.configure_button = configure
-        self.picker.move(self.value.mapToGlobal(self.value.rect().bottomLeft()))
-        self.picker.show()
+        self.picker.show_at(self.value)
 
     def record(self):
         previous = self.snapshot.stored_value
