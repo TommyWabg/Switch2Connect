@@ -273,3 +273,7 @@ Happy gaming, and thank you for your generous support!
 * **[SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge):** Main reference for DualSense audio endpoint HID descriptor.
 * **[JibbSmart/JoyShockLibrary](https://github.com/JibbSmart/JoyShockLibrary):** Reference for Switch 1 Joy-Cons gyro direction.
 * **[RyanCopley/NSO-GameCube-Controller-Pairing-App](https://github.com/RyanCopley/NSO-GameCube-Controller-Pairing-App):** Reference for all NSO GameCube Controller related features. Also a reference for BLE throughput optimized mode.
+
+## New interface (beta)
+
+The classic interface remains the default. Use the **Try the new interface** button in the classic interface to switch. In the new interface, open **Settings → Interface** to switch back; switching restarts the app. You can also select an interface for a launch with `--ui=modern` or `--ui=classic`.

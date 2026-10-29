@@ -23,6 +23,15 @@ Pillow==12.1.1
 pywebview==5.4
 pyinstaller==6.20.0
 
+# Modern interface (Fluent requires the PySide6 metapackage; frozen builds exclude unused modules).
+PySide6-Essentials==6.11.2
+PySide6==6.11.2
+PySide6-Addons==6.11.2
+shiboken6==6.11.2
+PySide6-Fluent-Widgets==1.11.3
+PySideSix-Frameless-Window==0.8.2
+darkdetect==0.8.0
+
 # External C/C++ Driver & Sub-library Repositories (For reference / self-compilation)
 # WinUHid Driver: https://github.com/lurebat/WinUHid
 # Fusion IMU Library: https://github.com/xioTechnologies/Fusion

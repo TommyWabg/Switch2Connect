@@ -1,6 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
-from PyInstaller.utils.hooks import collect_all
+import sys
+import pkgutil
+import PySide6
+sys.path.insert(0, os.path.join(SPECPATH, "src"))
+from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
 datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/esp32s3', 'drivers/esp32s3'), ('drivers/tools', 'drivers/tools')]
 binaries = []
@@ -36,16 +40,38 @@ tmp_ret = collect_all('webview')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
+# Dynamic page factories and CLI-selected composition roots are invisible to analysis.
+hiddenimports += collect_submodules('ui_modern') + collect_submodules('app_core')
+hiddenimports += collect_submodules('qfluentwidgets') + collect_submodules('qframelesswindow')
+datas += collect_data_files('qfluentwidgets') + collect_data_files('qframelesswindow')
+# PySide6 hooks collect plugins for modules actually used; never collect_all('PySide6').
+qt_excludes = ['PySide6.' + name for name in (
+    'QtWebEngineCore', 'QtWebEngineWidgets', 'QtWebEngineQuick', 'QtWebChannel',
+    'Qt3DCore', 'Qt3DRender', 'Qt3DInput', 'Qt3DLogic', 'Qt3DAnimation', 'Qt3DExtras',
+    'QtMultimedia', 'QtMultimediaWidgets', 'QtQuick', 'QtQuickWidgets', 'QtQuickControls2',
+    'QtQuick3D', 'QtQuickTest', 'QtQml', 'QtQmlModels', 'QtQmlWorkerScript',
+    'QtCharts', 'QtDataVisualization', 'QtGraphs', 'QtGraphsWidgets', 'QtPdf', 'QtPdfWidgets',
+    'QtSql', 'QtTest', 'QtBluetooth', 'QtPositioning', 'QtLocation', 'QtRemoteObjects',
+    'QtSensors', 'QtSerialBus', 'QtSerialPort', 'QtScxml', 'QtSpatialAudio',
+    'QtTextToSpeech', 'QtVirtualKeyboard', 'QtHttpServer', 'QtNetworkAuth',
+    'QtDesigner', 'QtHelp', 'QtUiTools')]
+# Also cover future modules in these unused families, without importing them.
+unused_qt_prefixes = ('QtWebEngine', 'Qt3D', 'QtMultimedia', 'QtQuick', 'QtQml', 'QtPdf')
+qt_excludes += ['PySide6.' + module.name for module in pkgutil.iter_modules(PySide6.__path__)
+                if module.name.startswith(unused_qt_prefixes)]
+# Ko-fi uses WebView2 on Windows; its optional Qt adapter would pull WebEngine back in.
+qt_excludes += ['webview.platforms.qt', 'PyQt5', 'PyQt6', 'PySide2']
+
 a = Analysis(
     ['src/gui.py'],
-    pathex=['.'],
+    pathex=['.', 'src'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=qt_excludes,
     noarchive=False,
     optimize=0,
 )

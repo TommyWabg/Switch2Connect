@@ -4253,9 +4253,8 @@ class VirtualController:
 
     def trigger_disconnect(self):
         if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.disconnect(), self.loop)
-        else:
-            logger.error("Event loop not found or not running.")
+            return asyncio.run_coroutine_threadsafe(self.disconnect(), self.loop)
+        logger.error("Event loop not found or not running.")
 
     async def remove_controller(self, controller: Controller, clear_mac_port: bool = False) -> bool:
         if controller not in self.controllers:

@@ -838,6 +838,9 @@ class Config:
         
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
+        self.ui_mode = config.get("ui_mode", "classic")
+        if self.ui_mode not in ("classic", "modern"):
+            self.ui_mode = "classic"
         self.power_saving_mode = config.get("power_saving_mode", "Off")
         if self.power_saving_mode not in ("Off", "Auto", "Full"):
             self.power_saving_mode = "Off"
@@ -1891,6 +1894,7 @@ class Config:
             'simulation_mode': self.simulation_mode,
             'open_when_startup': self.open_when_startup,
             'start_minimized': self.start_minimized,
+            'ui_mode': self.ui_mode,
             'power_saving_mode': self.power_saving_mode,
             'power_saving_auto_warning_suppressed': self.power_saving_auto_warning_suppressed,
             'power_saving_full_warning_suppressed': self.power_saving_full_warning_suppressed,
