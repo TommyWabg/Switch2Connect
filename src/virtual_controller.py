@@ -255,6 +255,20 @@ def get_ds4_dpad(up, down, left, right):
 def float_to_byte(val):
     return int(max(0, min(255, round(val * 127.5 + 128))))
 
+def _own_usbip_endpoint(port_block):
+    """Return (port, bus_id) when a `usbip port` block belongs to one of our own
+    loopback servers (USBIPAllocator hands out 127.0.0.N), otherwise None.
+
+    Other software may use usbip-win2 too, e.g. to import a Bluetooth adapter from
+    another machine on the default port 3240. Plain substring checks such as ":3240"
+    or "/1-1" (which also matches "/1-10") would detach those devices as well.
+    """
+    import re
+    m = re.search(r"usbip://(127\.\d+\.\d+\.\d+):(\d+)/(\S+)", port_block)
+    if not m:
+        return None
+    return int(m.group(2)), m.group(3)
+
 def detach_usbip_device(server_port: int, timeout=2.0):
     import subprocess
     import os
@@ -281,7 +295,8 @@ def detach_usbip_device(server_port: int, timeout=2.0):
             port_match = re.match(r"^(\d+):", first_line)
             if port_match:
                 port_num_str = port_match.group(1)
-                if f":{server_port}" in port_block or f"/{bus_id}" in port_block:
+                own = _own_usbip_endpoint(port_block)
+                if own and (own[0] == server_port or own[1] == bus_id):
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with server port {server_port} (bus_id: {bus_id})")
                     try:
                         subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=max(0.1, float(timeout)))
@@ -315,13 +330,8 @@ def detach_all_usbip_devices(timeout=2.0):
             port_match = re.match(r"^(\d+):", first_line)
             if port_match:
                 port_num_str = port_match.group(1)
-                should_detach = False
-                for p in range(3240, 3248):
-                    bus_id = f"1-{p - 3240 + 1}"
-                    if f":{p}" in port_block or f"/{bus_id}" in port_block:
-                        should_detach = True
-                        break
-                if should_detach:
+                # Only our own loopback servers; never devices imported from other hosts
+                if _own_usbip_endpoint(port_block):
                     logger.info(f"Detaching USBIP device on port {port_num_str} associated with a virtual controller slot")
                     try:
                         subprocess.run([usbip_exe, "detach", "-p", port_num_str], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, timeout=max(0.1, float(timeout)))
