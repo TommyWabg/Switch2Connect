@@ -23,6 +23,7 @@ import threading
 import logging
 import time
 import queue
+import select
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,90 @@ class USBIPServer:
         except Exception:
             pass
 
+    # --- Deferred EP1 IN pacing (Native Rumble only) -------------------------
+    # Enabled by the owner via `in_pacing_defer_predicate` (a callable returning
+    # True while Native Rumble is active).  Everything runs on the recv thread:
+    # no extra Python thread, so no GIL hand-off on the USBIP hot path.
+    def _in_pacing_deferred(self):
+        predicate = getattr(self, 'in_pacing_defer_predicate', None)
+        if predicate is None:
+            return False
+        try:
+            return bool(predicate())
+        except Exception:
+            return False
+
+    def _send_ep1_in_reply(self, sock, seqnum, devid, ep):
+        self.last_ep_in_time = time.perf_counter()
+        try:
+            reply_data = self.input_queue.get_nowait()
+        except queue.Empty:
+            with self.lock:
+                reply_data = bytes(self.last_state)
+        ret_header = struct.pack(
+            "!IIIII i IiiI 8s",
+            USBIP_RET_SUBMIT, seqnum, devid, 1, ep, 0, len(reply_data),
+            0, 0, 0, b"\x00" * 8
+        )
+        with self.send_lock:
+            sock.sendall(ret_header + reply_data)
+
+    def _service_deferred_in(self, sock):
+        """Send deferred EP1 IN replies as they fall due (4 ms apart); return as
+        soon as the socket has a new request to read, or nothing is deferred."""
+        deferred = self._deferred_in
+        while deferred:
+            wait = getattr(self, 'last_ep_in_time', 0) + 0.004 - time.perf_counter()
+            if wait > 0:
+                readable, _, _ = select.select([sock], [], [], wait)
+                if readable:
+                    return
+                continue
+            seqnum, devid, ep = deferred.pop(0)
+            self._send_ep1_in_reply(sock, seqnum, devid, ep)
+
+    def _cancel_deferred_in(self, seqnum):
+        deferred = getattr(self, '_deferred_in', None)
+        if not deferred:
+            return False
+        for i, item in enumerate(deferred):
+            if item[0] == seqnum:
+                del deferred[i]
+                return True
+        return False
+
+    def _record_rumble_out_timing(self, t0, t1):
+        """Rumble OUT diagnostics, logged at most every 5 s while rumble flows.
+
+        interval = time between consecutive rumble OUT reports (SDL3 queues one
+        every 12 ms; a steady interval above ~12 ms means SDL3's rumble queue is
+        backing up).  handler = time spent in the rumble callback.
+        """
+        st = getattr(self, '_rumble_out_stats', None)
+        if st is None:
+            st = self._rumble_out_stats = {'last': 0.0, 'n': 0, 'int_sum': 0.0,
+                                           'int_max': 0.0, 'cb_sum': 0.0,
+                                           'cb_max': 0.0, 'since': t0}
+        last = st['last']
+        st['last'] = t0
+        cb = t1 - t0
+        st['n'] += 1
+        st['cb_sum'] += cb
+        st['cb_max'] = max(st['cb_max'], cb)
+        if last and t0 - last < 0.5:
+            iv = t0 - last
+            st['int_sum'] += iv
+            st['int_max'] = max(st['int_max'], iv)
+        if t1 - st['since'] >= 5.0:
+            n = st['n']
+            if n > 1:
+                logger.info(
+                    "Rumble OUT stats: %d pkts/%.1fs, interval avg %.1fms max %.1fms, "
+                    "handler avg %.2fms max %.2fms",
+                    n, t1 - st['since'], st['int_sum'] / max(1, n - 1) * 1000.0,
+                    st['int_max'] * 1000.0, st['cb_sum'] / n * 1000.0, st['cb_max'] * 1000.0)
+            st.update(n=0, int_sum=0.0, int_max=0.0, cb_sum=0.0, cb_max=0.0, since=t1)
+
     def _recvexact(self, sock, n):
         """Read exactly n bytes from socket. Raises ConnectionError on disconnect."""
         buf = b""
@@ -180,6 +265,7 @@ class USBIPServer:
         with self._urb_lock:
             self._pending_seqnums.clear()
             self._unlinked_seqnums.clear()
+        self._deferred_in = []
 
     def _mark_urb_pending(self, seqnum):
         """Record that a URB was deferred to a background completion thread."""
@@ -355,6 +441,10 @@ class USBIPServer:
             # CRITICAL: TCP is a stream protocol; recv() may return fewer bytes than requested.
             # We must loop until we have exactly 20 bytes or the connection closes.
             try:
+                # Native Rumble: answer any paced (deferred) EP1 IN reads that are
+                # due, and return as soon as the host sends something else.
+                if getattr(self, '_deferred_in', None):
+                    self._service_deferred_in(sock)
                 common_header = self._recvexact(sock, 20)
             except ConnectionError as e:
                 logger.info(f"Data loop exit: {e}")
@@ -429,7 +519,8 @@ class USBIPServer:
                 # If the victim URB is still queued on a background thread, mark it so
                 # its completion path suppresses the (now stale) RET_SUBMIT, and report
                 # -ECONNRESET.  If it already completed, report 0.
-                was_pending = self._mark_urb_unlinked(seqnum_to_unlink)
+                was_pending = (self._cancel_deferred_in(seqnum_to_unlink) or
+                               self._mark_urb_unlinked(seqnum_to_unlink))
                 unlink_status = -104 if was_pending else 0  # -ECONNRESET
                 if hasattr(self, '_on_urb_unlink'):
                     try:
@@ -465,6 +556,16 @@ class USBIPServer:
             if direction == 1: # IN (Read input state)
                 now = time.perf_counter()
                 elapsed = now - getattr(self, 'last_ep_in_time', 0)
+                deferred = getattr(self, '_deferred_in', None)
+                if (deferred or elapsed < 0.004) and self._in_pacing_deferred():
+                    # Native Rumble: keep the 4 ms IN pacing without sleeping on
+                    # the recv thread, so a rumble OUT queued behind this read is
+                    # completed at once (SDL3 holds its device lock for the whole
+                    # blocking hid_write and skips input reads meanwhile).
+                    if deferred is None:
+                        deferred = self._deferred_in = []
+                    deferred.append((seqnum, devid, ep))
+                    return
                 if elapsed < 0.004:
                     time.sleep(0.004 - elapsed)
                 self.last_ep_in_time = time.perf_counter()
@@ -477,9 +578,11 @@ class USBIPServer:
                 actual_length = len(reply_data)
             else: # OUT (Rumble output report)
                 if len(out_data) > 0:
+                    _cb_t0 = time.perf_counter()
                     if self.on_rumble_callback:
                         self.on_rumble_callback(out_data)
                     actual_length = len(out_data)
+                    self._record_rumble_out_timing(_cb_t0, time.perf_counter())
         elif ep == 2: # Switch 2 vendor bulk interface
             if direction == 1: # IN
                 try:

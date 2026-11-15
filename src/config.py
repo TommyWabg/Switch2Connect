@@ -294,6 +294,10 @@ MODE_SHIFT_LABEL = "Mode Shift"
 # In-app Gyro logic identical to Mode Shift / Gyro Lock, allowing Tap/Hold per-button
 IN_APP_GYRO_TOKEN = "INAPPGYRO"
 IN_APP_GYRO_LABEL = "In-app Gyro"
+# Gyro panel "Always Active": a UI-driven virtual Tap trigger for In-app Gyro. Its
+# per-trigger settings (Deadzone/Dampening, set in the In-app Gyro popup) are stored
+# under this pseudo mapping key, i.e. "gyro_always_active_in_app_gyro_<setting>".
+GYRO_ALWAYS_ACTIVE_KEY = "gyro_always_active"
 
 
 # Default Mode Shift auto-apply state per Gyro Control mode. When On, entering In-app
@@ -1043,6 +1047,8 @@ class Config:
                 config.get("stabilized_gyro", False))),
             "virtual_gyro_soft_deadzone": float(deadzone),
             "in_app_gyro_soft_deadzone": float(in_app_deadzone),
+            # Reset default is Off; never inherited from saved profile_defaults.
+            "gyro_always_active": False,
             "gyro_passthrough_mode": config.get("gyro_passthrough_mode", "Default"),
             "experimental_9axis_v2_mode": config.get("experimental_9axis_v2_mode", "Legacy"),
             "horizon_lock_v2_enabled": bool(config.get("horizon_lock_v2_enabled", False)),
@@ -1075,6 +1081,7 @@ class Config:
             "gyro_passthrough_9axis_enabled": False,
             "virtual_gyro_soft_deadzone": 0.0,
             "in_app_gyro_soft_deadzone": 0.0,
+            "gyro_always_active": False,
             "gyro_passthrough_mode": "Default",
             "experimental_9axis_v2_mode": "Legacy",
             "horizon_lock_v2_enabled": False,
@@ -1519,6 +1526,33 @@ class Config:
     @in_app_gyro_soft_deadzone.setter
     def in_app_gyro_soft_deadzone(self, value):
         self._set_profile_setting("in_app_gyro_soft_deadzone", float(value))
+
+    @property
+    def gyro_always_active(self):
+        """Gyro panel "Always Active" (per profile, reset default Off).
+
+        On behaves like one extra In-app Gyro Tap trigger: selecting On switches the
+        shared In-app Gyro trigger pool on, Off switches it off. Physical In-app Gyro
+        buttons keep flipping the same pool afterwards."""
+        return bool(self._get_profile_setting("gyro_always_active"))
+
+    @gyro_always_active.setter
+    def gyro_always_active(self, value):
+        self._set_profile_setting("gyro_always_active", bool(value))
+        self.request_gyro_always_active()
+
+    def request_gyro_always_active(self):
+        """Ask every controller to (re)apply the Always Active state to its In-app Gyro
+        trigger pool on its next report, even if the stored value did not change."""
+        self._gyro_always_active_seq = int(getattr(self, "_gyro_always_active_seq", 0)) + 1
+        self._bump_settings_generation()
+
+    @property
+    def gyro_always_active_request(self):
+        """(sequence, value) pair. Controllers apply the Always Active value whenever
+        this pair differs from the one they last applied, which covers UI clicks,
+        profile switches and profile resets."""
+        return (int(getattr(self, "_gyro_always_active_seq", 0)), self.gyro_always_active)
 
     @property
     def impulse_trigger_enabled(self):

@@ -54,7 +54,7 @@ from discoverer import (
     request_wired_rescan,
     set_wired_auto_scan_enabled,
 )
-from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, packaged_winuhid_available, refresh_packaged_winuhid_capability, confirm_packaged_winuhid_capability
+from config import get_resource, CONFIG, BACK_BUTTON_OPTIONS, JOYSTICK_OPTIONS, SWITCH_BUTTONS, get_driver_path, GYRO_LOCK_TOKEN, GYRO_LOCK_LABEL, MODE_SHIFT_TOKEN, MODE_SHIFT_LABEL, IN_APP_GYRO_TOKEN, IN_APP_GYRO_LABEL, GYRO_ALWAYS_ACTIVE_KEY, _YamlLoader, _YamlDumper, SWITCH_INPUT_DAMPENING_OPTIONS, MOUSE_CLICK_BACK_BUTTON_TOKENS, back_button_label, normalize_dampening_inputs, packaged_winuhid_available, refresh_packaged_winuhid_capability, confirm_packaged_winuhid_capability
 from cemuhook_udp import cemuhook_server
 from virtual_controller import VirtualController
 from discoverer import split_controller, merge_controllers, VIRTUAL_CONTROLLERS
@@ -97,7 +97,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v2.9.1"
+APP_VERSION = "v3.0"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -6242,9 +6242,8 @@ class ControllerWindow:
             )
 
     def run_usbip_uninstall(self):
-        # Both builds invoke the registered Inno uninstaller directly. USBIP keeps
-        # driver components loaded until reboot, so do not inspect or clean them up
-        # synchronously after a successful uninstall.
+        # Prefer the registered uninstaller. A broken installation may have lost
+        # it, in which case the bundled recovery script removes only USBIP.
         import os
 
         # Stop discoverer before uninstallation
@@ -6258,11 +6257,21 @@ class ControllerWindow:
         emergency_cleanup()
 
         uninstaller_exe = "C:\\Program Files\\USBip\\unins000.exe"
-        if not os.path.exists(uninstaller_exe):
+        recovery_script = None
+        if os.path.exists(uninstaller_exe):
+            uninstall_file = uninstaller_exe
+            uninstall_args = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+            uninstall_dir = os.path.dirname(uninstaller_exe)
+        else:
+            recovery_script = get_driver_path("uninstall_usbip.ps1")
+            uninstall_file = "powershell.exe"
+            uninstall_args = self._ps_hidden_args(recovery_script)
+            uninstall_dir = os.path.dirname(recovery_script)
+        if recovery_script is not None and not os.path.isfile(recovery_script):
             self.show_centered_message(
                 "Error",
-                "Could not find the USBIP uninstaller. Reinstall USBIP, then try "
-                "uninstalling it again.",
+                "The USBIP uninstaller and bundled recovery script are missing. "
+                "Please restore the application files, then retry Repair USBIP Driver.",
             )
             if discoverer_was_running:
                 self.start_discoverer_thread()
@@ -6282,15 +6291,16 @@ class ControllerWindow:
 
             tk.Label(
                 progress_win,
-                text="Running USBIP-win2 Uninstaller...\nPlease authorize the UAC prompt if asked.",
+                text=("Recovering incomplete USBIP installation..." if recovery_script
+                      else "Running USBIP-win2 Uninstaller...")
+                     + "\nPlease authorize the UAC prompt if asked.",
                 fg="white", bg="#1E1E1E",
                 font=scale_font(("Arial", 11, "bold"))
             ).pack(pady=int(40 * scaling_factor))
 
-            # Both MSIX and standalone builds elevate the Inno uninstaller itself.
             hProcess = self._launch_elevated(
-                uninstaller_exe, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
-                progress_win=progress_win, lp_dir="C:\\Program Files\\USBip")
+                uninstall_file, uninstall_args,
+                progress_win=progress_win, lp_dir=uninstall_dir)
             if not hProcess:
                 progress_win.grab_release()
                 progress_win.destroy()
@@ -6325,11 +6335,17 @@ class ControllerWindow:
                 self.start_discoverer_thread()
             return False
 
-        if proc_exit_code[0] != 0:
+        if proc_exit_code[0] != 0 and not (
+            recovery_script is not None and proc_exit_code[0] == 3010
+        ):
+            recovery_detail = ""
+            if recovery_script is not None:
+                recovery_detail = "\nRecovery log: " + os.path.join(
+                    os.environ.get("TEMP", ""), "Switch2Connect_USBIP_uninstall.log")
             self.show_centered_message(
                 "Error",
                 "USBIP uninstallation failed.\n\n"
-                f"Exit code: {proc_exit_code[0]}",
+                f"Exit code: {proc_exit_code[0]}{recovery_detail}",
             )
             if discoverer_was_running:
                 self.start_discoverer_thread()
@@ -8758,6 +8774,19 @@ bg_color=panel_bg, widths=[8, 10])
         self.stick_scale.set(getattr(CONFIG, "stick_mouse_sensitivity", 5.0))
         self.stick_scale.grid(row=3, column=3, padx=int(5 * scaling_factor), pady=(int(10 * scaling_factor), 0), sticky="w")
 
+        # ---- Row 3 (right, below the Mag Cal hint): Always Active ----
+        # On = one extra In-app Gyro Tap trigger in the shared trigger pool; pressing On
+        # also opens the In-app Gyro settings popup (Deadzone / Dampening) for it.
+        always_active_frame = tk.Frame(self.gyro_frame, bg=panel_bg)
+        tk.Label(always_active_frame, text="Always Active:", bg=panel_bg, fg=text_color, font=scale_font(("Arial", 11, "bold"))).pack(side=tk.LEFT, padx=(0, int(5 * scaling_factor)))
+        self.gyro_always_active_switch = ToggleSwitch(always_active_frame, labels=["On", "Off"], values=[True, False], initial_value=bool(getattr(CONFIG, "gyro_always_active", False)), command=self.update_gyro_always_active_setting, bg_color=panel_bg)
+        self.gyro_always_active_switch.pack(side=tk.LEFT)
+        # Pressing On must always open the popup (and re-assert On), even when On is
+        # already selected, so route the On button around ToggleSwitch's same-value guard.
+        self.gyro_always_active_on_btn = self.gyro_always_active_switch.buttons[0][0]
+        self.gyro_always_active_on_btn.config(command=self.on_gyro_always_active_on_clicked)
+        always_active_frame.grid(row=3, column=4, columnspan=3, padx=(int(20 * scaling_factor), int(5 * scaling_factor)), pady=(int(10 * scaling_factor), 0), sticky="w")
+
         self._update_gyro_control_visibility(initial_gyro_control)
 
 
@@ -8879,6 +8908,90 @@ bg_color=panel_bg, widths=[8, 10])
     def update_act_setting(self, val):
         CONFIG.gyro_activation_mode = val
         self.on_gyro_setting_changed()
+
+    def update_gyro_always_active_setting(self, val):
+        """Always Active On/Off. Every selection sets the shared In-app Gyro trigger
+        pool to that state (like a Tap trigger); physical In-app Gyro buttons can still
+        flip the pool afterwards."""
+        val = bool(val)
+        CONFIG.gyro_always_active = val
+        CONFIG.save_config()
+        logger.info(f"Gyro Always Active: {'On' if val else 'Off'}")
+        if hasattr(self, "gyro_always_active_switch"):
+            self.gyro_always_active_switch.set_value(val)
+        if not val:
+            anchor = getattr(self, "gyro_always_active_on_btn", None)
+            if anchor is not None and getattr(self, "in_app_gyro_popup_anchor", None) is anchor:
+                self.close_in_app_gyro_popup()
+
+    def on_gyro_always_active_on_clicked(self):
+        self.update_gyro_always_active_setting(True)
+        anchor = getattr(self, "gyro_always_active_on_btn", None)
+        if anchor is None:
+            return
+        try:
+            self.open_gyro_always_active_settings(anchor)
+        except Exception:
+            logger.exception("Failed to open the Always Active In-app Gyro popup")
+
+    def open_gyro_always_active_settings(self, anchor_widget):
+        """Open the existing In-app Gyro settings popup for Always Active.
+
+        Reuses the popup builder through a hidden bridge mapping widget (same approach
+        as the Joy-con IR sensor). Settings are stored under
+        gyro_always_active_in_app_gyro_* mapping keys, which the controller path reads
+        when Always Active is the In-app Gyro trigger source."""
+        existing = getattr(self, "in_app_gyro_popup", None)
+        if (existing is not None and existing.winfo_exists()
+                and getattr(self, "in_app_gyro_popup_anchor", None) is anchor_widget):
+            self.close_in_app_gyro_popup()
+            return
+
+        self.close_in_app_gyro_popup()
+        # Mark the pseudo key as a Tap In-app Gyro trigger so the bridge widget shows its
+        # In-app Gyro button. Written directly (no Controller Mapping <-> Mode Shift
+        # mirroring): it is not a physical button and never enters the mapping pre-pass.
+        cat = CONFIG.get_current_category()
+        CONFIG.button_remaps.setdefault(cat, {})[f"{GYRO_ALWAYS_ACTIVE_KEY}_mapping"] = f"Custom[Tap]:{IN_APP_GYRO_TOKEN}"
+
+        self.root.update_idletasks()
+        anchor_x = anchor_widget.winfo_rootx() - self.root.winfo_rootx()
+        anchor_y = anchor_widget.winfo_rooty() - self.root.winfo_rooty()
+        width = max(1, anchor_widget.winfo_width())
+        height = max(1, anchor_widget.winfo_height())
+        bridge = tk.Frame(self.root, bg=background_color, width=width, height=height)
+        bridge.place(in_=self.root, x=anchor_x, y=anchor_y, width=width, height=height)
+        try:
+            bridge.lower()
+        except Exception:
+            pass
+        # close_in_app_gyro_popup() already destroys this bridge attribute.
+        self.joycon_ir_in_app_gyro_bridge = bridge
+        self.joycon_ir_in_app_gyro_anchor = None
+
+        self.create_mapping_widget(
+            bridge,
+            GYRO_ALWAYS_ACTIVE_KEY,
+            "",
+            None,
+            compact=True,
+            fixed_size=(width, height),
+        )
+        suffix = self._mapping_scope_suffix(None)
+        attr_key = self._mapping_attr(GYRO_ALWAYS_ACTIVE_KEY, suffix)
+        in_app_button = getattr(self, f"{attr_key}_in_app_gyro_btn", None)
+        if in_app_button is not None and in_app_button.winfo_exists():
+            in_app_button.invoke()
+            popup = getattr(self, "in_app_gyro_popup", None)
+            if popup is not None and popup.winfo_exists():
+                self.in_app_gyro_popup_anchor = anchor_widget
+                popup.in_app_visible_anchor = anchor_widget
+                self._place_popup_within_root_bounds(
+                    popup,
+                    anchor_widget,
+                    requested_size=getattr(popup, "in_app_full_requested_size", None),
+                )
+                popup.lift()
 
     def update_mode_shift_setting(self, val):
         # Stored per (profile, Gyro Control mode). Controls only whether In-app Gyro
@@ -9902,8 +10015,14 @@ bg_color=panel_bg, widths=[8, 10])
             popup.bind("<<InAppGyroSimulReflow>>", schedule_simultaneous_reflow, add="+")
             self.root.after_idle(reflow_simultaneous_input)
 
-            create_popup_separator()
-            dz_row, dz_control_cell = create_aligned_popup_row("Trigger Deadzone:", pady_top=section_gap / scaling_factor)
+            # Always Active has no physical button press, so Simultaneous Input has no
+            # meaning there: drop that row (and its separator) from the popup layout.
+            if key == GYRO_ALWAYS_ACTIVE_KEY:
+                hide_popup_row(_row)
+                popup_rows.remove(popup_row_meta.pop(_row))
+            else:
+                create_popup_separator()
+            dz_row, dz_control_cell = create_aligned_popup_row("Trigger Deadzone:", pady_top=(0 if key == GYRO_ALWAYS_ACTIVE_KEY else section_gap / scaling_factor))
 
             dz_mode_key = f"{key}_in_app_gyro_deadzone_mode"
             dz_button_group = tk.Frame(dz_control_cell, bg=background_color, width=popup_control_width, height=popup_control_height)
@@ -13867,7 +13986,15 @@ bg_color=panel_bg, widths=[8, 10])
         sim_mode = getattr(CONFIG, "simulation_mode", "PS5")
         current_rumble = getattr(CONFIG, "rumble_mode", "Xbox")
         is_usbip_ps5 = driver_type == "USBIP" and sim_mode == "PS5"
-        allowed_values = ["Xbox", "PS5"] if is_usbip_ps5 else ["Xbox", "Switch"]
+        is_switch2_emu = sim_mode == "Switch2"
+        if is_usbip_ps5:
+            allowed_values = ["Xbox", "PS5"]
+        elif is_switch2_emu:
+            # "Native" forwards SDL3's Switch 2 HD Rumble frames unchanged
+            # (capped at SDL3's own RUMBLE_MAX); only meaningful in Switch 2 Emu Mode.
+            allowed_values = ["Xbox", "Switch", "Native"]
+        else:
+            allowed_values = ["Xbox", "Switch"]
 
         # Rumble values are persisted per Emu Mode category.  "PS5" is only a
         # valid alias for USBIP PS5 audio/HD rumble; converting it globally used
@@ -13877,6 +14004,8 @@ bg_color=panel_bg, widths=[8, 10])
         if is_usbip_ps5 and current_rumble == "Switch":
             normalized_rumble = "PS5"
         elif not is_usbip_ps5 and current_rumble == "PS5":
+            normalized_rumble = "Switch"
+        elif not is_switch2_emu and current_rumble == "Native":
             normalized_rumble = "Switch"
         elif current_rumble not in allowed_values:
             logger.warning(
@@ -13907,6 +14036,9 @@ bg_color=panel_bg, widths=[8, 10])
         elif driver_type == "WinUHid" and sim_mode == "Xbox One":
             self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
             self.impulse_trigger_button.pack(side=tk.LEFT, after=self.rumble_mode_switch, padx=(int(10 * scaling_factor), 0))
+        elif is_switch2_emu:
+            # Label "SDL3 Native"; the stored config value stays "Native".
+            self.rumble_mode_switch.update_options(["Xbox", "Switch", "SDL3 Native"], ["Xbox", "Switch", "Native"], current_rumble, widths=[8, 8, 12])
         else:
             self.rumble_mode_switch.update_options(["Xbox", "Switch"], ["Xbox", "Switch"], current_rumble)
 
@@ -13918,10 +14050,21 @@ bg_color=panel_bg, widths=[8, 10])
             self.vibration_frequency_scale.set(CONFIG.vibration_frequency)
 
     def update_rumble_mode_ui(self, mode):
-        if mode in ["Switch", "PS5"]:
-            self.vibration_frequency_label.pack_forget()
-            self.vibration_frequency_scale.pack_forget()
-        else:
+        # Forget the frequency widgets first so Strength (when re-shown) is always
+        # packed ahead of Frequency, both just before Delay.
+        self.vibration_frequency_label.pack_forget()
+        self.vibration_frequency_scale.pack_forget()
+        has_strength = hasattr(self, 'strength_label') and hasattr(self, 'vibration_strength_scale')
+        if mode == "Native":
+            # Native mirrors SDL3 exactly: no Strength or Frequency adjustment.
+            if has_strength:
+                self.strength_label.pack_forget()
+                self.vibration_strength_scale.pack_forget()
+            return
+        if has_strength and not self.vibration_strength_scale.winfo_manager():
+            self.strength_label.pack(side=tk.LEFT, before=self.delay_label, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
+            self.vibration_strength_scale.pack(side=tk.LEFT, before=self.delay_label)
+        if mode not in ["Switch", "PS5"]:
             self.vibration_frequency_label.pack(side=tk.LEFT, before=self.delay_label, padx=(int(20 * scaling_factor), int(2 * scaling_factor)))
             self.vibration_frequency_scale.pack(side=tk.LEFT, before=self.delay_label)
 
@@ -15673,6 +15816,8 @@ bg_color=panel_bg, widths=[8, 10])
             self.gyro_mode_switch.set_value(mode_value if mode_value in ("World", "Yaw") else "World")
         if hasattr(self, 'mode_shift_switch'):
             self.mode_shift_switch.set_value(CONFIG.mode_shift_enabled)
+        if hasattr(self, 'gyro_always_active_switch'):
+            self.gyro_always_active_switch.set_value(bool(getattr(CONFIG, "gyro_always_active", False)))
         if hasattr(self, 'gyro_control_switch'):
             gyro_control_mode = "Steering" if getattr(CONFIG, "gyro_mode", "World") == "Roll" else getattr(CONFIG, "gyro_control_mode", "Mouse")
             self.gyro_control_switch.set_value(gyro_control_mode)

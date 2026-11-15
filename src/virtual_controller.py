@@ -50,11 +50,11 @@ import logging
 import gc
 import timer_resolution
 import power_saving
-from controller import (Controller, ControllerInputData, VibrationData,
+from controller import (select_in_app_gyro_source, toggle_in_app_gyro_tap_latches, Controller, ControllerInputData, VibrationData,
                         NSO_GAMECUBE_CONTROLLER_PID,
                         USBIP_PS5_CONCURRENT_RUMBLE_TEST,
                         ds_motion_scale)
-from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS
+from config import CONFIG, ButtonConfig, SWITCH_BUTTONS, XB_BUTTONS, GYRO_ALWAYS_ACTIVE_KEY
 from usbip_server import USBIPServer
 from audio_endpoint_guard import DualSenseAudioEndpointGuard
 from utils import USBIPAllocator
@@ -173,6 +173,45 @@ def _copy_vibration(v) -> VibrationData:
 def _zero_vibration(lf_freq=0x0e1, hf_freq=0x1e1) -> VibrationData:
     return VibrationData(lf_freq=lf_freq, hf_freq=hf_freq, lf_amp=0, hf_amp=0)
 
+# --- Native Rumble (Switch 2 Emu Mode) -------------------------------------
+# SDL3's wired Switch 2 Pro driver (SDL_hidapi_switch2.c, UpdateRumble) sends
+# output report 0x02 with the left-motor HD Rumble frame at [2..6] and an
+# identical right-motor frame at [0x12..0x16].  A frame with zero amplitude
+# and SDL3's fixed frequencies (0x187 / 0x112) is SDL3's "stop" frame.
+NATIVE_SDL3_NEUTRAL_FRAME = bytes((0x87, 0x01, 0x20, 0x11, 0x00))
+NATIVE_LEFT_FRAME_OFFSET = 0x02
+NATIVE_RIGHT_FRAME_OFFSET = 0x12
+
+
+def _native_frame_to_vibration(frame) -> VibrationData:
+    """Decode one 5-byte HD Rumble frame losslessly.
+
+    The field split matches VibrationData.get_bytes(), so get_bytes() of the
+    result reproduces the original 40 bits exactly (a 10-bit frequency is held
+    as 9 frequency bits + the en_tone bit).
+    """
+    value = int.from_bytes(bytes(frame[:5]).ljust(5, b'\x00'), byteorder='little')
+    return VibrationData(
+        lf_freq=value & 0x1FF,
+        lf_en_tone=bool((value >> 9) & 1),
+        lf_amp=(value >> 10) & 0x3FF,
+        hf_freq=(value >> 20) & 0x1FF,
+        hf_en_tone=bool((value >> 29) & 1),
+        hf_amp=(value >> 30) & 0x3FF,
+    )
+
+
+def _is_sdl3_switch2_rumble_packet(out_data) -> bool:
+    """True for SDL3's Switch 2 Pro rumble layout: only frame slot 1 is used
+    ([7..0x10] all zero) and [0x11..0x16] mirrors [1..6] for the right motor."""
+    return (len(out_data) >= 0x17 and out_data[0] == 0x02 and
+            not any(out_data[7:0x11]) and
+            bytes(out_data[0x11:0x17]) == bytes(out_data[1:7]))
+
+
+def _native_rumble_mode_active(mode) -> bool:
+    return mode == "Switch2" and getattr(CONFIG, "rumble_mode", "Xbox") == "Native"
+
 def _clear_vibration_buffer(frames, lf_freq=0x0e1, hf_freq=0x1e1):
     for f in frames:
         f.lf_amp = 0
@@ -255,19 +294,33 @@ def get_ds4_dpad(up, down, left, right):
 def float_to_byte(val):
     return int(max(0, min(255, round(val * 127.5 + 128))))
 
+_OWN_USBIP_ENDPOINT_RE = None
+
+
 def _own_usbip_endpoint(port_block):
     """Return (port, bus_id) when a `usbip port` block belongs to one of our own
-    loopback servers (USBIPAllocator hands out 127.0.0.N), otherwise None.
+    loopback servers, otherwise None.
 
-    Other software may use usbip-win2 too, e.g. to import a Bluetooth adapter from
-    another machine on the default port 3240. Plain substring checks such as ":3240"
-    or "/1-1" (which also matches "/1-10") would detach those devices as well.
+    USBIPAllocator hands out the triple (127.0.0.N, 3240 + N - 1, "1-N") for
+    N in 1..254, and every attach passes that host/port/bus verbatim, so
+    usbip-win2 prints `usbip://127.0.0.N:<3239+N>/1-N` for our devices.
+    Other software may use usbip-win2 too, e.g. to import a Bluetooth adapter
+    from another machine on the default port 3240. Plain substring checks such
+    as ":3240" or "/1-1" (which also matches "/1-10") would detach those devices
+    as well, so only an exact, self-consistent loopback triple counts as ours.
     """
     import re
-    m = re.search(r"usbip://(127\.\d+\.\d+\.\d+):(\d+)/(\S+)", port_block)
+    global _OWN_USBIP_ENDPOINT_RE
+    if _OWN_USBIP_ENDPOINT_RE is None:
+        _OWN_USBIP_ENDPOINT_RE = re.compile(
+            r"usbip://127\.0\.0\.(\d{1,3}):(\d+)/1-(\d{1,3})(?!\S)")
+    m = _OWN_USBIP_ENDPOINT_RE.search(port_block)
     if not m:
         return None
-    return int(m.group(2)), m.group(3)
+    n, port, bus_n = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= n <= 254) or bus_n != n or port != 3240 + n - 1:
+        return None
+    return port, f"1-{n}"
 
 def detach_usbip_device(server_port: int, timeout=2.0):
     import subprocess
@@ -1508,6 +1561,12 @@ class VirtualController:
                             on_rumble_callback=self._usbip_rumble_callback,
                             bus_id=bus_id, mac_address=mac_address
                         )
+                        # Switch 2 Emu (any rumble mode): pace EP1 IN without sleeping on the
+                        # recv thread, so SDL3's blocking rumble writes never queue
+                        # behind the 4 ms input pacing.
+                        self.usbip_server.in_pacing_defer_predicate = (
+                            # All Switch 2 Emu rumble modes (Xbox, Switch, Native) defer paced IN replies.
+                            lambda: self.mode == "Switch2")
                         self.usbip_server.start()
                         started = True
                         break
@@ -2387,7 +2446,15 @@ class VirtualController:
                     not (side_last_active > 0 and
                          now - side_last_active <= SWITCH_RUMBLE_TIMEOUT)
                 )
-                if audio_haptic_expired or traditional_expired:
+                # Native Rumble safety watchdog: SDL3 refreshes an active effect
+                # every 12 ms, so 150 ms without any packet means the host is gone.
+                native_last = getattr(self, 'native_rumble_last_packet_time', 0)
+                native_expired = (
+                    native_last > 0 and
+                    _native_rumble_mode_active(self.mode) and
+                    now - native_last > SWITCH_RUMBLE_TIMEOUT
+                )
+                if audio_haptic_expired or traditional_expired or native_expired:
                     sl = _zero_vibration()
                 v1 = _copy_vibration(sl)
                 v2 = _copy_vibration(sl)
@@ -2587,6 +2654,9 @@ class VirtualController:
         controller._shared_mode_shift_active = False
         controller._shared_in_app_gyro_toggle = False
         controller._shared_in_app_gyro_hold_pressed = False
+        # Re-apply the Gyro panel "Always Active" state to the (new) pool layout.
+        self._gyro_always_active_seen = None
+        controller._gyro_always_active_seen = None
         controller._shared_dampening_btn_states = {}
         controller.gyro_target_vx = 0.0
         controller.gyro_target_vy = 0.0
@@ -2647,9 +2717,45 @@ class VirtualController:
                 with self.merged_input_lock:
                     if not hasattr(self, '_in_app_gyro_shared_toggle'):
                         self._in_app_gyro_shared_toggle = False
+                    if not hasattr(self, '_in_app_gyro_shared_latches'):
+                        self._in_app_gyro_shared_latches = {}
                     if getattr(controller, '_own_in_app_gyro_tap_edge', False):
                         self._in_app_gyro_shared_toggle = not self._in_app_gyro_shared_toggle
                         controller._own_in_app_gyro_tap_edge = False
+                        # Per-trigger Tap latches (settings-source bookkeeping only).
+                        toggle_in_app_gyro_tap_latches(
+                            self._in_app_gyro_shared_latches,
+                            getattr(controller, '_own_in_app_gyro_tap_edge_keys', ()),
+                            time.perf_counter())
+                    controller._own_in_app_gyro_tap_edge_keys = ()
+                    # Gyro panel "Always Active": a UI-driven virtual Tap trigger in the
+                    # same shared pool. A new UI request sets the shared latch to the
+                    # selected state; physical Tap buttons keep flipping it afterwards.
+                    always_active_request = CONFIG.gyro_always_active_request
+                    if always_active_request != getattr(self, '_gyro_always_active_seen', None):
+                        self._gyro_always_active_seen = always_active_request
+                        always_active_on = bool(always_active_request[1])
+                        if always_active_on:
+                            # Make Always Active the Deadzone/Dampening settings source on
+                            # BOTH sides (even if the pool was already on), and drop any
+                            # pending physical-button key so the off->on commit below
+                            # cannot replace it with a stale source.
+                            commit_time = time.perf_counter()
+                            for c_aa in (left_c, right_c, controller):
+                                if c_aa is None:
+                                    continue
+                                c_aa._pending_in_app_gyro_trigger_key = None
+                                c_aa._pending_in_app_gyro_trigger_side = None
+                                c_aa._last_in_app_gyro_trigger_key = GYRO_ALWAYS_ACTIVE_KEY
+                                c_aa._last_in_app_gyro_trigger_time = commit_time
+                                c_aa._last_in_app_gyro_trigger_side = None
+                                c_aa._own_last_in_app_gyro_trigger_key = GYRO_ALWAYS_ACTIVE_KEY
+                                c_aa._own_last_in_app_gyro_trigger_time = commit_time
+                                c_aa._own_last_in_app_gyro_trigger_side = None
+                        self._in_app_gyro_shared_toggle = always_active_on
+                        self._in_app_gyro_shared_latches = (
+                            {(GYRO_ALWAYS_ACTIVE_KEY, None): time.perf_counter()} if always_active_on else {})
+                        logger.info("Gyro Always Active applied: pool=%s source=%s", "On" if always_active_on else "Off", GYRO_ALWAYS_ACTIVE_KEY if always_active_on else "unchanged")
                     shared_in_app_gyro_toggle = bool(self._in_app_gyro_shared_toggle)
                     shared_in_app_gyro_hold_pressed = (
                         getattr(left_c, '_own_in_app_gyro_hold_pressed', False) or
@@ -2702,6 +2808,18 @@ class VirtualController:
                 else:
                     shared_last_in_app_gyro_trigger_key = getattr(right_c, '_own_last_in_app_gyro_trigger_key', None)
                     shared_last_in_app_gyro_trigger_side = getattr(right_c, '_own_last_in_app_gyro_trigger_side', None)
+                # Settings source = the trigger that most recently turned on and still keeps
+                # the shared pool on (Tap latches incl. Always Active, held Hold buttons on
+                # either side). Falls back to the activation-edge pick above.
+                if shared_in_app_gyro:
+                    shared_hold_since = {}
+                    for c_src in (left_c, right_c):
+                        if c_src is not None:
+                            shared_hold_since.update(getattr(c_src, '_own_in_app_gyro_held_since', None) or {})
+                    shared_source = select_in_app_gyro_source(
+                        getattr(self, '_in_app_gyro_shared_latches', {}), shared_hold_since)
+                    if shared_source is not None:
+                        shared_last_in_app_gyro_trigger_key, shared_last_in_app_gyro_trigger_side = shared_source
 
                 shared_gyro = shared_in_app_gyro
 
@@ -4281,6 +4399,12 @@ class VirtualController:
         if getattr(controller, "virtual_controller", None) is self:
             controller.virtual_controller = None
         self._refresh_controller_cache()
+        # A split changes which In-app Gyro pool (own vs. shared) is live; let the
+        # Gyro panel "Always Active" state re-apply to the remaining/removed sides.
+        self._gyro_always_active_seen = None
+        controller._gyro_always_active_seen = None
+        for remaining in self.controllers:
+            remaining._gyro_always_active_seen = None
         if clear_mac_port:
                 # Only clear the MAC->port mapping when the physical controller truly disconnects
                 # (BLE disconnect), NOT during merge/split operations where it stays connected.
@@ -5079,6 +5203,10 @@ class VirtualController:
             self.last_rumble_received_time = time.perf_counter()
             return
 
+        if _native_rumble_mode_active(self.mode):
+            self._native_switch2_rumble_received(out_data)
+            return
+
         if out_data[0] != 0x02:
             # Explicitly clear all rumble state on disconnect (or unknown packet)
             with self.vibration_lock:
@@ -5153,6 +5281,17 @@ class VirtualController:
             v1 = vibration_data_from_bytes(out_data[2:7])
             v2 = vibration_data_from_bytes(out_data[7:12])
             v3 = vibration_data_from_bytes(out_data[12:17])
+            # SDL3 (SDL_hidapi_switch2.c) fills only the first of the three frame
+            # slots and leaves the rest all-zero.  An all-zero slot is "unused",
+            # not "silence": hold the previous frame so latest_vibration (played
+            # between the 12 ms host packets) is not a zero frame.  Otherwise the
+            # ~7 ms scheduler alternates rumble/silence, which sounds choppy and
+            # pitch-warped.  Hosts that fill all three slots (Steam Input) are
+            # unaffected.
+            if not any(out_data[7:12]):
+                v2 = vibration_data_from_bytes(out_data[2:7])
+            if not any(out_data[12:17]):
+                v3 = vibration_data_from_bytes(bytes(out_data[7:12]) if any(out_data[7:12]) else out_data[2:7])
             
             if rumble_mode != "Switch":
                 XBOX_LF_FREQ = 0x0e1
@@ -5184,7 +5323,13 @@ class VirtualController:
                 self.vibration_dirty_r = True
         else:
             last_active = getattr(self, 'last_rumble_active_time', 0)
-            if not last_active or packet_time - last_active > SWITCH_RUMBLE_TIMEOUT:
+            # SDL3 sends exactly one stop packet and then goes silent, so its stop
+            # must apply immediately (the scheduler may not tick again to apply a
+            # deferred stop).  Other hosts keep the keepalive grace window.
+            sdl3_stop = _is_sdl3_switch2_rumble_packet(out_data)
+            if sdl3_stop:
+                self.last_rumble_active_time = 0
+            if sdl3_stop or not last_active or packet_time - last_active > SWITCH_RUMBLE_TIMEOUT:
                 with self.vibration_lock:
                     self.frame_vibrations = [VibrationData() for _ in range(3)]
                     self.latest_vibration = VibrationData()
@@ -5195,6 +5340,43 @@ class VirtualController:
                     self.latest_vibration_r = VibrationData()
                     self.vibration_dirty_l = True
                     self.vibration_dirty_r = True
+
+    def _native_switch2_rumble_received(self, out_data):
+        """Native Rumble: keep SDL3's Switch 2 HD Rumble frames bit-exact.
+
+        Left block -> left side buffers (Pro left motor / Joy-Con L), right
+        block -> right side buffers (Pro right motor / Joy-Con R).  Unlike the
+        Switch mode, a stop (neutral/zero) packet takes effect immediately, the
+        same way SDL3 stops a wired controller.  Any other report (including the
+        all-zero disconnect push from usbip_server) is treated as a stop.
+        """
+        now = time.perf_counter()
+        if len(out_data) >= NATIVE_LEFT_FRAME_OFFSET + 5 and out_data[0] == 0x02:
+            left = _native_frame_to_vibration(
+                out_data[NATIVE_LEFT_FRAME_OFFSET:NATIVE_LEFT_FRAME_OFFSET + 5])
+            if len(out_data) >= NATIVE_RIGHT_FRAME_OFFSET + 5:
+                right = _native_frame_to_vibration(
+                    out_data[NATIVE_RIGHT_FRAME_OFFSET:NATIVE_RIGHT_FRAME_OFFSET + 5])
+            else:
+                right = _copy_vibration(left)
+        else:
+            left = _native_frame_to_vibration(NATIVE_SDL3_NEUTRAL_FRAME)
+            right = _native_frame_to_vibration(NATIVE_SDL3_NEUTRAL_FRAME)
+
+        active = any(int(v.lf_amp) > 0 or int(v.hf_amp) > 0 for v in (left, right))
+        with self.vibration_lock:
+            self.native_rumble_last_packet_time = now
+            self.last_rumble_received_time = now
+            self.last_rumble_active_time = now if active else 0
+            self.frame_vibrations_l = [_copy_vibration(left) for _ in range(3)]
+            self.frame_vibrations_r = [_copy_vibration(right) for _ in range(3)]
+            self.latest_vibration_l = _copy_vibration(left)
+            self.latest_vibration_r = _copy_vibration(right)
+            self.frame_vibrations = [_copy_vibration(left) for _ in range(3)]
+            self.latest_vibration = _copy_vibration(left)
+            self.vibration_dirty = True
+            self.vibration_dirty_l = True
+            self.vibration_dirty_r = True
 
     def update_as_switch2_pro(self, inputData: ControllerInputData, buttons: int, controller: Controller):
         state = bytearray(64)

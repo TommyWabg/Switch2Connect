@@ -134,7 +134,7 @@ def _fit_full_soft_iron_calibration(samples):
 # SWITCH2_IR_DIAGNOSTICS=0 before launch to silence it.
 _IR_SENSOR_DIAGNOSTICS = os.environ.get('SWITCH2_IR_DIAGNOSTICS', '0') != '0'
 import timer_resolution
-from config import IN_APP_GYRO_TOKEN, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
+from config import IN_APP_GYRO_TOKEN, GYRO_ALWAYS_ACTIVE_KEY, CONFIG, SWITCH_BUTTONS, GYRO_LOCK_TOKEN, MODE_SHIFT_TOKEN, normalize_dampening_inputs, MOUSE_CLICK_BACK_BUTTON_TOKENS
 import power_saving
 power_saving.notify_mode_changed()
 from utils import (
@@ -209,6 +209,27 @@ _atexit.register(_log_listener.stop)
 # noisy; keep it quiet even if the root level is lowered for debugging (matches 0.10.1).
 logging.getLogger("bleak").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def toggle_in_app_gyro_tap_latches(latches, edge_keys, now):
+    """Flip each Tap trigger's own latch ((mapping_key, side) -> time it turned on)."""
+    for edge_key in edge_keys:
+        if edge_key in latches:
+            del latches[edge_key]
+        else:
+            latches[edge_key] = now
+
+
+def select_in_app_gyro_source(tap_latches, hold_since):
+    """Return the (mapping_key, side) of the trigger that most recently turned on and is
+    still on (a latched Tap trigger / Always Active, or a held Hold trigger), or None."""
+    best = None
+    best_time = None
+    for source_map in (tap_latches, hold_since):
+        for source_key, since in (source_map or {}).items():
+            if best_time is None or since >= best_time:
+                best, best_time = source_key, since
+    return best
 
 # --- IMU raw-scale measurement probe -----------------------------------------
 # Diagnostic only, off unless S2_IMU_SCALE_PROBE is set in the environment:
@@ -1513,6 +1534,49 @@ def _limit_joycon_total_amplitude(v):
     v.lf_amp = lf_amp
     v.hf_amp = hf_amp
     return v
+
+
+# --- Native Rumble (Switch 2 Emu Mode) -------------------------------------
+# SDL3 (SDL_hidapi_switch2.c) scales every amplitude by RUMBLE_MAX / 65535
+# with RUMBLE_MAX = 29000 "so the controller is not damaged".  In the 10-bit
+# HD Rumble amplitude field that is 29000 >> 6 = 453.  Native Rumble forwards
+# frames unchanged and only clamps each band to this value, so SDL3 traffic is
+# passed through bit-exact while any other host can never exceed SDL3's level.
+NATIVE_RUMBLE_AMP_CAP = 29000 >> 6  # 453
+
+
+# Number of the 3 HD Rumble frame slots per packet that carry the SDL3 frame.
+# The last slot is sent silent (same frequencies, zero amplitude) so a short
+# SDL3 pulse is not stretched/smoothed across the whole packet.
+NATIVE_RUMBLE_FILLED_SLOTS = 2
+
+
+def _native_silent_frame(v) -> "VibrationData":
+    """Same frequencies as v, zero amplitude (SDL3-style neutral frame)."""
+    if v is None:
+        v = VibrationData()
+    return VibrationData(
+        lf_freq=int(v.lf_freq) & 0x1FF,
+        lf_en_tone=bool(getattr(v, 'lf_en_tone', False)),
+        lf_amp=0,
+        hf_freq=int(v.hf_freq) & 0x1FF,
+        hf_en_tone=bool(getattr(v, 'hf_en_tone', False)),
+        hf_amp=0,
+    )
+
+
+def _native_rumble_frame(v) -> "VibrationData":
+    """Return a bit-exact copy of an HD Rumble frame with amplitudes capped."""
+    if v is None:
+        v = VibrationData()
+    return VibrationData(
+        lf_freq=int(v.lf_freq) & 0x1FF,
+        lf_en_tone=bool(getattr(v, 'lf_en_tone', False)),
+        lf_amp=min(NATIVE_RUMBLE_AMP_CAP, max(0, int(v.lf_amp))),
+        hf_freq=int(v.hf_freq) & 0x1FF,
+        hf_en_tone=bool(getattr(v, 'hf_en_tone', False)),
+        hf_amp=min(NATIVE_RUMBLE_AMP_CAP, max(0, int(v.hf_amp))),
+    )
 
 
 def _collect_interpolation_sources(controller):
@@ -3022,6 +3086,66 @@ class Controller:
         with self._rumble_inflight_lock:
             self._rumble_task_running = False
 
+    def _run_native_rumble_scheduler_once(self, vc):
+        """Native Rumble (Switch 2 Emu Mode) scheduler tick.
+
+        Returns False when Native Rumble does not apply so the caller keeps its
+        existing path.  The NSO GameCube controller is intentionally left on the
+        existing path for now.  A Pro Controller gets SDL3's left block on its
+        left motor and the right block on its right motor; a Joy-Con (single or
+        merged) gets its own side's block.  Transport, pacing and the merged
+        pair coordinators are unchanged: only the frame content differs.
+        """
+        if getattr(vc, 'mode', None) != "Switch2":
+            return False
+        if getattr(CONFIG, "rumble_mode", "Xbox") != "Native":
+            return False
+        if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
+            return False
+
+        if self.is_pro_controller():
+            v1, v2, v3, zero_l = vc.get_current_vibration_frames(is_left=True)
+            r1, r2, r3, zero_r = vc.get_current_vibration_frames(is_left=False)
+            frames_r = (r1, r2, r3)
+            is_zero = zero_l and zero_r
+        else:
+            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
+            frames_r = None
+
+        if getattr(self, '_rumble_task_running', False):
+            return True
+
+        def dispatch(coro):
+            return self._dispatch_rumble_coro(getattr(vc, 'loop', None), coro)
+
+        if is_zero:
+            if not getattr(self, 'rumble_stopped', False):
+                self._zero_count = getattr(self, '_zero_count', 0) + 1
+                dispatch(self._native_rumble_send_worker((v1, v2, v3), frames_r))
+                if self._zero_count >= 3:
+                    self.rumble_stopped = True
+        else:
+            self.rumble_stopped = False
+            self._zero_count = 0
+            if self._bridge_rumble_due():
+                dispatch(self._native_rumble_send_worker((v1, v2, v3), frames_r))
+        return True
+
+    async def _native_rumble_send_worker(self, frames, frames_r=None):
+        """Native Rumble send worker; same running-flag semantics as the simple worker."""
+        kwargs = {'native': True}
+        if frames_r is not None:
+            kwargs.update(vibration_r1=frames_r[0], vibration_r2=frames_r[1],
+                          vibration_r3=frames_r[2])
+        if self._uses_system_bt_single_flight():
+            await self.set_vibration(frames[0], frames[1], frames[2], **kwargs)
+            return
+        self._rumble_task_running = True
+        try:
+            await self.set_vibration(frames[0], frames[1], frames[2], **kwargs)
+        finally:
+            self._rumble_task_running = False
+
     async def _simple_rumble_send_worker(self, v1, v2, v3):
         """Single-shot rumble send worker (non-audio-haptic path).
 
@@ -3375,6 +3499,9 @@ class Controller:
                 getattr(self, 'shared_client', None) is not None):
             return
 
+        if not use_dualsense_stereo and self._run_native_rumble_scheduler_once(vc):
+            return
+
         if not use_dualsense_stereo and self._run_xbox_impulse_scheduler_once(vc):
             return
 
@@ -3512,7 +3639,12 @@ class Controller:
             self._audio_haptic_sender_thread = sender_thread
             sender_thread.start()
 
-    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None, impulse_overlay = None, impulse_overlay_r = None, pair_sustain = True):
+    async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None, impulse_overlay = None, impulse_overlay_r = None, pair_sustain = True, native = False):
+        if native and NATIVE_RUMBLE_FILLED_SLOTS < 3:
+            # SDL3 Native: slots 1-2 carry the SDL3 frame, slot 3 is silent.
+            vibration3 = _native_silent_frame(vibration)
+            if vibration_r1 is not None:
+                vibration_r3 = _native_silent_frame(vibration_r1)
         strength = getattr(CONFIG, "vibration_strength", 5)
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()
@@ -3710,6 +3842,10 @@ class Controller:
             return convert_y700_audio_haptic_frame(scale_and_clamp(v, True))
 
         def merge_scaled_frame(base, trigger=None, audio=None, impulse=None):
+            if native:
+                # Native Rumble: no strength/frequency processing and no overlay
+                # merging; only the SDL3-equivalent amplitude cap.
+                return _native_rumble_frame(base)
             scaled_base = scale_and_clamp(base, force_direct_amplitude=False)
             scaled_trigger = scale_and_clamp(trigger, force_direct_amplitude=False) if trigger is not None else None
             scaled_audio = scaled_audio_frame(audio) if audio is not None else None
@@ -4601,6 +4737,12 @@ class Controller:
 
             in_app_gyro_newly_pressed_key = None
             in_app_gyro_newly_held_key = None
+            # Per-trigger bookkeeping for the Deadzone/Dampening settings source (see
+            # select_in_app_gyro_source): every Tap edge and every held Hold trigger.
+            in_app_gyro_tap_edge_keys = []
+            in_app_gyro_held_keys = set()
+            scoped_in_app_gyro_tap_edge_keys = []
+            scoped_in_app_gyro_held_keys = set()
 
             # Shifted-layer (Mode Shift) In-app Gyro activation, collected only while Mode
             # Shift is Off (On keeps the layers synced, so the base pre-pass already sees
@@ -4629,6 +4771,7 @@ class Controller:
                 base_resolved = default_action if base_action == "Default" else base_action
                 if base_is_pressed and base_resolved in ("Gyro", "In-app Gyro"):
                     in_app_gyro_hold_pressed = True
+                    in_app_gyro_held_keys.add(mapping_key)
                 
                 if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and CONFIG._is_in_app_gyro_value(base_resolved):
                     if base_is_pressed:
@@ -4637,9 +4780,11 @@ class Controller:
                         if base_is_pressed and btn_id not in self._in_app_gyro_armed:
                             in_app_gyro_tap_edge = True
                             in_app_gyro_newly_pressed_key = mapping_key
+                            in_app_gyro_tap_edge_keys.append(mapping_key)
                     else:  # Hold
                         if base_is_pressed:
                             in_app_gyro_hold_pressed = True
+                            in_app_gyro_held_keys.add(mapping_key)
                             if btn_id not in self._in_app_gyro_armed:
                                 in_app_gyro_newly_held_key = mapping_key
                 if isinstance(base_resolved, str) and base_resolved.startswith("Custom") and base_resolved.endswith(":" + MODE_SHIFT_TOKEN):
@@ -4657,6 +4802,7 @@ class Controller:
                     scoped_resolved = default_action if scoped_action == "Default" else scoped_action
                     if scoped_is_pressed and scoped_resolved in ("Gyro", "In-app Gyro"):
                         scoped_in_app_gyro_hold_pressed = True
+                        scoped_in_app_gyro_held_keys.add(mapping_key)
                     if isinstance(scoped_resolved, str) and scoped_resolved.startswith("Custom") and CONFIG._is_in_app_gyro_value(scoped_resolved):
                         if scoped_is_pressed:
                             scoped_in_app_gyro_pressed_ids.add(btn_id)
@@ -4664,9 +4810,11 @@ class Controller:
                             if scoped_is_pressed and btn_id not in self._in_app_gyro_armed:
                                 scoped_in_app_gyro_tap_edge = True
                                 scoped_in_app_gyro_newly_pressed_key = mapping_key
+                                scoped_in_app_gyro_tap_edge_keys.append(mapping_key)
                         else:  # Hold
                             if scoped_is_pressed:
                                 scoped_in_app_gyro_hold_pressed = True
+                                scoped_in_app_gyro_held_keys.add(mapping_key)
                                 if btn_id not in self._in_app_gyro_armed:
                                     scoped_in_app_gyro_newly_held_key = mapping_key
             is_merged = getattr(self, "is_merged", False)
@@ -4687,6 +4835,34 @@ class Controller:
                 self._in_app_gyro_toggle = local_in_app_gyro_toggle
             in_app_gyro_armed = set(in_app_gyro_pressed_ids)
             new_trigger_key = in_app_gyro_newly_pressed_key or in_app_gyro_newly_held_key
+            # Gyro panel "Always Active": a UI-driven virtual Tap trigger sharing the same
+            # In-app Gyro trigger pool (Tap latch). A new UI request sets the latch to the
+            # selected state; physical In-app Gyro buttons keep flipping it afterwards.
+            # Merged Joy-Cons apply it to the shared latch in virtual_controller.
+            always_active_request = CONFIG.gyro_always_active_request
+            if (not is_merged
+                    and always_active_request != getattr(self, "_gyro_always_active_seen", None)):
+                self._gyro_always_active_seen = always_active_request
+                always_active_on = bool(always_active_request[1])
+                if always_active_on:
+                    # Always Active On is the Trigger Deadzone/Dampening source even when
+                    # the pool was already on, so its own popup settings apply. Commit it
+                    # directly (the edge-based commit below only fires on an off->on
+                    # transition that coincides with a fresh press).
+                    commit_time = time.perf_counter()
+                    self._last_in_app_gyro_trigger_key = GYRO_ALWAYS_ACTIVE_KEY
+                    self._last_in_app_gyro_trigger_time = commit_time
+                    self._last_in_app_gyro_trigger_side = None
+                    self._pending_in_app_gyro_trigger_key = None
+                    self._pending_in_app_gyro_trigger_side = None
+                    new_trigger_key = None
+                # Always Active takes the Tap pool over: earlier Tap latches are cleared
+                # and Always Active becomes the only latched trigger while On.
+                self._in_app_gyro_tap_latches = (
+                    {(GYRO_ALWAYS_ACTIVE_KEY, None): time.perf_counter()} if always_active_on else {})
+                local_in_app_gyro_toggle = always_active_on
+                self._in_app_gyro_toggle = always_active_on
+                logger.info("Gyro Always Active applied: pool=%s source=%s", "On" if always_active_on else "Off", GYRO_ALWAYS_ACTIVE_KEY if always_active_on else "unchanged")
             trigger_gyro = local_in_app_gyro_toggle != in_app_gyro_hold_pressed
 
             local_mode_shift_toggle = bool(getattr(self, "_mode_shift_toggle", False))
@@ -4738,6 +4914,8 @@ class Controller:
                 in_app_gyro_hold_pressed = in_app_gyro_hold_pressed or scoped_in_app_gyro_hold_pressed
                 in_app_gyro_tap_edge = in_app_gyro_tap_edge or scoped_in_app_gyro_tap_edge
                 in_app_gyro_armed |= scoped_in_app_gyro_pressed_ids
+                in_app_gyro_held_keys |= scoped_in_app_gyro_held_keys
+                in_app_gyro_tap_edge_keys.extend(scoped_in_app_gyro_tap_edge_keys)
                 if not new_trigger_key:
                     new_trigger_key = scoped_in_app_gyro_newly_pressed_key or scoped_in_app_gyro_newly_held_key
                 trigger_gyro = local_in_app_gyro_toggle != in_app_gyro_hold_pressed
@@ -4785,6 +4963,42 @@ class Controller:
             self._own_last_in_app_gyro_trigger_side = getattr(self, "_last_in_app_gyro_trigger_side", None)
             self._own_in_app_gyro_hold_pressed = in_app_gyro_hold_pressed
             self._own_in_app_gyro_toggle = local_in_app_gyro_toggle
+
+            # Deadzone/Dampening settings source = the trigger that most recently turned
+            # on and is still keeping the pool on (Tap latches, held Hold buttons, Always
+            # Active). E.g. Always Active On -> Tap A (off) -> Tap A (on) goes back to
+            # Always Active, because A's own latch is off again.
+            source_side = "left" if self.is_joycon_left() else "right"
+            source_now = time.perf_counter()
+            hold_since = self.__dict__.get("_in_app_gyro_hold_since")
+            if hold_since is None:
+                hold_since = {}
+                self._in_app_gyro_hold_since = hold_since
+            current_held = {(k, source_side) for k in in_app_gyro_held_keys}
+            for held_key in list(hold_since):
+                if held_key not in current_held:
+                    del hold_since[held_key]
+            for held_key in current_held:
+                hold_since.setdefault(held_key, source_now)
+            self._own_in_app_gyro_held_since = dict(hold_since)
+            self._own_in_app_gyro_tap_edge_keys = tuple((k, source_side) for k in in_app_gyro_tap_edge_keys)
+            if not is_merged:
+                tap_latches = self.__dict__.get("_in_app_gyro_tap_latches")
+                if tap_latches is None:
+                    tap_latches = {}
+                    self._in_app_gyro_tap_latches = tap_latches
+                toggle_in_app_gyro_tap_latches(tap_latches, self._own_in_app_gyro_tap_edge_keys, source_now)
+                if trigger_gyro:
+                    source = select_in_app_gyro_source(tap_latches, hold_since)
+                    if source is not None and source != (
+                            getattr(self, "_last_in_app_gyro_trigger_key", None),
+                            getattr(self, "_last_in_app_gyro_trigger_side", None)):
+                        self._last_in_app_gyro_trigger_key = source[0]
+                        self._last_in_app_gyro_trigger_side = source[1]
+                        self._last_in_app_gyro_trigger_time = source_now
+                        self._own_last_in_app_gyro_trigger_key = source[0]
+                        self._own_last_in_app_gyro_trigger_side = source[1]
+                        self._own_last_in_app_gyro_trigger_time = source_now
 
             # Resolve the active In-app Gyro mapping dict once per report and index it
             # directly below, instead of calling a resolving getter for every button.
