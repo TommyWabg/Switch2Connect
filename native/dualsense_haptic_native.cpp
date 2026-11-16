@@ -471,6 +471,44 @@ DS_EXPORT int ds_haptic_process(void* handle, const uint8_t* data, int length, D
     return static_cast<Processor*>(handle)->process(data, length, result);
 }
 
+#if defined(_WIN32)
+namespace {
+// Final stretch of each wait that is spun instead of slept. High-resolution
+// waitable timers wake roughly 100-300 us late, so sleeping until 200 us before
+// the deadline and spinning the rest keeps sub-millisecond accuracy without
+// spinning for the whole wait.
+constexpr int kSpinTailUs = 200;
+
+// One waitable timer per thread, created on first use and closed when the
+// thread exits. Creating a timer per call and dropping it leaks a handle for
+// every call (about 1000 per second from the 1 kHz HID IN loop).
+struct ThreadTimer {
+    HANDLE handle = nullptr;
+    bool initialized = false;
+
+    HANDLE get() {
+        if (!initialized) {
+            initialized = true;
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (handle == nullptr) {
+                // High-resolution timers need Windows 10 1803 or newer.
+                handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+            }
+        }
+        return handle;
+    }
+
+    ~ThreadTimer() {
+        if (handle != nullptr) {
+            CloseHandle(handle);
+        }
+    }
+};
+
+thread_local ThreadTimer g_thread_timer;
+}  // namespace
+#endif
+
 DS_EXPORT void ds_precise_sleep_us(int microseconds) {
     if (microseconds <= 0) {
         return;
@@ -484,16 +522,23 @@ DS_EXPORT void ds_precise_sleep_us(int microseconds) {
         start.QuadPart + static_cast<long long>(
             (static_cast<double>(microseconds) / 1000000.0) * static_cast<double>(frequency.QuadPart));
 
-    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (timer != nullptr && microseconds > 2000) {
-        LARGE_INTEGER due{};
-        due.QuadPart = -static_cast<long long>((microseconds - 1000) * 10);
-        if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
-            WaitForSingleObject(timer, INFINITE);
+    // Sleep through all but the last kSpinTailUs. Previously waits of 2 ms or
+    // less (every wait from the 1 kHz HID IN loop) were spun in full, which
+    // kept a CPU core busy whenever the virtual DualSense was attached.
+    if (microseconds > kSpinTailUs) {
+        HANDLE timer = g_thread_timer.get();
+        bool slept = false;
+        if (timer != nullptr) {
+            LARGE_INTEGER due{};
+            due.QuadPart = -static_cast<long long>(microseconds - kSpinTailUs) * 10;  // relative, 100 ns units
+            if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+                WaitForSingleObject(timer, INFINITE);
+                slept = true;
+            }
         }
-        CloseHandle(timer);
-    } else if (microseconds > 2000) {
-        Sleep(static_cast<DWORD>((microseconds - 1000) / 1000));
+        if (!slept && microseconds > 2000) {
+            Sleep(static_cast<DWORD>((microseconds - 1000) / 1000));
+        }
     }
 
     for (;;) {
