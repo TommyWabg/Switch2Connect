@@ -397,6 +397,10 @@ def detach_all_usbip_devices(timeout=2.0):
         logger.error(f"Error detaching all USBIP devices: {e}")
 
 RUMBLE_WRITE_INTERVAL = 0.0166
+# Upper bounds for single steps of a user-requested disconnect. A Bluetooth stack that has
+# stopped answering must not leave the X button waiting forever.
+DISCONNECT_STEP_TIMEOUT = 1.0
+DISCONNECT_CALLBACK_TIMEOUT = 5.0
 SWITCH_RUMBLE_TIMEOUT = 0.150
 # A Joy-Con reports about every 11-15 ms, so a submit taking this long has already
 # cost the game a frame of input and points at the virtual pad driver blocking.
@@ -892,8 +896,10 @@ class VirtualController:
         if request_task is not None:
             request_task.cancel()
             try:
-                await request_task
-            except (asyncio.CancelledError, Exception):
+                # Bounded: a Bluetooth stack that stopped answering must not keep the
+                # X button's disconnect waiting here forever.
+                await asyncio.wait_for(request_task, timeout=DISCONNECT_STEP_TIMEOUT)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
         coordinator = getattr(self, '_system_bt_pair_rumble_coordinator', None)
         if coordinator is not None:
@@ -4374,7 +4380,10 @@ class VirtualController:
             for c in list(self.controllers):
                 if self.on_disconnected_callback:
                     try:
-                        await self.on_disconnected_callback(c)
+                        await asyncio.wait_for(self.on_disconnected_callback(c),
+                                               timeout=DISCONNECT_CALLBACK_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Player {self.player_number}: disconnect callback timed out")
                     except Exception:
                         pass
                     
@@ -4383,10 +4392,11 @@ class VirtualController:
             logger.info(f"Player {self.player_number}: Cleanup complete.")
 
     def trigger_disconnect(self):
+        """Schedule disconnect() on the controller loop; returns its future, or None."""
         if self.loop and self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.disconnect(), self.loop)
-        else:
-            logger.error("Event loop not found or not running.")
+            return asyncio.run_coroutine_threadsafe(self.disconnect(), self.loop)
+        logger.error("Event loop not found or not running.")
+        return None
 
     async def remove_controller(self, controller: Controller, clear_mac_port: bool = False) -> bool:
         if controller not in self.controllers:

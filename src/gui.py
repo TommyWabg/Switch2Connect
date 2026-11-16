@@ -1676,12 +1676,13 @@ class PlayerInfoBlock:
                         
                 if hasattr(c, 'client') and c.client and c.client.is_connected:
                     logger.info(f"Safe Disconnect: Disconnecting {c.device.address}...")
+                    # Each step is bounded: a hung Bluetooth stack never answers.
                     try:
-                        await c.client.stop_notify(INPUT_REPORT_UUID)
+                        await asyncio.wait_for(c.client.stop_notify(INPUT_REPORT_UUID), timeout=1.0)
                     except Exception:
                         pass
                     try:
-                        await c.client.stop_notify(COMMAND_RESPONSE_UUID)
+                        await asyncio.wait_for(c.client.stop_notify(COMMAND_RESPONSE_UUID), timeout=1.0)
                     except Exception:
                         pass
                         
@@ -1693,7 +1694,9 @@ class PlayerInfoBlock:
                 # Call the disconnect callback while c.client is still not None to completely avoid AttributeError
                 if vc.on_disconnected_callback:
                     try:
-                        await vc.on_disconnected_callback(c)
+                        await asyncio.wait_for(vc.on_disconnected_callback(c), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Player {vc.player_number}: disconnect callback timed out")
                     except Exception as e:
                         logger.error(f"Error in on_disconnected_callback: {e}")
                         
@@ -1703,20 +1706,90 @@ class PlayerInfoBlock:
             vc.controllers.clear()
             logger.info(f"Player {vc.player_number} (Merged): Safe sequential disconnect complete.")
 
+    # X button watchdog. The disconnect runs on the discovery loop; when a Bluetooth chip
+    # locks up, that loop can wait on a WinRT call forever and the slot would never leave
+    # the UI. After CLOSE_FORCE_REMOVE_MS the slot is removed without the loop; if the
+    # disconnect still has not answered after CLOSE_BT_FAULT_MS the Bluetooth stack is
+    # treated as hung: BLE scan/reconnect is paused and the user is told how to recover.
+    CLOSE_FORCE_REMOVE_MS = 5000
+    CLOSE_BT_FAULT_MS = 15000
+
     def _on_close_clicked(self):
-        if self.current_vc is not None:
-            if hasattr(self, 'close_btn') and self.close_btn:
-                self.close_btn.config(state=tk.DISABLED)
-            
-            if not self.current_vc.is_single():
-                # Merge mode close button: run the highly safe sequential disconnect
-                if self.current_vc.loop and self.current_vc.loop.is_running():
-                    asyncio.run_coroutine_threadsafe(self._disconnect_merged_sequential(self.current_vc), self.current_vc.loop)
-                else:
-                    logger.error("Event loop not found or not running for merged controller.")
+        vc = self.current_vc
+        if vc is None:
+            return
+        if hasattr(self, 'close_btn') and self.close_btn:
+            self.close_btn.config(state=tk.DISABLED)
+
+        future = None
+        if not vc.is_single():
+            # Merge mode close button: run the highly safe sequential disconnect
+            if vc.loop and vc.loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(self._disconnect_merged_sequential(vc), vc.loop)
             else:
-                # Single mode: standard trigger disconnect
-                self.current_vc.trigger_disconnect()
+                logger.error("Event loop not found or not running for merged controller.")
+        else:
+            # Single mode: standard trigger disconnect
+            future = vc.trigger_disconnect()
+
+        # Scheduled on the root window: this block's frames are destroyed as soon as the
+        # last slot leaves the UI, which would silently drop the later fault check.
+        root = self.window.root
+        root.after(self.CLOSE_FORCE_REMOVE_MS,
+                   lambda: self._check_close_progress(vc, future))
+        root.after(self.CLOSE_BT_FAULT_MS,
+                   lambda: self._check_close_bt_fault(vc, future))
+
+    @staticmethod
+    def _close_answered(future):
+        return future is not None and future.done()
+
+    @staticmethod
+    def _uses_system_bluetooth(vc):
+        for c in list(getattr(vc, 'controllers', ()) or ()):
+            if c.__class__.__name__ not in ("USBHidController", "ESP32S3Controller"):
+                return True
+        return False
+
+    def _check_close_progress(self, vc, future):
+        import discoverer
+        if vc not in discoverer.VIRTUAL_CONTROLLERS:
+            return
+        if self._close_answered(future) and not getattr(vc, 'controllers', None):
+            return
+        logger.warning(f"Player {getattr(vc, 'player_number', '?')}: X button got no answer "
+                       f"in {self.CLOSE_FORCE_REMOVE_MS / 1000:.0f}s; forcing removal")
+        # Remember the transport before the slot is torn down.
+        vc._close_used_system_bt = self._uses_system_bluetooth(vc)
+        discoverer.force_remove_virtual_controller(vc)
+
+    def _check_close_bt_fault(self, vc, future):
+        if self._close_answered(future):
+            return
+        used_bt = getattr(vc, '_close_used_system_bt', None)
+        if used_bt is None:
+            # The slot left normally before the first check but the disconnect future
+            # is still pending: only Bluetooth pads can be stuck in WinRT.
+            used_bt = self._uses_system_bluetooth(vc)
+        if not used_bt:
+            return
+        import discoverer
+        if discoverer.is_bluetooth_radio_faulted():
+            return
+        discoverer.mark_bluetooth_radio_fault(
+            f"X button disconnect unanswered after {self.CLOSE_BT_FAULT_MS / 1000:.0f}s")
+        try:
+            self.window.show_centered_message(
+                "Bluetooth not responding",
+                "The controller was removed, but Windows Bluetooth stopped responding.\n\n"
+                "Automatic Bluetooth reconnection is paused so the adapter is not stressed further.\n\n"
+                "If Bluetooth settings are missing or Device Manager shows unknown USB devices:\n"
+                "1. Shut down the PC.\n"
+                "2. Switch off the power supply (or unplug it) for about a minute.\n"
+                "3. Start the PC again.\n\n"
+                "Installing the latest Bluetooth driver from the chip vendor may also help.")
+        except Exception:
+            logger.exception("Failed to show the Bluetooth not responding message")
 
     def load_pictures(self):
         sf = scaling_factor

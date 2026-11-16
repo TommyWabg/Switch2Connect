@@ -2764,12 +2764,13 @@ class Controller:
                 try:
                     # Explicitly stop notifications to prevent WinRT background callbacks from firing 
                     # after the event loop is closed, which causes RuntimeError.
+                    # Each step is bounded: a hung Bluetooth stack never answers.
                     try:
-                        await self.client.stop_notify(INPUT_REPORT_UUID)
+                        await asyncio.wait_for(self.client.stop_notify(INPUT_REPORT_UUID), timeout=1.0)
                     except Exception:
                         pass
                     try:
-                        await self.client.stop_notify(COMMAND_RESPONSE_UUID)
+                        await asyncio.wait_for(self.client.stop_notify(COMMAND_RESPONSE_UUID), timeout=1.0)
                     except Exception:
                         pass
                         

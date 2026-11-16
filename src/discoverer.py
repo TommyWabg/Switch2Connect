@@ -235,6 +235,13 @@ def notify_bluetooth_radio_changed():
 
     Safe to call from any thread -- mirrors request_wired_rescan() above.
     """
+    if _BT_RADIO_FAULT:
+        try:
+            from utils import bluetooth_radio_present
+            if bluetooth_radio_present():
+                clear_bluetooth_radio_fault()
+        except Exception:
+            logger.debug("Bluetooth radio check after a radio change failed", exc_info=True)
     loop = DISCOVERER_LOOP
     event = BLUETOOTH_RADIO_EVENT
     if loop and event and loop.is_running():
@@ -242,6 +249,86 @@ def notify_bluetooth_radio_changed():
             loop.call_soon_threadsafe(event.set)
         except RuntimeError:
             pass
+
+
+# MACs whose slot was dropped by force_remove_virtual_controller() while the discovery
+# loop could not process the disconnect itself. The wireless route removes them from its
+# local connected/connecting bookkeeping the next time it runs, so the pad can reconnect.
+_FORCE_RELEASED_MACS = set()
+_FORCE_RELEASED_LOCK = threading.Lock()
+
+# Set when the user pressed X on a Bluetooth controller and the disconnect never
+# answered. While set, the wireless route neither scans nor reconnects, so it does not
+# keep hammering a Bluetooth chip that has locked up. Cleared when Windows reports a
+# Bluetooth radio change and a radio is present again.
+_BT_RADIO_FAULT = False
+
+
+def is_bluetooth_radio_faulted() -> bool:
+    return _BT_RADIO_FAULT
+
+
+def mark_bluetooth_radio_fault(reason: str):
+    """Pause the wireless route after the Bluetooth stack stopped answering. Any thread."""
+    global _BT_RADIO_FAULT
+    if not _BT_RADIO_FAULT:
+        logger.error("Bluetooth stack not responding (%s); pausing BLE scan and reconnect.", reason)
+    _BT_RADIO_FAULT = True
+
+
+def clear_bluetooth_radio_fault():
+    global _BT_RADIO_FAULT
+    if _BT_RADIO_FAULT:
+        logger.info("Bluetooth radio changed; resuming BLE scan and reconnect.")
+    _BT_RADIO_FAULT = False
+
+
+def _take_force_released_macs() -> set:
+    with _FORCE_RELEASED_LOCK:
+        macs = set(_FORCE_RELEASED_MACS)
+        _FORCE_RELEASED_MACS.clear()
+    return macs
+
+
+def _force_close_quietly(vc):
+    try:
+        vc.force_close()
+    except Exception:
+        logger.debug("force_close after forced removal failed", exc_info=True)
+
+
+def force_remove_virtual_controller(vc) -> bool:
+    """Drop a player slot whose disconnect never completed, without the event loop.
+
+    Called from the GUI thread when the X button got no answer: the discovery loop may
+    be stuck on a Bluetooth call that will never return, so nothing here may await it.
+    The virtual device is torn down on a daemon thread because a hung driver handle must
+    not freeze the UI either. Returns False when the slot was already gone.
+    """
+    removed = False
+    with DISCOVERY_LOCK:
+        for i, slot in enumerate(VIRTUAL_CONTROLLERS):
+            if slot is vc:
+                VIRTUAL_CONTROLLERS[i] = None
+                removed = True
+    if not removed:
+        return False
+    macs = set()
+    for controller in list(getattr(vc, "controllers", ()) or ()):
+        address = getattr(getattr(controller, "device", None), "address", None)
+        if address:
+            macs.add(address)
+    with _FORCE_RELEASED_LOCK:
+        _FORCE_RELEASED_MACS.update(macs)
+    vc.running = False
+    logger.warning("Player %s: disconnect did not complete; removed the slot from the UI (%s)",
+                   getattr(vc, "player_number", "?"), ", ".join(sorted(macs)) or "no MAC")
+    threading.Thread(target=_force_close_quietly, args=(vc,), daemon=True,
+                     name="force-remove-virtual-controller").start()
+    reorder_controllers()
+    if UPDATE_CALLBACK is not None:
+        UPDATE_CALLBACK(list(VIRTUAL_CONTROLLERS))
+    return True
 
 
 async def _wait_for_bluetooth_radio(quit_event) -> bool:
@@ -1704,8 +1791,15 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                            for c in (getattr(vc, "controllers", ()) or ())]
             return power_saving.full_scan_capacity_reached(controllers)
 
+        def release_force_removed_macs():
+            for mac in _take_force_released_macs():
+                while mac in connected_mac_addresses:
+                    connected_mac_addresses.remove(mac)
+                _connecting_macs.discard(mac)
+
         while not quit_event.is_set():
-            if full_capacity_reached():
+            release_force_removed_macs()
+            if full_capacity_reached() or _BT_RADIO_FAULT:
                 await asyncio.sleep(1.0)
                 continue
             try:
@@ -1743,8 +1837,12 @@ async def run_discovery(quit_event, startup_bridge_context=None):
                                 active, seen_age,
                                 sysbt_side_decisions.get("L", "not_seen"),
                                 sysbt_side_decisions.get("R", "not_seen"))
+                        release_force_removed_macs()
                         if full_capacity_reached():
                             logger.info("Full power-saving capacity reached; pausing automatic BLE scan")
+                            break
+                        if _BT_RADIO_FAULT:
+                            logger.warning("Bluetooth stack not responding; stopping the BLE scanner")
                             break
                         # On Windows, check if the watcher was aborted (e.g. Bluetooth turned off)
                         if hasattr(scanner, '_backend') and hasattr(scanner._backend, 'watcher'):
