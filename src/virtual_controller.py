@@ -209,6 +209,9 @@ def _is_sdl3_switch2_rumble_packet(out_data) -> bool:
             bytes(out_data[0x11:0x17]) == bytes(out_data[1:7]))
 
 
+NATIVE_FRAME_LOG_LEN = 16  # ~190 ms of SDL3 frames at 12 ms
+
+
 def _native_rumble_mode_active(mode) -> bool:
     return mode == "Switch2" and getattr(CONFIG, "rumble_mode", "Xbox") == "Native"
 
@@ -5341,6 +5344,12 @@ class VirtualController:
                     self.vibration_dirty_l = True
                     self.vibration_dirty_r = True
 
+    def native_frame_log_snapshot(self):
+        """Copy of the Native frame log: [(arrival_time, left, right), ...]."""
+        with self.vibration_lock:
+            log = getattr(self, 'native_frame_log', None)
+            return list(log) if log else []
+
     def _native_switch2_rumble_received(self, out_data):
         """Native Rumble: keep SDL3's Switch 2 HD Rumble frames bit-exact.
 
@@ -5365,6 +5374,16 @@ class VirtualController:
 
         active = any(int(v.lf_amp) > 0 or int(v.hf_amp) > 0 for v in (left, right))
         with self.vibration_lock:
+            # Timestamped frame log for the Native resampler (controller.py):
+            # every SDL3 frame is kept with its arrival time so 15 ms BLE packets
+            # can be filled from the 12 ms host timeline without dropping frames.
+            # A stop is just the next frame on the timeline: frames before it
+            # must still be played, or a short pulse would be cut or lost.
+            log = getattr(self, 'native_frame_log', None)
+            if log is None:
+                log = self.native_frame_log = deque(maxlen=NATIVE_FRAME_LOG_LEN)
+            log.append((now, _copy_vibration(left), _copy_vibration(right)))
+            self.native_frame_log_seq = getattr(self, 'native_frame_log_seq', 0) + 1
             self.native_rumble_last_packet_time = now
             self.last_rumble_received_time = now
             self.last_rumble_active_time = now if active else 0

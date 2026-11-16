@@ -1545,10 +1545,69 @@ def _limit_joycon_total_amplitude(v):
 NATIVE_RUMBLE_AMP_CAP = 29000 >> 6  # 453
 
 
-# Number of the 3 HD Rumble frame slots per packet that carry the SDL3 frame.
-# The last slot is sent silent (same frequencies, zero amplitude) so a short
-# SDL3 pulse is not stretched/smoothed across the whole packet.
-NATIVE_RUMBLE_FILLED_SLOTS = 2
+# --- SDL3 Native resampler -------------------------------------------------
+# SDL3 sends one HD Rumble frame every 12 ms; a BLE packet carries 3 frames of
+# 5 ms each and is sent every 15 ms.  Taking only the newest frame per packet
+# drops about one SDL3 frame in five.  Instead each packet covers the next
+# 15 ms of the host timeline (contiguous windows, NATIVE_RESAMPLE_MARGIN behind
+# real time so every frame in the window has already arrived) and each 5 ms
+# slot carries the frame active at the slot centre.  A 12 ms frame therefore
+# always lands in 2 or 3 slots (2.4 on average) and none is skipped.
+NATIVE_PACKET_INTERVAL = 0.015
+NATIVE_SLOTS_PER_PACKET = 3
+NATIVE_RESAMPLE_MARGIN = 0.003
+NATIVE_TICK_TOLERANCE = 0.0015  # one rumble scheduler tick
+NATIVE_HOST_TIMEOUT = 0.500  # host silent this long -> treat as gone
+
+
+def _native_window(start, now):
+    """Window to send next, given the start of the next unsent window.
+
+    Returns (start, end, dropped).  Windows are 15 ms on one timeline grid.
+    Whole windows already complete before the newest complete one are stale
+    (a slow write held the sender back) and are dropped rather than queued.
+    The window may still be incomplete (end > now - MARGIN): the caller waits.
+    """
+    target_end = now - NATIVE_RESAMPLE_MARGIN
+    dropped = int((target_end - (start + NATIVE_PACKET_INTERVAL)) // NATIVE_PACKET_INTERVAL)
+    dropped = max(0, dropped)
+    start += dropped * NATIVE_PACKET_INTERVAL
+    return start, start + NATIVE_PACKET_INTERVAL, dropped
+
+
+def _native_resample(log, start, end, side):
+    """Fill the 3 slots of [start, end) from a Native frame log.
+
+    log: [(arrival_time, left, right), ...] in arrival order.  side: 0 = left
+    block, 1 = right block.  A frame is held until the next one arrives (an
+    SDL3 stop is itself a silent frame).  Returns 3 VibrationData (copies).
+    """
+    slots = []
+    width = (end - start) / NATIVE_SLOTS_PER_PACKET
+    for k in range(NATIVE_SLOTS_PER_PACKET):
+        tc = start + (k + 0.5) * width
+        chosen = None
+        for entry in log:
+            if entry[0] <= tc:
+                chosen = entry[1 + side]
+            else:
+                break
+        if chosen is None:
+            slots.append(_native_silent_frame(log[0][1 + side]) if log else VibrationData())
+            continue
+        slots.append(_copy_native_frame(chosen))
+    return slots
+
+
+def _native_frames_silent(frames):
+    return all(int(f.lf_amp) == 0 and int(f.hf_amp) == 0 for f in frames)
+
+
+def _copy_native_frame(v) -> "VibrationData":
+    if v is None:
+        return VibrationData()
+    return VibrationData(lf_freq=v.lf_freq, lf_en_tone=v.lf_en_tone, lf_amp=v.lf_amp,
+                         hf_freq=v.hf_freq, hf_en_tone=v.hf_en_tone, hf_amp=v.hf_amp)
 
 
 def _native_silent_frame(v) -> "VibrationData":
@@ -3093,8 +3152,15 @@ class Controller:
         existing path.  The NSO GameCube controller is intentionally left on the
         existing path for now.  A Pro Controller gets SDL3's left block on its
         left motor and the right block on its right motor; a Joy-Con (single or
-        merged) gets its own side's block.  Transport, pacing and the merged
-        pair coordinators are unchanged: only the frame content differs.
+        merged) gets its own side's block.
+
+        Timeline playback: each packet carries the next 15 ms of the SDL3
+        timeline (three 5 ms slots, _native_resample).  A packet is sent once
+        its whole window lies NATIVE_RESAMPLE_MARGIN in the past, so windows go
+        out every 15 ms and every frame in them has already arrived.  Playback
+        starts at the first active frame's arrival, and an SDL3 stop is played
+        in order like any other frame, so short pulses keep their full length.
+        Only a host that went quiet for 500 ms is silenced at once.
         """
         if getattr(vc, 'mode', None) != "Switch2":
             return False
@@ -3103,37 +3169,101 @@ class Controller:
         if getattr(self.controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             return False
 
-        if self.is_pro_controller():
-            v1, v2, v3, zero_l = vc.get_current_vibration_frames(is_left=True)
-            r1, r2, r3, zero_r = vc.get_current_vibration_frames(is_left=False)
-            frames_r = (r1, r2, r3)
-            is_zero = zero_l and zero_r
-        else:
-            v1, v2, v3, is_zero = vc.get_current_vibration_frames(is_left=self.is_joycon_left())
-            frames_r = None
-
         if getattr(self, '_rumble_task_running', False):
             return True
+
+        now = time.perf_counter()
+        snapshot = getattr(vc, 'native_frame_log_snapshot', None)
+        log = snapshot() if callable(snapshot) else []
+        is_pro = self.is_pro_controller()
+        sides = (0, 1) if is_pro else ((0,) if self.is_joycon_left() else (1,))
 
         def dispatch(coro):
             return self._dispatch_rumble_coro(getattr(vc, 'loop', None), coro)
 
-        if is_zero:
+        def send(per_side):
+            frames = per_side[0]
+            frames_r = per_side[1] if len(per_side) > 1 else None
+            dispatch(self._native_rumble_send_worker(tuple(frames), frames_r))
+
+        def is_active(entry):
+            return not all(_native_frames_silent((entry[1 + side],)) for side in sides)
+
+        def slot_ready(earliest):
+            # Every Native packet (timeline, trailing silence or host-gone
+            # silence) sits on one 15 ms send grid per controller.  `target`
+            # is the grid time this packet belongs to; it is never closer than
+            # 15 ms (minus one scheduler tick) to the previous actual send, so
+            # a late write cannot cause a burst of catch-up packets.
+            target = max(earliest, getattr(self, '_native_next_send_at', 0.0))
+            return now >= target, target
+
+        def mark_sent(target):
+            self._native_next_send_at = max(
+                target + NATIVE_PACKET_INTERVAL,
+                now + NATIVE_PACKET_INTERVAL - NATIVE_TICK_TOLERANCE)
+
+        idle_at = getattr(self, '_native_idle_at', 0.0)
+        host_gone = not log or now - log[-1][0] > NATIVE_HOST_TIMEOUT
+        pending = [e for e in log if e[0] > idle_at]
+        first_active = next((e for e in pending if is_active(e)), None)
+
+        if host_gone or first_active is None:
+            # Nothing left to play: send silence a few times, then idle.
+            if host_gone and log:
+                self._native_idle_at = log[-1][0]
+            elif pending:
+                self._native_idle_at = pending[-1][0]
+            self._native_window_end = None
             if not getattr(self, 'rumble_stopped', False):
+                # Silence stays on the 15 ms grid too: a packet sent right after
+                # the last timeline packet would replace it on the controller
+                # before it finished playing and cut the ending.
+                ready, target = slot_ready(0.0)
+                if not ready:
+                    return True
+                mark_sent(target)
                 self._zero_count = getattr(self, '_zero_count', 0) + 1
-                dispatch(self._native_rumble_send_worker((v1, v2, v3), frames_r))
+                if log:
+                    per_side = [[_native_silent_frame(log[-1][1 + side])] * 3 for side in sides]
+                else:
+                    per_side = [[VibrationData() for _ in range(3)] for _ in sides]
+                send(per_side)
                 if self._zero_count >= 3:
                     self.rumble_stopped = True
-        else:
-            self.rumble_stopped = False
-            self._zero_count = 0
-            if self._bridge_rumble_due():
-                dispatch(self._native_rumble_send_worker((v1, v2, v3), frames_r))
+            return True
+
+        # Timeline still to play: keep the scheduler ticking until it is done.
+        self.rumble_stopped = False
+        self._zero_count = 0
+        start = getattr(self, '_native_window_end', None)
+        if start is None:
+            start = first_active[0]
+        # A slow write (or a stall) can leave whole windows waiting: those are
+        # dropped and only the newest complete one is played, so no backlog
+        # builds up.  Windows stay on the same 15 ms timeline grid.
+        start, end, dropped = _native_window(start, now)
+        ready, target = slot_ready(end + NATIVE_RESAMPLE_MARGIN)
+        if not ready:
+            return True  # window not complete yet, or not this grid slot yet
+        mark_sent(target)
+        if dropped:
+            self._native_dropped_windows = getattr(self, '_native_dropped_windows', 0) + dropped
+        self._native_window_end = end
+        per_side = [_native_resample(log, start, end, side) for side in sides]
+        send(per_side)
+        newest = log[-1]
+        if not is_active(newest) and end >= newest[0]:
+            # Played through the stop: go idle (silence follows on next ticks).
+            self._native_idle_at = newest[0]
+            self._native_window_end = None
         return True
 
     async def _native_rumble_send_worker(self, frames, frames_r=None):
         """Native Rumble send worker; same running-flag semantics as the simple worker."""
-        kwargs = {'native': True}
+        # pair_sustain=False: the merged System-BT pair coordinator sends each
+        # Native packet once instead of replaying it on its own cadence.
+        kwargs = {'native': True, 'pair_sustain': False}
         if frames_r is not None:
             kwargs.update(vibration_r1=frames_r[0], vibration_r2=frames_r[1],
                           vibration_r3=frames_r[2])
@@ -3640,11 +3770,6 @@ class Controller:
             sender_thread.start()
 
     async def set_vibration(self, vibration: VibrationData, vibration2 = VibrationData(), vibration3 = VibrationData(), ignore_freq_scaling = False, vibration_r1 = None, vibration_r2 = None, vibration_r3 = None, direct_amplitude = False, audio_overlay = None, audio_overlay_r = None, trigger_overlay = None, trigger_overlay_r = None, impulse_overlay = None, impulse_overlay_r = None, pair_sustain = True, native = False):
-        if native and NATIVE_RUMBLE_FILLED_SLOTS < 3:
-            # SDL3 Native: slots 1-2 carry the SDL3 frame, slot 3 is silent.
-            vibration3 = _native_silent_frame(vibration)
-            if vibration_r1 is not None:
-                vibration_r3 = _native_silent_frame(vibration_r1)
         strength = getattr(CONFIG, "vibration_strength", 5)
         freq_setting = getattr(CONFIG, "vibration_frequency", 10)
         is_pro = self.is_pro_controller()

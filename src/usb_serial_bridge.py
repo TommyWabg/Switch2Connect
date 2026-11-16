@@ -202,6 +202,14 @@ class ESP32S3SerialClient:
         self._rumble_tx_stop = False
         self._rumble_tx_thread = None
         self._write_count = 0
+        # Link diagnostics (always on, one INFO line per 5 s while traffic flows):
+        # rumble serial writes and input packets per channel, so a BLE backlog
+        # (input rate drops / gaps grow while rumble writes stay at full rate)
+        # can be seen in a user's log.
+        self._link_diag_lock = threading.Lock()
+        self._link_diag_t0 = time.perf_counter()
+        self._link_diag = {}
+        self._link_diag_backlog_max = 0
         self._response_queue = queue.Queue()
         self._closed_by_error = False
         self._heartbeat_stop = threading.Event()
@@ -445,7 +453,9 @@ class ESP32S3SerialClient:
             try:
                 self.open()
                 self._ensure_read_thread()
+                _t0 = time.perf_counter()
                 self.handle.write(cmd.encode("ascii"))
+                self._note_rumble_write("rs", (channel,), time.perf_counter() - _t0)
                 return True
             except Exception as e:
                 logger.debug("Failed to write ESP32-S3 rs payload: %s", e)
@@ -691,7 +701,11 @@ class ESP32S3SerialClient:
             self.open()
             self._ensure_read_thread()
             try:
+                _t0 = time.perf_counter()
                 self.handle.write(f"wr {chan_field} {kind} {payload}\n".encode("ascii"))
+                if kind == "r":
+                    _chs = [channel] + ([mirror_channel] if mirror_channel is not None else [])
+                    self._note_rumble_write("wr", _chs, time.perf_counter() - _t0)
                 return True
             except Exception as e:
                 logger.debug("Failed to write ESP32-S3 BLE payload: %s", e)
@@ -714,7 +728,10 @@ class ESP32S3SerialClient:
             self.open()
             self._ensure_read_thread()
             try:
+                _t0 = time.perf_counter()
                 self.handle.write(cmd.encode("ascii"))
+                self._note_rumble_write("pair", (left_channel, right_channel),
+                                        time.perf_counter() - _t0)
                 return True
             except Exception as e:
                 logger.debug("Failed to write ESP32-S3 wrpair payload: %s", e)
@@ -752,7 +769,9 @@ class ESP32S3SerialClient:
             self.open()
             self._ensure_read_thread()
             try:
+                _t0 = time.perf_counter()
                 self.handle.write(cmd.encode("ascii"))
+                self._note_rumble_write("rd", (channel,), time.perf_counter() - _t0)
                 return True
             except Exception as e:
                 logger.debug("Failed to write ESP32-S3 rd payload: %s", e)
@@ -810,6 +829,76 @@ class ESP32S3SerialClient:
             except Exception:
                 logger.exception("ESP32-S3 control dispatcher failed")
 
+    def _link_diag_channel_locked(self, channel):
+        d = self._link_diag.get(channel)
+        if d is None:
+            d = self._link_diag[channel] = {
+                "in": 0, "in_last": 0.0, "in_gap_max": 0.0, "in_overwrite": 0,
+                "wr": 0, "rd": 0, "rs": 0, "pair": 0, "write_max": 0.0,
+            }
+        return d
+
+    def _note_rumble_write(self, kind, channels, write_s):
+        try:
+            with self._link_diag_lock:
+                for ch in channels:
+                    d = self._link_diag_channel_locked(int(ch))
+                    d[kind] += 1
+                    if write_s > d["write_max"]:
+                        d["write_max"] = write_s
+            self._maybe_log_link_diag()
+        except Exception:
+            pass
+
+    def _note_input(self, channel, now, overwritten):
+        try:
+            with self._link_diag_lock:
+                d = self._link_diag_channel_locked(int(channel))
+                d["in"] += 1
+                if d["in_last"]:
+                    gap = now - d["in_last"]
+                    if gap > d["in_gap_max"]:
+                        d["in_gap_max"] = gap
+                d["in_last"] = now
+                if overwritten:
+                    d["in_overwrite"] += 1
+            self._maybe_log_link_diag()
+        except Exception:
+            pass
+
+    def _maybe_log_link_diag(self):
+        now = time.perf_counter()
+        with self._link_diag_lock:
+            elapsed = now - self._link_diag_t0
+            if elapsed < 5.0:
+                return
+            parts = []
+            for ch in sorted(self._link_diag):
+                d = self._link_diag[ch]
+                writes = d["wr"] + d["rd"] + d["rs"] + d["pair"]
+                if not d["in"] and not writes:
+                    continue
+                parts.append(
+                    "ch%d in %d (%.1f/s, max gap %.1fms, overwritten %d) "
+                    "rumble %d (%.1f/s: wr %d rd %d rs %d pair %d, serial write max %.2fms)" % (
+                        ch, d["in"], d["in"] / elapsed, d["in_gap_max"] * 1000.0,
+                        d["in_overwrite"], writes, writes / elapsed, d["wr"], d["rd"],
+                        d["rs"], d["pair"], d["write_max"] * 1000.0))
+                last = d["in_last"]
+                d.update({"in": 0, "in_gap_max": 0.0, "in_overwrite": 0, "wr": 0,
+                          "rd": 0, "rs": 0, "pair": 0, "write_max": 0.0, "in_last": last})
+            backlog = self._link_diag_backlog_max
+            self._link_diag_backlog_max = 0
+            self._link_diag_t0 = now
+        if parts:
+            try:
+                mode = "%s/%s" % (getattr(CONFIG, "simulation_mode", "?"),
+                                  getattr(CONFIG, "rumble_mode", "?"))
+            except Exception:
+                mode = "?"
+            logger.info("ESP32 link stats %s (%.1fs, %s, CDC backlog max %dB): %s",
+                        self.port, elapsed, mode, backlog, "; ".join(parts))
+
     def _publish_input(self, channel, source_uuid, payload, callbacks):
         self._ensure_input_consumer(channel)
         key = (int(channel), self._norm_uuid(source_uuid or INPUT_REPORT_UUID))
@@ -825,11 +914,13 @@ class ESP32S3SerialClient:
                 diag["publish"] += 1
                 if key in self._input_slots:
                     diag["overwrite"] += 1
+            overwritten = key in self._input_slots
             self._input_slots[key] = (
                 now, self._input_sequence, tuple(callbacks), bytes(payload))
             # Consumers are channel-affine; wake all so the matching channel is
             # never left asleep behind an unrelated consumer.
             self._input_condition.notify_all()
+        self._note_input(channel, now, overwritten)
 
     def _take_next_input_locked(self, channel):
         keys = [key for key in self._input_slots if key[0] == channel]
@@ -1056,6 +1147,8 @@ class ESP32S3SerialClient:
                     self._cdc_diag_gap_count += 1
                     self._cdc_diag_gap_max_us = max(self._cdc_diag_gap_max_us, gap_us)
                     self._cdc_diag_backlog_max = max(self._cdc_diag_backlog_max, waiting)
+                    if waiting > self._link_diag_backlog_max:
+                        self._link_diag_backlog_max = waiting
                     chunk = self.handle.read(waiting or 1024)
                     if chunk:
                         buf.extend(chunk)
