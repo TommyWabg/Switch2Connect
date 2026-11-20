@@ -55,7 +55,7 @@ function Get-UsbipDeviceInstances {
     try {
         $len = 0
         if ([Switch2.CfgMgrUsbip]::CM_Get_Device_ID_List_SizeW([ref]$len, 'ROOT', 1) -ne 0) { return $null }
-        if ($len -le 0) { return @() }
+        if ($len -le 0) { return ,@() }
         $buffer = New-Object char[] $len
         if ([Switch2.CfgMgrUsbip]::CM_Get_Device_ID_ListW('ROOT', $buffer, $len, 1) -ne 0) { return $null }
         $matched = @()
@@ -73,7 +73,7 @@ function Get-UsbipDeviceInstances {
                 Where-Object { $_ } | ForEach-Object { $_.ToUpperInvariant() })
             if ($hwids -contains $HWID.ToUpperInvariant()) { $matched += $id.ToUpperInvariant() }
         }
-        return @($matched | Select-Object -Unique)
+        return ,@($matched | Select-Object -Unique)
     }
     catch { return $null }
 }
@@ -92,7 +92,7 @@ function Get-UsbipDriverPackages {
                 $packages += $currentInf
             }
         }
-        return @($packages | Select-Object -Unique)
+        return ,@($packages | Select-Object -Unique)
     }
 
     Write-CleanupLog "pnputil /enum-drivers failed with exit code $LASTEXITCODE; scanning the INF store instead."
@@ -108,9 +108,9 @@ function Get-UsbipDriverPackages {
     foreach ($inf in $infs) {
         try { $text = Get-Content -LiteralPath $inf.FullName -Raw -ErrorAction Stop }
         catch { continue }
-        if ($text -match "(?i)($($InfNames -join '|'))") { $found += $inf.Name.ToLowerInvariant() }
+        if ($text -match "(?i)\b($($InfNames -join '|'))\b") { $found += $inf.Name.ToLowerInvariant() }
     }
-    return @($found | Select-Object -Unique)
+    return ,@($found | Select-Object -Unique)
 }
 
 function Get-UsbipServices {
@@ -120,6 +120,7 @@ function Get-UsbipServices {
 }
 
 $script:failures = @()
+$script:RestartRequired = $false
 function Add-Failure {
     param([string]$Message)
     $script:failures += $Message
@@ -155,7 +156,10 @@ $nodeRemoved = $false
 $devnode = Join-Path $AppDir 'devnode.exe'
 if (Test-Path $devnode) {
     & $devnode remove $HWID root 2>&1 | ForEach-Object { Write-CleanupLog ([string]$_) }
-    if ($LASTEXITCODE -eq 0) { $nodeRemoved = $true }
+    if ($LASTEXITCODE -in @(0, 3010)) {
+        $nodeRemoved = $true
+        if ($LASTEXITCODE -eq 3010) { $script:RestartRequired = $true }
+    }
     else { Write-CleanupLog "devnode.exe remove returned exit code $LASTEXITCODE; trying pnputil." }
 }
 if (-not $nodeRemoved) {
@@ -163,14 +167,18 @@ if (-not $nodeRemoved) {
     if ($null -ne $instances -and $instances.Count -gt 0) {
         foreach ($instance in $instances) {
             & pnputil /remove-device $instance /force 2>&1 | ForEach-Object { Write-CleanupLog ([string]$_) }
-            if ($LASTEXITCODE -eq 0) { $nodeRemoved = $true }
+            if ($LASTEXITCODE -in @(0, 3010)) {
+                $nodeRemoved = $true
+                if ($LASTEXITCODE -eq 3010) { $script:RestartRequired = $true }
+            }
             else { Add-Failure "pnputil /remove-device $instance returned exit code $LASTEXITCODE" }
         }
     }
     elseif ($null -eq $instances) {
         Write-CleanupLog 'Device enumeration unavailable; falling back to the device-ID form.'
         & pnputil /remove-device /deviceid $HWID /subtree /force 2>&1 | ForEach-Object { Write-CleanupLog ([string]$_) }
-        if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -eq 3010) { $script:RestartRequired = $true }
+        elseif ($LASTEXITCODE -ne 0) {
             Add-Failure "pnputil /remove-device /deviceid $HWID returned exit code $LASTEXITCODE"
         }
     }
@@ -185,7 +193,8 @@ else {
     foreach ($inf in $packages) {
         Write-CleanupLog "Deleting driver package $inf from Driver Store..."
         & pnputil /delete-driver $inf /uninstall /force 2>&1 | ForEach-Object { Write-CleanupLog ([string]$_) }
-        if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -eq 3010) { $script:RestartRequired = $true }
+        elseif ($LASTEXITCODE -ne 0) {
             Add-Failure "pnputil /delete-driver $inf returned exit code $LASTEXITCODE"
         }
     }
@@ -193,11 +202,25 @@ else {
 
 # 4. Clean up the install directory.
 if (Test-Path $AppDir) {
-    try { Remove-Item -Path $AppDir -Recurse -Force -ErrorAction Stop }
+    try {
+        $resolvedAppDir = (Resolve-Path -LiteralPath $AppDir -ErrorAction Stop).ProviderPath
+        if ($resolvedAppDir -ne 'C:\Program Files\USBip') {
+            throw "Unexpected USBIP install directory: $resolvedAppDir"
+        }
+        Remove-Item -LiteralPath $resolvedAppDir -Recurse -Force -ErrorAction Stop
+    }
     catch { Add-Failure "Could not remove ${AppDir}: $($_.Exception.Message)" }
 }
 
 # 5. Verify. An unanswerable query must not read as "nothing left".
+if ($script:failures.Count -gt 0) {
+    Write-CleanupLog "ERROR: USBIP recovery failed. Errors: $($script:failures -join '; ')"
+    Exit 1
+}
+if ($script:RestartRequired) {
+    Write-CleanupLog 'USBIP removal is pending a Windows restart.'
+    Exit 3010
+}
 $remainingInstances = Get-UsbipDeviceInstances
 $deviceLayerVerified = $null -ne $remainingInstances
 if (-not $deviceLayerVerified) { $remainingInstances = @() }
@@ -215,7 +238,7 @@ if (@($remainingInstances).Count -or @($remainingPackages).Count -or $remainingF
     Write-CleanupLog "ERROR: USBIP cleanup incomplete."
     Exit 1
 }
-if ((-not $deviceLayerVerified -or -not $packageLayerVerified) -and $script:failures.Count -gt 0) {
+if (-not $deviceLayerVerified -or -not $packageLayerVerified) {
     Write-CleanupLog "ERROR: USBIP cleanup could not be verified. Errors: $($script:failures -join '; ')"
     Exit 1
 }
