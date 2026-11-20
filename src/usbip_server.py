@@ -963,6 +963,27 @@ SWITCH1_PRO_REPORT_DESCRIPTOR = bytes.fromhex(
 )
 
 
+# Eden/yuzu's direct Joy-Con/Pro driver integrates every 0x30 report as exactly 15 ms
+# (Joycons::OnMotionUpdate hard-codes delta_timestamp = 15000 us).  It is the only host
+# we know of that sends subcommand 0x41 (SetIMUSensitivity); SDL never does.
+EDEN_DIRECT_SUBCMD = 0x41
+EDEN_ASSUMED_REPORT_DT = 0.015
+EDEN_MAX_REPORT_DT = 0.1
+SWITCH1_IMU_FRAME_OFFSETS = (13, 25, 37)
+
+
+def scale_switch1_gyro(report, factor):
+    """Scale the three gyro triples of a 0x30 report in place (accel untouched)."""
+    for off in SWITCH1_IMU_FRAME_OFFSETS:
+        g = off + 6
+        if len(report) < g + 6:
+            break
+        vals = struct.unpack_from('<3h', report, g)
+        struct.pack_into('<3h', report, g,
+                         *(max(-32768, min(32767, int(round(v * factor)))) for v in vals))
+    return report
+
+
 class USBIPJoyConServer(USBIPServer):
     def __init__(self, device_type="L", host="127.0.0.1", port=3240, on_rumble_callback=None, bus_id="1-1", mac_address=None):
         super().__init__(host=host, port=port, on_rumble_callback=on_rumble_callback, bus_id=bus_id, mac_address=mac_address)
@@ -972,6 +993,10 @@ class USBIPJoyConServer(USBIPServer):
         self._device_info_queried = False
         self._vibration_enabled = False
         self._imu_enabled = False
+        # Eden direct-driver motion compensation (Pro only), see scale_switch1_gyro.
+        self._eden_direct = False
+        self._last_motion_report_t = None
+        self._eden_watch = None
         
         # Subcommand reply queue
         self.subcmd_reply_queue = queue.Queue(maxsize=4)
@@ -1025,6 +1050,56 @@ class USBIPJoyConServer(USBIPServer):
         """
         report[1] = self.seq_num & 0xff
         self.seq_num += 3
+
+    def _reset_urb_tracking(self):
+        super()._reset_urb_tracking()
+        self._stop_eden_direct(None)
+        self._last_motion_report_t = None
+
+    def _start_eden_direct(self):
+        """0x41 from the Eden direct driver: compensate, and watch the process that sent
+        it (hid_handle_owner) so the compensation ends when Eden closes."""
+        first = not self._eden_direct
+        self._eden_direct = True
+        if self.device_type != "Pro" or not first:
+            return
+        logger.info("Pro: SetIMUSensitivity (0x41) received (Eden/yuzu-style direct driver), "
+                    "gyro rescaled to its fixed 15 ms per report")
+        try:
+            import hid_handle_owner
+            watch = hid_handle_owner.OwnerWatch(
+                vid=0x057E, pid=self.product_id, serial=f"PRO_{self.bus_id}",
+                on_gone=self._on_eden_owner_gone)
+            self._eden_watch = watch
+            watch.start()
+        except Exception:
+            logger.debug("Eden owner watch unavailable", exc_info=True)
+
+    def _stop_eden_direct(self, reason):
+        watch, self._eden_watch = self._eden_watch, None
+        if watch is not None:
+            watch.stop()
+        if self._eden_direct and reason:
+            logger.info("Pro: %s -> 15 ms motion compensation off", reason)
+        self._eden_direct = False
+
+    def _on_eden_owner_gone(self, reason, watch):
+        if watch is self._eden_watch:
+            self._stop_eden_direct(reason)
+
+    def _apply_eden_motion_timing(self, reply_data):
+        """Pro + Eden direct driver: rescale gyro so that Eden's fixed 15 ms per report
+        integrates the real elapsed time.  Buttons, sticks, accel and report rate are
+        unchanged, and nothing happens for SDL (which never sends 0x41)."""
+        if self.device_type != "Pro" or not reply_data or reply_data[0] != 0x30:
+            return reply_data
+        now = time.perf_counter()
+        last = self._last_motion_report_t
+        self._last_motion_report_t = now
+        if not self._eden_direct:
+            return reply_data
+        dt = EDEN_ASSUMED_REPORT_DT if last is None else min(max(now - last, 0.0), EDEN_MAX_REPORT_DT)
+        return bytes(scale_switch1_gyro(bytearray(reply_data), dt / EDEN_ASSUMED_REPORT_DT))
 
     def _get_device_desc(self):
         path = f"/sys/devices/virtual/usbip/{self.bus_id}".encode('ascii')
@@ -1144,6 +1219,7 @@ class USBIPJoyConServer(USBIPServer):
                         if self.last_state[0] == 0x30:
                             self._stamp_timer_byte(self.last_state)
                         reply_data = bytes(self.last_state)
+                reply_data = self._apply_eden_motion_timing(reply_data)
         else:
             status = -1
             
@@ -1360,6 +1436,9 @@ class USBIPJoyConServer(USBIPServer):
             # USB handshake commands sent by Steam/hid-nintendo to initialize the controller.
             # These arrive on EP1 OUT and require an 81 xx response on EP1 IN.
             subcmd = data[1] if len(data) > 1 else 0x00
+            # Not a signal to end the Eden compensation: SDL hosts that share the device
+            # with Eden send 80 04 (ForceUSB) whenever input pauses for 100 ms, and
+            # Eden's own close is detected by hid_handle_owner instead.
             logger.info(f"Joy-Con USB Handshake: 80 {subcmd:02x}")
             reply = bytearray(64)
             reply[0] = 0x81
@@ -1468,7 +1547,8 @@ class USBIPJoyConServer(USBIPServer):
         elif subcmd == 0x40:
             self._imu_enabled = (len(data) > 11 and data[11] == 0x01)
             reply = self._build_subcommand_reply(0x40)
-        elif subcmd == 0x41:
+        elif subcmd == EDEN_DIRECT_SUBCMD:
+            self._start_eden_direct()
             reply = self._build_subcommand_reply(0x41)
         elif subcmd == 0x42:
             reply = self._build_subcommand_reply(0x42)
@@ -1517,7 +1597,12 @@ class USBIPJoyConServer(USBIPServer):
 
         if 0x6000 <= addr < 0x6100:
             spi_memory = [0xFF] * 0x100
-            
+
+            # 0x6012: Device type (1=Joy-Con L, 2=Joy-Con R, 3=Pro Controller).
+            # Eden/yuzu's direct Pro Controller driver reads this to tell a real Pro
+            # from a 3rd-party pad; 0xFF makes it drop every input report.
+            spi_memory[0x12] = {"L": 0x01, "R": 0x02}.get(getattr(self, "device_type", "Pro"), 0x03)
+
             # 0x6020: IMU calibration -- accel origin[3], accel coeff[3],
             #                            gyro origin[3],  gyro coeff[3]  (all int16 LE)
             #

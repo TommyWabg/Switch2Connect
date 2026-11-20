@@ -92,6 +92,11 @@ AUDIO_OUT_SOFT_CLEAR_MAX_COMPLETE_AGE_SEC = 0.100
 # CLEAR_FEATURE(ENDPOINT_HALT) loop.  The accumulated clock is primary; this cap is only
 # a runaway safety (4x duration) for a pathological backlog, and triggering it resyncs.
 AUDIO_OUT_RUNAWAY_CAP_SEC = 0.040
+# Audio OUT (Audio Haptic) completions must stay on the 1 ms grid. Waits up to
+# this long are spun in full, as before the low-CPU sleep change; only the
+# HID IN loop uses the short default spin tail. A short tail here made
+# continuous Audio Haptic feel slightly choppy (timer wake-ups 0.4-0.8 ms late).
+AUDIO_OUT_SPIN_TAIL_US = 2000
 OUTPUT_REPORT_QUEUE_MAX = 256
 OUTPUT_REPORT_BACKLOG_LOG_INTERVAL = 2.0
 TX_PRIORITY_CONTROL = 0
@@ -141,6 +146,12 @@ def _load_native_timing():
             lib = ctypes.CDLL(path)
             lib.ds_precise_sleep_us.argtypes = [ctypes.c_int]
             lib.ds_precise_sleep_us.restype = None
+            try:
+                lib.ds_precise_sleep_tail_us.argtypes = [ctypes.c_int, ctypes.c_int]
+                lib.ds_precise_sleep_tail_us.restype = None
+            except AttributeError:
+                # Older DLL without the spin-tail export.
+                pass
             _NATIVE_TIMING_LIB = lib
             logger.info("Loaded native USB audio timing helper: %s", path)
             return lib
@@ -397,14 +408,19 @@ class USBIPDualSenseServer(USBIPServer):
             self._audio_out_last_pacer_late = 0.0
         self.pending_iso_out_urbs.put(urb)
 
-    def _audio_out_precise_wait(self, wait):
+    def _audio_out_precise_wait(self, wait, spin_tail_us=None):
         if wait <= 0:
             return
         target = time.perf_counter() + wait
         native = getattr(self, "_native_timing", None)
         if native is not None:
             try:
-                native.ds_precise_sleep_us(max(1, int(wait * 1000000.0)))
+                wait_us = max(1, int(wait * 1000000.0))
+                tail_sleep = getattr(native, "ds_precise_sleep_tail_us", None) if spin_tail_us is not None else None
+                if tail_sleep is not None:
+                    tail_sleep(wait_us, int(spin_tail_us))
+                else:
+                    native.ds_precise_sleep_us(wait_us)
                 return
             except Exception:
                 self._native_timing = None
@@ -938,7 +954,7 @@ class USBIPDualSenseServer(USBIPServer):
                         self._audio_out_last_target_source = target_source
                     wait = due_time - time.perf_counter()
                     if wait > 0:
-                        self._audio_out_precise_wait(wait)
+                        self._audio_out_precise_wait(wait, AUDIO_OUT_SPIN_TAIL_US)
                     after_wait = time.perf_counter()
                     late = max(0.0, after_wait - due_time)
                     if late > duration:
