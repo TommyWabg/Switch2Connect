@@ -2976,6 +2976,31 @@ class ControllerWindow:
         self.update_driver_buttons_visibility()
         return self.esp32s3_bridge_status
 
+    def _run_poll_worker(self, fn):
+        """Run a recurring background poll job on a small set of persistent daemon threads.
+
+        Tcl allocates a per-thread Win32 event the first time a thread calls into Tk
+        (e.g. ``root.after``) and never frees it when the thread exits. Spawning a fresh
+        thread for every 5 s status poll therefore leaked ~0.4 event handles per second
+        (100k+ after a few days). Reusing the same threads caps it at one per thread.
+        """
+        q = getattr(self, '_poll_job_queue', None)
+        if q is None:
+            q = self._poll_job_queue = queue.Queue()
+
+            def _loop():
+                while True:
+                    job = q.get()
+                    try:
+                        job()
+                    except Exception as e:
+                        logger.debug(f"Background poll job failed: {e}")
+
+            # Two threads so a slow ESP32-S3 COM probe can't stall the wired-pad poll.
+            for i in range(2):
+                threading.Thread(target=_loop, name=f"GuiPollWorker{i}", daemon=True).start()
+        q.put(fn)
+
     def refresh_esp32s3_status_async(self):
         if getattr(self, '_esp32s3_refresh_running', False) or getattr(self, 'is_quitting', False):
             return
@@ -3068,7 +3093,7 @@ class ControllerWindow:
             except RuntimeError:
                 self._esp32s3_refresh_running = False
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_poll_worker(worker)
 
     def maybe_auto_update_esp32s3_firmware(self, status, on_complete=None):
         # Never auto-flash via OTG: esptool requires manual BOOT button hold on native USB
@@ -16409,7 +16434,7 @@ bg_color=panel_bg, widths=[8, 10])
             except Exception:
                 self._wired_pro2_refresh_running = False
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_poll_worker(worker)
 
     def start_detection_and_discovery(self):
         if getattr(self, '_startup_detection_done', False) or getattr(self, 'is_quitting', False):
