@@ -471,17 +471,27 @@ DS_EXPORT int ds_haptic_process(void* handle, const uint8_t* data, int length, D
     return static_cast<Processor*>(handle)->process(data, length, result);
 }
 
+namespace {
+// Default final stretch of each wait that is spun instead of slept.
+// High-resolution waitable timers usually wake 100-300 us late (occasionally
+// up to ~0.8 ms), so sleeping until 200 us before the deadline keeps the HID IN
+// loop on its 1 ms grid without spinning for the whole wait. Audio OUT passes
+// a longer tail through ds_precise_sleep_tail_us for tighter pacing.
+constexpr int kSpinTailUs = 200;
+}  // namespace
+
 #if defined(_WIN32)
 namespace {
-// Final stretch of each wait that is spun instead of slept. High-resolution
-// waitable timers wake roughly 100-300 us late, so sleeping until 200 us before
-// the deadline and spinning the rest keeps sub-millisecond accuracy without
-// spinning for the whole wait.
-constexpr int kSpinTailUs = 200;
 
 // One waitable timer per thread, created on first use and closed when the
 // thread exits. Creating a timer per call and dropping it leaks a handle for
 // every call (about 1000 per second from the 1 kHz HID IN loop).
+//
+// Only a high-resolution timer is used. Without one (Windows before 10 1803)
+// a normal waitable timer has the system tick granularity (1-15.6 ms), so a
+// 1 ms wait from the Audio OUT pacer or the HID IN loop could overshoot by
+// many milliseconds and make Audio Haptic stutter. In that case get() returns
+// nullptr and ds_precise_sleep_us keeps the original Sleep + spin behaviour.
 struct ThreadTimer {
     HANDLE handle = nullptr;
     bool initialized = false;
@@ -490,10 +500,6 @@ struct ThreadTimer {
         if (!initialized) {
             initialized = true;
             handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-            if (handle == nullptr) {
-                // High-resolution timers need Windows 10 1803 or newer.
-                handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
-            }
         }
         return handle;
     }
@@ -509,7 +515,13 @@ thread_local ThreadTimer g_thread_timer;
 }  // namespace
 #endif
 
-DS_EXPORT void ds_precise_sleep_us(int microseconds) {
+// Waits up to `microseconds`, sleeping on the per-thread high-resolution timer
+// for all but the last `spin_tail_us` and spinning the rest. A larger tail
+// trades CPU for accuracy: waits no longer than the tail are spun in full.
+DS_EXPORT void ds_precise_sleep_tail_us(int microseconds, int spin_tail_us) {
+    if (spin_tail_us < 0) {
+        spin_tail_us = 0;
+    }
     if (microseconds <= 0) {
         return;
     }
@@ -522,21 +534,23 @@ DS_EXPORT void ds_precise_sleep_us(int microseconds) {
         start.QuadPart + static_cast<long long>(
             (static_cast<double>(microseconds) / 1000000.0) * static_cast<double>(frequency.QuadPart));
 
-    // Sleep through all but the last kSpinTailUs. Previously waits of 2 ms or
+    // Sleep through all but the last spin_tail_us. Previously waits of 2 ms or
     // less (every wait from the 1 kHz HID IN loop) were spun in full, which
     // kept a CPU core busy whenever the virtual DualSense was attached.
-    if (microseconds > kSpinTailUs) {
+    if (microseconds > spin_tail_us) {
         HANDLE timer = g_thread_timer.get();
         bool slept = false;
         if (timer != nullptr) {
             LARGE_INTEGER due{};
-            due.QuadPart = -static_cast<long long>(microseconds - kSpinTailUs) * 10;  // relative, 100 ns units
+            due.QuadPart = -static_cast<long long>(microseconds - spin_tail_us) * 10;  // relative, 100 ns units
             if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
                 WaitForSingleObject(timer, INFINITE);
                 slept = true;
             }
         }
         if (!slept && microseconds > 2000) {
+            // No high-resolution timer: original behaviour. Sleep only for
+            // long waits, keep a 1 ms margin and spin the rest.
             Sleep(static_cast<DWORD>((microseconds - 1000) / 1000));
         }
     }
@@ -564,4 +578,9 @@ DS_EXPORT void ds_precise_sleep_us(int microseconds) {
         std::this_thread::yield();
     }
 #endif
+}
+
+// Default: short spin tail, low CPU. Used by the 1 kHz HID IN loop.
+DS_EXPORT void ds_precise_sleep_us(int microseconds) {
+    ds_precise_sleep_tail_us(microseconds, kSpinTailUs);
 }
