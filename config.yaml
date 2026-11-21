@@ -5697,8 +5697,8 @@ virtual_driver_ready_probe: true
 virtual_gyro_soft_deadzone: 0.0
 window_height: 1270
 window_width: 1270
-window_x: 1079
-window_y: 51
+window_x: 1075
+window_y: 26
 winrt_cached_services: true
 winrt_skip_pro2_unsupported_init_0101: true
 winuhid_sim_mode: PS5

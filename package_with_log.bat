@@ -97,6 +97,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Remove Python bytecode caches (__pycache__) from the folders this build bundles,
+REM so no stale .pyc files end up inside the package. Only these folders are scanned;
+REM .venv, backup, reference and other unpackaged folders are left alone.
+echo Removing __pycache__ folders before packaging...
+for %%d in (src resources drivers firmware_bin tools) do if exist "%%d\" (
+    pushd "%%d"
+    for /d /r %%p in (__pycache__) do if exist "%%p\" (
+        echo   Deleting %%p
+        rmdir /S /Q "%%p"
+    )
+    popd
+)
+
 %PYTHON_COMMAND% -m PyInstaller --console --onefile --clean --runtime-hook "tools/enable_system_bt_diagnostics.py" --paths src --add-binary "drivers/WinUHid.dll;drivers" --add-binary "drivers/WinUHidDevs.dll;drivers" --add-data "resources;resources" --add-data "%PACKAGE_CONFIG_FILE%;resources" --add-data "%PACKAGE_CONFIG_DIR%\mag_tester_enabled.marker;." --add-data "drivers/install_driver.ps1;drivers" --add-data "drivers/install.bat;drivers" --add-data "drivers/uninstall_driver.ps1;drivers" --add-data "drivers/uninstall.bat;drivers" --add-data "drivers/uninstall_vigembus.ps1;drivers" --add-data "drivers/uninstall_vigembus.bat;drivers" --add-data "drivers/USBip-0.9.7.7-x64.exe;drivers" --add-data "drivers/install_usbip.ps1;drivers" --add-data "drivers/uninstall_usbip.ps1;drivers" --add-data "drivers/WinUHidDriver.inf;drivers" --add-data "drivers/WinUHidDriver.dll;drivers" --add-data "drivers/winuhiddriver.cat;drivers" --add-data "drivers/WinUHidDriver.cer;drivers" --add-data "drivers/esp32s3;drivers/esp32s3" --add-data "drivers/hidhide;drivers/hidhide" --add-data "firmware_bin;firmware_bin" --add-binary "drivers/dualsense_haptic_native.dll;drivers" --add-data "src;src" --collect-all vgamepad --collect-all imufusion --collect-all bleak --collect-all winrt --collect-all bluetooth --collect-all hid --collect-all libusb_package --collect-all comtypes --hidden-import imufusion --hidden-import hid --hidden-import usb.core --hidden-import usb.util --hidden-import libusb_package --hidden-import driver_install_helper --hidden-import usb_hid_controller --hidden-import hidhide --hidden-import usbip_server --hidden-import usbip_dualsense_server --hidden-import dualsense_descriptors --hidden-import dualsense_structs --hidden-import dualsense_haptic --hidden-import audio_endpoint_guard --hidden-import comtypes --hidden-import comtypes.client --hidden-import comtypes.automation --name "Switch2Connect_%APP_VERSION%_log" --icon="resources/images/icon.ico" src/gui.py
 set "BUILD_EXIT=%ERRORLEVEL%"
 
