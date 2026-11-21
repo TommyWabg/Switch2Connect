@@ -198,6 +198,7 @@ If WinUHid is not installed or the installation is incomplete:
 * **No Working NSO GameCube Controller Gyro:** Gyro data from the NSO GameCube Controller cannot be decoded correctly.
 * **No NSO GameCube Controller Rumble Brake & Strength Difference:** The Rumble Motor Brake command is not known, so PWM-based rumble strength control cannot be implemented correctly. Only basic rumble motor on/off control is currently implemented.
 * **No Switch 2 Joy-Con Charging Grip Back Buttons Support:** Back buttons on the Switch 2 Joy-Con Charging Grip are not supported.
+* **No Additional Controller Support:** There are no plans for this fork to support any controller other than Nintendo's official Switch 2 controllers, including Switch 1 controllers and 3rd-party controllers.
 
 ## System Requirements
 
