@@ -1576,6 +1576,11 @@ class VirtualController:
                         self.usbip_server.in_pacing_defer_predicate = (
                             # All Switch 2 Emu rumble modes (Xbox, Switch, Native) defer paced IN replies.
                             lambda: self.mode == "Switch2")
+                        # Every EP1 IN reply is a new IMU sample with a regular 2000-unit
+                        # timestamp step (like a real Switch 2 Pro: 2 ms reports, us
+                        # timestamps), so SDL3 picks the same gyro coefficient as on
+                        # hardware regardless of our pacing jitter.
+                        self.usbip_server.in_report_finalizer = make_switch2_pro_ts_finalizer()
                         self.usbip_server.start()
                         started = True
                         break
@@ -5502,28 +5507,34 @@ class VirtualController:
                 inputData,
             )
             
+            # Joy-Con cases = PS5 mapping for the same case with the axis-1
+            # slot (last_s2_gz/az -> report 0x39/0x33) negated, exactly as the
+            # verified Pro branch below differs from PS5 (+g1/+a1 vs -g1/-a1).
             if self.hold_mode == "Horizontal" and not controller.is_pro_controller():
                 if controller.is_joycon_right():
                     self.last_s2_gx = inputData.gyroscope[1]
-                    self.last_s2_gy = inputData.gyroscope[2]
-                    self.last_s2_gz = -inputData.gyroscope[0]
-                    self.last_s2_ax = -inputData.accelerometer[1]
-                    self.last_s2_ay = inputData.accelerometer[2]
-                    self.last_s2_az = inputData.accelerometer[0]
-                else:
-                    self.last_s2_gx = -inputData.gyroscope[1]
                     self.last_s2_gy = inputData.gyroscope[2]
                     self.last_s2_gz = inputData.gyroscope[0]
                     self.last_s2_ax = -inputData.accelerometer[1]
                     self.last_s2_ay = inputData.accelerometer[2]
                     self.last_s2_az = -inputData.accelerometer[0]
+                else:
+                    self.last_s2_gx = -inputData.gyroscope[1]
+                    self.last_s2_gy = inputData.gyroscope[2]
+                    self.last_s2_gz = -inputData.gyroscope[0]
+                    self.last_s2_ax = -inputData.accelerometer[1]
+                    self.last_s2_ay = inputData.accelerometer[2]
+                    self.last_s2_az = inputData.accelerometer[0]
             else:
+                # Axis 1 is NOT negated: report bytes 0x33 = +a1 and 0x39 = +g1
+                # match a real Switch 2 Pro over USB (SDL3 accel Z from -0x33
+                # reads +1.68 on hardware; the old -a1 gave -1.57).
                 self.last_s2_gx = inputData.gyroscope[0]
                 self.last_s2_gy = inputData.gyroscope[2]
-                self.last_s2_gz = -inputData.gyroscope[1]
+                self.last_s2_gz = inputData.gyroscope[1]
                 self.last_s2_ax = inputData.accelerometer[0]
                 self.last_s2_ay = inputData.accelerometer[2]
-                self.last_s2_az = -inputData.accelerometer[1]
+                self.last_s2_az = inputData.accelerometer[1]
         else: # Dual Joycons (len == 2)
             mixed_left, mixed_right = self._update_merged_stick_mix(inputData, controller)
             mixed_right = self._add_gyro_rstick_overlay(mixed_right[0], mixed_right[1], inputData)
@@ -5534,19 +5545,21 @@ class VirtualController:
                 
             if self._is_djg_none_merge():
                 merged_g, merged_a = self._direct_merged_motion(inputData)
+                # PS5 maps merged Joy-Cons exactly like Pro, so use the Pro
+                # Switch 2 mapping (axis 1 not negated).
                 self.last_s2_gx = merged_g[0]
                 self.last_s2_gy = merged_g[2]
-                self.last_s2_gz = -merged_g[1]
+                self.last_s2_gz = merged_g[1]
                 self.last_s2_ax = merged_a[0]
                 self.last_s2_ay = merged_a[2]
-                self.last_s2_az = -merged_a[1]
+                self.last_s2_az = merged_a[1]
             elif getattr(controller, 'gyro_active', False):
                 self.last_s2_gx = inputData.gyroscope[0]
                 self.last_s2_gy = inputData.gyroscope[2]
-                self.last_s2_gz = -inputData.gyroscope[1]
+                self.last_s2_gz = inputData.gyroscope[1]
                 self.last_s2_ax = inputData.accelerometer[0]
                 self.last_s2_ay = inputData.accelerometer[2]
-                self.last_s2_az = -inputData.accelerometer[1]
+                self.last_s2_az = inputData.accelerometer[1]
 
         if getattr(CONFIG, "gyro_mode", "World") == "Roll" and controller.gyro_mouse_enabled:
             steer = getattr(controller, '_shared_steer_value', controller._own_steer_value if hasattr(controller, '_own_steer_value') else 0.0)
@@ -5599,6 +5612,30 @@ class VirtualController:
             return True
         return False
 
+
+
+SWITCH2_PRO_IN_TS_STEP = 2000
+
+
+def make_switch2_pro_ts_finalizer(step=SWITCH2_PRO_IN_TS_STEP, start=0):
+    """EP1 IN finalizer for the Switch 2 Pro USBIP device (Switch 2 Emu Mode).
+
+    Keeps a u32 counter that advances by `step` per EP1 IN reply and writes it
+    little-endian to the IMU timestamp at bytes 43-46 (0x2B, read by SDL3) and to
+    bytes 32-35, where update_as_switch2_pro writes the same value.  Only the
+    timestamps change: accel/gyro (49-60) keep the latest sample.
+    """
+    counter = [start & 0xffffffff]
+
+    def finalize(report):
+        if len(report) >= 47:
+            counter[0] = (counter[0] + step) & 0xffffffff
+            ts = struct.pack("<I", counter[0])
+            report[32:36] = ts
+            report[43:47] = ts
+        return report
+
+    return finalize
 
 
 def reset_vigem_bus(force=False):

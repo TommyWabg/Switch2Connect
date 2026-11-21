@@ -105,6 +105,11 @@ class USBIPServer:
         self.last_state[0] = 0x05 # Report ID
         self.last_state[2] = 0x12 # Switch 2 status byte
         self.seq_num = 0
+
+        # Optional EP1 IN hook (Switch 2 Pro / Switch 2 Emu Mode): called as
+        # finalizer(bytearray(report)) -> bytes-like right before each EP1 IN
+        # reply is sent (immediate and deferred paths).
+        self.in_report_finalizer = None
         
         # Lock for thread safety
         self.lock = threading.Lock()
@@ -179,13 +184,66 @@ class USBIPServer:
         except Exception:
             return False
 
-    def _send_ep1_in_reply(self, sock, seqnum, devid, ep):
-        self.last_ep_in_time = time.perf_counter()
+    def _record_ep1_in(self, reply_data):
+        """EP1 IN diagnostics, one INFO line per 5 s: replies/s, interval, how
+        many carried a new IMU timestamp (bytes 43-46) and deferred-list depth."""
         try:
-            reply_data = self.input_queue.get_nowait()
-        except queue.Empty:
+            now = time.perf_counter()
+            st = getattr(self, '_ep1_in_stats', None)
+            if st is None:
+                st = self._ep1_in_stats = {'since': now, 'n': 0, 'new_ts': 0, 'last': 0.0,
+                                           'int_max': 0.0, 'last_ts': None, 'defer_max': 0}
+            st['n'] += 1
+            if st['last']:
+                st['int_max'] = max(st['int_max'], now - st['last'])
+            st['last'] = now
+            ts = bytes(reply_data[43:47]) if len(reply_data) >= 47 else None
+            if ts != st['last_ts']:
+                st['new_ts'] += 1
+                st['last_ts'] = ts
+            st['defer_max'] = max(st['defer_max'], len(getattr(self, '_deferred_in', None) or ()))
+            elapsed = now - st['since']
+            if elapsed >= 5.0:
+                n = st['n']
+                logger.info("EP1 IN stats: %d replies/%.1fs (%.1f/s, avg %.2fms, max %.1fms), "
+                            "%d with a new IMU timestamp (%.1f/s), deferred max %d",
+                            n, elapsed, n / elapsed, elapsed / max(1, n) * 1000.0,
+                            st['int_max'] * 1000.0, st['new_ts'], st['new_ts'] / elapsed,
+                            st['defer_max'])
+                st.update(since=now, n=0, new_ts=0, int_max=0.0, defer_max=0)
+        except Exception:
+            pass
+
+    def _finalize_ep1_in(self, reply_data):
+        """Apply the optional per-server EP1 IN finalizer to a report."""
+        finalizer = getattr(self, 'in_report_finalizer', None)
+        if finalizer is None:
+            return reply_data
+        try:
+            return bytes(finalizer(bytearray(reply_data)))
+        except Exception as e:
+            logger.debug(f"EP1 IN finalizer error: {e}")
+            return reply_data
+
+    def _latest_input_report(self):
+        """Newest queued EP1 IN state (older queued states are dropped), or the
+        held last_state when nothing new arrived since the previous reply."""
+        reply_data = None
+        while True:
+            try:
+                reply_data = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+        if reply_data is None:
             with self.lock:
                 reply_data = bytes(self.last_state)
+        return reply_data
+
+    def _send_ep1_in_reply(self, sock, seqnum, devid, ep):
+        self.last_ep_in_time = time.perf_counter()
+        reply_data = self._latest_input_report()
+        reply_data = self._finalize_ep1_in(reply_data)
+        self._record_ep1_in(reply_data)
         ret_header = struct.pack(
             "!IIIII i IiiI 8s",
             USBIP_RET_SUBMIT, seqnum, devid, 1, ep, 0, len(reply_data),
@@ -196,14 +254,21 @@ class USBIPServer:
 
     def _service_deferred_in(self, sock):
         """Send deferred EP1 IN replies as they fall due (4 ms apart); return as
-        soon as the socket has a new request to read, or nothing is deferred."""
+        soon as the socket has a new request to read, or nothing is deferred.
+
+        The wait polls the socket (zero timeout) and sleeps in <= 1 ms slices.
+        A select() timeout is rounded to the Windows timer tick (15.6 ms when
+        the 1 ms timer request is not honoured, e.g. app window hidden), which
+        cut the paced IN rate to ~65/s; time.sleep uses a high-resolution
+        waitable timer (Python >= 3.11) and keeps the 4 ms pacing."""
         deferred = self._deferred_in
         while deferred:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if readable:
+                return
             wait = getattr(self, 'last_ep_in_time', 0) + 0.004 - time.perf_counter()
             if wait > 0:
-                readable, _, _ = select.select([sock], [], [], wait)
-                if readable:
-                    return
+                time.sleep(min(wait, 0.001))
                 continue
             seqnum, devid, ep = deferred.pop(0)
             self._send_ep1_in_reply(sock, seqnum, devid, ep)
@@ -569,12 +634,10 @@ class USBIPServer:
                 if elapsed < 0.004:
                     time.sleep(0.004 - elapsed)
                 self.last_ep_in_time = time.perf_counter()
-                
-                try:
-                    reply_data = self.input_queue.get_nowait()
-                except queue.Empty:
-                    with self.lock:
-                        reply_data = bytes(self.last_state)
+
+                reply_data = self._latest_input_report()
+                reply_data = self._finalize_ep1_in(reply_data)
+                self._record_ep1_in(reply_data)
                 actual_length = len(reply_data)
             else: # OUT (Rumble output report)
                 if len(out_data) > 0:
@@ -927,7 +990,11 @@ class USBIPServer:
         elif address in [0x1fc040, 0x1fc080, 0x13060]:
             data[:] = [0xff] * data_len
         elif address == 0x13040:
-            data[:] = bytes.fromhex("16 f4 d3 41 48 ce 85 ba f1 05 71 ba 1f 27 cb 3b")
+            # Factory IMU calibration.  SDL3 subtracts the gyro bias floats at
+            # +4/+8/+12 (rad/s) from every sample.  The gyro we forward is already
+            # bias-corrected by the app, so report a zero bias; keep the first
+            # float (26.494...) as the real block has it.
+            data[:] = bytes.fromhex("16 f4 d3 41 00 00 00 00 00 00 00 00 00 00 00 00")
         elif address == 0x13100:
             data[:] = bytes.fromhex("00 00 00 00 00 00 00 00 00 00 00 00 2d 10 a7 3d e7 49 35 3c a4 2d 20 41")
             
