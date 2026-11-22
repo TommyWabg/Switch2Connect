@@ -1,5 +1,5 @@
 # Switch 2 Connect
-### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
+### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, NSO GameCube Controller, and Mobapad M12 Pro Joy-Cons with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v3.3.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
@@ -198,7 +198,7 @@ If WinUHid is not installed or the installation is incomplete:
 * **No Working NSO GameCube Controller Gyro:** Gyro data from the NSO GameCube Controller cannot be decoded correctly.
 * **No NSO GameCube Controller Rumble Brake & Strength Difference:** The Rumble Motor Brake command is not known, so PWM-based rumble strength control cannot be implemented correctly. Only basic rumble motor on/off control is currently implemented.
 * **No Switch 2 Joy-Con Charging Grip Back Buttons Support:** Back buttons on the Switch 2 Joy-Con Charging Grip are not supported.
-* **No Additional Controller Support:** There are no plans for this fork to support any controller other than Nintendo's official Switch 2 controllers, including Switch 1 controllers and 3rd-party controllers.
+* **~~No Additional Controller Support:~~**~~ There are no plans for this fork to support any controller other than Nintendo's official Switch 2 controllers, including Switch 1 controllers and 3rd-party controllers.~~ With the release of the M12 Pro fix by DarkEslariate, the only current third-party controller support are the Mobapad M12 Pro Joy-Cons.
 
 ## System Requirements
 

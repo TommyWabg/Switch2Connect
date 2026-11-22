@@ -32,6 +32,7 @@ import time
 import threading
 import functools
 import math
+import struct
 from windows_ble_parameters import preferred_connection_parameters_supported
 import imufusion
 import numpy as np
@@ -1186,6 +1187,11 @@ VIBRATION_WRITE_PRO_CONTROLLER_UUID = "cc483f51-9258-427d-a939-630c31f72b05"
 
 COMMAND_WRITE_UUID = "649d4ac9-8eb7-4e6c-af44-1ea54fe5f005"
 COMMAND_RESPONSE_UUID = "c765a961-d9d8-4d36-a20a-5315b111836a"
+M12_SESSION_SERVICE_UUID = "00c5af5d-1964-4e30-8f51-1956f96bd280"
+M12_SESSION_CHAR_UUID = "00c5af5d-1964-4e30-8f51-1956f96bd282"
+M12_NATIVE_INPUT_UUID_L = "cc1bbbb5-7354-4d32-a716-a81cb241a32a"
+M12_NATIVE_INPUT_UUID_R = "d5a9e01e-2ffc-4cca-b20c-8b67142bf442"
+M12_NATIVE_ENABLE_DESC_UUID = "679d5510-5a24-4dee-9557-95df80486ecb"
 
 # Commands and subcommands
 COMMAND_LEDS = 0x09
@@ -1698,6 +1704,12 @@ class Controller:
         # the controller-info memory read has completed.
         self.advertised_product_id = advertised_product_id
         self.paired_connection = bool(paired_connection)
+        # Mobapad M12 Pro pads advertise the Joy-Con 2 PIDs, so the PID alone can't
+        # tell them apart from real Joy-Con 2s. This is set True only when the
+        # connect sequence actually switches to the M12 console protocol (see
+        # enable_input_notify_callback) and only drives which artwork the GUI
+        # shows; all input handling still goes by PID.
+        self.is_m12 = False
         self.input_report_callback = None
         self.disconnected_callback = None
         self.left_stick_calibration: StickCalibrationData = None
@@ -2101,6 +2113,46 @@ class Controller:
             except Exception:
                 pass
 
+    async def _windows_unpair_if_paired(self):
+        """Remove a leftover Windows-level Bluetooth pairing for this controller.
+
+        A real Joy-Con 2 that worked once and then only exposes the generic GAP/GATT
+        services on the next connect is consistent with a stale OS bond (the same effect
+        as "Remove device" in Windows Bluetooth settings). Returns a short status string
+        for logging; never raises.
+        """
+        if os.name != "nt":
+            return "not-windows"
+        try:
+            try:
+                import winrt.windows.devices.enumeration  # noqa: F401  (projection must be loaded)
+            except ImportError:
+                import bleak_winrt.windows.devices.enumeration  # noqa: F401
+            try:
+                from winrt.windows.devices.bluetooth import BluetoothLEDevice
+            except ImportError:
+                from bleak_winrt.windows.devices.bluetooth import BluetoothLEDevice
+
+            addr_int = int(str(self.device.address).replace(":", "").replace("-", ""), 16)
+            ble_dev = await BluetoothLEDevice.from_bluetooth_address_async(addr_int)
+            if ble_dev is None:
+                return "device-not-found"
+            try:
+                pairing = ble_dev.device_information.pairing
+                if not pairing.is_paired:
+                    return "not-paired-in-windows"
+                result = await pairing.unpair_async()
+                status = getattr(result, "status", result)
+                return "unpaired:" + str(getattr(status, "name", status))
+            finally:
+                try:
+                    ble_dev.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("Windows unpair check failed", exc_info=True)
+            return f"check-failed:{type(e).__name__}"
+
     async def connect_ble(self):
         try:
             if (self.client is not None):
@@ -2116,18 +2168,37 @@ class Controller:
             }
             use_service_filter = getattr(self, "advertised_product_id", None) in switch2_pids
 
-            def make_client(services=None, cached_services=False):
+            # A Joy-Con 2 in pairing mode must not have an old Windows-level bond: with
+            # one, it connects but only exposes the generic GAP/GATT services, and the
+            # recovery path below costs several seconds. Clear it up front instead.
+            # (Not for controllers reconnecting to this host - those are not in
+            # pairing mode and are left alone.)
+            if (not getattr(self, "paired_connection", False)
+                    and getattr(self, "advertised_product_id", None) in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID)):
+                pre_status = await self._windows_unpair_if_paired()
+                if pre_status.startswith("unpaired"):
+                    logger.info("Removed stale Windows pairing for %s before connecting (%s)",
+                                self.device.address, pre_status)
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.debug("Windows pairing pre-check for %s: %s", self.device.address, pre_status)
+
+            def make_client(services=None, cached_services=False, fresh_services=False):
                 kwargs = {"disconnected_callback": disconnected_callback}
                 if services is not None:
                     kwargs["services"] = services
                 if cached_services:
                     kwargs["winrt"] = {"use_cached_services": True}
+                elif fresh_services:
+                    # Force Windows to re-read the GATT table from the device instead
+                    # of trusting a possibly stale/partial cached copy.
+                    kwargs["winrt"] = {"use_cached_services": False}
                 try:
                     return BleakClient(self.device, **kwargs), cached_services
                 except TypeError:
                     # Bleak 1.0 installations that predate the WinRT argument keep
                     # service filtering but let Windows choose its cache policy.
-                    if cached_services:
+                    if cached_services or fresh_services:
                         kwargs.pop("winrt", None)
                         logger.info("Bleak backend does not support WinRT cached services; using OS default.")
                         return BleakClient(self.device, **kwargs), False
@@ -2145,12 +2216,12 @@ class Controller:
                     except Exception:
                         pass
 
-            async def connect_variant(services, cached_services=False):
-                self.client, cache_applied = make_client(services, cached_services)
+            async def connect_variant(services, cached_services=False, fresh_services=False):
+                self.client, cache_applied = make_client(services, cached_services, fresh_services)
                 await self.client.connect(timeout=20.0)
                 return cache_applied
 
-            requested_services = [SW2_SERVICE_UUID] if use_service_filter else None
+            requested_services = [SW2_SERVICE_UUID, M12_SESSION_SERVICE_UUID] if use_service_filter else None
             use_cached_services = bool(
                 requested_services
                 and getattr(self, "paired_connection", False)
@@ -2202,10 +2273,46 @@ class Controller:
                 service_list = list(services) if services else []
 
             if requested_services and not has_sw2_service():
+                # Windows sometimes returns a stale or partial GATT table (seen on a
+                # Joy-Con 2 reconnecting after a disconnect in the same session), which
+                # has no Switch 2 service and makes initialize() fail. Re-discover with
+                # the OS cache bypassed, a few times at most, before giving up.
+                def describe_services():
+                    parts = []
+                    for svc in service_list:
+                        try:
+                            chars = ",".join(str(ch.uuid)[:8] for ch in svc.characteristics)
+                        except Exception:
+                            chars = "?"
+                        parts.append(f"{str(svc.uuid)}[{chars}]")
+                    return "; ".join(parts) if parts else "none"
+
+                logger.warning("Switch 2 GATT service missing on %s; services returned: %s",
+                               self.device.address, describe_services())
                 await release_client()
-                cached_services_active = await connect_variant(None, False)
-                services = getattr(self.client, "services", None)
-                service_list = list(services) if services else []
+                unpair_status = await self._windows_unpair_if_paired()
+                logger.warning("Windows pairing state for %s: %s", self.device.address, unpair_status)
+                if unpair_status.startswith("unpaired"):
+                    await asyncio.sleep(1.0)
+                for sw2_attempt in range(1, 3):
+                    await release_client()
+                    if sw2_attempt > 1:
+                        await asyncio.sleep(1.0)
+                    cached_services_active = await connect_variant(None, False, True)
+                    services = getattr(self.client, "services", None)
+                    service_list = list(services) if services else []
+                    if has_sw2_service():
+                        break
+                    logger.warning(
+                        "Switch 2 GATT service still missing on %s (uncached discovery %d/2); services returned: %s",
+                        self.device.address, sw2_attempt, describe_services())
+                if not has_sw2_service():
+                    # Every Switch 2 pad exposes this service. Fail now with a clear
+                    # reason instead of letting initialize() burn seconds on notify
+                    # retries for a characteristic that does not exist.
+                    raise BleakError(
+                        f"Switch 2 service not exposed by {self.device.address} "
+                        f"(services: {describe_services()})")
 
             logger.info(f"Connected to {self.device.address}")
         
@@ -2766,7 +2873,7 @@ class Controller:
                     # after the event loop is closed, which causes RuntimeError.
                     # Each step is bounded: a hung Bluetooth stack never answers.
                     try:
-                        await asyncio.wait_for(self.client.stop_notify(INPUT_REPORT_UUID), timeout=1.0)
+                        await asyncio.wait_for(self.client.stop_notify(getattr(self, "_active_input_uuid", INPUT_REPORT_UUID)), timeout=1.0)
                     except Exception:
                         pass
                     try:
@@ -5862,7 +5969,228 @@ class Controller:
                 logger.warning(f"Error subscribing to GameCube characteristics: {e}")
                 await self.client.start_notify(INPUT_REPORT_UUID, gc_input_report_callback)
         else:
-            await self.client.start_notify(INPUT_REPORT_UUID, input_report_callback)
+            self._active_input_uuid = INPUT_REPORT_UUID
+            self._std_input_seen = False
+
+            def _std_input_callback(sender, data):
+                self._std_input_seen = True
+                input_report_callback(sender, data)
+
+            await self.client.start_notify(INPUT_REPORT_UUID, _std_input_callback)
+
+            if (product_id in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID)
+                    and not getattr(self, "is_esp32s3_bridge", False)
+                    and not getattr(self, "is_wired_usb", False)):
+                # Start every connect as "not an M12"; only the protocol switch below
+                # can mark it. GATT UUID presence alone is NOT used: real Joy-Con 2s
+                # expose some of the same characteristics (that mislabelled them).
+                self.is_m12 = False
+                self._log_m12_gatt_presence(device_address)
+                for _ in range(12):
+                    if self._std_input_seen or not self.client or not self.client.is_connected:
+                        break
+                    await asyncio.sleep(0.05)
+
+                if not self._std_input_seen and self.client and self.client.is_connected:
+                    is_left_pad = (product_id == JOYCON2_LEFT_PID)
+                    native_uuid = M12_NATIVE_INPUT_UUID_L if is_left_pad else M12_NATIVE_INPUT_UUID_R
+                    native_char = None
+                    session_char = None
+                    for svc in self.client.services:
+                        for ch in svc.characteristics:
+                            cu = str(ch.uuid).lower()
+                            if cu == native_uuid:
+                                native_char = ch
+                            elif cu == M12_SESSION_CHAR_UUID:
+                                session_char = ch
+
+                    if native_char is not None:
+                        logger.info("Standard input silent on %s; switching to M12 Pro console protocol (%s)", device_address, native_uuid)
+                        self.is_m12 = True
+                        logger.info("Controller %s classified as Mobapad M12 Pro", device_address)
+                        try:
+                            await self.client.stop_notify(INPUT_REPORT_UUID)
+                        except Exception:
+                            pass
+
+                        if session_char is not None:
+                            try:
+                                use_resp = "write" in session_char.properties
+                                await self.client.write_gatt_char(session_char.uuid, b"\x01\x00", response=use_resp)
+                                await asyncio.sleep(0.05)
+                            except Exception as e:
+                                logger.warning("M12 Pro session enable failed on %s: %s", device_address, e)
+
+                        for sub_cmd in (SUBCOMMAND_FEATURE_INIT, SUBCOMMAND_FEATURE_ENABLE):
+                            try:
+                                await self.write_command(COMMAND_FEATURE, sub_cmd, b"\x37\x00\x00\x00")
+                            except Exception as e:
+                                logger.debug("M12 Pro feature 0x37 sub %02x note: %s", sub_cmd, e)
+
+                        for d in getattr(native_char, "descriptors", ()):
+                            if str(d.uuid).lower() == M12_NATIVE_ENABLE_DESC_UUID:
+                                try:
+                                    await self.client.write_gatt_descriptor(d.handle, b"\x85\x00")
+                                except Exception as e:
+                                    logger.warning("M12 Pro native descriptor write failed: %s", e)
+                                break
+
+                        self._m12_quat_state = None
+                        self._m12_mouse_x = 0
+                        self._m12_mouse_y = 0
+                        self._m12_mouse_last_active = 0.0
+
+                        def _m12_native_callback(sender, data):
+                            translated = self._translate_m12pro_native_report(bytes(data), is_left_pad)
+                            if translated is not None:
+                                input_report_callback(sender, translated)
+
+                        await self.client.start_notify(native_uuid, _m12_native_callback)
+                        self._active_input_uuid = native_uuid
+
+    def _log_m12_gatt_presence(self, device_address):
+        """Diagnostics only: log which M12-related GATT UUIDs this peripheral exposes."""
+        client = getattr(self, "client", None)
+        if client is None:
+            return
+        wanted = {
+            "session_service": M12_SESSION_SERVICE_UUID,
+            "session_char": M12_SESSION_CHAR_UUID,
+            "native_L": M12_NATIVE_INPUT_UUID_L,
+            "native_R": M12_NATIVE_INPUT_UUID_R,
+        }
+        found = set()
+        try:
+            for svc in client.services:
+                found.add(str(svc.uuid).lower())
+                for ch in svc.characteristics:
+                    found.add(str(ch.uuid).lower())
+        except Exception:
+            logger.debug("M12 GATT presence check failed", exc_info=True)
+            return
+        logger.info("M12 GATT presence on %s: %s", device_address,
+                    ", ".join(f"{name}={'yes' if uuid in found else 'no'}" for name, uuid in wanted.items()))
+
+    def _translate_m12pro_native_report(self, buf: bytes, is_left: bool) -> bytearray | None:
+        if len(buf) < 8:
+            return None
+        g = bytearray(63)
+        g[0] = buf[0]
+        g[1] = buf[1]
+        if is_left:
+            g[10:13] = buf[5:8]
+            g[13:16] = b"\x00\x08\x80"
+        else:
+            g[10:13] = b"\x00\x08\x80"
+            g[13:16] = buf[5:8]
+
+        nb = buf[2] | (buf[3] << 8)
+        if is_left:
+            b5 = 0
+            b6 = 0
+            if nb & (1 << 0):  b6 |= 0x01
+            if nb & (1 << 3):  b6 |= 0x02
+            if nb & (1 << 1):  b6 |= 0x04
+            if nb & (1 << 2):  b6 |= 0x08
+            if nb & (1 << 14): b6 |= 0x10
+            if nb & (1 << 15): b6 |= 0x20
+            if nb & (1 << 4):  b6 |= 0x40
+            if nb & (1 << 5):  b6 |= 0x80
+            if nb & (1 << 6):  b5 |= 0x01
+            if nb & (1 << 7):  b5 |= 0x08
+            if nb & (1 << 8):  b5 |= 0x20
+            g[5] = b5
+            g[6] = b6
+        else:
+            b4 = 0
+            b5 = 0
+            if nb & (1 << 2):  b4 |= 0x01
+            if nb & (1 << 3):  b4 |= 0x02
+            if nb & (1 << 0):  b4 |= 0x04
+            if nb & (1 << 1):  b4 |= 0x08
+            if nb & (1 << 14): b4 |= 0x10
+            if nb & (1 << 15): b4 |= 0x20
+            if nb & (1 << 4):  b4 |= 0x40
+            if nb & (1 << 5):  b4 |= 0x80
+            if nb & (1 << 6):  b5 |= 0x02
+            if nb & (1 << 7):  b5 |= 0x04
+            if nb & (1 << 8):  b5 |= 0x10
+            if nb & (1 << 12): b5 |= 0x40
+            g[4] = b4
+            g[5] = b5
+
+        if len(buf) >= 0x0D:
+            mdx, mdy = struct.unpack_from("<hh", buf, 0x09)
+            self._m12_mouse_x = (getattr(self, "_m12_mouse_x", 0) + mdx) & 0xFFFF
+            self._m12_mouse_y = (getattr(self, "_m12_mouse_y", 0) + mdy) & 0xFFFF
+            struct.pack_into("<HH", g, 16, self._m12_mouse_x, self._m12_mouse_y)
+            now_m = time.perf_counter()
+            if mdx != 0 or mdy != 0:
+                self._m12_mouse_last_active = now_m
+            if now_m - getattr(self, "_m12_mouse_last_active", 0.0) <= 1.5:
+                struct.pack_into("<HH", g, 20, 100, 100)
+
+        struct.pack_into("<H", g, 31, 3850)
+
+        base = 0x0F if is_left else 0x10
+        if len(buf) >= base + 0x1C and buf[base - 1] >= 0x1C:
+            ax = struct.unpack_from("<h", buf, base + 0x12)[0]
+            ay = struct.unpack_from("<h", buf, base + 0x16)[0]
+            az = struct.unpack_from("<h", buf, base + 0x1A)[0]
+            struct.pack_into("<hhh", g, 48, ax, ay, az)
+
+            if buf[base + 3] == 0x0C:
+                ts12 = ((buf[base + 1] & 0x0F) << 8) | buf[base]
+                idx = buf[base + 4] & 0x03
+                w0, w1, w2 = struct.unpack_from("<III", buf, base + 5)
+                f0 = (w0 >> 1) & 0x01FFFFFF
+                f1 = w1 & 0x01FFFFFF
+                f2 = ((w2 << 1) | (w1 >> 31)) & 0x01FFFFFF
+                scale = 16777216.0 * 1.4142135623730951
+                v0 = (f0 - 0x01000000) / scale
+                v1 = (f1 - 0x01000000) / scale
+                v2 = (f2 - 0x01000000) / scale
+                sum_sq = v0 * v0 + v1 * v1 + v2 * v2
+                if sum_sq <= 1.05:
+                    d = math.sqrt(max(0.0, 1.0 - sum_sq))
+                    q = [
+                        (d, v0, v1, v2),
+                        (v2, d, v0, v1),
+                        (v1, v2, d, v0),
+                        (v0, v1, v2, d),
+                    ][idx]
+                    st = getattr(self, "_m12_quat_state", None)
+                    if st is None:
+                        self._m12_quat_state = (ts12, q, (0, 0, 0))
+                    else:
+                        prev_ts, prev_q, prev_lsb = st
+                        dticks = (ts12 - prev_ts) & 0x0FFF
+                        if dticks == 0:
+                            struct.pack_into("<hhh", g, 54, *prev_lsb)
+                        elif dticks > 400:
+                            self._m12_quat_state = (ts12, q, (0, 0, 0))
+                        else:
+                            dt = dticks / 800.0
+                            dot = prev_q[0]*q[0] + prev_q[1]*q[1] + prev_q[2]*q[2] + prev_q[3]*q[3]
+                            if dot < 0.0:
+                                q = (-q[0], -q[1], -q[2], -q[3])
+                            pw, px, py, pz = prev_q[0], -prev_q[1], -prev_q[2], -prev_q[3]
+                            dw = pw*q[0] - px*q[1] - py*q[2] - pz*q[3]
+                            dx = pw*q[1] + px*q[0] + py*q[3] - pz*q[2]
+                            dy = pw*q[2] - px*q[3] + py*q[0] + pz*q[1]
+                            dz = pw*q[3] + px*q[2] - py*q[1] + pz*q[0]
+                            vn = math.sqrt(dx*dx + dy*dy + dz*dz)
+                            if vn > 1e-7:
+                                ang = 2.0 * math.atan2(vn, max(-1.0, min(1.0, dw)))
+                                k = (ang / (dt * vn)) * 57.29577951308232 * S2_GYRO_LSB_PER_DPS_JOYCON
+                                gx_lsb = max(-32768, min(32767, int(round(dx * k))))
+                                gy_lsb = max(-32768, min(32767, int(round(dy * k))))
+                                gz_lsb = max(-32768, min(32767, int(round(dz * k))))
+                            else:
+                                gx_lsb = gy_lsb = gz_lsb = 0
+                            self._m12_quat_state = (ts12, q, (gx_lsb, gy_lsb, gz_lsb))
+                            struct.pack_into("<hhh", g, 54, gx_lsb, gy_lsb, gz_lsb)
+        return g
 
     def set_input_report_callback(self, callback):
         self.input_report_callback = callback
@@ -7886,6 +8214,10 @@ class Controller:
     def is_joycon(self):
         return self.is_joycon_left() or self.is_joycon_right()
     
+    def is_m12_pro(self):
+        """Mobapad M12 Pro half (still reports as a Joy-Con 2 left/right by PID)."""
+        return bool(getattr(self, "is_m12", False))
+
     def is_pro_controller(self):
         return self.controller_info.product_id in (PRO_CONTROLLER2_PID, PRO_CONTROLLER_PID, NSO_GAMECUBE_CONTROLLER_PID)
 
