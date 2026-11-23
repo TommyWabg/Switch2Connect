@@ -1,5 +1,5 @@
 # Switch 2 Connect
-### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, NSO GameCube Controller, and Mobapad M12 Pro Joy-Cons with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
+### The ultimate app to connect your Switch 2 Joy-Cons, Switch 2 Pro Controller, and NSO GameCube Controller with standard Bluetooth or ESP32-S3 N16R8 and seamlessly integrate them into the Windows gaming ecosystem.
 <p align="center">
  <a href="https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v3.4.exe"><img width="200" alt="icon" src="https://github.com/TommyWabg/Switch2Connect/blob/main/resources/images/icon.png" />
 </p>
@@ -73,11 +73,11 @@ If WinUHid is not installed or the installation is incomplete:
 * No auto-update support.
 
 #### Get Started With GitHub Version
-1. Download the [latest version](https://github.com/TommyWabg/Switch2Connect/releases/latest/) of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v1.7.exe)**.
+1. Download the [latest version](https://github.com/TommyWabg/Switch2Connect/releases/latest/) of **[Switch2Connect.exe](https://github.com/TommyWabg/Switch2Connect/releases/latest/download/Switch2Connect_v3.4.exe)**.
 2. Launch the app. If the WinUHid driver is not installed, a dialog will ask to install it. If you select the USBIP driver mode in the settings, a dialog will ask to install the USBIP driver. Click **Yes** and approve the administrator UAC prompt.
 3. Once the installation completes, the setup window will close automatically, and the main application will launch.
 4. Turn on your Switch 2 controller by holding the Sync button (or pressing any button if already paired). **Do not** pair controllers manually in Windows Bluetooth settings; the app uses automatic GATT discovery.
-6. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
+5. Use the settings panel at the bottom of the app to configure your preferred driver (WinUHid / ViGEmBus / USBIP) and controller layout, gyro sensitivity, and custom button mappings.
 
 ##
 
@@ -87,6 +87,7 @@ If WinUHid is not installed or the installation is incomplete:
 * **Low Latency Bluetooth Mode:** Configures Windows Bluetooth LE connections with the ThroughputOptimized mode to reduce the connection interval and controller input latency.
 * **ESP32-S3 N16R8 Low-Latency Connection:** Supports the ESP32-S3 N16R8 development board as a BLE bridge with polling rates up to 133Hz. The application provides firmware installation and repair, controller pairing through the SYNC button, and reconnection for controllers bonded to the bridge.
 * **Wired Controller Support:** Supports USB-connected Switch 2 Pro Controllers and NSO GameCube Controllers, with polling rates up to 500Hz. The **Wired Pro Controller** menu provides HidHide management, automatic discovery controls, and one-time manual scanning. For NSO GameCube Controller rumble, the application automatically selects between the available USB interfaces and falls back to the compatible path when necessary.
+* **Mobapad M12 Pro Support:** Supports Mobapad M12 Pro Joy-Cons over standard Bluetooth and the ESP32-S3 N16R8 bridge. M12 halves are detected automatically when connecting and support all Joy-Con 2 buttons, sticks, mouse mode, gyro, accelerometer, and rumble. An M12 half can be merged with a Joy-Con 2 of the opposite side.
 * **Multiple Driver and Emulation Backends:** Supports WinUHid, ViGEmBus, and USBIP backends. WinUHid provides Xbox One, PS4, and PS5 emulation; ViGEmBus provides Xbox 360 and PS4 emulation; USBIP provides USB-connected Switch 2 Pro Controller and DualSense emulation. The application detects missing or incomplete WinUHid and ViGEmBus installations and provides Install, Repair, and Uninstall actions. ViGEmBus can be downloaded and installed from the application after UAC authorization.
 * **Tabbed Settings Interface:** Organizes settings into Controller Mapping, Mode Shift Mapping, and Gyro Settings tabs.
 * **DualSense Audio Haptic Feedback:** The USBIP-based PS5 emulation mode exposes a four-channel audio playback endpoint for games that support DualSense audio haptics. It supports DualSense audio haptics, standard PS5 rumble, Xbox rumble translation, and adaptive-trigger feedback translated into independent HD Rumble output for the left and right triggers.
@@ -198,7 +199,8 @@ If WinUHid is not installed or the installation is incomplete:
 * **No Working NSO GameCube Controller Gyro:** Gyro data from the NSO GameCube Controller cannot be decoded correctly.
 * **No NSO GameCube Controller Rumble Brake & Strength Difference:** The Rumble Motor Brake command is not known, so PWM-based rumble strength control cannot be implemented correctly. Only basic rumble motor on/off control is currently implemented.
 * **No Switch 2 Joy-Con Charging Grip Back Buttons Support:** Back buttons on the Switch 2 Joy-Con Charging Grip are not supported.
-* **~~No Additional Controller Support:~~** ~~There are no plans for this fork to support any controller other than Nintendo's official Switch 2 controllers, including Switch 1 controllers and 3rd-party controllers.~~ With the release of the M12 Pro fix by DarkEslariate, the only current third-party controller support are the Mobapad M12 Pro Joy-Cons.
+* **No Additional Controller Support:** There are no plans for this fork to support any controller other than Nintendo's official Switch 2 controllers and Mobapad M12 Pro Joy-Cons, including Switch 1 controllers and other 3rd-party controllers.
+* **Mobapad M12 Pro Limitations:** The battery level always shows full, and no magnetometer data is available.
 
 ## System Requirements
 
@@ -276,3 +278,4 @@ Happy gaming, and thank you for your generous support!
 * **[SundayMoments/DS5_Bridge](https://github.com/SundayMoments/DS5_Bridge):** Main reference for DualSense audio endpoint HID descriptor.
 * **[JibbSmart/JoyShockLibrary](https://github.com/JibbSmart/JoyShockLibrary):** Reference for Switch 1 Joy-Cons gyro direction.
 * **[RyanCopley/NSO-GameCube-Controller-Pairing-App](https://github.com/RyanCopley/NSO-GameCube-Controller-Pairing-App):** Reference for all NSO GameCube Controller related features. Also a reference for BLE throughput optimized mode.
+* **[DarkEslariate/m12-pro-support](https://github.com/DarkEslariate/Switch2Connect/tree/m12-pro-support):** Mobapad M12 Pro Joy-Con support.
