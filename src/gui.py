@@ -97,7 +97,7 @@ print("This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'
 print("This is free software, and you are welcome to redistribute it")
 print("under certain conditions; type `show c' for details.")
 
-APP_VERSION = "v3.3"
+APP_VERSION = "v3.4"
 MAG_TESTER_BUILD_ENABLED = mag_tester_build_enabled()
 
 def _set_current_thread_priority(level):
@@ -1710,7 +1710,7 @@ class PlayerInfoBlock:
                     logger.info(f"Safe Disconnect: Disconnecting {c.device.address}...")
                     # Each step is bounded: a hung Bluetooth stack never answers.
                     try:
-                        await asyncio.wait_for(c.client.stop_notify(INPUT_REPORT_UUID), timeout=1.0)
+                        await asyncio.wait_for(c.client.stop_notify(getattr(c, "_active_input_uuid", INPUT_REPORT_UUID)), timeout=1.0)
                     except Exception:
                         pass
                     try:

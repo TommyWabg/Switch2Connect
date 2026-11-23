@@ -80,7 +80,7 @@ STARTUP_STATUS_WAKE_DELAY_SECONDS = 0.5
 STARTUP_STATUS_READ_WINDOW_SECONDS = 0.5
 
 ESP32S3_LABEL = "ESP32-S3 CDC"
-APP_FIRMWARE_VERSION = "2.4"
+APP_FIRMWARE_VERSION = "3.4"
 EXPECTED_FIRMWARE_PROFILE = "tinyusb_direct"
 EXPECTED_FIRMWARE_BUILD = "cdc_bridge_3"
 MAX_ESP32S3_CHANNELS = 8
@@ -91,6 +91,9 @@ NINTENDO_REPORT_SIZE = 64
 # callback so they aren't misparsed as controller input.
 INPUT_UUID_PREFIX = "ab7de9be"
 NSO_GAMECUBE_INPUT_UUID = "8261cba1-9435-420c-84d6-f0c75a2c8e4d"
+# Mobapad M12 Pro setup over the bridge ("m12 <ch> session|native <l|r>").  The
+# firmware answers with {"cmd":"m12","channel":N,"stage":...,"ok":0|1,...}.
+M12_STAGE_TIMEOUT_S = 2.0
 DEFAULT_STICK_CALIBRATION = bytes.fromhex("00 08 80 dc c5 5d dc c5 5d")
 
 @dataclass
@@ -193,6 +196,9 @@ class ESP32S3SerialClient:
         self._gatt_lock = threading.RLock()
         self._gatt_chars = {}
         self._gatt_done_channels = set()
+        # Latest "m12" setup reply per (channel, stage); see m12_setup_stage().
+        self._m12_condition = threading.Condition()
+        self._m12_results = {}
         self._write_lock = threading.Lock()
         # Shadow rumble publication must never block an Audio Haptic cadence
         # thread on USB CDC.  Keep one latest payload per channel and let a
@@ -225,6 +231,11 @@ class ESP32S3SerialClient:
     @property
     def supports_latest_rumble_shadow(self) -> bool:
         return bool(self.firmware_features.get("shadow_latest"))
+
+    @property
+    def supports_m12(self) -> bool:
+        """Firmware can run the Mobapad M12 Pro setup ("m12" command)."""
+        return bool(self.firmware_features.get("m12"))
 
     def _update_firmware_features(self, text) -> None:
         try:
@@ -498,6 +509,11 @@ class ESP32S3SerialClient:
                 if "r" in props_text:
                     properties.append("read")
                 service = self._norm_uuid(event.get("service", "ab7de9be-89fe-49ad-828f-118f09df7fd0"))
+                if channel in self._gatt_done_channels:
+                    # First characteristic of a new discovery on this channel: drop
+                    # the previous controller's characteristics.
+                    self._gatt_done_channels.discard(channel)
+                    self._gatt_chars.pop(channel, None)
                 self._gatt_chars.setdefault(channel, {})[handle] = {
                     "uuid": uuid,
                     "properties": properties,
@@ -525,6 +541,56 @@ class ESP32S3SerialClient:
         with self._gatt_lock:
             char = (self._gatt_chars.get(int(channel)) or {}).get(int(handle))
         return char.get("uuid") if char else None
+
+    def _handle_m12_event(self, event):
+        try:
+            channel = int(event.get("channel", -1))
+        except Exception:
+            return
+        stage = str(event.get("stage", ""))
+        with self._m12_condition:
+            self._m12_results[(channel, stage)] = dict(event)
+            self._m12_condition.notify_all()
+
+    def _wait_m12_result(self, channel, stage, timeout):
+        deadline = time.monotonic() + timeout
+        key = (int(channel), stage)
+        with self._m12_condition:
+            while key not in self._m12_results:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._m12_condition.wait(remaining)
+            return self._m12_results.pop(key)
+
+    async def m12_setup_stage(self, channel, stage, side=None, timeout=M12_STAGE_TIMEOUT_S):
+        """Run one Mobapad M12 Pro setup stage on the firmware and wait for its reply.
+
+        stage "session": FD2 CCCD off + session char 01 00.
+        stage "native":  vendor descriptor 85 00 + native CCCD on; afterwards the
+                         firmware forwards the native char (handle-tagged frames).
+        Returns the firmware's reply dict, or {"ok": 0, "reason": ...} on a timeout
+        or when the firmware has no M12 support.
+        """
+        channel = int(channel)
+        if not self.supports_m12:
+            return {"cmd": "m12", "channel": channel, "stage": stage, "ok": 0,
+                    "reason": "firmware_without_m12"}
+        command = f"m12 {channel} {stage}"
+        if stage == "native":
+            command += " l" if side == "l" else " r"
+        with self._m12_condition:
+            self._m12_results.pop((channel, stage), None)
+        if not self.send_command_line(command):
+            return {"cmd": "m12", "channel": channel, "stage": stage, "ok": 0,
+                    "reason": "write_failed"}
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, self._wait_m12_result, channel, stage, float(timeout))
+        if result is None:
+            return {"cmd": "m12", "channel": channel, "stage": stage, "ok": 0,
+                    "reason": "timeout"}
+        return result
 
     def channel_is_gamecube(self, channel):
         """Identify only the bridged NSO GameCube path from discovered GATT metadata."""
@@ -1031,6 +1097,12 @@ class ESP32S3SerialClient:
         else:
             text = text[start:]
         if text:
+            if '"cmd":"m12"' in text:
+                try:
+                    self._handle_m12_event(json.loads(text))
+                except Exception:
+                    logger.debug("Failed to parse ESP32-S3 M12 reply: %s", text, exc_info=True)
+                return
             if ('"cmd":"gatt_char"' in text or '"cmd":"gatt_done"' in text):
                 try:
                     self._handle_gatt_event(json.loads(text))
@@ -1269,6 +1341,19 @@ class ESP32S3ChannelClient:
 
     def is_gamecube_channel(self):
         return self.shared_client.channel_is_gamecube(self.channel)
+
+    @property
+    def supports_m12(self):
+        return self.shared_client.supports_m12
+
+    async def m12_prepare_session(self):
+        """M12 Pro: stop the silent FD2 stream and write 01 00 to the session char."""
+        return await self.shared_client.m12_setup_stage(self.channel, "session")
+
+    async def m12_enable_native(self, is_left):
+        """M12 Pro: write 85 00 to the native descriptor and subscribe the native char."""
+        return await self.shared_client.m12_setup_stage(
+            self.channel, "native", "l" if is_left else "r")
 
     async def disconnect(self):
         return

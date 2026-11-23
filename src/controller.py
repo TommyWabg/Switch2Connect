@@ -1193,6 +1193,10 @@ M12_NATIVE_INPUT_UUID_L = "cc1bbbb5-7354-4d32-a716-a81cb241a32a"
 M12_NATIVE_INPUT_UUID_R = "d5a9e01e-2ffc-4cca-b20c-8b67142bf442"
 M12_NATIVE_ENABLE_DESC_UUID = "679d5510-5a24-4dee-9557-95df80486ecb"
 
+
+class M12BridgeSetupError(RuntimeError):
+    """The ESP32-S3 bridge could not switch an M12 Pro to its native protocol."""
+
 # Commands and subcommands
 COMMAND_LEDS = 0x09
 SUBCOMMAND_LEDS_SET_PLAYER = 0x07
@@ -2168,21 +2172,6 @@ class Controller:
             }
             use_service_filter = getattr(self, "advertised_product_id", None) in switch2_pids
 
-            # A Joy-Con 2 in pairing mode must not have an old Windows-level bond: with
-            # one, it connects but only exposes the generic GAP/GATT services, and the
-            # recovery path below costs several seconds. Clear it up front instead.
-            # (Not for controllers reconnecting to this host - those are not in
-            # pairing mode and are left alone.)
-            if (not getattr(self, "paired_connection", False)
-                    and getattr(self, "advertised_product_id", None) in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID)):
-                pre_status = await self._windows_unpair_if_paired()
-                if pre_status.startswith("unpaired"):
-                    logger.info("Removed stale Windows pairing for %s before connecting (%s)",
-                                self.device.address, pre_status)
-                    await asyncio.sleep(0.5)
-                else:
-                    logger.debug("Windows pairing pre-check for %s: %s", self.device.address, pre_status)
-
             def make_client(services=None, cached_services=False, fresh_services=False):
                 kwargs = {"disconnected_callback": disconnected_callback}
                 if services is not None:
@@ -2221,7 +2210,14 @@ class Controller:
                 await self.client.connect(timeout=20.0)
                 return cache_applied
 
-            requested_services = [SW2_SERVICE_UUID, M12_SESSION_SERVICE_UUID] if use_service_filter else None
+            # Mobapad M12 Pro pads advertise the Joy-Con 2 PIDs and need their session
+            # service in the filtered GATT table; other Switch 2 pads keep the original filter.
+            if not use_service_filter:
+                requested_services = None
+            elif getattr(self, "advertised_product_id", None) in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID):
+                requested_services = [SW2_SERVICE_UUID, M12_SESSION_SERVICE_UUID]
+            else:
+                requested_services = [SW2_SERVICE_UUID]
             use_cached_services = bool(
                 requested_services
                 and getattr(self, "paired_connection", False)
@@ -5978,8 +5974,12 @@ class Controller:
 
             await self.client.start_notify(INPUT_REPORT_UUID, _std_input_callback)
 
+            # ESP32-S3 bridge: the firmware runs the M12 GATT writes ("m12" command,
+            # firmware feature "m12"); older firmware keeps the previous behaviour.
+            is_bridge = bool(getattr(self, "is_esp32s3_bridge", False))
+            bridge_m12 = is_bridge and bool(getattr(self.client, "supports_m12", False))
             if (product_id in (JOYCON2_LEFT_PID, JOYCON2_RIGHT_PID)
-                    and not getattr(self, "is_esp32s3_bridge", False)
+                    and (not is_bridge or bridge_m12)
                     and not getattr(self, "is_wired_usb", False)):
                 # Start every connect as "not an M12"; only the protocol switch below
                 # can mark it. GATT UUID presence alone is NOT used: real Joy-Con 2s
@@ -6009,11 +6009,23 @@ class Controller:
                         self.is_m12 = True
                         logger.info("Controller %s classified as Mobapad M12 Pro", device_address)
                         try:
-                            await self.client.stop_notify(INPUT_REPORT_UUID)
+                            await asyncio.wait_for(self.client.stop_notify(INPUT_REPORT_UUID), timeout=1.0)
                         except Exception:
                             pass
 
-                        if session_char is not None:
+                        if is_bridge:
+                            # FD2 CCCD off + session char 01 00, done by the firmware.
+                            res = await self.client.m12_prepare_session()
+                            if not res.get("ok"):
+                                # Same outcome as a failed WinRT setup: fail the
+                                # connect so the controller is retried.
+                                self.is_m12 = False
+                                raise M12BridgeSetupError(
+                                    f"M12 Pro session setup failed on bridge {device_address}: {res}")
+                            if res.get("warn"):
+                                logger.warning("M12 Pro session setup on bridge %s: %s", device_address, res)
+                            await asyncio.sleep(0.05)
+                        elif session_char is not None:
                             try:
                                 use_resp = "write" in session_char.properties
                                 await self.client.write_gatt_char(session_char.uuid, b"\x01\x00", response=use_resp)
@@ -6027,7 +6039,20 @@ class Controller:
                             except Exception as e:
                                 logger.debug("M12 Pro feature 0x37 sub %02x note: %s", sub_cmd, e)
 
-                        for d in getattr(native_char, "descriptors", ()):
+                        if is_bridge:
+                            # Descriptor 85 00 + native CCCD on; the firmware then
+                            # forwards the native char as handle-tagged frames.
+                            res = await self.client.m12_enable_native(is_left_pad)
+                            if not res.get("ok"):
+                                # Without the native stream the pad has no input at
+                                # all; fail the connect (like WinRT start_notify) so
+                                # it is retried instead of staying connected silent.
+                                self.is_m12 = False
+                                raise M12BridgeSetupError(
+                                    f"M12 Pro native input setup failed on bridge {device_address}: {res}")
+                            if res.get("warn"):
+                                logger.warning("M12 Pro native input setup on bridge %s: %s", device_address, res)
+                        for d in (() if is_bridge else getattr(native_char, "descriptors", ())):
                             if str(d.uuid).lower() == M12_NATIVE_ENABLE_DESC_UUID:
                                 try:
                                     await self.client.write_gatt_descriptor(d.handle, b"\x85\x00")
