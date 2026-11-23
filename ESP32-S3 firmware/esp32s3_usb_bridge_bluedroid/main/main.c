@@ -55,7 +55,7 @@
 
 static const char *TAG = "S3_BLUEDROID";
 
-#define APP_FIRMWARE_VERSION      "2.4"
+#define APP_FIRMWARE_VERSION      "3.4"
 #define EXPECTED_FIRMWARE_PROFILE "tinyusb_direct"
 #define EXPECTED_FIRMWARE_BUILD   "cdc_bridge_3"
 #define CDC_LINE_STATE_DTR        0x01
@@ -97,6 +97,40 @@ static const esp_bt_uuid_t UUID_RUMBLE_JOYCON_L =
 static const esp_bt_uuid_t UUID_CCCD =
     { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG } };
 
+// --- Mobapad M12 Pro (same UUIDs as the WinRT path in controller.py) ---
+// The M12 Pro halves advertise the Joy-Con 2 PIDs and expose the normal SW2 service,
+// but in "console" mode their input never arrives on FD2.  Instead the host switches
+// them to their own protocol: write 01 00 to the session char, send feature 0x37
+// init/enable on the normal command char, write 85 00 to a vendor descriptor on the
+// native input char, then subscribe to that native char.  The firmware only records
+// the handles here and runs the GATT writes when the host asks ("m12 <ch> ...");
+// the host decides whether a pad is an M12 (standard input silent + native char present).
+static const esp_bt_uuid_t UUID_M12_SESSION_CHAR =
+    UUID128(0x00,0xc5,0xaf,0x5d,0x19,0x64,0x4e,0x30,0x8f,0x51,0x19,0x56,0xf9,0x6b,0xd2,0x82);
+static const esp_bt_uuid_t UUID_M12_NATIVE_L =
+    UUID128(0xcc,0x1b,0xbb,0xb5,0x73,0x54,0x4d,0x32,0xa7,0x16,0xa8,0x1c,0xb2,0x41,0xa3,0x2a);
+static const esp_bt_uuid_t UUID_M12_NATIVE_R =
+    UUID128(0xd5,0xa9,0xe0,0x1e,0x2f,0xfc,0x4c,0xca,0xb2,0x0c,0x8b,0x67,0x14,0x2b,0xf4,0x42);
+static const esp_bt_uuid_t UUID_M12_ENABLE_DESC =
+    UUID128(0x67,0x9d,0x55,0x10,0x5a,0x24,0x4d,0xee,0x95,0x57,0x95,0xdf,0x80,0x48,0x6e,0xcb);
+
+// M12 setup steps (channel_t.m12_step).  Each GATT write waits for its completion
+// event before the next one is issued (no back-to-back writes, like the GCN drain).
+enum {
+    M12_IDLE = 0,
+    M12_FD2_OFF,       // "session": disable the silent FD2 CCCD (WinRT stop_notify parity)
+    M12_SESSION,       // "session": write 01 00 to the session char
+    M12_NATIVE_REG,    // "native":  waiting for REG_FOR_NOTIFY_EVT of the native char
+    M12_NATIVE_DESC,   // "native":  write 85 00 to the vendor enable descriptor
+    M12_NATIVE_CCCD,   // "native":  enable the native char's CCCD
+};
+// Non-fatal setup problems, reported to the host in the "m12" JSON "warn" field.
+#define M12_WARN_SESSION_WRITE  0x01   // session char write failed
+#define M12_WARN_NO_DESC        0x02   // native char has no 679d5510 descriptor
+#define M12_WARN_DESC_WRITE     0x04   // descriptor write failed
+#define M12_WARN_FD2_OFF        0x08   // FD2 CCCD disable failed
+#define INPUT_SRC_M12           3      // input_src value: M12 native char
+
 // --- per-controller channel: fixed slot, each owns one GATTC app interface ---
 typedef struct {
     esp_gatt_if_t gattc_if;  // assigned once at REG_EVT (channel == app_id); permanent
@@ -127,6 +161,15 @@ typedef struct {
     bool     cccd_draining;
     bool     cccd_input_ready;
     bool     cccd_ack_ready;
+    // Mobapad M12 Pro (see UUID_M12_*).  Handles are 0 when the char is absent.
+    uint16_t m12_native_l;       // cc1bbbb5… native input (left half)
+    uint16_t m12_native_r;       // d5a9e01e… native input (right half)
+    uint16_t m12_session_handle; // 00c5af5d…282 session char
+    bool     m12_session_rsp;    // session char supports write-with-response
+    uint8_t  m12_step;           // M12_* setup step (M12_IDLE when no setup runs)
+    uint8_t  m12_warn;           // M12_WARN_* bits of the current setup
+    uint16_t m12_native;         // native char chosen by "m12 <ch> native <l|r>"
+    uint16_t m12_wait_handle;    // attribute handle of the in-flight M12 write
 } channel_t;
 static channel_t s_ch[MAX_CH];
 
@@ -372,7 +415,7 @@ static void send_status_response(void) {
     char b[256];
     snprintf(b, sizeof(b),
         "{\"cmd\":\"status\",\"version\":\"%s\",\"profile\":\"%s\",\"build\":\"%s\","
-        "\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1,\"shadow_latest\":1,\"direct_rumble\":1,\"gatt_ready\":1}}\n",
+        "\"ble_channels\":%u,\"mac\":\"%s\",\"features\":{\"wrpair\":1,\"shadow\":1,\"shadow_latest\":1,\"direct_rumble\":1,\"gatt_ready\":1,\"m12\":1}}\n",
         APP_FIRMWARE_VERSION, EXPECTED_FIRMWARE_PROFILE, EXPECTED_FIRMWARE_BUILD,
         (unsigned)ch_active_mask(), s_own_mac);
     send_json(b);
@@ -488,6 +531,14 @@ static void do_conn(char *args) {
     s_ch[ch].cccd_draining = false;
     s_ch[ch].cccd_input_ready = false;
     s_ch[ch].cccd_ack_ready = false;
+    s_ch[ch].m12_native_l = 0;
+    s_ch[ch].m12_native_r = 0;
+    s_ch[ch].m12_session_handle = 0;
+    s_ch[ch].m12_session_rsp = false;
+    s_ch[ch].m12_step = M12_IDLE;
+    s_ch[ch].m12_warn = 0;
+    s_ch[ch].m12_native = 0;
+    s_ch[ch].m12_wait_handle = 0;
     {   // Diagnostic: which channel + how many links already live when this starts.
         char dbg[110];
         snprintf(dbg, sizeof(dbg),
@@ -749,6 +800,7 @@ static void do_wrpair(char *args) {  // wrpair <ch_l> <ch_r> <kind> <hex_l> <hex
     wr_one(atoi(cl), k[0], bl, parse_hex(hl, bl, sizeof(bl)));
     wr_one(atoi(cr), k[0], br, parse_hex(hr, br, sizeof(br)));
 }
+static void do_m12(char *args);   // Mobapad M12 Pro setup (defined with the GATT helpers)
 static void handle_command(char *cmd) {
     if (strncmp(cmd, "status", 6) == 0)         { s_request_status = true; }
     else if (strcmp(cmd, "heartbeat") == 0)     {
@@ -783,6 +835,7 @@ static void handle_command(char *cmd) {
     else if (strncmp(cmd, "auto", 4) == 0)      { /* host-driven conn only */ }
     else if (strncmp(cmd, "conn ", 5) == 0)     { do_conn(cmd + 5); }
     else if (strncmp(cmd, "inputsrc ", 9) == 0) { do_inputsrc(cmd + 9); }
+    else if (strncmp(cmd, "m12 ", 4) == 0)      { do_m12(cmd + 4); }
     else if (strncmp(cmd, "disc ", 5) == 0)     { do_disc(cmd + 5); }
     else if (strncmp(cmd, "wrpair ", 7) == 0)   { do_wrpair(cmd + 7); }
     else if (strncmp(cmd, "wr ", 3) == 0)       { do_wr(cmd + 3); }
@@ -928,7 +981,23 @@ static void fail_gcn_ready(int ch, uint16_t handle, const char *reason) {
     portEXIT_CRITICAL(&s_disc_mux);
     kick_disc_queue();
 }
-static void scan_service_chars(int ch, uint16_t start, uint16_t end, bool is_sw2) {
+// Record a Mobapad M12 Pro characteristic.  Returns true when it is one of them.
+static bool m12_match_char(int ch, const esp_gattc_char_elem_t *e) {
+    if (memcmp(&e->uuid, &UUID_M12_NATIVE_L, sizeof(e->uuid)) == 0) {
+        s_ch[ch].m12_native_l = e->char_handle; return true;
+    }
+    if (memcmp(&e->uuid, &UUID_M12_NATIVE_R, sizeof(e->uuid)) == 0) {
+        s_ch[ch].m12_native_r = e->char_handle; return true;
+    }
+    if (memcmp(&e->uuid, &UUID_M12_SESSION_CHAR, sizeof(e->uuid)) == 0) {
+        s_ch[ch].m12_session_handle = e->char_handle;
+        s_ch[ch].m12_session_rsp = (e->properties & ESP_GATT_CHAR_PROP_BIT_WRITE) != 0;
+        return true;
+    }
+    return false;
+}
+static void scan_service_chars(int ch, uint16_t start, uint16_t end, bool is_sw2,
+                               const esp_bt_uuid_t *svc_uuid) {
     uint16_t count = 0;
     if (esp_ble_gattc_get_attr_count(s_ch[ch].gattc_if, s_ch[ch].conn_id, ESP_GATT_DB_CHARACTERISTIC,
                                      start, end, 0, &count) != ESP_OK || count == 0) return;
@@ -938,11 +1007,16 @@ static void scan_service_chars(int ch, uint16_t start, uint16_t end, bool is_sw2
     if (esp_ble_gattc_get_all_char(s_ch[ch].gattc_if, s_ch[ch].conn_id, start, end, elems, &got, 0) == ESP_OK)
         for (int i = 0; i < got; i++) {
             match_and_store_char(ch, &elems[i].uuid, elems[i].char_handle);
-            if (is_sw2) {
+            // M12 chars are published to the host from whatever service holds them,
+            // so the host's GATT view (MockService) can see them like WinRT does.
+            bool is_m12 = m12_match_char(ch, &elems[i]);
+            if (is_sw2 || is_m12) {
                 char uuid_s[40];
+                char svc_s[40];
                 char props[8];
                 int pi = 0;
                 uuid_to_str(&elems[i].uuid, uuid_s, sizeof(uuid_s));
+                uuid_to_str(svc_uuid, svc_s, sizeof(svc_s));
                 if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) props[pi++] = 'n';
                 if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) props[pi++] = 'w';
                 if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_WRITE) props[pi++] = 'W';
@@ -951,11 +1025,11 @@ static void scan_service_chars(int ch, uint16_t start, uint16_t end, bool is_sw2
 
                 char msg[220];
                 snprintf(msg, sizeof(msg),
-                         "{\"cmd\":\"gatt_char\",\"channel\":%d,\"service\":\"ab7de9be-89fe-49ad-828f-118f09df7fd0\",\"handle\":%u,\"uuid\":\"%s\",\"props\":\"%s\"}\n",
-                         ch, elems[i].char_handle, uuid_s, props);
+                         "{\"cmd\":\"gatt_char\",\"channel\":%d,\"service\":\"%s\",\"handle\":%u,\"uuid\":\"%s\",\"props\":\"%s\"}\n",
+                         ch, svc_s, elems[i].char_handle, uuid_s, props);
                 out_json(msg);
 
-                if (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY)
+                if (is_sw2 && (elems[i].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY))
                     note_notify_handle(ch, elems[i].char_handle);
             }
         }
@@ -1045,6 +1119,153 @@ static void publish_channel_ready(int ch, const char *event_name) {
     out_json(b);
     restore_widened_links();
     if (s_scan_mode) s_resume_scan = true;
+}
+
+// --- Mobapad M12 Pro setup (host-driven, see do_m12) ---
+static uint16_t descr_handle(int ch, uint16_t char_handle, esp_bt_uuid_t uuid) {
+    if (char_handle == 0) return 0;
+    esp_gattc_descr_elem_t descr;
+    uint16_t got = 1;
+    if (esp_ble_gattc_get_descr_by_char_handle(s_ch[ch].gattc_if, s_ch[ch].conn_id, char_handle,
+                                                uuid, &descr, &got) == ESP_OK && got > 0)
+        return descr.handle;
+    return 0;
+}
+static void m12_report(int ch, const char *stage, bool ok, const char *reason) {
+    char b[200];
+    snprintf(b, sizeof(b),
+        "{\"cmd\":\"m12\",\"channel\":%d,\"stage\":\"%s\",\"ok\":%d,\"warn\":%u,"
+        "\"input\":%u,\"session\":%u,\"reason\":\"%s\"}\n",
+        ch, stage, ok ? 1 : 0, (unsigned)s_ch[ch].m12_warn, (unsigned)s_ch[ch].input_handle,
+        (unsigned)s_ch[ch].m12_session_handle, reason ? reason : "");
+    out_json(b);
+}
+static void m12_fail(int ch, const char *stage, const char *reason) {
+    s_ch[ch].m12_step = M12_IDLE;
+    s_ch[ch].m12_wait_handle = 0;
+    m12_report(ch, stage, false, reason);
+}
+static bool m12_write_descr(int ch, uint16_t dh, uint8_t b0, uint8_t b1) {
+    uint8_t v[2] = { b0, b1 };
+    s_ch[ch].m12_wait_handle = dh;
+    if (esp_ble_gattc_write_char_descr(s_ch[ch].gattc_if, s_ch[ch].conn_id, dh, sizeof(v), v,
+                                       ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE) == ESP_OK)
+        return true;
+    s_ch[ch].m12_wait_handle = 0;
+    return false;
+}
+// Issue the GATT write of the current step.  A step with nothing to do (or whose write
+// cannot be queued) records a warning where the WinRT path would just log, and moves on.
+static void m12_run(int ch) {
+    channel_t *c = &s_ch[ch];
+    for (;;) {
+        switch (c->m12_step) {
+        case M12_FD2_OFF: {
+            uint16_t dh = descr_handle(ch, c->fd2_handle, UUID_CCCD);
+            if (dh && m12_write_descr(ch, dh, 0x00, 0x00)) return;
+            if (dh) c->m12_warn |= M12_WARN_FD2_OFF;
+            c->m12_step = M12_SESSION;
+            continue;
+        }
+        case M12_SESSION: {
+            if (c->m12_session_handle) {
+                uint8_t v[2] = { 0x01, 0x00 };
+                c->m12_wait_handle = c->m12_session_handle;
+                if (esp_ble_gattc_write_char(c->gattc_if, c->conn_id, c->m12_session_handle,
+                        sizeof(v), v,
+                        c->m12_session_rsp ? ESP_GATT_WRITE_TYPE_RSP : ESP_GATT_WRITE_TYPE_NO_RSP,
+                        ESP_GATT_AUTH_REQ_NONE) == ESP_OK)
+                    return;
+                c->m12_warn |= M12_WARN_SESSION_WRITE;
+            }
+            // WinRT skips the session write silently when the char is absent.
+            c->m12_step = M12_IDLE;
+            c->m12_wait_handle = 0;
+            m12_report(ch, "session", true, c->m12_session_handle ? "" : "no_session_char");
+            return;
+        }
+        case M12_NATIVE_DESC: {
+            uint16_t dh = descr_handle(ch, c->m12_native, UUID_M12_ENABLE_DESC);
+            if (dh && m12_write_descr(ch, dh, 0x85, 0x00)) return;
+            c->m12_warn |= dh ? M12_WARN_DESC_WRITE : M12_WARN_NO_DESC;
+            c->m12_step = M12_NATIVE_CCCD;
+            continue;
+        }
+        case M12_NATIVE_CCCD: {
+            uint16_t dh = descr_handle(ch, c->m12_native, UUID_CCCD);
+            if (dh && m12_write_descr(ch, dh, 0x01, 0x00)) return;
+            m12_fail(ch, "native", dh ? "cccd_write_not_queued" : "no_cccd");
+            return;
+        }
+        default:
+            return;
+        }
+    }
+}
+// Completion of the in-flight M12 write (WRITE_CHAR_EVT / WRITE_DESCR_EVT).
+static void m12_write_done(int ch, esp_gatt_status_t status) {
+    channel_t *c = &s_ch[ch];
+    c->m12_wait_handle = 0;
+    switch (c->m12_step) {
+    case M12_FD2_OFF:
+        if (status != ESP_GATT_OK) c->m12_warn |= M12_WARN_FD2_OFF;
+        c->m12_step = M12_SESSION;
+        m12_run(ch);
+        break;
+    case M12_SESSION:
+        if (status != ESP_GATT_OK) c->m12_warn |= M12_WARN_SESSION_WRITE;
+        c->m12_step = M12_IDLE;
+        m12_report(ch, "session", true, "");
+        break;
+    case M12_NATIVE_DESC:
+        if (status != ESP_GATT_OK) c->m12_warn |= M12_WARN_DESC_WRITE;
+        c->m12_step = M12_NATIVE_CCCD;
+        m12_run(ch);
+        break;
+    case M12_NATIVE_CCCD:
+        if (status != ESP_GATT_OK) { m12_fail(ch, "native", "cccd_write_failed"); break; }
+        // Forward the native stream from now on.  NOTIFY_EVT tags it with its handle
+        // (CDC v2 frame) so the host routes it to the native-UUID callback.
+        c->input_handle = c->m12_native;
+        c->input_src = INPUT_SRC_M12;
+        c->m12_step = M12_IDLE;
+        m12_report(ch, "native", true, "");
+        break;
+    default:
+        break;
+    }
+}
+// m12 <ch> session        -> FD2 CCCD off, session char 01 00          -> {"cmd":"m12","stage":"session",...}
+// m12 <ch> native <l|r>   -> descriptor 85 00, native CCCD on, forward -> {"cmd":"m12","stage":"native",...}
+// The host sends the feature 0x37 init/enable commands (normal "wr c") between the two.
+static void do_m12(char *args) {
+    char *save = NULL;
+    char *ch_s = strtok_r(args, " ", &save);
+    char *stage_s = strtok_r(NULL, " ", &save);
+    char *side_s = strtok_r(NULL, " ", &save);
+    if (!ch_s || !stage_s) return;
+    int ch = atoi(ch_s);
+    if (ch < 0 || ch >= MAX_CH) return;
+    bool native = (strcmp(stage_s, "native") == 0);
+    if (!native && strcmp(stage_s, "session") != 0) return;
+    const char *stage = native ? "native" : "session";
+    if (!s_ch[ch].used || !s_ch[ch].ready) { m12_report(ch, stage, false, "not_ready"); return; }
+    s_ch[ch].m12_wait_handle = 0;
+    if (!native) {
+        s_ch[ch].m12_warn = 0;
+        s_ch[ch].m12_step = M12_FD2_OFF;
+        m12_run(ch);
+        return;
+    }
+    if (!side_s || (side_s[0] != 'l' && side_s[0] != 'r')) { m12_fail(ch, stage, "bad_side"); return; }
+    uint16_t h = (side_s[0] == 'l') ? s_ch[ch].m12_native_l : s_ch[ch].m12_native_r;
+    if (!h) { m12_fail(ch, stage, "no_native_char"); return; }
+    s_ch[ch].m12_native = h;
+    s_ch[ch].m12_step = M12_NATIVE_REG;
+    // Bluedroid only delivers NOTIFY_EVT for registered handles.  The descriptor and
+    // CCCD writes start from REG_FOR_NOTIFY_EVT (registration is processed first).
+    if (esp_ble_gattc_register_for_notify(s_ch[ch].gattc_if, s_ch[ch].bda, h) != ESP_OK)
+        m12_fail(ch, stage, "register_failed");
 }
 
 static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
@@ -1174,7 +1395,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         const esp_bt_uuid_t *su = &param->search_res.srvc_id.uuid;
         bool is_sw2 = (su->len == ESP_UUID_LEN_128 &&
                        memcmp(su->uuid.uuid128, UUID_SVC_SW2.uuid.uuid128, ESP_UUID_LEN_128) == 0);
-        scan_service_chars(ch, param->search_res.start_handle, param->search_res.end_handle, is_sw2);
+        scan_service_chars(ch, param->search_res.start_handle, param->search_res.end_handle, is_sw2, su);
         break;
     }
 
@@ -1189,6 +1410,12 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                  s_ch[ch].fd2_handle, s_ch[ch].legacy_handle,
                  s_ch[ch].ack_handle, s_ch[ch].cmd_handle, s_ch[ch].rumble_handle);
         out_debug(b);
+        if (s_ch[ch].m12_native_l || s_ch[ch].m12_native_r || s_ch[ch].m12_session_handle) {
+            snprintf(b, sizeof(b), "M12 chars ch=%d native_l=0x%04x native_r=0x%04x session=0x%04x(rsp=%d)",
+                     ch, s_ch[ch].m12_native_l, s_ch[ch].m12_native_r,
+                     s_ch[ch].m12_session_handle, s_ch[ch].m12_session_rsp);
+            out_debug(b);
+        }
         snprintf(b, sizeof(b), "{\"cmd\":\"gatt_done\",\"channel\":%d}\n", ch);
         out_json(b);
         enable_notifications(ch);
@@ -1197,6 +1424,15 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
         uint16_t h = param->reg_for_notify.handle;
+        if (s_ch[ch].m12_step == M12_NATIVE_REG && h == s_ch[ch].m12_native) {
+            if (param->reg_for_notify.status != ESP_GATT_OK) {
+                m12_fail(ch, "native", "register_failed");
+            } else {
+                s_ch[ch].m12_step = M12_NATIVE_DESC;
+                m12_run(ch);
+            }
+            break;
+        }
         // Non-GCN: enable this char's CCCD immediately (unchanged).  GCN channels enable every
         // SW2 notify CCCD via the sequential drain instead (start_cccd_drain), so skip here to
         // avoid issuing a descriptor write on top of the drain's in-flight write.
@@ -1227,7 +1463,9 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         } else if (param->notify.handle == s_ch[ch].input_handle) {
             portENTER_CRITICAL(&s_in_mux);
             s_in_shadow[ch].ch = ch; s_in_shadow[ch].len = len;
-            s_in_shadow[ch].handle = 0;
+            // M12 native input goes out as a handle-tagged (v2) frame so the host
+            // routes it by UUID; FD2/legacy input keeps the plain frame.
+            s_in_shadow[ch].handle = (s_ch[ch].input_src == INPUT_SRC_M12) ? param->notify.handle : 0;
             memcpy(s_in_shadow[ch].data, param->notify.value, len);
             s_in_dirty[ch] = true;
             portEXIT_CRITICAL(&s_in_mux);
@@ -1239,6 +1477,11 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     }
 
     case ESP_GATTC_WRITE_DESCR_EVT:
+        if (s_ch[ch].m12_step != M12_IDLE && s_ch[ch].m12_wait_handle != 0 &&
+                param->write.handle == s_ch[ch].m12_wait_handle) {
+            m12_write_done(ch, param->write.status);
+            break;
+        }
         if (s_ch[ch].cccd_draining && s_ch[ch].cccd_idx < s_ch[ch].notify_count) {
             uint16_t completed = s_ch[ch].notify_handles[s_ch[ch].cccd_idx];
             if (param->write.status != ESP_GATT_OK && gcn_required_cccd(ch, completed)) {
@@ -1270,6 +1513,11 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         break;
 
     case ESP_GATTC_WRITE_CHAR_EVT:
+        if (s_ch[ch].m12_step == M12_SESSION && s_ch[ch].m12_wait_handle != 0 &&
+                param->write.handle == s_ch[ch].m12_wait_handle) {
+            m12_write_done(ch, param->write.status);
+            break;
+        }
         if (param->write.handle == s_ch[ch].rumble_handle &&
                 param->write.status != ESP_GATT_OK) {
             portENTER_CRITICAL(&s_rumble_mux);
