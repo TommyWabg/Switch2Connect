@@ -1595,14 +1595,46 @@ class PlayerInfoBlock:
                         CONFIG.save_config()
             self.window.force_refresh_player_slots()
 
+    @staticmethod
+    def _is_m12(controller):
+        """True for a Mobapad M12 Pro half (same PID as a Joy-Con 2, flagged at connect time)."""
+        return controller is not None and bool(getattr(controller, "is_m12", False))
+
+    @staticmethod
+    def _first_image(*candidates):
+        for img in candidates:
+            if img is not None:
+                return img
+        return None
+
     def _update_controller_image(self):
         if self.current_vc is None: return
+        horizontal = self.current_vc.hold_mode == "Horizontal"
         if not self.current_vc.is_single():
-            image = self.joycon2leftandright
+            left_m12 = self._is_m12(self.get_left_controller())
+            right_m12 = self._is_m12(self.get_right_controller())
+            if left_m12 and right_m12:
+                image = self._first_image(self.m12leftandright, self.joycon2leftandright)
+            elif left_m12:
+                image = self._first_image(self.m12leftjoycon2right, self.joycon2leftandright)
+            elif right_m12:
+                image = self._first_image(self.m12rightjoycon2left, self.joycon2leftandright)
+            else:
+                image = self.joycon2leftandright
         elif self.current_vc.is_single_joycon_right():
-            image = self.joycon2right_sideway if self.current_vc.hold_mode == "Horizontal" else self.joycon2right_vertical
+            if self._is_m12(self.current_vc.controllers[0]):
+                image = self._first_image(
+                    self.m12right_sideway if horizontal else self.m12right_vertical,
+                    self.joycon2right_sideway if horizontal else self.joycon2right_vertical)
+            else:
+                image = self.joycon2right_sideway if horizontal else self.joycon2right_vertical
         elif self.current_vc.is_single_joycon_left():
-            image = self.joycon2left_sideway if self.current_vc.hold_mode == "Horizontal" else self.joycon2left_vertical
+            if self._is_m12(self.current_vc.controllers[0]):
+                image = self._first_image(
+                    self.m12left_sideway if horizontal else self.m12left_vertical,
+                    self.joycon2left_sideway if horizontal else self.joycon2left_vertical)
+            else:
+                image = self.joycon2left_sideway if horizontal else self.joycon2left_vertical
         elif len(self.current_vc.controllers) > 0 and getattr(self.current_vc.controllers[0].controller_info, 'product_id', 0) == NSO_GAMECUBE_CONTROLLER_PID:
             image = self.gamecubecontroller
         else:
@@ -1821,6 +1853,38 @@ class PlayerInfoBlock:
             self.joycon2left_vertical = self.joycon2left_sideway
         self.procontroller2 = load_img("images/procontroller2.png")
         self.gamecubecontroller = load_img("images/nsogamecubecontroller.png")
+
+        # Mobapad M12 Pro artwork. The full-size M12 PNGs are ~930px tall, so they are
+        # fitted to the same on-screen footprint as the Joy-Con images (130 base px on
+        # the long edge) instead of being scaled by the usual 1:1 factor. If any file is
+        # missing the attribute is None and _update_controller_image falls back to the
+        # regular Joy-Con picture.
+        def load_m12_img(path, fit="height", base=130):
+            try:
+                img = Image.open(get_resource(path))
+                orig_w, orig_h = img.size
+                if fit == "width":
+                    w = _scaled_px(base, scale=sf)
+                    h = max(1, int(round(orig_h * w / orig_w)))
+                else:
+                    h = _scaled_px(base, scale=sf)
+                    w = max(1, int(round(orig_w * h / orig_h)))
+                img = img.resize((w, h), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
+                return ImageTk.PhotoImage(img)
+            except Exception as e:
+                logger.warning(f"M12 image {path} unavailable, using Joy-Con artwork instead: {e}")
+                return None
+
+        self.m12left_vertical = load_m12_img("images/m12left.png")
+        self.m12right_vertical = load_m12_img("images/m12right.png")
+        self.m12left_sideway = load_m12_img("images/m12left_sideway.png", fit="width")
+        self.m12right_sideway = load_m12_img("images/m12right_sideway.png", fit="width")
+        self.m12leftandright = load_m12_img("images/m12leftandright.png")
+        # Mixed merged pairs, named after which half is the M12:
+        #   m12leftjoycon2right = M12 left + normal Joy-Con 2 right
+        #   m12rightjoycon2left = normal Joy-Con 2 left + M12 right
+        self.m12leftjoycon2right = load_m12_img("images/m12leftjoycon2right.png")
+        self.m12rightjoycon2left = load_m12_img("images/m12rightjoycon2left.png")
         
         bat_w, bat_h = _scaled_px(28, scale=sf), _scaled_px(14, scale=sf)
         self.battery_h = load_img("images/battery_h.png", bat_w, bat_h)
