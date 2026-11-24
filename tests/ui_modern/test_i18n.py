@@ -51,9 +51,9 @@ def test_chinese_settings_and_lazy_pages(app, pump, isolated_preferences):
         picker = OptionPicker(options, choose=chosen.append, parent=window)
         picker.show_at(window.profile)
         picker.search.setText("默认")
-        assert picker.buttons["Default"].isEnabled()
-        assert not picker.buttons["None"].isEnabled()
-        picker.buttons["Default"].click()
+        assert not picker.items["Default"].isHidden()
+        assert picker.items["None"].isHidden()
+        picker.choose_item(picker.tree.currentItem())
         assert chosen == ["Default"]
         assert i18n.tr("Unrecognized diagnostic") == "Unrecognized diagnostic"
         assert QDialogButtonBox(QDialogButtonBox.Close).button(QDialogButtonBox.Close).text() != "Close"

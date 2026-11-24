@@ -3,7 +3,8 @@ from ...i18n import tr
 from ...widgets.changes import apply_change, show_error
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QHBoxLayout
-from qfluentwidgets import BodyLabel, PushButton, ComboBox, ProgressBar, qconfig, isDarkTheme
+from ...widgets.controls import ComboBox
+from qfluentwidgets import BodyLabel, PushButton, ProgressBar, FluentStyleSheet
 from app_core import events
 from ...qt_bridge import BusBridge, call_core
 from ...widgets.common import SettingsGroup, Segments
@@ -16,7 +17,7 @@ class FirmwareManagerDialog(QDialog):
         self.core, self.toast = core, toast
         self.setWindowTitle(tr('ESP32-S3 firmware manager')); self.resize(640, 460)
         self.setObjectName('firmwareManager')
-        qconfig.themeChangedFinished.connect(self.refresh_surface); self.refresh_surface()
+        FluentStyleSheet.DIALOG.apply(self)
         self.can_close = True; self.awaiting_replug = False; self.busy = False
         self.session_done = False; self.verified_replug = False
         box = QVBoxLayout(self); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(16)
@@ -49,9 +50,6 @@ class FirmwareManagerDialog(QDialog):
         call_core(core.esp32.port_mode, on_result=self.apply_mode)
         call_core(core.esp32.firmware_session, on_result=self.apply_session)
         self.refresh_ports()
-
-    def refresh_surface(self):
-        self.setStyleSheet('QDialog#firmwareManager { background-color: ' + ('#202020' if isDarkTheme() else '#f3f3f3') + '; }')
 
     def on_bus_event(self, topic, value):
         if topic == events.ESP32_STATE_CHANGED:

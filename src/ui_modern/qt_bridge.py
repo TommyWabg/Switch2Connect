@@ -6,7 +6,8 @@ import logging
 from .i18n import tr
 from PySide6.QtCore import QObject, Signal, Slot, Qt, QThread, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
-from qfluentwidgets import MessageBox, MessageBoxBase, LineEdit, ComboBox, CheckBox, BodyLabel, ProgressBar
+from .widgets.controls import ComboBox
+from qfluentwidgets import MessageBox, MessageBoxBase, LineEdit, CheckBox, BodyLabel, ProgressBar
 from app_core import events
 
 

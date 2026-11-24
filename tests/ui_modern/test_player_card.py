@@ -36,7 +36,7 @@ def test_visible_merge_selection_target_split_and_hold(app, pump):
     assert card.ping.geometry().right() < card.merge.geometry().left()
     assert card.merge.geometry().right() < card.more.geometry().left()
     card.merge.click(); assert calls[-1] == ("merge_select", (0, 12))
-    card.hold.setCurrentItem("Horizontal"); assert calls[-1] == ("set_hold_mode", (0, 12), "Horizontal")
+    card.hold.activated.emit(card.hold.findData("Horizontal")); assert calls[-1] == ("set_hold_mode", (0, 12), "Horizontal")
     card.update_snapshot(replace(slot, pending_merge_index=1, merge_target=True))
     assert card.merge.text() == "Merge" and "#e88724" in card.styleSheet()
     card.update_snapshot(replace(slot, pending_merge_index=None, is_merged_pair=True, split_available=True, hold_mode_available=False))

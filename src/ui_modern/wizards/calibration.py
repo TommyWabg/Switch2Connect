@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen
 from PySide6.QtWidgets import QDialog, QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (TitleLabel, BodyLabel, CaptionLabel, PushButton,
-                           PrimaryPushButton, ProgressBar, ToolTipFilter, isDarkTheme, qconfig)
+                           PrimaryPushButton, ProgressBar, ToolTipFilter, FluentStyleSheet)
 from ..qt_bridge import BusBridge, call_core
 from ..widgets.common import SettingsGroup
 
@@ -63,10 +63,7 @@ class SessionDialog(QDialog):
         self.finished.connect(self._finish)
         self.auto_close = QTimer(self); self.auto_close.setSingleShot(True); self.auto_close.setInterval(3000)
         self.auto_close.timeout.connect(self.accept)
-        qconfig.themeChangedFinished.connect(self.refresh_theme); self.refresh_theme()
-
-    def refresh_theme(self):
-        self.setStyleSheet("QDialog { background: " + ("#202020" if isDarkTheme() else "#f3f3f3") + "; }")
+        FluentStyleSheet.DIALOG.apply(self)
 
     def attach(self, session_id):
         if self._closed:

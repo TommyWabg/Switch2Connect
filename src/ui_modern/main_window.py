@@ -4,7 +4,7 @@ from PySide6.QtGui import QAction, QIcon, QGuiApplication, QCursor
 from shiboken6 import isValid
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QSystemTrayIcon, QMenu
 from qfluentwidgets import (FluentWindow, FluentIcon, NavigationItemPosition, BodyLabel,
-                           PushButton, TransparentToolButton, RoundMenu, InfoBar, InfoBarPosition, IndeterminateProgressRing, qconfig, isDarkTheme)
+                           PushButton, DropDownPushButton, TransparentToolButton, RoundMenu, CheckableMenu, MenuIndicatorType, InfoBar, InfoBarPosition, IndeterminateProgressRing, qconfig, isDarkTheme)
 from app_core import events
 from app_core.models import SettingsState
 from .qt_bridge import BusBridge, call_core
@@ -28,7 +28,7 @@ class MainWindow(FluentWindow):
         self.bridge = BusBridge(core.bus, self)
         self.bridge.event.connect(self.apply_event)
         self.status = BodyLabel(tr("Connecting…"), self.titleBar)
-        self.profile = PushButton(tr("Profile"), self.titleBar)
+        self.profile = DropDownPushButton(tr("Profile"), self.titleBar)
         self.task_indicator = IndeterminateProgressRing(self.titleBar); self.task_indicator.setFixedSize(18, 18); self.task_indicator.hide()
         self.window_menu = TransparentToolButton(FluentIcon.MORE, self.titleBar); self.window_menu.setAccessibleName(tr("More"))
         for widget in (self.status, self.profile, self.task_indicator, self.window_menu):
@@ -156,7 +156,8 @@ class MainWindow(FluentWindow):
             button.clicked.connect(restore)
             bar.addWidget(button)
     def profile_menu(self):
-        menu = RoundMenu(parent=self)
+        menu = CheckableMenu(parent=self.profile, indicatorType=MenuIndicatorType.RADIO)
+        menu.setAttribute(Qt.WA_DeleteOnClose)
         state = getattr(self, "profiles_state", None)
         for name in state.names if state else ():
             action = QAction(name, menu); action.setCheckable(True); action.setChecked(name == state.active)
@@ -169,7 +170,8 @@ class MainWindow(FluentWindow):
         if not result.ok:
             self.toast(result.reason or "Could not switch profile.", "warning")
     def show_window_menu(self):
-        menu = RoundMenu(parent=self); action = QAction(tr("Hide to tray"), menu)
+        menu = RoundMenu(parent=self.window_menu); menu.setAttribute(Qt.WA_DeleteOnClose)
+        action = QAction(tr("Hide to tray"), menu)
         action.triggered.connect(self.hide_to_tray); menu.addAction(action)
         self._window_menu = menu; menu.exec(self.window_menu.mapToGlobal(self.window_menu.rect().bottomLeft()))
     def save_placement(self):

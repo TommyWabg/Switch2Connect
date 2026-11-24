@@ -146,7 +146,11 @@ def test_checklists_import_export(setup_page, pump, monkeypatch):
     assert called(core, 'profiles.do_import', ('profiles.yaml', ('Imported',), True, True))
     page.export_profiles(); pump(); page.checklist.accept(); pump(timeout=.3)
     assert called(core, 'profiles.export', ('profiles.yaml', ('Default', 'Gaming'), False))
-    dialog = ChecklistDialog(ImportPreview('p.yaml', ('A',), True), True, page)
+    dialog = ChecklistDialog(ImportPreview('p.yaml', ('A', 'B'), True), True, page)
+    dialog.checks['B'].setChecked(False)
+    assert dialog.select_all.checkState() == Qt.PartiallyChecked
+    dialog.select_all.click()
+    assert dialog.selected() == ('A', 'B')
     dialog.select_all.setChecked(False); assert not dialog.yesButton.isEnabled()
     dialog.controller.setChecked(True); assert dialog.yesButton.isEnabled()
     dialog.reject()
@@ -171,11 +175,11 @@ def test_settings_driver_controls_and_app(setup_page, pump):
     page, core, toasts = setup_page(SettingsPage)
     for name in ('WinUHid', 'USBIP', 'HidHide'): page.driver_rows[name][2].click()
     core.driver_state = replace(core.driver_state, driver_type='ViGEmBus'); page.apply_driver(core.driver_state)
-    page.driver_rows['ViGEmBus'][2].click(); page.mouse.click()
+    page.driver_rows['ViGEmBus'][2].click()
     page.auto_scan.setChecked(True); page.manual_scan.click(); page.hidhide.setChecked(True); page.hidhide_uninstall.click()
     page.startup.setChecked(True); page.minimized.setChecked(True); page.power.setCurrentItem('Auto'); pump()
     for method in ('on_winuhid_manager_driver_action', 'on_vigembus_driver_action', 'on_usbip_btn_clicked', 'on_hidhide_button',
-                   'toggle_mouse_output', 'toggle_wired_auto_scan', 'manual_wired_scan', 'toggle_hidhide_active'):
+                   'toggle_wired_auto_scan', 'manual_wired_scan', 'toggle_hidhide_active'):
         assert called(core, 'drivers.' + method)
     assert called(core, 'settings.set_run_at_startup', (True,)) and called(core, 'settings.set_start_minimized', (True,))
     assert called(core, 'settings.set_power_saving_mode', ('Auto',))
@@ -184,9 +188,10 @@ def test_settings_driver_controls_and_app(setup_page, pump):
     assert not page.manual_scan.isEnabled()
 
 
-def test_keyboard_dropdown_commits_only_a_new_choice(setup_page, pump):
+@pytest.mark.parametrize("device", ["keyboard", "mouse"])
+def test_backend_dropdown_commits_only_a_new_choice(setup_page, pump, device):
     page, core, toasts = setup_page(SettingsPage)
-    combo = page.keyboard
+    combo = getattr(page, device)
     page.ensureWidgetVisible(combo)
 
     def choose(index):
@@ -194,19 +199,41 @@ def test_keyboard_dropdown_commits_only_a_new_choice(setup_page, pump):
         pump()
         view = combo.dropMenu.view
         assert [view.item(i).text().strip() for i in range(view.count())] == ['Win32 API', 'WinUHid Virtual HID']
-        assert not called(core, 'drivers.set_keyboard_output')
+        assert not called(core, f'drivers.set_{device}_output')
         QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=view.visualItemRect(view.item(index)).center())
         pump()
 
     choose(0)
-    assert not called(core, 'drivers.set_keyboard_output')
+    assert not called(core, f'drivers.set_{device}_output')
     choose(1)
-    assert called(core, 'drivers.set_keyboard_output', ('WinUHid Virtual HID',))
+    assert called(core, f'drivers.set_{device}_output', ('WinUHid Virtual HID',))
     assert combo.currentText() == 'WinUHid Virtual HID'
     toasts[-1][1]['undo']()
     pump()
-    assert called(core, 'drivers.set_keyboard_output', ('Win32 API',))
+    assert called(core, f'drivers.set_{device}_output', ('Win32 API',))
     assert combo.currentText() == 'Win32 API'
+
+
+def test_mouse_dropdown_keyboard_cancel_and_commit(setup_page, pump):
+    page, core, _ = setup_page(SettingsPage)
+    combo = page.mouse
+    page.ensureWidgetVisible(combo)
+    combo.setFocus()
+    QTest.keyClick(combo, Qt.Key_Space)
+    pump()
+    view = combo.dropMenu.view
+    QTest.keyClick(view, Qt.Key_Down)
+    QTest.keyClick(view, Qt.Key_Escape)
+    pump()
+    assert not called(core, 'drivers.set_mouse_output')
+    QTest.keyClick(combo, Qt.Key_Return)
+    pump()
+    view = combo.dropMenu.view
+    QTest.keyClick(view, Qt.Key_End)
+    QTest.keyClick(view, Qt.Key_Return)
+    pump()
+    assert called(core, 'drivers.set_mouse_output', ('WinUHid Virtual HID',))
+    assert combo.currentText() == 'WinUHid Virtual HID'
 
 
 def test_wired_group_opens_from_header_and_resizes_for_driver_state(setup_page, pump):

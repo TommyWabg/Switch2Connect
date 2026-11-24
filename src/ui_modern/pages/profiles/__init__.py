@@ -1,9 +1,9 @@
 from ...i18n import tr
 from ...widgets.changes import apply_change
-from PySide6.QtWidgets import QWidget, QHBoxLayout
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QButtonGroup
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
-from qfluentwidgets import PushButton, TransparentPushButton, SwitchButton, RoundMenu, MessageBoxBase, MessageBox, LineEdit, BodyLabel, themeColor, isDarkTheme, qconfig
+from qfluentwidgets import PushButton, RadioButton, TransparentToolButton, FluentIcon, SwitchButton, RoundMenu, MessageBoxBase, MessageBox, LineEdit, BodyLabel
 from ...widgets.display import input_display
 from ...qt_bridge import call_core
 from ...widgets.common import SettingsGroup, Segments
@@ -15,6 +15,7 @@ from ...widgets.combo_recording import ComboRecorder
 class ProfilesPage(ServicePage):
     def __init__(self, core, toast, parent=None):
         super().__init__('Profiles', core, toast, parent)
+        self.profile_selection = QButtonGroup(self)
         self.profile_rows, self.app_rows = {}, {}
         actions = QWidget(self.content); layout = QHBoxLayout(actions); layout.setContentsMargins(0, 0, 0, 0)
         for title, callback in [('New profile', lambda: apply_change(self, core.profiles.add)), ('Import', self.import_profiles), ('Export', self.export_profiles)]:
@@ -26,7 +27,7 @@ class ProfilesPage(ServicePage):
         self.add_app.clicked.connect(lambda: self.choose_app())
         self.switching = SettingsGroup('Profile switching', self.content); self.box.addWidget(self.switching)
         holder = QWidget(self.switching); line = QHBoxLayout(holder); line.setContentsMargins(0, 0, 0, 0)
-        self.trigger = PushButton(tr('None'), holder)
+        self.trigger = PushButton(FluentIcon.EDIT, tr('Record combo…'), holder)
         self.clear_trigger = PushButton(tr('Clear'), holder)
         line.addWidget(self.trigger); line.addWidget(self.clear_trigger)
         self.switching.row('Global combo trigger', holder)
@@ -38,12 +39,7 @@ class ProfilesPage(ServicePage):
         self.mode.currentItemChanged.connect(lambda val: apply_change(self, core.profiles.set_change_profile_mode, val,
             undo=lambda old=self.state.change_profile_mode: apply_change(self, core.profiles.set_change_profile_mode, old)))
         self.box.addStretch(); self.bridge.profiles_changed.connect(self.apply_profiles)
-        qconfig.themeChangedFinished.connect(self.refresh_profiles_theme)
         call_core(core.profiles.state, on_result=self.apply_profiles)
-
-    def refresh_profiles_theme(self):
-        if hasattr(self, 'state'):
-            self.apply_profiles(self.state)
 
     def apply_profiles(self, state):
         self.state = state
@@ -53,11 +49,14 @@ class ProfilesPage(ServicePage):
                 holder = QWidget(self.list); layout = QHBoxLayout(holder); layout.setContentsMargins(0, 0, 0, 0)
                 include = SwitchButton(holder); include.setOnText(''); include.setOffText(''); include.setFocusPolicy(Qt.StrongFocus); include.setAccessibleName(tr('Include {name} in change list', name=name))
                 include.setToolTip(tr('Include in change list'))
-                menu = PushButton('⋯', holder); menu.setAccessibleName(tr('Actions for {name}', name=name))
+                menu = TransparentToolButton(FluentIcon.MORE, holder); menu.setAccessibleName(tr('Actions for {name}', name=name))
+                menu.setToolTip(menu.accessibleName())
                 layout.addWidget(BodyLabel(tr("Include in change list"), holder))
                 for control in (include, menu): layout.addWidget(control)
                 row = self.list.row(name, holder, 'No switching combo')
-                select = TransparentPushButton(name, row); row.textLayout.insertWidget(0, select)
+                select = RadioButton(name, row)
+                self.profile_selection.addButton(select)
+                row.textLayout.insertWidget(0, select)
                 row.textLayout.setAlignment(select, Qt.AlignLeft)
                 row.titleLabel.hide()
                 select.clicked.connect(lambda checked=False, n=name: self.select_profile(n))
@@ -65,14 +64,14 @@ class ProfilesPage(ServicePage):
                 menu.clicked.connect(lambda checked=False, n=name, b=menu: self.profile_menu(n, b))
                 self.profile_rows[name] = row, select, include, menu
             row, select, include, menu = self.profile_rows[name]
-            select.setStyleSheet("QPushButton { background: transparent; border: none; text-align: left; padding: 0; " +
-                ("color: " + (themeColor().name() if name == state.active else "#ffffff" if isDarkTheme() else "#202020") + ";") + " }")
-            row.show(); select.setText(('● ' if name == state.active else '') + name); select.setToolTip(name)
+            row.show()
+            sync(select, 'setChecked', name == state.active)
             sync(include, 'setChecked', name in state.change_list)
             row.captionLabel.setText(input_display(combos.get(name)) if combos.get(name) else tr('No switching combo'))
         for name, controls in self.profile_rows.items():
             controls[0].setVisible(name in state.names)
-        self.trigger.setText(input_display(state.combo_trigger) if state.combo_trigger else tr('None')); self.trigger.setToolTip(self.trigger.text())
+        self.trigger.setText(input_display(state.combo_trigger) if state.combo_trigger else tr('Record combo…'))
+        self.trigger.setToolTip(tr('Record combo…'))
         self.clear_trigger.setEnabled(bool(state.combo_trigger))
         self.mode.sync(('Auto', 'Manual'), state.change_profile_mode)
         apps = dict(state.assigned_apps).get(state.active, ())
@@ -111,7 +110,8 @@ class ProfilesPage(ServicePage):
             apply_change(self, self.core.profiles.select, name, undo=lambda: apply_change(self, self.core.profiles.select, old))
 
     def profile_menu(self, name, button):
-        menu = RoundMenu(parent=self)
+        menu = RoundMenu(parent=button)
+        menu.setAttribute(Qt.WA_DeleteOnClose)
         for label, callback in [('Record combo…', lambda: self.record(name)), ('Clear combo', lambda: self.clear_combo(name)), ('Rename', lambda: self.rename(name)), ('Reset', lambda: self.active_action(name, self.core.profiles.reset)), ('Delete', lambda: self.active_action(name, self.core.profiles.delete))]:
             action = QAction(tr(label), menu); action.triggered.connect(callback)
             if label == 'Clear combo': action.setEnabled(bool(dict(self.state.switching_combos).get(name)))

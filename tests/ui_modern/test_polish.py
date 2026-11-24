@@ -56,16 +56,15 @@ def test_setting_row_alignment_and_disclosure(app, pump):
     row = SettingRow('Title', 'Two-line setting', control)
     row.resize(600, 64); row.show(); pump()
     assert abs(control.geometry().center().y() - row.rect().center().y()) <= 1
-    assert row.titleLabel.font().pixelSize() == 14
-    assert row.captionLabel.font().pixelSize() == 12
+    assert row.contentLabel.text() == "Two-line setting"
     row.close()
     disclosure = ExpandSettingRow('Advanced')
-    content = QWidget(); disclosure.addWidget(content)
-    assert disclosure.body.isHidden()
+    content = QWidget(); disclosure.add_body_widget(content)
+    assert not disclosure.isExpand
     disclosure.setExpand(True)
-    assert not disclosure.body.isHidden()
+    assert disclosure.isExpand
     disclosure.setExpand(False)
-    assert disclosure.body.isHidden()
+    assert not disclosure.isExpand
     assert disclosure.viewLayout.itemAt(0).widget() is content
     disclosure.deleteLater()
 

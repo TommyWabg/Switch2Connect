@@ -45,10 +45,10 @@ class FakeService:
                 return ready(ready(SettingResult(False, "rolled_back")))
             if self.name == "drivers":
                 key = {"switch_driver": "driver_type", "set_simulation_mode": "simulation_mode", "set_layout": "abxy_mode",
-                       "set_keyboard_output": "keyboard_backend"}.get(method)
+                       "set_keyboard_output": "keyboard_backend", "set_mouse_output": "mouse_backend"}.get(method)
                 if key:
                     self.core.driver_state = replace(self.core.driver_state, **{key: args[0]})
-                    if method == "set_keyboard_output":
+                    if method in ("set_keyboard_output", "set_mouse_output"):
                         self.core.bus.publish(events.DRIVER_STATE_CHANGED, self.core.driver_state)
                 result = ActionResult(True)
             elif self.name == "settings":

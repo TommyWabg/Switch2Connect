@@ -1,9 +1,9 @@
 """Shared model-driven choices and throttled numeric controls."""
 from ..i18n import tr
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal
 import sys
 from PySide6.QtWidgets import QWidget, QHBoxLayout
-from qfluentwidgets import ComboBox, Slider, InfoBar, InfoBarPosition, PushButton, DoubleSpinBox, SwitchButton
+from qfluentwidgets import ComboBox as FluentComboBox, Slider, InfoBar, InfoBarPosition, PushButton, DoubleSpinBox, SwitchButton
 from .display import setting_title
 
 
@@ -20,6 +20,36 @@ def local_toast(parent):
             button.clicked.connect(lambda: (bar.close(), undo()))
             bar.addWidget(button)
     return toast
+
+
+class ComboBox(FluentComboBox):
+    """Use the same Fluent popup for pointer and keyboard selection."""
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_F4, Qt.Key_Down):
+            if self.count():
+                self._showComboMenu()
+                self.dropMenu.view.setFocus()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _createComboMenu(self):
+        menu = super()._createComboMenu()
+        menu.view.installEventFilter(self)
+        return menu
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.KeyPress and self.dropMenu and watched is self.dropMenu.view:
+            if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+                item = watched.currentItem()
+                if item is not None:
+                    watched.itemClicked.emit(item)
+                return True
+            if event.key() == Qt.Key_Escape:
+                self.dropMenu.close()
+                self.setFocus()
+                return True
+        return super().eventFilter(watched, event)
 
 
 class Choice(ComboBox):

@@ -1,10 +1,11 @@
 from ..i18n import tr
 from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
-from .common import FitImage, Segments
+from .common import FitImage
 from ..resources import resource_path
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy
-from qfluentwidgets import CardWidget, BodyLabel, CaptionLabel, TransparentPushButton, ToolButton, RoundMenu, FluentIcon, themeColor, qconfig, isDarkTheme
+from .controls import ComboBox
+from qfluentwidgets import CardWidget, BodyLabel, CaptionLabel, TransparentPushButton, ToolButton, CheckableMenu, FluentIcon, themeColor, qconfig, isDarkTheme
 
 _ASSETS = resource_path("resources/images")
 CARD_HEIGHT = 250
@@ -50,27 +51,29 @@ class PlayerCard(CardWidget):
         self.illustration = FitImage(_ASSETS / "procontroller2.png", self); self.illustration.setFixedHeight(76); box.addWidget(self.illustration)
         self.model = BodyLabel("", self); self.model.setWordWrap(True); self.model.setAlignment(Qt.AlignCenter)
         box.addWidget(self.model, 1)
-        self.battery = BatteryGlyph(self); box.addWidget(self.battery, 0, Qt.AlignHCenter)
-        self.transport = CaptionLabel("", self); self.transport.setAlignment(Qt.AlignCenter)
-        transport_row = QHBoxLayout(); transport_row.addStretch(); transport_row.addWidget(self.transport); box.addLayout(transport_row)
-        self.refresh_chip()
-        qconfig.themeChangedFinished.connect(self.refresh_chip)
+        self.battery = BatteryGlyph(self)
+        self.transport = CaptionLabel("", self)
+        status = QHBoxLayout()
+        status.addStretch(); status.addWidget(self.battery); status.addWidget(self.transport); status.addStretch()
+        box.addLayout(status)
         row = QHBoxLayout(); self.ping = ToolButton(FluentIcon.VOLUME, self)
         self.ping.setToolTip(tr("Ping")); self.ping.setAccessibleName(tr("Ping"))
         self.merge = TransparentPushButton(tr("Merge"), self)
         self.merge.clicked.connect(lambda: self.action("split" if self.snapshot.split_available else "merge_select"))
-        self.hold = Segments(self); self.hold.sync(("Vertical", "Horizontal"), "Vertical", {"Vertical": "V", "Horizontal": "H"})
-        self.hold.setFixedWidth(70); transport_row.addWidget(self.hold); transport_row.addStretch()
-        self.hold.currentItemChanged.connect(lambda mode: self.action("set_hold_mode", mode))
+        self.hold = ComboBox(self)
+        for mode in ("Vertical", "Horizontal"):
+            self.hold.addItem(tr(mode), userData=mode)
+        self.hold.setAccessibleName(tr("Joy-Con orientation"))
+        self.hold.setToolTip(tr("Joy-Con orientation"))
+        box.addWidget(self.hold, 0, Qt.AlignHCenter)
+        self.hold.activated.connect(lambda index: self.action("set_hold_mode", self.hold.itemData(index)))
         self.merge_hint = CaptionLabel(tr("Choose the other Joy-Con"), self); box.addWidget(self.merge_hint, 0, Qt.AlignHCenter)
         self.more = ToolButton(FluentIcon.MORE, self)
+        self.more.setAccessibleName(tr("More"))
+        self.more.setToolTip(tr("More"))
         row.setSpacing(2); row.addWidget(self.ping); row.addWidget(self.merge); row.addStretch(); row.addWidget(self.more); box.addLayout(row)
         self.ping.clicked.connect(lambda: self.action("ping"))
         self.more.clicked.connect(self.open_menu)
-    def refresh_chip(self):
-        color = "#bfbfbf" if isDarkTheme() else "#606060"
-        self.transport.setStyleSheet(f"color: {color}; border: 1px solid rgba(128,128,128,80); border-radius: 8px; padding: 2px 8px;")
-
     def action(self, method, *args):
         if self.snapshot and self.snapshot.slot_token:
             self.invoke(method, self.snapshot.slot_token, *args)
@@ -92,7 +95,7 @@ class PlayerCard(CardWidget):
         self.merge.setMinimumWidth(95 if pending else 0)
         self.merge_hint.setVisible(pending)
         self.hold.setVisible(not slot.is_empty and slot.hold_mode_available)
-        self.hold.sync(("Vertical", "Horizontal"), slot.hold_mode, {"Vertical": "V", "Horizontal": "H"})
+        self.hold.setCurrentIndex(self.hold.findData(slot.hold_mode))
         border = themeColor().name() if pending else "#e88724" if slot.merge_target else None
         self.setStyleSheet(f"PlayerCard {{border: 2px solid {border}; border-radius: 8px;}}" if border else "PlayerCard {border: 1px dashed #888; border-radius: 8px;}" if slot.is_empty else "")
         if slot.is_empty:
@@ -108,10 +111,13 @@ class PlayerCard(CardWidget):
         self.illustration.pixmap = QPixmap(str(self.illustration.path)); self.illustration.update()
     def open_menu(self):
         s = self.snapshot
-        menu = RoundMenu(parent=self)
+        menu = CheckableMenu(parent=self)
+        menu.setAttribute(Qt.WA_DeleteOnClose)
         self.menu_actions = {}
-        def add(label, fn):
+        def add(label, fn, checked=None):
             action = QAction(tr(label), menu); action.triggered.connect(fn)
+            if checked is not None:
+                action.setCheckable(True); action.setChecked(checked)
             menu.addAction(action); self.menu_actions[label] = action
         add("Calibrate sticks", lambda: self.action("calibrate_sticks"))
         for i, controller in enumerate(s.controllers):
@@ -121,7 +127,9 @@ class PlayerCard(CardWidget):
                 add(label, lambda checked=False, side=side: self.action("toggle_mag_calibration", side))
         if s.gyro_side_available:
             for side in ("Left", "Right"):
-                add(tr("Gyro side {side}", side=tr(side)), lambda checked=False, side=side: self.action("toggle_gyro_side", side))
+                active = (s.djg_left_active if side == "Left" else s.djg_right_active) if s.independent_gyro_sides else s.active_gyro_side == side
+                add(tr("Gyro side {side}", side=tr(side)),
+                    lambda checked=False, side=side: self.action("toggle_gyro_side", side), checked=active)
         menu.addSeparator()
         add("Disconnect", lambda: self.action("disconnect"))
         self.menu = menu

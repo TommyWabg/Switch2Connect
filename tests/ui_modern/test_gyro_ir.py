@@ -243,7 +243,7 @@ def test_click_multi_select(t9, pump, key):
     picker = p._children[-1]
     for i in range(picker.listing.count()):
         picker.listing.item(i).setCheckState(Qt.Checked if i in (0, 2) else Qt.Unchecked)
-    picker.save(); pump()
+    picker.yesButton.click(); pump(timeout=.25)
     assert ("settings.set_ir_mouse_setting", ("left", key, ["L", "R"], None), p.context) in core.calls
     assert p.controls[key].toolTip() == "L + R"
 
@@ -254,7 +254,7 @@ def test_ir_gyro_live_mirror_and_reset_undo(t9, pump):
     assert not p.gyro.isHidden() and p.mouse.isHidden()
     assert p.gyro_rows["deadzone_amount"].isHidden()
     p.pick_inputs("deadzone_mode", True); pump(); picker = p._children[-1]
-    picker.listing.item(0).setCheckState(Qt.Checked); picker.save(); pump()
+    picker.listing.item(0).setCheckState(Qt.Checked); picker.yesButton.click(); pump(timeout=.25)
     assert not p.gyro_rows["deadzone_amount"].isHidden()
     for key in ("deadzone_amount", "deadzone_pause_after_pressed_ms", "deadzone_pause_after_released_ms", "deadzone_effect_after_released_ms", "dampening_amount", "dampening_effect_after_released_ms"):
         w = p.gyro_controls[key]; w.spin.setValue(42); w.finish(); pump()
@@ -275,9 +275,9 @@ def test_profile_mode_picker_and_recording(t9, pump):
     assert ("settings.set_change_profile_mode", ("Auto",), {}) in core.calls
     p.pick_function(); pump(); picker = p._children[-1]
     picker.search.setText("Gyro")
-    assert picker.visible_buttons()
-    assert all("gyro" in button.text().lower() for button in picker.visible_buttons())
-    assert not picker.buttons["Change Profile"].isEnabled()
+    assert picker.tree.currentItem() is not None
+    assert all("gyro" in button.text(0).lower() for button in picker.items.values() if not button.isHidden())
+    assert picker.items["Change Profile"].isHidden()
     picker.open_record(); pump(); record = p._children[-1]
     if hasattr(record, "toggle"):
         record.toggle()
@@ -328,18 +328,18 @@ def test_gyro_ir_origin_and_remaining_controls(t9, pump):
     from qfluentwidgets.components.widgets.flyout import Flyout
     assert isinstance(function_picker.flyout, Flyout)
     assert function_picker.flyout.aniManager is not None
-    function_picker.buttons["In-app Gyro"].click(); pump(timeout=.25)
+    function_picker.choose_item(function_picker.items["In-app Gyro"]); pump(timeout=.25)
     assert ("settings.set_ir_function", ("left", "In-app Gyro", None), p.context) in core.calls
     assert function_picker not in p._children
     assert "simul" in p.gyro_controls
     p.pick_inputs("dampening_mode", True); pump(); picker = p._children[-1]
-    picker.listing.item(1).setCheckState(Qt.Checked); picker.save(); pump()
+    picker.listing.item(1).setCheckState(Qt.Checked); picker.yesButton.click(); pump(timeout=.25)
     assert ("settings.set_ir_gyro_setting", ("left", "dampening_mode", ["ZL"], None), p.context) in core.calls
     assert not p.gyro_rows["dampening_amount"].isHidden()
     p.pick_simultaneous(CHOICES); pump(timeout=.25)
     simultaneous_picker = p._children[-1]
     assert isinstance(simultaneous_picker.flyout, Flyout)
-    simultaneous_picker.buttons["R"].click(); pump(timeout=.25)
+    simultaneous_picker.choose_item(simultaneous_picker.items["R"]); pump(timeout=.25)
     assert simultaneous_picker not in p._children
     assert ("settings.set_ir_gyro_setting", ("left", "simul", "R", None), p.context) in core.calls
     assert core.settings.sensor("left", None, p.context)["gyro"]["dampening_mode"] == ["ZL"]
@@ -350,7 +350,7 @@ def test_picker_keyboard_save_cancel_and_empty_record(t9, pump):
     core, _, _, dialog = t9; p = dialog(); p.pick_inputs("middle_click"); pump()
     picker = p._children[-1]; picker.listing.setFocus()
     picker.listing.setCurrentRow(0); QTest.keyClick(picker.listing, Qt.Key_Space)
-    QTest.keyClick(picker, Qt.Key_Return); pump()
+    QTest.keyClick(picker, Qt.Key_Return); pump(timeout=.25)
     assert core.settings.sensor("left", None)["mouse"]["middle_click"] == ["L"]
     p.pick_function(); pump(); QTest.keyClick(p._children[-1], Qt.Key_Escape); pump(timeout=.25)
     assert not p._children

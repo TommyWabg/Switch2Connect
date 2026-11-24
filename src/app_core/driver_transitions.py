@@ -325,17 +325,19 @@ def set_keyboard_output(keyboard_output, status_query, ui, refresh, *, raw_input
         refresh()
 
 
-def toggle_mouse_output(config, raw_input_mouse, status_query, wake, refresh):
+def toggle_mouse_output(config, raw_input_mouse, status_query, wake, refresh, *, raw_input=None):
     try:
         status = status_query("WinUHid", use_cache=False)
         effective_raw = (raw_input_mouse.requested_mode() == "Raw Input"
                          and status.state == "healthy")
-        if effective_raw:
-            config.mouse_output_mode = "Standard"
-        else:
-            if status.state != "healthy":
-                return ActionResult(False, "driver_unavailable")
-            config.mouse_output_mode = "Raw Input"
+        if raw_input is None:
+            raw_input = not effective_raw
+        if raw_input and status.state != "healthy":
+            return ActionResult(False, "driver_unavailable")
+        requested_mode = "Raw Input" if raw_input else "Standard"
+        if raw_input_mouse.requested_mode() == requested_mode:
+            return ActionResult(True)
+        config.mouse_output_mode = requested_mode
         config.save_config()
         wake()
         return ActionResult(True)

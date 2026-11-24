@@ -2,13 +2,14 @@ from ...widgets.changes import apply_change, apply_setting, apply_toggle
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import QWidget, QHBoxLayout
-from qfluentwidgets import (PushButton, SwitchButton, ComboBox, BodyLabel, MessageBox,
-                            SimpleExpandGroupSettingCard, FluentIcon)
+from ...widgets.controls import ComboBox
+from qfluentwidgets import (PushButton, SwitchButton, BodyLabel, MessageBox,
+                            FluentIcon)
 from app_core import events
-from app_core.models import WIN32_KEYBOARD, WINUHID_KEYBOARD
+from app_core.models import WIN32_BACKEND, WINUHID_BACKEND
 from ...widgets.display import setting_title
 from ...qt_bridge import call_core
-from ...widgets.common import SettingsGroup, Segments
+from ...widgets.common import ExpandSettingRow, SettingsGroup, Segments
 from ... import i18n, theme as ui_theme
 from ...i18n import tr
 from ..rumble.support import ServicePage, sync
@@ -17,7 +18,7 @@ from .firmware import FirmwareManagerDialog
 
 class SettingsPage(ServicePage):
     def __init__(self, core, toast, request_restart=lambda: None, apply_priority=lambda policy: None,
-                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.3'):
+                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.4'):
         super().__init__('Settings', core, toast, parent)
         self.request_restart, self.apply_priority, self.hide_to_tray = request_restart, apply_priority, hide_to_tray
         self.driver_rows = {}
@@ -31,24 +32,17 @@ class SettingsPage(ServicePage):
             self.driver_rows[name] = row, badge, button
             button.clicked.connect(lambda checked=False, n=name: self.driver_action(n))
         self.restart_notice = drivers.row('Restart required', BodyLabel(tr('Restart Windows before reinstalling USBIP.'), drivers))
-        self.keyboard = ComboBox(drivers)
-        for backend in (WIN32_KEYBOARD, WINUHID_KEYBOARD):
-            self.keyboard.addItem(tr(backend), userData=backend)
-        self.keyboard.setAccessibleName(tr('Keyboard output backend'))
-        self.keyboard.setEnabled(False)
-        self.keyboard_row = drivers.row('Keyboard output backend', self.keyboard)
-        self.mouse = PushButton('Win32 API', drivers)
-        self.mouse_row = drivers.row('Mouse output backend', self.mouse)
-        self.keyboard.activated.connect(self.select_keyboard_backend)
-        self.mouse.clicked.connect(lambda: apply_toggle(self, core.drivers.toggle_mouse_output, lambda: self.driver_state.mouse_backend))
+        self.keyboard, self.keyboard_row = self.output_selector(
+            drivers, 'Keyboard output backend', 'keyboard_backend', core.drivers.set_keyboard_output)
+        self.mouse, self.mouse_row = self.output_selector(
+            drivers, 'Mouse output backend', 'mouse_backend', core.drivers.set_mouse_output)
         hardware = SettingsGroup('Hardware', self.content); self.box.addWidget(hardware)
         self.firmware = PushButton(tr('Manage firmware…'), hardware)
         self.esp_row = hardware.row('ESP32-S3 bridge', self.firmware, 'Checking…')
         self.firmware.clicked.connect(self.manage_firmware)
-        self.wired = SimpleExpandGroupSettingCard(
-            FluentIcon.GAME, tr('Wired controller'), tr('Controller scanning and HidHide'), hardware)
+        self.wired = ExpandSettingRow(
+            'Wired controller', 'Controller scanning and HidHide', hardware, icon=FluentIcon.GAME)
         hardware.addRow(self.wired)
-        self.wired.card.expandButton.setFocusPolicy(Qt.StrongFocus)
         self.auto_scan = SwitchButton(self.wired)
         self.manual_scan = PushButton(tr('Manual scan'), self.wired)
         self.hidhide = SwitchButton(self.wired)
@@ -157,7 +151,7 @@ class SettingsPage(ServicePage):
                 button.setText(tr('Restart Required')); button.setEnabled(not state.busy)
         self.restart_notice.setVisible(state.usbip_restart_pending)
         self.keyboard.setCurrentIndex(self.keyboard.findData(state.keyboard_backend))
-        self.mouse.setText(state.mouse_backend)
+        self.mouse.setCurrentIndex(self.mouse.findData(state.mouse_backend))
         self.keyboard_row.setVisible(state.keyboard_available); self.mouse_row.setVisible(state.mouse_available)
         self.keyboard.setEnabled(not state.busy); self.mouse.setEnabled(not state.busy)
         title = setting_title(state.wired_settings_label)
@@ -170,11 +164,21 @@ class SettingsPage(ServicePage):
         self.wired._adjustViewSize()
         for control in (self.auto_scan, self.manual_scan, self.hidhide, self.hidhide_uninstall): control.setEnabled(not state.busy)
 
-    def select_keyboard_backend(self, index):
-        backend = self.keyboard.itemData(index)
-        current = self.driver_state.keyboard_backend
-        if backend != current:
-            apply_change(self, self.core.drivers.set_keyboard_output, backend, old_args=(current,))
+    def output_selector(self, group, title, state_field, setter):
+        combo = ComboBox(group)
+        for backend in (WIN32_BACKEND, WINUHID_BACKEND):
+            combo.addItem(tr(backend), userData=backend)
+        combo.setAccessibleName(tr(title))
+        combo.setEnabled(False)
+
+        def select(index):
+            backend = combo.itemData(index)
+            current = getattr(self.driver_state, state_field)
+            if backend != current:
+                apply_change(self, setter, backend, old_args=(current,))
+
+        combo.activated.connect(select)
+        return combo, group.row(title, combo)
 
     def apply_esp32(self, state):
         self.esp_row.captionLabel.setText(' · '.join(filter(None, (tr(state.status), tr(state.firmware_text)))))

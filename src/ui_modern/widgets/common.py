@@ -1,11 +1,11 @@
 """Shared Windows Settings-style building blocks for modern pages."""
 from ..i18n import tr
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QPainter, QPixmap
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from PySide6.QtSvgWidgets import QSvgWidget
-from qfluentwidgets import (CardWidget, BodyLabel, CaptionLabel, SegmentedWidget,
-    FluentIcon, ToolButton, ToolTipFilter, InfoBar, InfoBarIcon, InfoBarPosition)
+from qfluentwidgets import (SettingCard, CaptionLabel, SegmentedWidget,
+    FluentIcon, SimpleExpandGroupSettingCard, ToolTipFilter, InfoBar, InfoBarIcon, InfoBarPosition)
 from .display import setting_title
 from pathlib import Path
 
@@ -38,32 +38,26 @@ class FitImage(QWidget):
         painter.drawPixmap(x, y, scaled.width(), scaled.height(), self.pixmap)
 
 
-class SettingRow(CardWidget):
+class SettingRow(SettingCard):
     def __init__(self, title, caption=None, control=None, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(64 if caption else 48)
-        self.rowLayout = QHBoxLayout(self)
-        self.rowLayout.setContentsMargins(16, 10, 16, 10)
-        self.rowLayout.setSpacing(16)
-        text = self.textLayout = QVBoxLayout(); text.setSpacing(2); text.setContentsMargins(0, 0, 0, 0)
-        self.titleLabel = BodyLabel(setting_title(title), self)
-        font = self.titleLabel.font(); font.setPixelSize(14); self.titleLabel.setFont(font)
-        text.addWidget(self.titleLabel)
         self.helper_text = tr(caption or "")
-        self.captionLabel = CaptionLabel(self.helper_text, self)
-        font = self.captionLabel.font(); font.setPixelSize(12); self.captionLabel.setFont(font)
-        self.captionLabel.setTextColor("#606060", "#bfbfbf")
-        self.captionLabel.setWordWrap(True); self.captionLabel.setVisible(bool(caption))
-        text.addWidget(self.captionLabel)
+        super().__init__(QIcon(), setting_title(title), self.helper_text, parent)
+        self.iconLabel.hide()
+        self.hBoxLayout.takeAt(1)  # remove the spacer reserved for a leading icon
+        self.hBoxLayout.setContentsMargins(16, 8, 16, 8)
+        self.setMaximumHeight(16777215)
+        self.setMinimumHeight(64 if caption else 48)
+        self.textLayout = self.vBoxLayout
+        self.captionLabel = self.contentLabel
+        self.captionLabel.setWordWrap(True)
         self.titleLabel.setToolTip(setting_title(title))
         self.titleLabel.installEventFilter(ToolTipFilter(self.titleLabel, showDelay=350))
-        self.rowLayout.addLayout(text, 1)
         if control is not None and hasattr(control, "setOnText"):
             control.setOnText(""); control.setOffText("")
             control.setFocusPolicy(Qt.StrongFocus)
         self.control = control
         if control is not None:
-            self.rowLayout.addWidget(control, 0, Qt.AlignVCenter)
+            self.hBoxLayout.addWidget(control, 0, Qt.AlignVCenter)
             for widget in (control, *control.findChildren(QWidget)):
                 widget.installEventFilter(ToolTipFilter(widget, showDelay=350))
 
@@ -116,28 +110,22 @@ class SettingsGroup(QWidget):
         return self.addRow(SettingRow(title, helper, control, self))
 
 
-class ExpandSettingRow(QWidget):
-    """Closed-by-default setting row with a persistent disclosure body."""
-    def __init__(self, title, caption=None, control=None, parent=None):
-        super().__init__(parent)
-        box = QVBoxLayout(self); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(4)
-        self.row = SettingRow(title, caption, control, self)
-        self.toggle = ToolButton(FluentIcon.CHEVRON_DOWN_MED, self.row)
-        self.toggle.setAccessibleName(tr("Expand {title}", title=self.row.titleLabel.text()))
-        self.row.rowLayout.addWidget(self.toggle, 0, Qt.AlignVCenter)
-        self.body = QWidget(self); self.viewLayout = QVBoxLayout(self.body)
-        self.viewLayout.setContentsMargins(16, 8, 16, 8)
-        box.addWidget(self.row); box.addWidget(self.body); self.body.hide()
-        self.isExpand = False
-        self.toggle.clicked.connect(lambda: self.setExpand(not self.isExpand))
+class ExpandSettingRow(SimpleExpandGroupSettingCard):
+    """Fluent disclosure card that follows conditional settings in its body."""
+    def __init__(self, title, caption=None, parent=None, *, icon=FluentIcon.SETTING):
+        super().__init__(icon, setting_title(title), tr(caption or ""), parent)
+        self.card.expandButton.setAccessibleName(self.card.titleLabel.text())
+        self.card.expandButton.setFocusPolicy(Qt.StrongFocus)
+        self.view.installEventFilter(self)
 
-    def setExpand(self, expanded):
-        self.isExpand = bool(expanded); self.body.setVisible(self.isExpand)
-        self.toggle.setIcon(FluentIcon.UP if self.isExpand else FluentIcon.CHEVRON_DOWN_MED)
-        self.toggle.setAccessibleName(tr("Collapse {title}" if self.isExpand else "Expand {title}", title=self.row.titleLabel.text()))
-
-    def addWidget(self, widget):
+    def add_body_widget(self, widget):
         self.viewLayout.addWidget(widget)
+
+    def eventFilter(self, watched, event):
+        if (event.type() == QEvent.LayoutRequest and watched is getattr(self, "view", None)
+                and self.isExpand and self.expandAni.state() != self.expandAni.State.Running):
+            self._adjustViewSize()
+        return super().eventFilter(watched, event)
 
 
 # Compatibility for existing page callers.

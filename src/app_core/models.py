@@ -62,6 +62,7 @@ class SlotInfo:
     hold_mode_available: bool = False
     gyro_side_available: bool = False
     ping_available: bool = False
+    independent_gyro_sides: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +77,8 @@ class StatusInfo:
     color: str = "#888888"
 
 
-WIN32_KEYBOARD = "Win32 API"
-WINUHID_KEYBOARD = "WinUHid Virtual HID"
+WIN32_BACKEND = "Win32 API"
+WINUHID_BACKEND = "WinUHid Virtual HID"
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,8 +113,8 @@ class DriverState:
     action_label: str = "Install WinUHid Driver"
     action_kind: str = "install"
     needs_attention: bool = False
-    keyboard_backend: str = WIN32_KEYBOARD
-    mouse_backend: str = "Win32 API"
+    keyboard_backend: str = WIN32_BACKEND
+    mouse_backend: str = WIN32_BACKEND
     keyboard_available: bool = False
     mouse_available: bool = False
     wired_settings_label: str = "Wired Controller"

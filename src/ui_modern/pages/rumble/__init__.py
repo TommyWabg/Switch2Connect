@@ -44,7 +44,7 @@ class RumblePage(ServicePage):
             layout.addWidget(slider); layout.addWidget(label)
             self.controls[key] = slider
             row = SettingRow(title, control=holder, parent=owner)
-            (owner.addRow if isinstance(owner, SettingsGroup) else owner.addWidget)(row)
+            (owner.addRow if isinstance(owner, SettingsGroup) else owner.add_body_widget)(row)
             self.rows[key] = row
             slider.valueChanged.connect(lambda value, k=key, l=label: (l.setText(str(value)), self.queue(k, value)))
             slider.sliderPressed.connect(lambda k=key: self.begin_drag(k))
@@ -64,7 +64,7 @@ class RumblePage(ServicePage):
             switch = SwitchButton(owner)
             switch.setAccessibleName(title)
             self.controls[key] = switch
-            owner.addWidget(SettingRow(title, control=switch, parent=owner))
+            owner.add_body_widget(SettingRow(title, control=switch, parent=owner))
             switch.checkedChanged.connect(lambda value, k=key: apply_change(self, core.settings.set_rumble_setting, k, value, old_args=(k, self.values[k])))
         self.box.addWidget(self.impulse); self.box.addWidget(self.audio); self.box.addStretch()
         self.bridge.event.connect(self.on_bus_event)

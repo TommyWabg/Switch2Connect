@@ -343,6 +343,19 @@ def test_keyboard_backend_selection_is_idempotent(rig):
         assert rig.trace.count((action, True)) == 1
 
 
+def test_mouse_backend_selection_is_idempotent_and_requires_healthy_driver(rig):
+    for backend, mode in (("WinUHid Virtual HID", "Raw Input"), ("Win32 API", "Standard")):
+        assert resolve(rig.service.set_mouse_output(backend)).ok
+        assert rig.config.mouse_output_mode == mode
+        assert rig.service.state().mouse_backend == backend
+        trace = list(rig.trace)
+        assert resolve(rig.service.set_mouse_output(backend)).ok
+        assert rig.trace == trace
+    rig.health["WinUHid"] = Status("absent")
+    assert resolve(rig.service.set_mouse_output("WinUHid Virtual HID")).reason == "driver_unavailable"
+    assert rig.config.mouse_output_mode == "Standard"
+
+
 def test_wired_events_scan_and_full_power_guard(rig):
     r = rig
     r.bus.publish(events.WIRED_STATE_CHANGED, WiredState(True, (0x2073,)))

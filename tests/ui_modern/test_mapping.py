@@ -110,11 +110,11 @@ def test_scopes_filters_gc_and_integration(mapping, pump, monkeypatch):
     combo.setCurrentIndex(next(i for i in range(combo.count()) if combo.itemData(i) == "100% at Max")); pump()
     assert page.rows[SHIFT_SCOPE, "gc_l_click"].isHidden()
     assert page.rows[SHIFT_SCOPE, "gc_r_click"].isHidden()
-    page.copy.click(); page.dialog.yesButton.click(); pump(timeout=.3)
+    page.copy.trigger(); page.dialog.yesButton.click(); pump(timeout=.3)
     assert any(c[0] == "settings.copy_controller_mapping_to_mode_shift" for c in core.calls)
-    page.reset_shift.click(); page.dialog.cancelButton.click(); pump(timeout=.3)
+    page.reset_shift.trigger(); page.dialog.cancelButton.click(); pump(timeout=.3)
     assert not any(c[0] == "settings.reset_mode_shift_mapping" for c in core.calls)
-    page.reset_shift.click(); page.dialog.yesButton.click(); pump(timeout=.3)
+    page.reset_shift.trigger(); page.dialog.yesButton.click(); pump(timeout=.3)
     assert any(c[0] == "settings.reset_mode_shift_mapping" for c in core.calls)
     assert identities == {k: id(v) for k, v in page.rows.items()}
 
@@ -169,13 +169,13 @@ def test_recording_restart_empty_stop_mouse_release_and_wheel(mapping, pump):
 def test_picker_categories_search_keyboard_and_modes(mapping, pump):
     page, core, _ = mapping; row = page.rows[None, "a"]
     row.pick(); picker = row.picker; pump()
-    assert set(picker.blocks) == {cat.title for cat in row.snapshot.options}
-    assert picker.buttons["Default"].isChecked()
+    assert {picker.tree.topLevelItem(i).text(0).casefold() for i in range(picker.tree.topLevelItemCount())} == {cat.title.casefold() for cat in row.snapshot.options}
+    assert not picker.items["Default"].icon(0).isNull()
     picker.search.setText("Mode Shift"); pump()
-    assert picker.visible_buttons() == [picker.buttons["Mode Shift"]]
+    assert [key for key, item in picker.items.items() if not item.isHidden()] == ["Mode Shift"]
     QTest.keyClick(picker.search, Qt.Key_Down)
-    assert picker.buttons["Mode Shift"].hasFocus()
-    QTest.keyClick(picker.buttons["Mode Shift"], Qt.Key_Return); pump()
+    assert picker.tree.hasFocus() and picker.tree.currentItem() is picker.items["Mode Shift"]
+    QTest.keyClick(picker.tree, Qt.Key_Return); pump()
     assert row.snapshot.stored_value == "Custom[Hold]:MODE_SHIFT"
     row.open_picker(); row.picker.activation.setCurrentItem("Tap"); pump()
     assert ("settings.set_mapping_mode", ("a", "Tap", None), {}) in core.calls
@@ -265,7 +265,7 @@ def test_deadzone_batch_link_and_close(mapping, pump):
 def test_activation_defaults_selection_clamping_close_persistence(mapping, pump):
     page, core, _ = mapping; dialog = ActivationDialog(core, "a", page.toast, page); dialog.show(); pump()
     assert dialog.values()["deadzone_amount"] == 15.0
-    assert dialog.fields["deadzone_pause_after_pressed_ms"].text() == "100"
+    assert dialog.fields["deadzone_pause_after_pressed_ms"].value() == 100
     assert dialog.field_rows["deadzone_group"].isHidden()
     for name, boxes in dialog.selections.items():
         for token, box in boxes.items():
@@ -278,14 +278,11 @@ def test_activation_defaults_selection_clamping_close_persistence(mapping, pump)
             field.slider.setValue(80); field.finish(); pump()
             assert dialog.values()[name] == 80
         else:
-            field.setFocus(); field.setText("-9"); field.textEdited.emit("-9"); pump()
+            field.setValue(-9); pump()
             assert dialog.values()[name] == 0
-            field.setText("5000000"); field.textEdited.emit("5000000"); pump()
+            field.setValue(5000000); pump()
             assert dialog.values()[name] == 5000000
-            field.setText(""); field.textEdited.emit(""); pump()
-            assert dialog.values()[name] == 5000000
-            field.setText("nan"); field.textEdited.emit("nan"); pump()
-            assert dialog.values()[name] == 5000000
+            assert not field.validate("nan", 0)[0] == field.lineEdit().validator().State.Acceptable
     dialog.simultaneous.choose("Custom[Tap]:VK_CONTROL+VK_A"); pump()
     assert ("settings.set_in_app_gyro_setting", ("a", "simul", "Custom[Tap]:VK_CONTROL+VK_A", None), {}) in core.calls
     before = core.config_fake.saves; dialog.reject(); pump()
@@ -339,23 +336,21 @@ def test_numeric_normalization_waits_for_core_completion(mapping, pump, monkeypa
     original = core.settings.set_in_app_gyro_setting
     monkeypatch.setattr(core.settings, "set_in_app_gyro_setting", lambda *a, **k: pending)
     field = dialog.fields["deadzone_amount"]; field.setFocus()
-    field.setText("42.5"); field.textEdited.emit("42.5")
-    dialog.normalize("deadzone_amount")
-    assert field.text() == "42.5" and dialog.values()["deadzone_amount"] == 15.0
-    field.setText(""); field.textEdited.emit(""); dialog.normalize("deadzone_amount")
-    assert field.text() == "42.5"
+    field.setValue(42.5)
+    dialog.apply_settings(core.settings.state())
+    assert field.value() == 42.5 and dialog.values()["deadzone_amount"] == 15.0
     if succeeds:
         original("a", "deadzone_amount", 42.5, None); pending.set_result(True)
     else:
         pending.set_exception(RuntimeError("Save failed"))
     pump()
-    assert field.text() == ("42.5" if succeeds else "15.0") and not dialog.numeric_pending
+    assert field.value() == (42.5 if succeeds else 15.0) and not dialog.numeric_pending
     before = core.config_fake.saves; dialog.reject(); pump()
     assert core.config_fake.saves == before
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
-def test_picker_classic_grid_highlight_and_screen(mapping, pump, theme):
+def test_picker_filtered_categories_highlight_and_screen(mapping, pump, theme):
     from qfluentwidgets import setTheme, Theme, TransparentTogglePushButton
     from qfluentwidgets.components.widgets.flyout import Flyout, FlyoutAnimationManager, FlyoutAnimationType
     from PySide6.QtWidgets import QWidget
@@ -379,57 +374,38 @@ def test_picker_classic_grid_highlight_and_screen(mapping, pump, theme):
         assert area.contains(picker.flyout.frameGeometry())
         assert picker.mapToGlobal(QPoint()).y() + picker.height() <= anchor.mapToGlobal(QPoint()).y()
         assert picker.search.hasFocus()
-        position = lambda title: picker.blocks[title].mapTo(picker, QPoint())
-        assert position("General").y() < position("Switch Input").y()
-        assert position("General").x() < position("In-app Gyro").x()
-        grid = picker.blocks["Switch Input"].layout().itemAt(1).layout()
-        assert grid.columnCount() == 3 and grid.rowCount() == 7
-        assert grid.itemAtPosition(0, 0).widget() is picker.buttons["ZL"]
-        assert grid.itemAtPosition(6, 2).widget() is picker.buttons["GR"]
-        assert len({button.width() for button in picker.buttons.values()}) == 1
-        assert isinstance(picker.buttons["Mode Shift"], TransparentTogglePushButton)
-        assert picker.buttons["Mode Shift"].isChecked()
-        assert not picker.buttons["Default"].isChecked()
+        assert picker.tree.currentItem() is picker.items["Mode Shift"]
+        assert picker.tree.topLevelItemCount() == len(snapshot.options)
+        assert picker.items["GR"].parent().text(0) == "Switch input"
+        assert not picker.items["Mode Shift"].icon(0).isNull()
         geometry = picker.flyout.geometry()
-        positions = {v: b.pos() for v, b in picker.buttons.items()}
         picker.search.setText("vol"); pump()
         assert picker.flyout.geometry() == geometry
-        assert {v: b.pos() for v, b in picker.buttons.items()} == positions
-        assert all(not b.isHidden() for b in picker.buttons.values())
-        assert not picker.blocks["General"].layout().itemAt(0).widget().isEnabled()
-        assert picker.blocks["Media Keys"].layout().itemAt(0).widget().isEnabled()
-        assert {v for v, b in picker.buttons.items() if b.isEnabled()} == {"Volume Up", "Volume Down"}
-        assert picker.search.hasFocus()
+        assert {v for v, item in picker.items.items() if not item.isHidden()} == {"Volume Up", "Volume Down"}
+        assert picker.items["Default"].parent().isHidden()
         QTest.keyClick(picker.search, Qt.Key_Down)
-        assert picker.buttons["Volume Up"].hasFocus()
-        QTest.keyClick(picker.buttons["Volume Up"], Qt.Key_Down)
-        assert picker.buttons["Volume Down"].hasFocus()
-        picker.search.setFocus()
+        assert picker.tree.hasFocus()
+        assert picker.tree.currentItem() is picker.items["Volume Up"]
+        QTest.keyClick(picker.tree, Qt.Key_Down)
+        assert picker.tree.currentItem() is picker.items["Volume Down"]
         picker.search.clear(); pump()
-        assert picker.search.hasFocus()
-        assert all(b.isEnabled() for b in picker.buttons.values())
+        assert all(not item.isHidden() for item in picker.items.values())
     finally:
         picker.flyout.close()
         anchor.close()
         setTheme(Theme.LIGHT)
 
 
-def test_picker_spatial_navigation_search_enter_and_escape(mapping, pump):
+def test_picker_list_navigation_search_enter_and_escape(mapping, pump):
     page, core, _ = mapping
     row = page.rows[None, "a"]
     row.open_picker(); picker = row.picker; pump()
     QTest.keyClick(picker.search, Qt.Key_Down)
-    assert picker.buttons["Default"].hasFocus()
-    QTest.keyClick(picker.buttons["Default"], Qt.Key_Right)
-    assert picker.buttons["In-app Gyro"].hasFocus()
-    QTest.keyClick(picker.buttons["In-app Gyro"], Qt.Key_Down)
-    assert picker.buttons["Gyro Lock"].hasFocus()
-    QTest.keyClick(picker.buttons["Gyro Lock"], Qt.Key_Left)
-    assert picker.buttons["Custom"].hasFocus()
-    QTest.keyClick(picker.buttons["Custom"], Qt.Key_Up)
-    assert picker.buttons["Default"].hasFocus()
+    assert picker.tree.hasFocus() and picker.tree.currentItem() is picker.items["Default"]
+    QTest.keyClick(picker.tree, Qt.Key_Down)
+    assert picker.tree.currentItem() is picker.items["Custom"]
     picker.search.setText("no matches"); pump()
-    assert not picker.visible_buttons() and all(not block.isHidden() for block in picker.blocks.values())
+    assert picker.tree.currentItem() is None and picker.empty.isVisible()
     QTest.keyClick(picker.search, Qt.Key_Return); pump()
     assert picker.isVisible() and picker.value is None
     emitted, closed = [], []
@@ -452,13 +428,14 @@ def test_joystick_picker_custom_and_record_hidden(mapping, pump):
     page, core, _ = mapping
     row = page.rows[None, "l_joystick"]
     row.open_picker(); picker = row.picker; pump()
-    assert list(picker.blocks) == ["Joystick"]
+    assert picker.tree.topLevelItemCount() == 1 and picker.tree.topLevelItem(0).text(0) == "Joystick"
     assert picker.record_button.isHidden()
     QTest.keyClick(picker.search, Qt.Key_Down)
-    QTest.keyClick(picker.buttons["Default"], Qt.Key_Space); pump()
+    picker.tree.setCurrentItem(picker.items["Default"])
+    QTest.keyClick(picker.tree, Qt.Key_Space); pump()
     assert picker.value == "Default"
     row.open_picker(); pump()
-    row.picker.buttons["Custom"].click(); pump()
+    row.picker.choose_item(row.picker.items["Custom"]); pump()
     assert ("settings.set_mapping", ("l_joystick", "Custom", None), {}) in core.calls
     assert not page.findChildren(RecordDialog)
 
@@ -474,13 +451,12 @@ def test_picker_extra_catalogue_order_and_record_callbacks(app, pump):
     picker = OptionPicker(categories, chosen.append, lambda: recorded.append(True))
     picker.chosen.connect(emitted.append)
     picker.show_at(anchor); pump(timeout=.25)
-    assert list(picker.blocks) == ["IR functions", "Other"]
-    assert picker.blocks["IR functions"].mapTo(picker, QPoint()).x() < picker.blocks["Other"].mapTo(picker, QPoint()).x()
-    picker.buttons["Custom"].click()
+    assert [picker.tree.topLevelItem(i).text(0) for i in range(2)] == ["IR functions", "Other"]
+    picker.choose_item(picker.items["Custom"])
     assert recorded == [True] and not chosen
     assert emitted == ["Custom"]
     pump(timeout=.25)
-    picker.show_at(anchor); pump(timeout=.25); picker.buttons["IR Mouse"].click()
+    picker.show_at(anchor); pump(timeout=.25); picker.choose_item(picker.items["IR Mouse"])
     assert chosen == ["IR Mouse"] and picker.value == "IR Mouse"
     pump(timeout=.25)
     picker.show_at(anchor); pump(timeout=.25); picker.open_record()
@@ -509,7 +485,9 @@ def test_picker_below_anchor_and_immediate_writer(mapping, pump):
     assert picker.mapToGlobal(QPoint()).x() == row.value.mapToGlobal(QPoint()).x()
     assert picker.mapToGlobal(QPoint()).y() == row.value.mapToGlobal(QPoint(0, row.value.height())).y()
     assert area.contains(picker.flyout.frameGeometry())
-    picker.buttons["Mode Shift"].click()
+    item = picker.items["Mode Shift"]
+    picker.tree.scrollToItem(item)
+    QTest.mouseClick(picker.tree.viewport(), Qt.LeftButton, pos=picker.tree.visualItemRect(item).center())
     assert values == chosen == ["Mode Shift"]
     assert picker.flyout.isVisible()  # callback precedes completion of the fade
     pump(timeout=.25)

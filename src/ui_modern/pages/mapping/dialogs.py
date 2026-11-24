@@ -1,8 +1,9 @@
 from ...i18n import tr
 from ...widgets.changes import apply_change, setting_writer
 from ...widgets.display import setting_title
-import math
-from qfluentwidgets import SwitchButton, LineEdit
+import sys
+from PySide6.QtCore import QSignalBlocker
+from qfluentwidgets import SwitchButton, DoubleSpinBox
 from ...widgets.common import SettingsGroup, ExpandSettingRow, Segments
 from ...widgets.support import SettingsDialog, BatchSlider
 from .rows import MappingRow
@@ -146,10 +147,10 @@ class ActivationDialog(SettingsDialog):
             self.selections[name] = panel.checks
             for checkbox in panel.checks.values():
                 checkbox.toggled.connect(lambda _, name=name: self.selection_changed(name))
-            disclosure.addWidget(panel)
+            disclosure.add_body_widget(panel)
             self.field_rows[name] = disclosure
             numeric_group = SettingsGroup(title + " tuning", self)
-            group.addRow(numeric_group)
+            disclosure.add_body_widget(numeric_group)
             prefix = name.removesuffix("mode")
             for control in view.controls:
                 if not control.key.startswith(prefix) or control.key == name:
@@ -159,14 +160,17 @@ class ActivationDialog(SettingsDialog):
                         setting_writer(self, core.settings.set_in_app_gyro_setting, key, "dampening_amount", suffix=(None,)), self,
                         toast=toast, reader=lambda: self.values()["dampening_amount"])
                 else:
-                    field = LineEdit(self)
+                    field = DoubleSpinBox(self)
+                    field.setDecimals(6 if control.key == "deadzone_amount" else 0)
+                    field.setRange(0, sys.float_info.max)
+                    field.setKeyboardTracking(False)
                     field.setFixedWidth(155)
+                    if control.key.endswith("_ms"):
+                        field.setSuffix(" ms")
                     field.setAccessibleName(setting_title(control.label.rstrip(":")))
-                    field.textEdited.connect(lambda text, name=control.key: self.numeric_edit(name, text))
-                    field.editingFinished.connect(lambda name=control.key: self.normalize(name))
+                    field.valueChanged.connect(lambda value, name=control.key: self.write_number(name, value))
                 self.fields[control.key] = field
-                self.field_rows[control.key] = numeric_group.row(control.label.rstrip(":"), field,
-                    helper=None if isinstance(field, BatchSlider) else "Enter a non-negative number. Saved as you type.")
+                self.field_rows[control.key] = numeric_group.row(control.label.rstrip(":"), field)
             self.field_rows[prefix + "group"] = numeric_group
         self.start_settings()
         self.footer()
@@ -187,66 +191,35 @@ class ActivationDialog(SettingsDialog):
                 checkbox.blockSignals(True)
                 checkbox.setChecked(token in selected)
                 checkbox.blockSignals(False)
-            self.field_rows[name].row.captionLabel.setText(", ".join(token for token in boxes if token in selected) or tr("None"))
+            self.field_rows[name].card.setContent(", ".join(token for token in boxes if token in selected) or tr("None"))
             self.field_rows[name].setToolTip(", ".join(selected) if isinstance(selected, (list, tuple)) else str(selected))
             self.field_rows[name.removesuffix("mode") + "group"].setVisible(bool([token for token in boxes if token in selected]))
         for name, field in self.fields.items():
             if isinstance(field, BatchSlider):
                 field.set_value(values[name])
-            elif not field.hasFocus() or field.property("normalizeRequested"):
-                if name in self.numeric_pending:
-                    continue
-                field.setText(str(values[name]))
-
+            elif name not in self.numeric_pending and field.value() != values[name]:
+                with QSignalBlocker(field):
+                    field.setValue(values[name])
 
     def selection_changed(self, setting):
         apply_change(self, self.core.settings.set_in_app_gyro_setting, self.key, setting,
                      [token for token, box in self.selections[setting].items() if box.isChecked()],
                      old_args=(self.key, setting, self.values()[setting]))
 
-    def numeric_edit(self, name, text):
-        field = self.fields[name]
-        field.setProperty("normalizeRequested", False)
-        try:
-            number = float(text)
-            if not math.isfinite(number):
-                raise ValueError
-        except ValueError:
-            field.setToolTip(tr("Enter a number; the last saved value is retained."))
-            field.setProperty("invalid", True)
-            self.field_rows[name].captionLabel.setText(tr("Enter a number. The last saved value is retained."))
-            self.field_rows[name].captionLabel.setTextColor("#c42b1c", "#ff99a4")
-            return
-        field.setToolTip("")
-        field.setProperty("invalid", False)
-        self.field_rows[name].captionLabel.setText(tr("Enter a non-negative number. Saved as you type."))
-        self.field_rows[name].captionLabel.setTextColor("#606060", "#bfbfbf")
-        value = max(0., number)
-        value = value if name == "deadzone_amount" else int(round(value))
-        if value != self.numeric_pending.get(name, (None, self.values()[name]))[1]:
-            revision = object()
-            self.numeric_pending[name] = (revision, value)
-            old = self.values()[name]
-            fn = self.core.settings.set_in_app_gyro_setting
-            def completed():
-                if self.numeric_pending.get(name, (None,))[0] is revision:
-                    self.numeric_pending.pop(name, None)
-                if not field.hasFocus() or field.property("normalizeRequested"):
-                    self.normalize(name)
-            apply_change(self, fn, self.key, name, value, None,
-                undo=lambda: apply_change(self, fn, self.key, name, old, None), on_finished=completed)
-
-    def normalize(self, name):
-        # No service write on focus loss/close: valid text has already persisted.
-        self.fields[name].setProperty("normalizeRequested", True)
-        self.fields[name].setText(str(self.numeric_pending.get(name, (None, self.values()[name]))[1]))
-        self.fields[name].setProperty("invalid", False)
-        self.field_rows[name].captionLabel.setText(tr("Enter a non-negative number. Saved as you type."))
-        self.field_rows[name].captionLabel.setTextColor("#606060", "#bfbfbf")
+    def write_number(self, name, value):
+        if name != "deadzone_amount":
+            value = int(value)
+        revision = object()
+        self.numeric_pending[name] = revision
+        def finished():
+            if self.numeric_pending.get(name) is revision:
+                self.numeric_pending.pop(name)
+                self.render_settings(self.core.settings.state())
+        apply_change(self, self.core.settings.set_in_app_gyro_setting, self.key, name, value, None,
+                     old_args=(self.key, name, self.values()[name], None), on_finished=finished)
 
     def flush(self, *_):
-        for name, field in self.fields.items():
-            field.finish() if isinstance(field, BatchSlider) else self.normalize(name)
+        self.fields["dampening_amount"].finish()
 
     def configure_mapping(self, *_):
         pass

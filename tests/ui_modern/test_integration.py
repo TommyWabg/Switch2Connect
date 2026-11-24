@@ -88,15 +88,18 @@ def test_startup_switch(app, pump):
     page.close(); page.bridge.close(); pump()
 
 
-def test_inactive_profile_text_follows_theme(window, pump):
+def test_active_profile_radio_follows_theme_and_selection(window, pump):
     from qfluentwidgets import Theme, setTheme
     window, core = window
     window.navigate('profiles'); pump()
     page = window.pages['profiles'].content_page
     setTheme(Theme.DARK); pump()
-    assert '#ffffff' in page.profile_rows['Gaming'][1].styleSheet()
+    assert page.profile_rows['Default'][1].isChecked()
+    assert not page.profile_rows['Gaming'][1].isChecked()
     setTheme(Theme.LIGHT); pump()
-    assert '#202020' in page.profile_rows['Gaming'][1].styleSheet()
+    page.apply_profiles(replace(core.profiles_state, active='Gaming'))
+    assert page.profile_rows['Gaming'][1].isChecked()
+    assert not page.profile_rows['Default'][1].isChecked()
 
 
 def test_source_and_frozen_asset_paths(monkeypatch, core_tmp_path):

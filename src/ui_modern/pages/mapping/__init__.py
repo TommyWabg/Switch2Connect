@@ -5,7 +5,8 @@ from ...widgets.support import FluentSurface
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget
 from PySide6.QtGui import QAction
-from qfluentwidgets import ScrollArea, TitleLabel, PushButton, CheckBox, MessageBox, RoundMenu, SearchLineEdit, FlowLayout, CardWidget, BodyLabel, ComboBox
+from ...widgets.controls import ComboBox
+from qfluentwidgets import ScrollArea, TitleLabel, PushButton, TransparentToolButton, FluentIcon, CheckBox, MessageBox, RoundMenu, SearchLineEdit, FlowLayout, CardWidget, BodyLabel
 from app_core import events
 from ...widgets.display import input_display, setting_title
 from ...widgets.common import SettingsGroup, Segments
@@ -52,11 +53,11 @@ class MappingPage(ScrollArea):
         self.search.textChanged.connect(self.filter_rows)
         self.cells = {}; self.band_widgets = []
         self.shift_actions = QWidget(self); actions = QHBoxLayout(self.shift_actions); actions.setContentsMargins(0, 0, 0, 0)
-        self.copy = PushButton(tr("Copy from controller mapping"), self)
-        self.reset_shift = PushButton(tr("Reset mode shift mapping"), self)
-        self.copy.hide()
-        self.reset_shift.hide()
-        self.overflow = PushButton("⋯", self.shift_actions); self.overflow.setFixedWidth(36)
+        self.overflow = TransparentToolButton(FluentIcon.MORE, self.shift_actions)
+        self.shift_menu = RoundMenu(parent=self.overflow)
+        self.copy = QAction(tr("Copy from controller mapping"), self.shift_menu)
+        self.reset_shift = QAction(tr("Reset mode shift mapping"), self.shift_menu)
+        self.shift_menu.addActions([self.copy, self.reset_shift])
         self.overflow.setAccessibleName(tr("Mode shift actions"))
         self.overflow.setToolTip(tr("Mode shift actions"))
         actions.addWidget(self.overflow); header.addWidget(self.shift_actions)
@@ -64,8 +65,8 @@ class MappingPage(ScrollArea):
         policy.setRetainSizeWhenHidden(True)
         self.shift_actions.setSizePolicy(policy)
         self.overflow.clicked.connect(self.show_shift_menu)
-        self.copy.clicked.connect(lambda: self.confirm_shift(tr("Copy controller mapping?"), tr("This replaces the mode shift mappings with controller mappings."), core.settings.copy_controller_mapping_to_mode_shift))
-        self.reset_shift.clicked.connect(lambda: self.confirm_shift(tr("Reset mode shift mapping?"), tr("This clears the mode shift mappings and simultaneous inputs."), core.settings.reset_mode_shift_mapping))
+        self.copy.triggered.connect(lambda: self.confirm_shift(tr("Copy controller mapping?"), tr("This replaces the mode shift mappings with controller mappings."), core.settings.copy_controller_mapping_to_mode_shift))
+        self.reset_shift.triggered.connect(lambda: self.confirm_shift(tr("Reset mode shift mapping?"), tr("This clears the mode shift mappings and simultaneous inputs."), core.settings.reset_mode_shift_mapping))
         for scope in (None, SHIFT_SCOPE):
             panel = QWidget(self); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(8)
             groups = {}
@@ -140,10 +141,6 @@ class MappingPage(ScrollArea):
         self.show_dialog(dialog)
 
     def show_shift_menu(self):
-        self.shift_menu = RoundMenu(parent=self)
-        for title, button in (("Copy from controller mapping", self.copy), ("Reset mode shift mapping", self.reset_shift)):
-            action = QAction(tr(title), self.shift_menu)
-            action.triggered.connect(button.click); self.shift_menu.addAction(action)
         self.shift_menu.exec(self.overflow.mapToGlobal(self.overflow.rect().bottomLeft()))
 
     def set_gc(self, mode, scope):

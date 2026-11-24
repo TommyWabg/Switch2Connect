@@ -1,8 +1,9 @@
 """Profile checklists, asynchronous file pickers and combo capture."""
 from ...i18n import tr
 import threading
-from PySide6.QtWidgets import QFileDialog, QWidget, QVBoxLayout, QScrollArea
-from qfluentwidgets import MessageBoxBase, BodyLabel, CheckBox
+from PySide6.QtCore import Qt, QSignalBlocker
+from PySide6.QtWidgets import QFileDialog, QWidget, QVBoxLayout
+from qfluentwidgets import MessageBoxBase, BodyLabel, CheckBox, ScrollArea
 from ...qt_bridge import call_core, gui_dispatcher
 
 
@@ -50,7 +51,7 @@ class ChecklistDialog(MessageBoxBase):
         self.viewLayout.addWidget(BodyLabel(tr('Import profiles') if importing else tr('Export profiles'), self))
         self.select_all = CheckBox(tr('Select all'), self); self.select_all.setChecked(True)
         self.viewLayout.addWidget(self.select_all)
-        area = QScrollArea(self); area.setWidgetResizable(True); area.setMinimumHeight(160)
+        area = ScrollArea(self); area.setWidgetResizable(True); area.setMinimumHeight(160)
         content = QWidget(area); layout = QVBoxLayout(content); area.setWidget(content)
         self.checks = {}
         for name in preview.names:
@@ -63,7 +64,7 @@ class ChecklistDialog(MessageBoxBase):
         self.controller = CheckBox(tr('Import controller related data' if importing else 'Export controller related data'), self)
         self.controller.setVisible(preview.has_controller_data); self.viewLayout.addWidget(self.controller)
         self.controller.stateChanged.connect(self.validate)
-        self.select_all.stateChanged.connect(lambda: [c.setChecked(self.select_all.isChecked()) for c in self.checks.values()])
+        self.select_all.stateChanged.connect(self.set_all)
         self.yesButton.setText(tr('Import') if importing else tr('Export')); self.cancelButton.setText(tr('Cancel'))
         self.error = BodyLabel('', self); self.viewLayout.addWidget(self.error)
         self.widget.setMinimumWidth(440); self.validate()
@@ -71,8 +72,19 @@ class ChecklistDialog(MessageBoxBase):
     def selected(self):
         return tuple(name for name, check in self.checks.items() if check.isChecked())
 
+    def set_all(self, state):
+        for check in self.checks.values():
+            with QSignalBlocker(check):
+                check.setChecked(state != Qt.Unchecked.value)
+        self.validate()
+
     def validate(self, *_):
-        valid = bool(self.selected()) or self.controller.isChecked()
+        selected = self.selected()
+        with QSignalBlocker(self.select_all):
+            state = Qt.Unchecked if not selected else Qt.Checked if len(selected) == len(self.checks) else Qt.PartiallyChecked
+            self.select_all.setCheckState(state)
+            self.select_all.setEnabled(bool(self.checks))
+        valid = bool(selected) or self.controller.isChecked()
         self.yesButton.setEnabled(valid)
         self.error.setText('' if valid else tr('Select a profile or controller related data.'))
         return valid

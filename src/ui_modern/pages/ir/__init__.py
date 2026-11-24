@@ -2,8 +2,8 @@
 from ...i18n import tr
 from ...widgets.support import ThemedDialog
 from ...widgets.changes import apply_change, bind_numeric
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QDialogButtonBox
-from qfluentwidgets import ScrollArea, PushButton, BodyLabel, TitleLabel
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QHBoxLayout
+from qfluentwidgets import ScrollArea, DropDownPushButton, PushButton, BodyLabel, TitleLabel
 from app_core import events
 from ...widgets.display import input_display, setting_title
 from ...qt_bridge import BusBridge, call_core
@@ -48,7 +48,7 @@ class IrSensorDialog(ThemedDialog):
         scroll.viewport().setAutoFillBackground(False)
         self.body = QVBoxLayout(content); self.body.setContentsMargins(0, 8, 0, 8); self.body.setSpacing(12)
         self.general = SettingsGroup("Function", content); self.body.addWidget(self.general)
-        self.function = PushButton(tr("Default (IR Mouse)"), self); self.function.setFixedWidth(260)
+        self.function = DropDownPushButton(tr("Default (IR Mouse)"), self); self.function.setFixedWidth(260)
         self.function.clicked.connect(self.pick_function)
         self.function_row = self.general.row("IR function", self.function)
         self.mode = Choice(self)
@@ -61,10 +61,10 @@ class IrSensorDialog(ThemedDialog):
         self.reset_button = reset
         self.mouse = ExpandSettingRow("IR mouse settings", parent=content)
         self.body.addWidget(self.mouse)
-        self.mouse_group = SettingsGroup("Mouse", self.mouse.body); self.mouse.addWidget(self.mouse_group)
+        self.mouse_group = SettingsGroup("Mouse", self.mouse.view); self.mouse.add_body_widget(self.mouse_group)
         self.gyro = ExpandSettingRow("In-app gyro settings", parent=content)
         self.body.addWidget(self.gyro)
-        self.gyro_group = SettingsGroup("Activation settings", self.gyro.body); self.gyro.addWidget(self.gyro_group)
+        self.gyro_group = SettingsGroup("Activation settings", self.gyro.view); self.gyro.add_body_widget(self.gyro_group)
         self.profile = SettingsGroup("Change profile", content); self.body.addWidget(self.profile)
         self.profile_mode = Choice(self)
         self.profile_mode.sync(("Auto", "Manual"), core.settings.state().app.change_profile_mode)
@@ -72,8 +72,10 @@ class IrSensorDialog(ThemedDialog):
         self.profile_mode.edited.connect(self.change_profile_mode)
         self.controls = {}; self.rows = {}; self.values = {}; self.gyro_controls = {}; self.gyro_rows = {}; self.gyro_values = {}
         self.body.addStretch()
-        buttons = QDialogButtonBox(QDialogButtonBox.Close, self); box.addWidget(buttons)
-        buttons.rejected.connect(self.reject)
+        footer = QHBoxLayout()
+        close = PushButton(tr("Close"), self)
+        close.clicked.connect(self.reject)
+        footer.addStretch(); footer.addWidget(close); box.addLayout(footer)
         self.finished.connect(self.cleanup)
         self.bridge = BusBridge(core.bus, self)
         self.bridge.event.connect(self.apply_event)
@@ -114,7 +116,7 @@ class IrSensorDialog(ThemedDialog):
             self.values[c.key] = c.value
             if c.key not in self.controls:
                 group = self.general if c.key == "activate_threshold" else self.mouse_group
-                widget = PushButton(tr("None"), self) if c.options else Numeric(c, self)
+                widget = DropDownPushButton(tr("None"), self) if c.options else Numeric(c, self)
                 widget.setAccessibleName(setting_title(c.label.rstrip(":")))
                 row = group.row(c.label.rstrip(":"), widget)
                 self.controls[c.key], self.rows[c.key] = widget, row
@@ -203,7 +205,7 @@ class IrSensorDialog(ThemedDialog):
         for c in view.controls:
             self.gyro_values[c.key] = c.value
             if c.key not in self.gyro_controls:
-                widget = PushButton(tr("None"), self) if c.options or c.key == "simul" else Numeric(c, self)
+                widget = DropDownPushButton(tr("None"), self) if c.options or c.key == "simul" else Numeric(c, self)
                 row = self.gyro_group.row(c.label.rstrip(":"), widget)
                 widget.setAccessibleName(setting_title(c.label.rstrip(":")))
                 self.gyro_controls[c.key], self.gyro_rows[c.key] = widget, row

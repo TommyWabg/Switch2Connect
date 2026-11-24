@@ -15,7 +15,7 @@ import time
 from .. import events
 from ..models import ActionResult, InstallStatus
 from ..executor import on_core, run_flow
-from ..models import DriverState, WiredState, WIN32_KEYBOARD, WINUHID_KEYBOARD
+from ..models import DriverState, WiredState, WIN32_BACKEND, WINUHID_BACKEND
 from .drivers_install import DriverInstallMixin
 from .drivers_checks import DriverChecksMixin
 
@@ -47,7 +47,7 @@ class DriverService(DriverInstallMixin, DriverChecksMixin):
         self._hidhide_service = None
         self._hidhide_active = False
         self._packaged_available = False
-        self._keyboard_backend = self._mouse_backend = "Win32 API"
+        self._keyboard_backend = self._mouse_backend = WIN32_BACKEND
         self._snapshot = DriverState()
         self._unsubscribe = bus.subscribe(events.WIRED_STATE_CHANGED, self._wired_changed)
         # Snapshot construction, including initial cached probes, belongs to core.
@@ -141,9 +141,9 @@ class DriverService(DriverInstallMixin, DriverChecksMixin):
         kb, mouse = self._module("keyboard_output"), self._module("raw_input_mouse")
         if initialize:
             kb.initialize()
-        self._keyboard_backend = WINUHID_KEYBOARD if kb.effective_mode() == kb.RAW_INPUT else WIN32_KEYBOARD
+        self._keyboard_backend = WINUHID_BACKEND if kb.effective_mode() == kb.RAW_INPUT else WIN32_BACKEND
         status = self._statuses.get("WinUHid")
-        self._mouse_backend = "WinUHid Virtual HID" if mouse.requested_mode() == "Raw Input" and status is not None and status.state == "healthy" else "Win32 API"
+        self._mouse_backend = WINUHID_BACKEND if mouse.requested_mode() == "Raw Input" and status is not None and status.state == "healthy" else WIN32_BACKEND
         self._bus.publish(PROFILE_OUTPUT_CHANGED, None)
 
     def _refresh_dependents(self):
@@ -235,29 +235,38 @@ class DriverService(DriverInstallMixin, DriverChecksMixin):
     @on_core
     def toggle_keyboard_output(self):
         kb = self._module("keyboard_output")
-        return self.set_keyboard_output(WIN32_KEYBOARD if kb.effective_mode() == kb.RAW_INPUT else WINUHID_KEYBOARD)
+        return self.set_keyboard_output(WIN32_BACKEND if kb.effective_mode() == kb.RAW_INPUT else WINUHID_BACKEND)
 
     @on_core
     def set_keyboard_output(self, backend):
         if self._busy:
             return self._reject("busy")
-        if backend not in (WIN32_KEYBOARD, WINUHID_KEYBOARD):
+        if backend not in (WIN32_BACKEND, WINUHID_BACKEND):
             return self._reject("invalid_backend")
         def refresh():
             self._refresh_output()
             self._publish()
         return driver_transitions.set_keyboard_output(
-            self._module("keyboard_output"), self._status, self._ui, refresh, raw_input=backend == WINUHID_KEYBOARD)
+            self._module("keyboard_output"), self._status, self._ui, refresh, raw_input=backend == WINUHID_BACKEND)
 
     @on_core
     def toggle_mouse_output(self):
+        return self._change_mouse_output(None)
+
+    @on_core
+    def set_mouse_output(self, backend):
+        if backend not in (WIN32_BACKEND, WINUHID_BACKEND):
+            return self._reject("invalid_backend")
+        return self._change_mouse_output(backend == WINUHID_BACKEND)
+
+    def _change_mouse_output(self, raw_input):
         if self._busy:
             return self._reject("busy")
         def refresh():
             self._refresh_output()
             self._publish()
         return driver_transitions.toggle_mouse_output(
-            self._config, self._module("raw_input_mouse"), self._status, self.wake_controller_mouse_output_reconcile, refresh)
+            self._config, self._module("raw_input_mouse"), self._status, self.wake_controller_mouse_output_reconcile, refresh, raw_input=raw_input)
 
     @on_core
     def wake_controller_mouse_output_reconcile(self):
