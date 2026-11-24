@@ -19,6 +19,7 @@ class MainWindow(FluentWindow):
     quit_requested = Signal(bool)
     def __init__(self, core, *, apply_priority=lambda policy: None):
         super().__init__()
+        self.navigationInterface.setExpandWidth(200)
         self.core = core
         self.setWindowTitle("Switch 2 Connect"); self.resize(1100, 760); self.setMinimumSize(960, 640)
         self.setWindowIcon(QIcon(str(resource_path("resources/images/icon.ico"))))
