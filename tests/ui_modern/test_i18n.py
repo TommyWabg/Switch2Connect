@@ -59,6 +59,10 @@ def test_chinese_settings_and_lazy_pages(app, pump, isolated_preferences):
         assert QDialogButtonBox(QDialogButtonBox.Close).button(QDialogButtonBox.Close).text() != "Close"
         page = window.settings
         assert page.language.currentText() == "简体中文"
+        assert page.keyboard.itemText(1) == "WinUHid 虚拟 HID"
+        assert page.keyboard.itemData(1) == "WinUHid Virtual HID"
+        assert page.wired.card.titleLabel.text() == "有线手柄"
+        assert page.wired.card.contentLabel.text() == "手柄扫描与 HidHide 设置"
         page.close_behavior.setCurrentText("最小化到托盘")
         pump(lambda: prefs.value("close_behavior") == "Hide to tray")
         assert prefs.value("close_behavior") == "Hide to tray"

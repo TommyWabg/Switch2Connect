@@ -335,6 +335,14 @@ def test_keyboard_and_mouse_backends_and_wake(rig):
     assert r.ui.calls[-1].args[0] == "Keyboard Raw Input Error"
 
 
+def test_keyboard_backend_selection_is_idempotent(rig):
+    for backend, action in (("WinUHid Virtual HID", "keyboard.raw"), ("Win32 API", "keyboard.standard")):
+        assert resolve(rig.service.set_keyboard_output(backend)).ok
+        assert resolve(rig.service.set_keyboard_output(backend)).ok
+        assert rig.service.state().keyboard_backend == backend
+        assert rig.trace.count((action, True)) == 1
+
+
 def test_wired_events_scan_and_full_power_guard(rig):
     r = rig
     r.bus.publish(events.WIRED_STATE_CHANGED, WiredState(True, (0x2073,)))

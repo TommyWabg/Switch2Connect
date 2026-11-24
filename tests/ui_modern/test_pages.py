@@ -171,17 +171,62 @@ def test_settings_driver_controls_and_app(setup_page, pump):
     page, core, toasts = setup_page(SettingsPage)
     for name in ('WinUHid', 'USBIP', 'HidHide'): page.driver_rows[name][2].click()
     core.driver_state = replace(core.driver_state, driver_type='ViGEmBus'); page.apply_driver(core.driver_state)
-    page.driver_rows['ViGEmBus'][2].click(); page.keyboard.click(); page.mouse.click()
+    page.driver_rows['ViGEmBus'][2].click(); page.mouse.click()
     page.auto_scan.setChecked(True); page.manual_scan.click(); page.hidhide.setChecked(True); page.hidhide_uninstall.click()
     page.startup.setChecked(True); page.minimized.setChecked(True); page.power.setCurrentItem('Auto'); pump()
     for method in ('on_winuhid_manager_driver_action', 'on_vigembus_driver_action', 'on_usbip_btn_clicked', 'on_hidhide_button',
-                   'toggle_keyboard_output', 'toggle_mouse_output', 'toggle_wired_auto_scan', 'manual_wired_scan', 'toggle_hidhide_active'):
+                   'toggle_mouse_output', 'toggle_wired_auto_scan', 'manual_wired_scan', 'toggle_hidhide_active'):
         assert called(core, 'drivers.' + method)
     assert called(core, 'settings.set_run_at_startup', (True,)) and called(core, 'settings.set_start_minimized', (True,))
     assert called(core, 'settings.set_power_saving_mode', ('Auto',))
     page.apply_driver(replace(core.driver_state, usbip_restart_pending=True, keyboard_available=False, mouse_available=False, busy=True))
     assert not page.restart_notice.isHidden() and page.keyboard_row.isHidden()
     assert not page.manual_scan.isEnabled()
+
+
+def test_keyboard_dropdown_commits_only_a_new_choice(setup_page, pump):
+    page, core, toasts = setup_page(SettingsPage)
+    combo = page.keyboard
+    page.ensureWidgetVisible(combo)
+
+    def choose(index):
+        QTest.mouseClick(combo, Qt.LeftButton)
+        pump()
+        view = combo.dropMenu.view
+        assert [view.item(i).text().strip() for i in range(view.count())] == ['Win32 API', 'WinUHid Virtual HID']
+        assert not called(core, 'drivers.set_keyboard_output')
+        QTest.mouseClick(view.viewport(), Qt.LeftButton, pos=view.visualItemRect(view.item(index)).center())
+        pump()
+
+    choose(0)
+    assert not called(core, 'drivers.set_keyboard_output')
+    choose(1)
+    assert called(core, 'drivers.set_keyboard_output', ('WinUHid Virtual HID',))
+    assert combo.currentText() == 'WinUHid Virtual HID'
+    toasts[-1][1]['undo']()
+    pump()
+    assert called(core, 'drivers.set_keyboard_output', ('Win32 API',))
+    assert combo.currentText() == 'Win32 API'
+
+
+def test_wired_group_opens_from_header_and_resizes_for_driver_state(setup_page, pump):
+    page, core, _ = setup_page(SettingsPage)
+    group = page.wired
+    page.ensureWidgetVisible(group)
+    assert not group.isExpand
+    QTest.mouseClick(group.card.titleLabel, Qt.LeftButton)
+    pump(timeout=.3)
+    assert group.isExpand and group.height() > group.card.height()
+    page.manual_scan.click()
+    assert group.isExpand and called(core, 'drivers.manual_wired_scan')
+    full_height = group.height()
+    page.apply_driver(replace(core.driver_state, hidhide_service_state=False))
+    pump()
+    assert group.card.height() < group.height() < full_height
+    assert not page.hidhide.isVisibleTo(group)
+    QTest.keyClick(group.card.expandButton, Qt.Key_Space)
+    pump(timeout=.3)
+    assert not group.isExpand and group.height() == group.card.height()
 
 
 def test_firmware_port_actions_close_and_replug(setup_page, pump):

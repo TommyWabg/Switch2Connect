@@ -299,9 +299,16 @@ def wake_controller_mouse_output_reconcile(controllers):
 
 
 def toggle_keyboard_output(keyboard_output, status_query, ui, refresh):
+    return set_keyboard_output(keyboard_output, status_query, ui, refresh,
+                               raw_input=keyboard_output.effective_mode() != keyboard_output.RAW_INPUT)
+
+
+def set_keyboard_output(keyboard_output, status_query, ui, refresh, *, raw_input):
     try:
         result = ActionResult(True)
-        if keyboard_output.effective_mode() == keyboard_output.RAW_INPUT:
+        if raw_input == (keyboard_output.effective_mode() == keyboard_output.RAW_INPUT):
+            return result
+        if not raw_input:
             keyboard_output.activate_standard(save=True)
         else:
             status = status_query("WinUHid", use_cache=False)

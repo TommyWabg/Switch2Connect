@@ -74,6 +74,8 @@
   "Restart Required": "需要重启",
   "Restart Windows before reinstalling USBIP.": "请先重启 Windows，再重新安装 USBIP。",
   "Keyboard output backend": "键盘输出方式",
+  "WinUHid Virtual HID": "WinUHid 虚拟 HID",
+  "Controller scanning and HidHide": "手柄扫描与 HidHide 设置",
   "Mouse output backend": "鼠标输出方式",
   "Manage firmware…": "管理固件…",
   "ESP32-S3 bridge": "ESP32-S3 桥接器",

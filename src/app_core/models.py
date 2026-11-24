@@ -76,6 +76,10 @@ class StatusInfo:
     color: str = "#888888"
 
 
+WIN32_KEYBOARD = "Win32 API"
+WINUHID_KEYBOARD = "WinUHid Virtual HID"
+
+
 @dataclass(frozen=True, slots=True)
 class DriverState:
     driver_type: str = ""
@@ -108,7 +112,7 @@ class DriverState:
     action_label: str = "Install WinUHid Driver"
     action_kind: str = "install"
     needs_attention: bool = False
-    keyboard_backend: str = "Win32 API"
+    keyboard_backend: str = WIN32_KEYBOARD
     mouse_backend: str = "Win32 API"
     keyboard_available: bool = False
     mouse_available: bool = False
