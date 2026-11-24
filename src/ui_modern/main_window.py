@@ -42,8 +42,9 @@ class MainWindow(FluentWindow):
         self.task_indicator = IndeterminateProgressRing(self.titleBar); self.task_indicator.setFixedSize(18, 18); self.task_indicator.hide()
         self.window_menu = TransparentToolButton(FluentIcon.MORE, self.titleBar); self.window_menu.setAccessibleName(tr("More"))
         self.window_menu.setToolTip(tr("More"))
-        for widget in (status_group, self.profile, self.task_indicator, self.window_menu):
-            self.titleBar.hBoxLayout.insertWidget(self.titleBar.hBoxLayout.count()-1, widget, 0, Qt.AlignVCenter)
+        # Share the caption buttons' row, which is shorter than the full title bar.
+        for index, widget in enumerate((status_group, self.profile, self.task_indicator, self.window_menu)):
+            self.titleBar.buttonLayout.insertWidget(index, widget, 0, Qt.AlignVCenter)
         self.profile.clicked.connect(self.profile_menu); self.window_menu.clicked.connect(self.show_window_menu)
         self.devices = DevicesPage(core, self.toast, self)
         self.settings = SettingsPage(core, self.toast, lambda: self.quit_requested.emit(True), apply_priority, self, hide_to_tray=self.hide_to_tray)

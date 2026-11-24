@@ -2,6 +2,23 @@ from dataclasses import replace
 import pytest
 from app_core import events
 from app_core.events import TaskState, Toast
+from PySide6.QtCore import QPoint
+
+
+def test_title_bar_actions_align_with_caption_buttons(window, pump):
+    w, _ = window
+    bar = w.titleBar
+    for width, busy in ((960, False), (1280, True)):
+        w.resize(width, 700)
+        w.task_indicator.setVisible(busy)
+        pump()
+        actions = [w.status, w.status_dot, w.profile, w.window_menu,
+                   bar.minBtn, bar.maxBtn, bar.closeBtn]
+        if busy:
+            actions.append(w.task_indicator)
+        centers = [widget.mapTo(bar, QPoint()).y() + widget.height() / 2 for widget in actions]
+        assert max(centers) - min(centers) <= 1
+        assert bar.closeBtn.geometry().topRight() == bar.rect().topRight()
 
 def test_build_navigation_and_diff(window, pump):
     w, core = window
