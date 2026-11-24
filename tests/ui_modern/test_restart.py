@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from ui_modern.restart import relaunch_args, resolve_ui_mode, schedule_relaunch
 
-@pytest.mark.parametrize("argv,config,expected", [([], "modern", "modern"), (["--ui=classic"], "modern", "classic"), (["--ui=modern"], "classic", "modern"), (["--ui=wrong"], "unknown", "classic"), (["--ui=modern", "--ui=classic"], "modern", "classic")])
+@pytest.mark.parametrize("argv,config,expected", [([], "modern", "modern"), (["--ui=classic"], "modern", "classic"), (["--ui=modern"], "classic", "modern"), (["--ui=wrong"], "unknown", "modern"), (["--ui=modern", "--ui=classic"], "modern", "classic")])
 def test_mode(argv, config, expected):
     assert resolve_ui_mode(argv, config)==expected
 

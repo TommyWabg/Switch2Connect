@@ -6,7 +6,7 @@ import sys
 
 
 def resolve_ui_mode(argv, config_value):
-    mode = config_value if config_value in ("classic", "modern") else "classic"
+    mode = config_value if config_value in ("classic", "modern") else "modern"
     for arg in argv:
         if arg in ("--ui=modern", "--ui=classic"):
             mode = arg.split("=", 1)[1]

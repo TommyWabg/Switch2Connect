@@ -842,9 +842,9 @@ class Config:
         
         self.open_when_startup = config.get("open_when_startup", False)
         self.start_minimized = config.get("start_minimized", False)
-        self.ui_mode = config.get("ui_mode", "classic")
+        self.ui_mode = config.get("ui_mode", "modern")
         if self.ui_mode not in ("classic", "modern"):
-            self.ui_mode = "classic"
+            self.ui_mode = "modern"
         self.power_saving_mode = config.get("power_saving_mode", "Off")
         if self.power_saving_mode not in ("Off", "Auto", "Full"):
             self.power_saving_mode = "Off"

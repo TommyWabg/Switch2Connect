@@ -252,7 +252,7 @@ class SettingsService:
             AutoDisconnectView(g("auto_disconnect_mode", "OFF"), g("auto_disconnect_days", 0),
                 g("auto_disconnect_hours", 0), g("auto_disconnect_minutes", 0)),
             AppSettingsView(g("open_when_startup", False), g("start_minimized", False),
-                g("power_saving_mode", "Off"), g("ui_mode", "classic"), g("change_profile_mode", "Manual")),
+                g("power_saving_mode", "Off"), g("ui_mode", "modern"), g("change_profile_mode", "Manual")),
             tuple(self._activation_view(key) for key in (
                 *(k for k, _, _ in INPUTS),
                 *(stick + "_" + direction for stick in ("l_joystick", "r_joystick")

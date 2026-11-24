@@ -14,7 +14,7 @@ from .firmware import FirmwareManagerDialog
 
 class SettingsPage(ServicePage):
     def __init__(self, core, toast, request_restart=lambda: None, apply_priority=lambda policy: None,
-                 parent=None, *, hide_to_tray=None, version='v3.4'):
+                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.1'):
         super().__init__('Settings', core, toast, parent)
         self.request_restart, self.apply_priority, self.hide_to_tray = request_restart, apply_priority, hide_to_tray
         self.driver_rows = {}

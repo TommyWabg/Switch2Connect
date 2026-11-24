@@ -1,44 +1,59 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import hashlib
+import re
+from pathlib import Path
+from PyInstaller.archive.readers import CArchiveReader
 import sys
 import pkgutil
 import PySide6
 sys.path.insert(0, os.path.join(SPECPATH, "src"))
 from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
-datas = [('resources', 'resources'), ('config.yaml', 'resources'), ('drivers/esp32s3', 'drivers/esp32s3'), ('drivers/tools', 'drivers/tools')]
-binaries = []
-if os.path.exists('drivers/dualsense_haptic_native.dll'):
-    binaries.append(('drivers/dualsense_haptic_native.dll', 'drivers'))
-hiddenimports = [
-    'driver_install_helper',
-    'usbip_server',
-    'usbip_dualsense_server',
-    'dualsense_descriptors',
-    'dualsense_structs',
-    'dualsense_haptic',
-    'audio_endpoint_guard',
-    'esp32s3_bridge',
-    'comtypes',
-    'comtypes.client',
-    'comtypes.automation',
-    'win32com',
-    'win32com.client',
-    'kofi_webview',
-    'webview',
-    'clr',
-    'proxy_tools',
-    'bottle',
-]
-tmp_ret = collect_all('vgamepad')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('imufusion')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('comtypes')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('webview')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+root = Path(SPECPATH)
+release = Path(os.environ.get("SWITCH2CONNECT_UPSTREAM_EXE") or
+               root / "build/upstream-v3.4/Switch2Connect_v3.4.exe")
+with release.open("rb") as stream:
+    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+if digest != "5f2b61f4ba8f88c3f201710fd718676731308dad843e5a1fea7c5831eb8d2829":
+    raise ValueError("The upstream executable must be the official Switch2Connect_v3.4.exe")
 
+# Upstream publishes the current firmware manifest, driver installer and reset
+# config in its release. Its source tree contains an older firmware manifest.
+archive = CArchiveReader(str(release))
+payload = Path(workpath) / "release-assets"
+datas = [(str(p), str(p.parent.relative_to(root))) for p in (root / "src").rglob("*.py")]
+binaries = []
+resources = {p.relative_to(root): p for p in (root / "resources").rglob("*") if p.is_file()}
+for name in archive.toc:
+    rel = Path(name)
+    if rel.parts[0] not in {"resources", "drivers", "firmware_bin"}:
+        continue
+    if rel.parts[0] == "resources" and rel in resources:
+        continue
+    local = root / rel
+    if not local.is_file() or "firmware" in rel.parts or rel.parts[0] == "firmware_bin":
+        local = payload / rel
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(archive.extract(name))
+    resources[rel] = local
+
+native = {"WinUHid.dll", "WinUHidDevs.dll", "dualsense_haptic_native.dll"}
+for rel, path in resources.items():
+    collection = binaries if rel.name in native else datas
+    collection.append((str(path), str(rel.parent)))
+
+hiddenimports = [
+    "driver_install_helper", "usb_hid_controller", "usbip_server", "usbip_dualsense_server",
+    "dualsense_descriptors", "dualsense_structs", "dualsense_haptic", "audio_endpoint_guard",
+    "usb.core", "usb.util", "win32com.client", "comtypes.client", "comtypes.automation",
+    "kofi_webview", "clr", "proxy_tools", "bottle",
+]
+for package in ("vgamepad", "imufusion", "bleak", "winrt", "bluetooth", "hid", "libusb_package", "comtypes", "webview"):
+    extra_data, extra_binaries, extra_imports = collect_all(package)
+    datas.extend(extra_data)
+    binaries.extend(extra_binaries)
+    hiddenimports.extend(extra_imports)
 
 # Dynamic page factories and CLI-selected composition roots are invisible to analysis.
 hiddenimports += collect_submodules('ui_modern') + collect_submodules('app_core')
@@ -75,7 +90,11 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Qt for Windows imports the system ICU API. An unrelated ICU build on PATH
+# can have the same filename and versioned exports that Qt cannot load.
+a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() not in {"icuuc.dll", "icuin.dll"}]
 pyz = PYZ(a.pure)
+version = re.search(r'^APP_VERSION = "([^"]+)"', (root / "src/gui.py").read_text(encoding="utf8"), re.M)[1]
 
 exe = EXE(
     pyz,
@@ -83,11 +102,11 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='gui',
+    name=f"Switch2Connect_{version}",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

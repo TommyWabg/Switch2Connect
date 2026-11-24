@@ -7,8 +7,8 @@ import pytest
 
 
 @pytest.mark.parametrize("value,expected", [
-    (None, "classic"), ("classic", "classic"), ("modern", "modern"),
-    ("invalid", "classic"), (False, "classic"), (["modern"], "classic"),
+    (None, "modern"), ("classic", "classic"), ("modern", "modern"),
+    ("invalid", "modern"), (False, "modern"), (["modern"], "modern"),
 ])
 def test_ui_mode_load_and_round_trip(core_tmp_path, value, expected):
     tmp_path = core_tmp_path
