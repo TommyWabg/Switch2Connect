@@ -1,8 +1,6 @@
 """Shared page utilities; all mutations cross the existing Qt boundary."""
-from ...i18n import tr
 from PySide6.QtCore import QSignalBlocker
-from PySide6.QtWidgets import QVBoxLayout
-from qfluentwidgets import ScrollArea, TitleLabel, SpinBox
+from qfluentwidgets import ScrollArea, SpinBox
 from ...qt_bridge import BusBridge
 from ...widgets.support import FluentSurface
 
@@ -29,12 +27,9 @@ class ServicePage(ScrollArea):
         self.setObjectName(title.lower())
         self.setWidgetResizable(True)
         self.enableTransparentBackground()
-        self.content = FluentSurface(self)
+        self.content = FluentSurface(title, self)
         self.content.setObjectName('t10Surface')
         self.setWidget(self.content)
-        self.box = QVBoxLayout(self.content)
-        self.box.setContentsMargins(24, 20, 24, 24)
-        self.box.setSpacing(16)
-        self.box.addWidget(TitleLabel(tr(title), self.content))
+        self.box = self.content.box
         self.bridge = BusBridge(core.bus, self)
         self.destroyed.connect(lambda: self.bridge.close())

@@ -3,8 +3,8 @@ from ..i18n import tr
 from ..widgets.changes import apply_change
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen
-from PySide6.QtWidgets import QDialog, QWidget, QVBoxLayout, QHBoxLayout
-from qfluentwidgets import (TitleLabel, BodyLabel, CaptionLabel, PushButton,
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QWidget, QVBoxLayout, QHBoxLayout
+from qfluentwidgets import (SubtitleLabel, BodyLabel, CaptionLabel, PushButton,
                            PrimaryPushButton, ProgressBar, ToolTipFilter, FluentStyleSheet)
 from ..qt_bridge import BusBridge, call_core
 from ..widgets.common import SettingsGroup
@@ -44,7 +44,7 @@ class SessionDialog(QDialog):
         self.setWindowTitle(tr("Calibration")); self.setMinimumWidth(560)
         self.setWindowModality(Qt.WindowModal)
         box = QVBoxLayout(self); box.setContentsMargins(24, 24, 24, 24); box.setSpacing(16)
-        self.title = TitleLabel(tr("Starting calibration…"), self)
+        self.title = SubtitleLabel(tr("Starting calibration…"), self)
         self.phase = BodyLabel(tr("Waiting for the controller"), self); self.phase.setWordWrap(True)
         self.error = CaptionLabel("", self); self.error.setWordWrap(True)
         for label in (self.title, self.phase, self.error):
@@ -52,12 +52,16 @@ class SessionDialog(QDialog):
         box.addWidget(self.title); box.addWidget(self.phase)
         self.body = QVBoxLayout(); box.addLayout(self.body)
         box.addWidget(self.error)
-        buttons = QHBoxLayout(); buttons.addStretch()
+        buttons = QDialogButtonBox(self)
         self.cancel_button = PushButton(tr("Cancel"), self)
         self.primary = PrimaryPushButton(tr("Done"), self); self.primary.setDefault(True)
-        buttons.addWidget(self.cancel_button); buttons.addWidget(self.primary); box.addLayout(buttons)
-        self.cancel_button.clicked.connect(self.reject)
-        self.primary.clicked.connect(self.advance)
+        self.cancel_button.setMinimumWidth(120)
+        self.primary.setMinimumWidth(120)
+        buttons.addButton(self.primary, QDialogButtonBox.AcceptRole)
+        buttons.addButton(self.cancel_button, QDialogButtonBox.RejectRole)
+        box.addWidget(buttons)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.advance)
         self.bridge = BusBridge(core.bus, self)
         self.bridge.calibration_session.connect(self.apply_session)
         self.finished.connect(self._finish)

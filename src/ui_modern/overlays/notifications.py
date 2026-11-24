@@ -3,7 +3,7 @@ from ..i18n import tr
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QCursor, QGuiApplication
 from PySide6.QtWidgets import QWidget, QVBoxLayout
-from qfluentwidgets import BodyLabel, CaptionLabel, TitleLabel, ToolTipFilter, isDarkTheme, qconfig
+from qfluentwidgets import BodyLabel, CaptionLabel, SubtitleLabel, ToolTipFilter, isDarkTheme, qconfig
 
 
 class NotificationOverlay(QWidget):
@@ -17,8 +17,11 @@ class NotificationOverlay(QWidget):
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
         self.surface = QWidget(self); self.surface.setObjectName(f"overlaySurface_{id(self)}")
         outer.addWidget(self.surface)
-        self.content = QVBoxLayout(self.surface); self.content.setContentsMargins(22, 18, 22, 18)
-        self.title = TitleLabel("", self.surface)
+        self.content = QVBoxLayout(self.surface); self.content.setContentsMargins(20, 16, 20, 16)
+        self.content.setSpacing(8)
+        self.content.setAlignment(Qt.AlignVCenter)
+        self.title = SubtitleLabel("", self.surface)
+        self.title.setWordWrap(True)
         self.message = BodyLabel("", self.surface); self.message.setWordWrap(True)
         for label in (self.title, self.message):
             label.installEventFilter(ToolTipFilter(label, showDelay=350))
@@ -34,9 +37,13 @@ class NotificationOverlay(QWidget):
         self.refresh_theme()
 
     def refresh_theme(self):
-        colors = {"info": "#0067c0", "success": "#0f7b0f", "warning": "#9d5d00", "error": "#c42b1c"}
-        bg = "#292929" if isDarkTheme() else "#fafafa"
-        self.surface.setStyleSheet(f"QWidget#{self.surface.objectName()} {{background: {bg}; border: 1px solid #888888; border-left: 4px solid {colors.get(self.kind, colors['info'])}; border-radius: 10px;}}")
+        if isDarkTheme():
+            bg, border = "#2c2c2c", "#494949"
+            colors = {"info": "#60cdff", "success": "#6ccb5f", "warning": "#fce100", "error": "#ff99a4"}
+        else:
+            bg, border = "#fafafa", "#d6d6d6"
+            colors = {"info": "#0067c0", "success": "#0f7b0f", "warning": "#9d5d00", "error": "#c42b1c"}
+        self.surface.setStyleSheet(f"QWidget#{self.surface.objectName()} {{background: {bg}; border: 1px solid {border}; border-left: 4px solid {colors.get(self.kind, colors['info'])}; border-radius: 8px;}}")
         self.surface.style().unpolish(self.surface)
         self.surface.style().polish(self.surface)
         self.surface.update()
@@ -78,7 +85,7 @@ class ProfileSelectionOverlay(NotificationOverlay):
         super().__init__(parent)
         self.setFixedHeight(290)
         self.previous = CaptionLabel("", self.surface)
-        self.current = TitleLabel("", self.surface)
+        self.current = SubtitleLabel("", self.surface)
         self.next = CaptionLabel("", self.surface)
         self.hints = CaptionLabel("", self.surface)
         for label in (self.previous, self.current, self.next, self.hints):

@@ -2,14 +2,14 @@ from ..i18n import tr
 from ..widgets.changes import apply_change, apply_setting
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QHBoxLayout, QStackedWidget
 from PySide6.QtCore import Qt
-from qfluentwidgets import ScrollArea, TitleLabel, BodyLabel, PushButton, IndeterminateProgressRing, CaptionLabel, SubtitleLabel
+from qfluentwidgets import ScrollArea, BodyLabel, PushButton, IndeterminateProgressRing, CaptionLabel, SubtitleLabel
 from app_core.models import SlotInfo
 from .rumble.support import int_spin
 from ..widgets.common import SettingsGroup, SettingRow, Segments, FitImage, WarningSettingRow
 from ..widgets.player_card import PlayerCard, CARD_HEIGHT, _ASSETS
 from ..widgets.support import FluentSurface
 
-EMPTY_HEIGHT = 340
+EMPTY_HEIGHT = 272
 
 class DevicesPage(ScrollArea):
     def __init__(self, core, toast, parent=None):
@@ -18,9 +18,9 @@ class DevicesPage(ScrollArea):
         self.setObjectName("devices")
         self.setWidgetResizable(True)
         self.enableTransparentBackground()
-        self.content = FluentSurface(self); self.setWidget(self.content)
-        box = QVBoxLayout(self.content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
-        box.addWidget(TitleLabel(tr("Devices"), self))
+        self.content = FluentSurface("Devices", self)
+        self.setWidget(self.content)
+        box = self.content.box
         self.controller_stack = QStackedWidget(self.content)
         self.controller_stack.setFixedHeight(EMPTY_HEIGHT)
         self.empty = QWidget(self.controller_stack)
@@ -28,7 +28,7 @@ class DevicesPage(ScrollArea):
         empty_box.addStretch()
         # Classic's pre-rendered pairing hint (pair.svg uses clip paths QtSvg cannot draw).
         self.pair_image = FitImage(_ASSETS / "pairing_hint.png", self.empty)
-        self.pair_image.setFixedHeight(200)
+        self.pair_image.setFixedHeight(144)
         empty_box.addWidget(self.pair_image)
         empty_box.addWidget(SubtitleLabel(tr("No controllers connected"), self.empty), 0, Qt.AlignCenter)
         body = BodyLabel(tr("Press a button on a paired controller, or hold the sync button to pair a new one."), self.empty)
@@ -36,6 +36,7 @@ class DevicesPage(ScrollArea):
         body.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(body)
         self.connection_route = CaptionLabel("", self.empty)
+        self.connection_route.setTextColor("#5d5d5d", "#c8c8c8")
         empty_box.addWidget(self.connection_route, 0, Qt.AlignCenter); empty_box.addStretch()
         self.card_panel = QWidget(self.controller_stack)
         self.grid = QGridLayout(self.card_panel); self.grid.setContentsMargins(0, 0, 0, 0); self.grid.setSpacing(12)
@@ -82,7 +83,9 @@ class DevicesPage(ScrollArea):
         self.gyro_button.clicked.connect(lambda: apply_change(self, core.players.start_gyro_calibration))
         box.addStretch()
     def _arrange(self):
-        columns = 2 if self.viewport().width() < 900 else 4
+        margins = self.content.box.contentsMargins()
+        usable_width = self.viewport().width() - margins.left() - margins.right()
+        columns = 4 if usable_width >= 4 * 196 + 3 * self.grid.horizontalSpacing() else 2
         if columns == self._columns:
             return
         self._columns = columns

@@ -2,10 +2,7 @@
 from ...i18n import tr
 from functools import partial
 from ...widgets.changes import apply_change, bind_numeric
-from PySide6.QtCore import QUrl
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QVBoxLayout
-from qfluentwidgets import ScrollArea, TitleLabel, PushButton
+from qfluentwidgets import ScrollArea, HyperlinkButton, PushButton
 from app_core import events
 from ...qt_bridge import BusBridge
 from ...widgets.common import SettingsGroup, SettingRow
@@ -41,11 +38,9 @@ class GyroPage(ScrollArea):
         self.setObjectName("gyro")
         self.setWidgetResizable(True)
         self.enableTransparentBackground()
-        self.content = FluentSurface(self); self.setWidget(self.content)
-        self.content.setAutoFillBackground(False)
-        self.viewport().setAutoFillBackground(False)
-        box = QVBoxLayout(self.content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
-        box.addWidget(TitleLabel(tr("Gyro"), self.content))
+        self.content = FluentSurface("Gyro", self)
+        self.setWidget(self.content)
+        box = self.content.box
         self.controls = {}; self.rows = {}; self.values = {}; self.keys = {}
         self.groups = {}
         for title in ("Pass-through", "In-app gyro", "Dual Joy-Con gyro"):
@@ -55,9 +50,8 @@ class GyroPage(ScrollArea):
         self.calibration_row = calibration.addRow(SettingRow("Calibrate gyro",
             "Place controllers on a flat surface and keep them still", self.calibrate, calibration))
         self.calibrate.clicked.connect(lambda: apply_change(self, core.players.start_gyro_calibration))
-        tutorial = PushButton(tr("Watch tutorial"), calibration)
+        tutorial = HyperlinkButton(TUTORIAL_URL, tr("Watch tutorial"), calibration)
         tutorial.setToolTip(TUTORIAL_URL)
-        tutorial.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(TUTORIAL_URL)))
         calibration.row("Magnetometer calibration", tutorial, "Move the controller in a figure 8 pattern.")
         self.tutorial = tutorial
         box.addStretch()

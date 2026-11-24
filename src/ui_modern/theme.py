@@ -1,8 +1,7 @@
 """UI-only preferences and system accent."""
 import sys
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QFont
-from qfluentwidgets import Theme, setTheme, setThemeColor
+from qfluentwidgets import Theme, getFont, setFontFamilies, setTheme, setThemeColor
 
 def preferences():
     return QSettings("Switch2Connect", "ModernUI")
@@ -12,7 +11,8 @@ def apply_theme(name=None):
     setTheme({"System": Theme.AUTO, "Light": Theme.LIGHT, "Dark": Theme.DARK}.get(name, Theme.AUTO))
 
 def initialize_theme(app):
-    app.setFont(QFont("Segoe UI Variable", 10))
+    setFontFamilies(["Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"])
+    app.setFont(getFont(14))
     accent = "#0067C0"
     if sys.platform == "win32":
         import ctypes

@@ -40,7 +40,7 @@ def test_chinese_settings_and_lazy_pages(app, pump, isolated_preferences):
         pump()
         assert window.devices.findChild(TitleLabel).text() == "设备"
         assert window.devices.cards[0].title.text() == "玩家 1"
-        assert window.status.text() == "● 就绪 · ESP32-S3"
+        assert window.status.text() == "就绪 · ESP32-S3"
         assert window.profile.text() == "Settings"
         for name, title in (("mapping", "按键映射"), ("gyro", "陀螺仪"), ("rumble", "振动"), ("profiles", "配置方案")):
             window.navigate(name)

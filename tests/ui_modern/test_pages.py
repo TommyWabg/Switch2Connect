@@ -336,7 +336,7 @@ def test_settings_interface_theme_tray_and_about(setup_page, pump, monkeypatch):
     from ui_modern.theme import preferences
     restarted = []; hidden = []; links = []
     page, core, toasts = setup_page(SettingsPage, request_restart=lambda: restarted.append(True), hide_to_tray=lambda: hidden.append(True))
-    monkeypatch.setattr('ui_modern.pages.settings_full.QDesktopServices.openUrl', lambda url: links.append(url.toString()))
+    monkeypatch.setattr('PySide6.QtGui.QDesktopServices.openUrl', lambda url: links.append(url.toString()))
     page.tray.click(); page.kofi.click()
     assert hidden and links == ['https://ko-fi.com/tagayama']
     page.theme.setCurrentText('Dark'); pump(); assert preferences().value('theme') == 'Dark'

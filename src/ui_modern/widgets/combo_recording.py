@@ -2,7 +2,7 @@
 from ..i18n import tr
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer
 from PySide6.QtWidgets import QApplication, QDialog
-from qfluentwidgets import MessageBoxBase, BodyLabel
+from qfluentwidgets import MessageBoxBase, BodyLabel, SubtitleLabel
 from ..qt_bridge import call_core
 from .display import input_display
 from .recording import key_token
@@ -22,7 +22,7 @@ class ComboRecorder(MessageBoxBase):
         self.tokens, self.pressed = [], set()
         self.setProperty("recording_active", True)
         self.saving = False; self.closed = False
-        self.viewLayout.addWidget(BodyLabel(tr('Record profile switching combo'), self))
+        self.viewLayout.addWidget(SubtitleLabel(tr('Record profile switching combo'), self))
         self.help = BodyLabel(tr('Press and release keys, mouse buttons, wheel or controller buttons. Escape cancels.'), self)
         self.help.setWordWrap(True); self.viewLayout.addWidget(self.help)
         self.value = BodyLabel(tr('Listening…'), self); self.value.setWordWrap(True); self.viewLayout.addWidget(self.value)

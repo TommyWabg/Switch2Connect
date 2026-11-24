@@ -4,7 +4,7 @@ from ..widgets.changes import apply_change
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QApplication, QWidget
-from qfluentwidgets import PushButton, BodyLabel, CaptionLabel, FlowLayout, isDarkTheme
+from qfluentwidgets import PushButton, BodyLabel, CaptionLabel, FlowLayout, FluentIcon, setCustomStyleSheet
 from .common import SettingsGroup, Segments
 from ..qt_bridge import call_core
 from .support import SettingsDialog
@@ -80,6 +80,7 @@ class RecordDialog(SettingsDialog):
                  parent=None, *, initial="", writer=None, on_saved=None, mode=None,
                  keyboard_snapshot=None):
         super().__init__(core, "Record keys", toast, parent)
+        self.resize(640, 448)
         self.key, self.scope, self.writer, self.on_saved = key, scope, writer, on_saved
         self.keyboard_snapshot = keyboard_snapshot or pressed_keyboard_tokens
         self.setProperty("recording_active", False)
@@ -91,13 +92,16 @@ class RecordDialog(SettingsDialog):
         if initial.startswith("Custom") and ":" in initial:
             self.tokens = canonical_tokens(initial.split(":", 1)[1].split("+"))
         group = SettingsGroup("Custom mapping", self); self.box.addWidget(group)
-        self.capture = PushButton(tr("Click to record"), self)
-        self.capture.setMinimumHeight(64); self.capture.setFocusPolicy(Qt.StrongFocus)
+        self.capture = PushButton(FluentIcon.EDIT, tr("Click to record"), self)
+        self.capture.setFocusPolicy(Qt.StrongFocus)
         self.capture.setAccessibleName(tr("Recording area"))
         group.row("Capture input", self.capture)
         self.chips = QWidget(self); self.chip_layout = FlowLayout(self.chips, needAni=False)
-        self.chip_layout.setContentsMargins(0, 0, 0, 0); self.chip_layout.setHorizontalSpacing(6)
-        group.row("Recorded keys", self.chips)
+        self.chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.chip_layout.setHorizontalSpacing(4); self.chip_layout.setVerticalSpacing(4)
+        recorded = group.row("Recorded keys", None)
+        recorded.textLayout.setSpacing(4)
+        recorded.textLayout.addWidget(self.chips)
         self.mode = Segments(self); self.mode.sync(("Hold", "Tap"), mode)
         group.row("Activation", self.mode)
         self.clear = PushButton(tr("Clear"), self); group.row("Remove all recorded keys", self.clear)
@@ -155,8 +159,10 @@ class RecordDialog(SettingsDialog):
         self.chip_layout.removeAllWidgets()
         for token in self.tokens or ["No keys recorded"]:
             chip = BodyLabel(input_display(token), self.chips)
-            chip.setStyleSheet("background: rgba(128,128,128,30); padding: 4px 8px; border-radius: 6px; color: " +
-                              ("white;" if isDarkTheme() else "black;"))
+            if self.tokens:
+                chip.setContentsMargins(8, 4, 8, 4)
+                setCustomStyleSheet(chip, "BodyLabel { background: #ebebeb; border-radius: 4px; }",
+                                    "BodyLabel { background: #454545; border-radius: 4px; }")
             chip.setToolTip(input_display(token)); self.chip_layout.addWidget(chip)
         self.chips.setToolTip(input_display("+".join(self.tokens)))
 

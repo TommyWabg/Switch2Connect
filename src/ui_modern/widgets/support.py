@@ -2,8 +2,8 @@
 from ..i18n import tr
 from .changes import apply_change
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QWidget
-from qfluentwidgets import TitleLabel, PushButton, PrimaryPushButton, BodyLabel, FluentStyleSheet, ScrollArea
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout, QWidget
+from qfluentwidgets import TitleLabel, SubtitleLabel, PushButton, PrimaryPushButton, BodyLabel, FluentStyleSheet, ScrollArea, setCustomStyleSheet
 from ..qt_bridge import call_core, BusBridge
 from app_core import events
 from app_core.models import Control
@@ -17,11 +17,18 @@ class ThemedDialog(QDialog):
         FluentStyleSheet.DIALOG.apply(self)
 
 
-class FluentSurface(QDialog):
-    """Opaque embedded surface managed by Fluent's theme stylesheet."""
-    def __init__(self, parent=None):
-        super().__init__(parent, Qt.Widget)
-        FluentStyleSheet.DIALOG.apply(self)
+class FluentSurface(QWidget):
+    """Page canvas with a neutral layer beneath Fluent settings cards."""
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground)
+        FluentStyleSheet.FLUENT_WINDOW.apply(self)
+        setCustomStyleSheet(self, "FluentSurface { background: #f7f7f7; }",
+                            "FluentSurface { background: #272727; }")
+        self.box = QVBoxLayout(self)
+        self.box.setContentsMargins(24, 24, 24, 24)
+        self.box.setSpacing(20)
+        self.box.addWidget(TitleLabel(tr(title), self))
 
 
 class SettingsDialog(ThemedDialog):
@@ -35,11 +42,13 @@ class SettingsDialog(ThemedDialog):
         self.resize(820, 640)
         self.outer = QVBoxLayout(self)
         self.outer.setContentsMargins(24, 20, 24, 20); self.outer.setSpacing(12)
-        self.outer.addWidget(TitleLabel(tr(title), self))
+        self.outer.addWidget(SubtitleLabel(tr(title), self))
         self.scroll = ScrollArea(self)
         self.scroll.setWidgetResizable(True)
         self.scroll.enableTransparentBackground()
         self.body = QWidget(self.scroll); self.body.setObjectName("mappingDialogBody"); self.scroll.setWidget(self.body)
+        self.body.setAutoFillBackground(False)
+        self.scroll.viewport().setAutoFillBackground(False)
         self.box = QVBoxLayout(self.body); self.box.setContentsMargins(0, 0, 0, 0); self.box.setSpacing(12)
         self.box.setAlignment(Qt.AlignTop)
         self.outer.addWidget(self.scroll, 1)
@@ -73,13 +82,18 @@ class SettingsDialog(ThemedDialog):
         self.apply_settings(state)
 
     def footer(self, save=None):
-        row = QHBoxLayout(); row.addStretch()
+        buttons = QDialogButtonBox(self)
         self.cancel = PushButton(tr("Cancel") if save else tr("Close"), self)
-        self.cancel.clicked.connect(self.reject); row.addWidget(self.cancel)
+        self.cancel.setMinimumWidth(120)
+        buttons.addButton(self.cancel, QDialogButtonBox.RejectRole)
+        buttons.rejected.connect(self.reject)
         if save:
             self.save = PrimaryPushButton(tr("Save"), self)
-            self.save.setDefault(True); self.save.clicked.connect(save); row.addWidget(self.save)
-        self.outer.addLayout(row)
+            self.save.setMinimumWidth(120)
+            buttons.addButton(self.save, QDialogButtonBox.AcceptRole)
+            self.save.setDefault(True)
+            buttons.accepted.connect(save)
+        self.outer.addWidget(buttons)
 
 
 class BatchSlider(Numeric):

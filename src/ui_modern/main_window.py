@@ -2,9 +2,9 @@ from .i18n import tr
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QAction, QIcon, QGuiApplication, QCursor
 from shiboken6 import isValid
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QSystemTrayIcon, QMenu
-from qfluentwidgets import (FluentWindow, FluentIcon, NavigationItemPosition, BodyLabel,
-                           PushButton, DropDownPushButton, TransparentToolButton, RoundMenu, CheckableMenu, MenuIndicatorType, InfoBar, InfoBarPosition, IndeterminateProgressRing, qconfig, isDarkTheme)
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QSystemTrayIcon, QMenu
+from qfluentwidgets import (FluentWindow, FluentIcon, NavigationItemPosition, CaptionLabel, DotInfoBadge, InfoLevel,
+                           PushButton, TransparentDropDownPushButton, TransparentToolButton, RoundMenu, CheckableMenu, MenuIndicatorType, InfoBar, InfoBarPosition, IndeterminateProgressRing)
 from app_core import events
 from app_core.models import SettingsState
 from .qt_bridge import BusBridge, call_core
@@ -28,13 +28,22 @@ class MainWindow(FluentWindow):
         self._tasks = {}; self.pages = {}; self.lazy_built = set()
         self.bridge = BusBridge(core.bus, self)
         self.bridge.event.connect(self.apply_event)
-        self.status = BodyLabel(tr("Connecting…"), self.titleBar)
-        self.profile = DropDownPushButton(tr("Profile"), self.titleBar)
+        status_group = QWidget(self.titleBar)
+        status_layout = QHBoxLayout(status_group)
+        status_layout.setContentsMargins(8, 0, 8, 0)
+        status_layout.setSpacing(8)
+        self.status_dot = DotInfoBadge(status_group)
+        self.status_dot.setFixedSize(8, 8)
+        self.status = CaptionLabel(tr("Connecting…"), status_group)
+        status_layout.addWidget(self.status_dot)
+        status_layout.addWidget(self.status)
+        self.profile = TransparentDropDownPushButton(tr("Profile"), self.titleBar)
+        self.profile.setToolTip(tr("Profile"))
         self.task_indicator = IndeterminateProgressRing(self.titleBar); self.task_indicator.setFixedSize(18, 18); self.task_indicator.hide()
         self.window_menu = TransparentToolButton(FluentIcon.MORE, self.titleBar); self.window_menu.setAccessibleName(tr("More"))
-        for widget in (self.status, self.profile, self.task_indicator, self.window_menu):
+        self.window_menu.setToolTip(tr("More"))
+        for widget in (status_group, self.profile, self.task_indicator, self.window_menu):
             self.titleBar.hBoxLayout.insertWidget(self.titleBar.hBoxLayout.count()-1, widget, 0, Qt.AlignVCenter)
-        qconfig.themeChangedFinished.connect(self._refresh_status)
         self.profile.clicked.connect(self.profile_menu); self.window_menu.clicked.connect(self.show_window_menu)
         self.devices = DevicesPage(core, self.toast, self)
         self.settings = SettingsPage(core, self.toast, lambda: self.quit_requested.emit(True), apply_priority, self, hide_to_tray=self.hide_to_tray)
@@ -90,7 +99,11 @@ class MainWindow(FluentWindow):
             self._status_state = value
             self._refresh_status()
         elif topic == events.PROFILES_CHANGED:
-            self.profiles_state = value; self.profile.setText(value.active or tr("Profile"))
+            self.profiles_state = value
+            name = value.active or tr("Profile")
+            self.profile.setText(self.profile.fontMetrics().elidedText(name, Qt.ElideRight, 148))
+            self.profile.setToolTip(name)
+            self.profile.setAccessibleName(f"{tr('Profile')} · {name}")
         elif topic == events.TASK_STATE:
             if value.active:
                 self._tasks[value.task_id] = value
@@ -108,9 +121,9 @@ class MainWindow(FluentWindow):
         state = getattr(self, "_status_state", None)
         if state is None:
             return
-        colors = {"ok": "#6ccb5f", "warn": "#fce100", "error": "#ff99a4"} if isDarkTheme() else {"ok": "#0f7b0f", "warn": "#9d5d00", "error": "#c42b1c"}
-        self.status.setText(f"● {tr(state.text)} · {tr(state.connection_route)}")
-        self.status.setStyleSheet(f"color: {colors.get(state.level, state.color)}; padding: 4px 8px; border-radius: 10px; background-color: rgba(128, 128, 128, 20);")
+        levels = {"ok": InfoLevel.SUCCESS, "warn": InfoLevel.WARNING, "error": InfoLevel.ERROR}
+        self.status_dot.setLevel(levels.get(state.level, InfoLevel.ATTENTION))
+        self.status.setText(f"{tr(state.text)} · {tr(state.connection_route)}")
     def _build_current(self, index):
         page = self.stackedWidget.widget(index); name = page.objectName()
         if name in ("devices", "settings") or name in self.lazy_built:

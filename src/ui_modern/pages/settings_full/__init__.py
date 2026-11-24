@@ -1,9 +1,9 @@
 from ...widgets.changes import apply_change, apply_setting, apply_toggle
-from PySide6.QtGui import QDesktopServices, QIcon
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QIcon
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QHBoxLayout
 from ...widgets.controls import ComboBox
-from qfluentwidgets import (PushButton, SwitchButton, BodyLabel, MessageBox,
+from qfluentwidgets import (PushButton, HyperlinkButton, SwitchButton, BodyLabel, MessageBox,
                             FluentIcon)
 from app_core import events
 from app_core.models import WIN32_BACKEND, WINUHID_BACKEND
@@ -18,18 +18,15 @@ from .firmware import FirmwareManagerDialog
 
 class SettingsPage(ServicePage):
     def __init__(self, core, toast, request_restart=lambda: None, apply_priority=lambda policy: None,
-                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.5'):
+                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.6'):
         super().__init__('Settings', core, toast, parent)
         self.request_restart, self.apply_priority, self.hide_to_tray = request_restart, apply_priority, hide_to_tray
         self.driver_rows = {}
         drivers = SettingsGroup('Drivers', self.content); self.box.addWidget(drivers)
         for name in ('WinUHid', 'ViGEmBus', 'USBIP', 'HidHide'):
-            holder = QWidget(drivers); line = QHBoxLayout(holder); line.setContentsMargins(0, 0, 0, 0)
-            badge = BodyLabel(tr('Unknown'), holder)
-            button = PushButton(tr('Check status'), holder)
-            line.addWidget(badge); line.addWidget(button)
-            row = drivers.row(name, holder)
-            self.driver_rows[name] = row, badge, button
+            button = PushButton(tr('Check status'), drivers)
+            row = drivers.row(name, button, 'Unknown')
+            self.driver_rows[name] = row, row.captionLabel, button
             button.clicked.connect(lambda checked=False, n=name: self.driver_action(n))
         self.restart_notice = drivers.row('Restart required', BodyLabel(tr('Restart Windows before reinstalling USBIP.'), drivers))
         self.keyboard, self.keyboard_row = self.output_selector(
@@ -109,9 +106,8 @@ class SettingsPage(ServicePage):
         self.restart_language.clicked.connect(self.request_restart)
         about = SettingsGroup('About', self.content); self.box.addWidget(about)
         about.row('Switch 2 Connect', BodyLabel(version, about))
-        self.kofi = PushButton(tr('Support on Ko-fi'), about)
+        self.kofi = HyperlinkButton('https://ko-fi.com/tagayama', tr('Support on Ko-fi'), about)
         about.row('Support development', self.kofi)
-        self.kofi.clicked.connect(lambda: QDesktopServices.openUrl(QUrl('https://ko-fi.com/tagayama')))
         about.row('License', BodyLabel(tr('GNU General Public License v3'), about))
         self.box.addStretch()
         self.bridge.event.connect(self.on_bus_event)
@@ -141,14 +137,15 @@ class SettingsPage(ServicePage):
             health = statuses.get(name, 'healthy' if name == 'HidHide' and state.hidhide_service_state else 'unknown')
             badge.setText(tr(health.title())); badge.setToolTip(next((s.description for s in state.install_status if s.driver == name), health))
             action = 'Uninstall' if health == 'healthy' else 'Repair' if health == 'partial' else 'Install'
-            if name == 'HidHide':
-                button.setText(tr(action + ' HidHide'))
-            else:
-                button.setText(tr(action + ' {driver} driver', driver=name))
+            button.setText(tr(action))
+            full_action = tr(action + ' HidHide') if name == 'HidHide' else tr(action + ' {driver} driver', driver=name)
+            button.setAccessibleName(full_action)
+            button.setToolTip(full_action)
             button.setEnabled(not state.busy and not state.pending_check)
             if name == 'WinUHid': button.setVisible(not state.packaged_build or state.packaged_winuhid_available)
             if name == 'USBIP' and state.usbip_restart_pending:
                 button.setText(tr('Restart Required')); button.setEnabled(not state.busy)
+                button.setAccessibleName(button.text()); button.setToolTip(button.text())
         self.restart_notice.setVisible(state.usbip_restart_pending)
         self.keyboard.setCurrentIndex(self.keyboard.findData(state.keyboard_backend))
         self.mouse.setCurrentIndex(self.mouse.findData(state.mouse_backend))
@@ -166,6 +163,7 @@ class SettingsPage(ServicePage):
 
     def output_selector(self, group, title, state_field, setter):
         combo = ComboBox(group)
+        combo.setMinimumWidth(168)
         for backend in (WIN32_BACKEND, WINUHID_BACKEND):
             combo.addItem(tr(backend), userData=backend)
         combo.setAccessibleName(tr(title))

@@ -4,7 +4,7 @@ from ...widgets.changes import apply_change, show_error
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QHBoxLayout
 from ...widgets.controls import ComboBox
-from qfluentwidgets import BodyLabel, PushButton, ProgressBar, FluentStyleSheet
+from qfluentwidgets import BodyLabel, SubtitleLabel, PushButton, ProgressBar, FluentStyleSheet
 from app_core import events
 from ...qt_bridge import BusBridge, call_core
 from ...widgets.common import SettingsGroup, Segments
@@ -21,7 +21,8 @@ class FirmwareManagerDialog(QDialog):
         self.can_close = True; self.awaiting_replug = False; self.busy = False
         self.session_done = False; self.verified_replug = False
         box = QVBoxLayout(self); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(16)
-        group = SettingsGroup('ESP32-S3 firmware', self); box.addWidget(group)
+        box.addWidget(SubtitleLabel(self.windowTitle(), self))
+        group = SettingsGroup('Connection', self); box.addWidget(group)
         self.status = BodyLabel(tr('Checking…'), group); self.status.setWordWrap(True); group.row('Status', self.status)
         self.mode = Segments(group); self.mode.sync(('auto', 'manual'), 'auto', {'auto': 'Automatic', 'manual': 'Manual'})
         group.row('Port mode', self.mode)
@@ -36,12 +37,18 @@ class FirmwareManagerDialog(QDialog):
         self.progress = ProgressBar(self); self.progress.setRange(0, 100); box.addWidget(self.progress)
         self.phase = BodyLabel(tr('Idle · 0%'), self); self.phase.setWordWrap(True); box.addWidget(self.phase)
         self.error = BodyLabel('', self); self.error.setWordWrap(True); box.addWidget(self.error)
-        actions = QHBoxLayout(); self.actions = {}
+        actions = QHBoxLayout(); actions.setSpacing(8); self.actions = {}
         for action in ('install', 'repair', 'delete'):
             button = PushButton(tr(action.title()), self); self.actions[action] = button; actions.addWidget(button)
+            button.setMinimumWidth(96)
             button.clicked.connect(lambda checked=False, a=action: self.start(a))
+        box.addStretch()
+        actions.addStretch()
+        self.close_button = PushButton(tr('Close'), self)
+        self.close_button.setMinimumWidth(96)
+        self.close_button.clicked.connect(self.reject)
+        actions.addWidget(self.close_button)
         box.addLayout(actions)
-        self.close_button = PushButton(tr('Close'), self); self.close_button.clicked.connect(self.reject); box.addWidget(self.close_button)
         self.bridge = BusBridge(core.bus, self); self.bridge.event.connect(self.on_bus_event)
         self.monitor = QTimer(self); self.monitor.setInterval(500)
         self.monitor.timeout.connect(lambda: call_core(core.esp32.refresh_manager_status_async))

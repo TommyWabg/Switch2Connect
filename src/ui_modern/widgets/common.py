@@ -1,10 +1,10 @@
 """Shared Windows Settings-style building blocks for modern pages."""
 from ..i18n import tr
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from PySide6.QtSvgWidgets import QSvgWidget
-from qfluentwidgets import (SettingCard, CaptionLabel, SegmentedWidget,
+from qfluentwidgets import (SettingCard, StrongBodyLabel, SegmentedWidget, PushButton,
     FluentIcon, SimpleExpandGroupSettingCard, ToolTipFilter, InfoBar, InfoBarIcon, InfoBarPosition)
 from .display import setting_title
 from pathlib import Path
@@ -44,12 +44,17 @@ class SettingRow(SettingCard):
         super().__init__(QIcon(), setting_title(title), self.helper_text, parent)
         self.iconLabel.hide()
         self.hBoxLayout.takeAt(1)  # remove the spacer reserved for a leading icon
+        self.hBoxLayout.takeAt(self.hBoxLayout.count() - 1)  # give spare width to the text column
+        self.hBoxLayout.setStretch(self.hBoxLayout.indexOf(self.vBoxLayout), 1)
         self.hBoxLayout.setContentsMargins(16, 8, 16, 8)
         self.setMaximumHeight(16777215)
         self.setMinimumHeight(64 if caption else 48)
         self.textLayout = self.vBoxLayout
         self.captionLabel = self.contentLabel
+        self.titleLabel.setWordWrap(True)
         self.captionLabel.setWordWrap(True)
+        self.textLayout.setSpacing(2)
+        self.textLayout.setAlignment(self.captionLabel, Qt.AlignVCenter)
         self.titleLabel.setToolTip(setting_title(title))
         self.titleLabel.installEventFilter(ToolTipFilter(self.titleLabel, showDelay=350))
         if control is not None and hasattr(control, "setOnText"):
@@ -57,6 +62,10 @@ class SettingRow(SettingCard):
             control.setFocusPolicy(Qt.StrongFocus)
         self.control = control
         if control is not None:
+            if not control.accessibleName() and not isinstance(control, PushButton):
+                control.setAccessibleName(self.titleLabel.text())
+            if isinstance(control, PushButton):
+                control.setMinimumWidth(max(control.minimumWidth(), 96))
             self.hBoxLayout.addWidget(control, 0, Qt.AlignVCenter)
             for widget in (control, *control.findChildren(QWidget)):
                 widget.installEventFilter(ToolTipFilter(widget, showDelay=350))
@@ -95,10 +104,7 @@ class SettingsGroup(QWidget):
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(8)
         self.box = QVBoxLayout(); self.box.setContentsMargins(0, 0, 0, 0); self.box.setSpacing(4)
         self.heading = QHBoxLayout()
-        self.label = CaptionLabel(tr(title), self)
-        font = self.label.font(); font.setPixelSize(14); font.setWeight(QFont.DemiBold)
-        self.label.setFont(font)
-        self.label.setTextColor("#606060", "#bfbfbf")
+        self.label = StrongBodyLabel(tr(title), self)
         self.heading.addWidget(self.label); self.heading.addStretch()
         outer.addLayout(self.heading); outer.addLayout(self.box)
 

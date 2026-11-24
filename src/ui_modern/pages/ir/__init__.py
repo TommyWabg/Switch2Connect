@@ -3,7 +3,7 @@ from ...i18n import tr
 from ...widgets.support import ThemedDialog
 from ...widgets.changes import apply_change, bind_numeric
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QHBoxLayout
-from qfluentwidgets import ScrollArea, DropDownPushButton, PushButton, BodyLabel, TitleLabel
+from qfluentwidgets import ScrollArea, DropDownPushButton, PushButton, BodyLabel, SubtitleLabel
 from app_core import events
 from ...widgets.display import input_display, setting_title
 from ...qt_bridge import BusBridge, call_core
@@ -34,8 +34,8 @@ class IrSensorDialog(ThemedDialog):
         self._children = []
         self.setWindowTitle(tr("Joy-Con IR sensor") + " · " + tr(side.title()))
         self.resize(780, 680)
-        box = QVBoxLayout(self); box.setContentsMargins(20, 16, 20, 16)
-        box.addWidget(TitleLabel(tr(f"{side.title()} IR sensor"), self))
+        box = QVBoxLayout(self); box.setContentsMargins(24, 20, 24, 20); box.setSpacing(12)
+        box.addWidget(SubtitleLabel(tr(f"{side.title()} IR sensor"), self))
         category_label = {"xbox": "Xbox", "ps4": "PS4", "ps5_winuhid": "PS5 · WinUHid",
             "ps5_usbip": "PS5 · USBIP", "switch1": "Switch", "switch2": "Switch 2"}.get(self.category, self.category)
         self.origin_label = BodyLabel(f"{self.profile_name} · {category_label} · {tr('Mode shift' if scope else 'Controller mapping')}", self)
@@ -74,6 +74,7 @@ class IrSensorDialog(ThemedDialog):
         self.body.addStretch()
         footer = QHBoxLayout()
         close = PushButton(tr("Close"), self)
+        close.setMinimumWidth(96)
         close.clicked.connect(self.reject)
         footer.addStretch(); footer.addWidget(close); box.addLayout(footer)
         self.finished.connect(self.cleanup)

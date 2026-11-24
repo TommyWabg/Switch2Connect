@@ -204,7 +204,7 @@ def test_mode_binding_visibility_in_place_and_legacy(t9, pump):
 
 def test_task_tutorial_error_and_irrelevant_event(t9, pump, monkeypatch):
     core, _, page, _ = t9; p = page(); urls = []
-    monkeypatch.setattr("ui_modern.pages.gyro.QDesktopServices.openUrl", lambda url: urls.append(url.toString()))
+    monkeypatch.setattr("PySide6.QtGui.QDesktopServices.openUrl", lambda url: urls.append(url.toString()))
     p.tutorial.click(); assert urls == [TUTORIAL_URL]
     p.calibrate.click(); pump()
     assert ("players.start_gyro_calibration", (), {}) in core.calls

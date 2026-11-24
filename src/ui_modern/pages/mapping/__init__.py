@@ -6,7 +6,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget
 from PySide6.QtGui import QAction
 from ...widgets.controls import ComboBox
-from qfluentwidgets import ScrollArea, TitleLabel, PushButton, TransparentToolButton, FluentIcon, CheckBox, MessageBox, RoundMenu, SearchLineEdit, FlowLayout, CardWidget, BodyLabel
+from qfluentwidgets import (ScrollArea, PushButton, TransparentToolButton, FluentIcon, CheckBox,
+                            MessageBox, RoundMenu, SearchLineEdit, AdaptiveFlowLayout, SimpleCardWidget, BodyLabel)
 from app_core import events
 from ...widgets.display import input_display, setting_title
 from ...widgets.common import SettingsGroup, Segments
@@ -31,17 +32,17 @@ class MappingPage(ScrollArea):
         self.setObjectName("mapping")
         self.setWidgetResizable(True)
         self.enableTransparentBackground()
-        content = FluentSurface(self); self.setWidget(content)
+        content = FluentSurface("Mapping", self); self.setWidget(content)
         content.setObjectName("mappingContent")
         self.content = content
-        content.setAutoFillBackground(False)
-        box = QVBoxLayout(content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
-        box.addWidget(TitleLabel(tr("Mapping"), self))
+        box = content.box
         header = QHBoxLayout()
+        header.setSpacing(8)
         self.scope_control = Segments(self)
         self.scope_control.sync(("base", "shift"), "base", {"base": "Controller mapping", "shift": "Mode shift"})
         self.changed_only = CheckBox(tr("Show changed only"), self)
-        self.search = SearchLineEdit(self); self.search.setPlaceholderText(tr("Search mappings")); self.search.setFixedWidth(210)
+        self.search = SearchLineEdit(self); self.search.setPlaceholderText(tr("Search mappings"))
+        self.search.setMinimumWidth(128); self.search.setMaximumWidth(210)
         header.addWidget(self.scope_control); header.addStretch(); header.addWidget(self.search); header.addWidget(self.changed_only)
         box.addLayout(header)
         self.scope = None; self.rows = {}; self.groups = {}; self.gc_modes = {}; self.ir_buttons = {}
@@ -51,7 +52,7 @@ class MappingPage(ScrollArea):
         self.scope_control.currentItemChanged.connect(self.change_scope)
         self.changed_only.toggled.connect(self.filter_rows)
         self.search.textChanged.connect(self.filter_rows)
-        self.cells = {}; self.band_widgets = []
+        self.cells = {}; self.empty_labels = {}
         self.shift_actions = QWidget(self); actions = QHBoxLayout(self.shift_actions); actions.setContentsMargins(0, 0, 0, 0)
         self.overflow = TransparentToolButton(FluentIcon.MORE, self.shift_actions)
         self.shift_menu = RoundMenu(parent=self.overflow)
@@ -61,46 +62,46 @@ class MappingPage(ScrollArea):
         self.overflow.setAccessibleName(tr("Mode shift actions"))
         self.overflow.setToolTip(tr("Mode shift actions"))
         actions.addWidget(self.overflow); header.addWidget(self.shift_actions)
-        policy = self.shift_actions.sizePolicy()
-        policy.setRetainSizeWhenHidden(True)
-        self.shift_actions.setSizePolicy(policy)
         self.overflow.clicked.connect(self.show_shift_menu)
         self.copy.triggered.connect(lambda: self.confirm_shift(tr("Copy controller mapping?"), tr("This replaces the mode shift mappings with controller mappings."), core.settings.copy_controller_mapping_to_mode_shift))
         self.reset_shift.triggered.connect(lambda: self.confirm_shift(tr("Reset mode shift mapping?"), tr("This clears the mode shift mappings and simultaneous inputs."), core.settings.reset_mode_shift_mapping))
         for scope in (None, SHIFT_SCOPE):
-            panel = QWidget(self); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(8)
+            panel = QWidget(self); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(20)
             groups = {}
             flows = {}
             for key, title in GROUPS:
                 group = SettingsGroup(title, panel); groups[key] = group; layout.addWidget(group)
-                group.layout().setSpacing(4)
-                card = CardWidget(group); group.addRow(card)
-                card_box = QVBoxLayout(card); card_box.setContentsMargins(8, 5, 8, 5); card_box.setSpacing(4)
-                for band in (range(5) if key == "shared" else (key,)):
-                    holder = QWidget(card); flow = FlowLayout(holder, needAni=False)
-                    flow.setContentsMargins(0, 0, 0, 0); flow.setHorizontalSpacing(6); flow.setVerticalSpacing(4)
-                    card_box.addWidget(holder); flows[band] = flow; self.band_widgets.append((holder, flow))
+                card = SimpleCardWidget(group)
+                group.addRow(card)
+                flow = AdaptiveFlowLayout(card, isTight=True)
+                flow.setContentsMargins(16, 12, 16, 16)
+                flow.setHorizontalSpacing(16)
+                flow.setVerticalSpacing(12)
+                flow.setWidgetMinimumWidth(152)
+                flow.setWidgetMaximumWidth(264)
+                flows[key] = flow
             self.groups[scope] = groups
             view = core.settings.mapping(scope)
             order = [key for band in BANDS for key in band] + ["gl", "gr", "sll", "srl", "slr", "srr", "gc_l_click", "gc_r_click"]
             for snapshot in sorted(view.rows, key=lambda s: order.index(s.key) if s.key in order else len(order)):
-                band = next((i for i, keys in enumerate(BANDS) if snapshot.key in keys), snapshot.group)
                 row = MappingRow(self, snapshot, scope, panel)
-                flows[band].addWidget(row)
+                group_key = snapshot.group if snapshot.group in groups else "shared"
+                flows[group_key].addWidget(row)
                 self.rows[scope, snapshot.key] = row
-                self.cells[scope, snapshot.key] = (row, "shared" if isinstance(band, int) else band)
-            def cell(key, title, control, group, band=None):
-                widget = QWidget(panel); widget.setFixedWidth(178)
-                cell_box = QVBoxLayout(widget); cell_box.setContentsMargins(0, 0, 0, 0); cell_box.setSpacing(1)
-                label = BodyLabel(tr(title), widget); font = label.font(); font.setPixelSize(12); label.setFont(font)
+                self.cells[scope, snapshot.key] = (row, group_key)
+            def cell(key, title, control, group):
+                widget = QWidget(panel)
+                cell_box = QVBoxLayout(widget); cell_box.setContentsMargins(0, 0, 0, 0); cell_box.setSpacing(4)
+                label = BodyLabel(tr(title), widget)
+                control.setAccessibleName(label.text())
                 cell_box.addWidget(label); cell_box.addWidget(control)
-                control.setFixedHeight(28)
-                control.setFixedWidth(170); flows[group if band is None else band].addWidget(widget)
+                control.setMinimumHeight(32)
+                flows[group].addWidget(widget)
                 self.cells[scope, key] = (widget, group)
                 widget.search_title = title + ' ' + label.text(); widget.control = control
                 return widget
             deadzones = PushButton(tr("Deadzones…"), self)
-            cell("deadzones", "Deadzone settings", deadzones, "shared", 2)
+            cell("deadzones", "Deadzone settings", deadzones, "shared")
             deadzones.clicked.connect(lambda: self.show_dialog(DeadzoneDialog(core, toast, self.window())))
             self.gc_modes[scope] = ComboBox(self)
             cell("gc_mode", "Analog trigger 100%", self.gc_modes[scope], "gamecube")
@@ -118,6 +119,10 @@ class MappingPage(ScrollArea):
                 self.ir_rows[scope, side] = cell(side + "_ir", side.title() + " IR sensor", button, "ir")
                 button.clicked.connect(lambda _, side=side, scope=scope: self.open_ir(side, scope))
                 self.ir_buttons[scope, side] = button
+            empty = BodyLabel(tr("No matching mappings"), panel)
+            empty.setAlignment(Qt.AlignCenter)
+            layout.addWidget(empty)
+            self.empty_labels[scope] = empty
             layout.addStretch(); self.stack.addWidget(panel)
         self.shift_actions.hide()
         self.bridge = BusBridge(core.bus, self)
@@ -195,11 +200,10 @@ class MappingPage(ScrollArea):
             text = cell.titleLabel.text() + " " + snapshot.label + " " + input_display(snapshot.display_text) if snapshot else cell.search_title + " " + (cell.control.currentText() if isinstance(cell.control, ComboBox) else cell.control.toolTip() or cell.control.text())
             default = snapshot.is_default if snapshot else self.ir_defaults.get((scope, key.removesuffix("_ir")), False)
             cell.setVisible((not snapshot or snapshot.visible) and (not self.changed_only.isChecked() or not default) and query in text.casefold())
-        for holder, flow in self.band_widgets:
-            holder.setVisible(any(not flow.itemAt(i).widget().isHidden() for i in range(flow.count())))
         for scope, groups in self.groups.items():
             for name, group in groups.items():
                 group.setVisible(any(not cell.isHidden() for (s, _), (cell, g) in self.cells.items() if s == scope and g == name))
+            self.empty_labels[scope].setVisible(all(group.isHidden() for group in groups.values()))
 
     def apply_event(self, topic, payload):
         if topic == events.SETTINGS_CHANGED:

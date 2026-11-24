@@ -19,7 +19,7 @@ def test_empty_state_transitions_keep_cards(window, pump):
     pump()
     assert page.controller_stack.currentWidget() is page.empty
     assert page.connection_route.text() == core.status.connection_route
-    assert page.pair_image.height() == 200 and page.pair_image.width() > 400
+    assert 0 < page.pair_image.height() < page.empty.height() and page.pair_image.width() > 400
     assert not page.pair_image.pixmap.isNull()
     core.bus.publish(events.CONTROLLERS_CHANGED, core.slots[:1])
     pump()

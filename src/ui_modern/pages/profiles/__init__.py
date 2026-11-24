@@ -3,7 +3,8 @@ from ...widgets.changes import apply_change
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QButtonGroup
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
-from qfluentwidgets import PushButton, RadioButton, TransparentToolButton, FluentIcon, SwitchButton, RoundMenu, MessageBoxBase, MessageBox, LineEdit, BodyLabel
+from qfluentwidgets import (PushButton, PrimaryPushButton, TransparentPushButton, RadioButton, TransparentToolButton,
+                            FluentIcon, SwitchButton, RoundMenu, MessageBoxBase, MessageBox, LineEdit, BodyLabel, SubtitleLabel)
 from ...widgets.display import input_display
 from ...qt_bridge import call_core
 from ...widgets.common import SettingsGroup, Segments
@@ -17,18 +18,22 @@ class ProfilesPage(ServicePage):
         super().__init__('Profiles', core, toast, parent)
         self.profile_selection = QButtonGroup(self)
         self.profile_rows, self.app_rows = {}, {}
-        actions = QWidget(self.content); layout = QHBoxLayout(actions); layout.setContentsMargins(0, 0, 0, 0)
-        for title, callback in [('New profile', lambda: apply_change(self, core.profiles.add)), ('Import', self.import_profiles), ('Export', self.export_profiles)]:
-            button = PushButton(tr(title), actions); button.clicked.connect(callback); layout.addWidget(button)
-        layout.addStretch(); self.box.addWidget(actions)
-        self.list = SettingsGroup('Profiles', self.content); self.box.addWidget(self.list)
+        self.list = SettingsGroup('Saved profiles', self.content); self.box.addWidget(self.list)
+        self.list.heading.setSpacing(8)
+        new_profile = PrimaryPushButton(FluentIcon.ADD, tr('New profile'), self.list)
+        new_profile.clicked.connect(lambda: apply_change(self, core.profiles.add))
+        self.list.heading.addWidget(new_profile)
+        for title, callback in [('Import', self.import_profiles), ('Export', self.export_profiles)]:
+            button = TransparentPushButton(tr(title), self.list)
+            button.clicked.connect(callback)
+            self.list.heading.addWidget(button)
         self.apps = SettingsGroup('Assigned apps', self.content); self.box.addWidget(self.apps)
-        self.add_app = PushButton(tr('Add app…'), self.apps); self.apps.heading.addWidget(self.add_app)
+        self.add_app = TransparentPushButton(FluentIcon.ADD, tr('Add app…'), self.apps); self.apps.heading.addWidget(self.add_app)
         self.add_app.clicked.connect(lambda: self.choose_app())
         self.switching = SettingsGroup('Profile switching', self.content); self.box.addWidget(self.switching)
         holder = QWidget(self.switching); line = QHBoxLayout(holder); line.setContentsMargins(0, 0, 0, 0)
         self.trigger = PushButton(FluentIcon.EDIT, tr('Record combo…'), holder)
-        self.clear_trigger = PushButton(tr('Clear'), holder)
+        self.clear_trigger = TransparentPushButton(tr('Clear'), holder)
         line.addWidget(self.trigger); line.addWidget(self.clear_trigger)
         self.switching.row('Global combo trigger', holder)
         self.trigger.clicked.connect(lambda: self.record())
@@ -79,7 +84,9 @@ class ProfilesPage(ServicePage):
         for index, (path, display) in enumerate(apps):
             if index not in self.app_rows:
                 holder = QWidget(self.apps); layout = QHBoxLayout(holder); layout.setContentsMargins(0, 0, 0, 0)
-                choose = PushButton(tr('Choose app…'), holder); remove = PushButton(tr('Remove'), holder)
+                choose = PushButton(tr('Choose app…'), holder)
+                remove = TransparentToolButton(FluentIcon.DELETE, holder)
+                remove.setToolTip(tr('Remove')); remove.setAccessibleName(tr('Remove'))
                 layout.addWidget(choose); layout.addWidget(remove)
                 row = self.apps.row('', holder); self.app_rows[index] = row
                 choose.clicked.connect(lambda checked=False, i=index: self.choose_app(i))
@@ -126,7 +133,9 @@ class ProfilesPage(ServicePage):
             apply_change(self, self.core.profiles.select, name, after=lambda result: apply_change(self, action) if result.ok else None)
 
     def rename(self, name):
-        dialog = MessageBoxBase(self.window()); dialog.viewLayout.addWidget(BodyLabel(tr('Rename profile'), dialog))
+        dialog = MessageBoxBase(self.window()); dialog.viewLayout.addWidget(SubtitleLabel(tr('Rename profile'), dialog))
+        dialog.yesButton.setText(tr('Rename'))
+        dialog.cancelButton.setText(tr('Cancel'))
         field = LineEdit(dialog); field.setText(name); field.selectAll(); dialog.viewLayout.addWidget(field)
         error = BodyLabel('', dialog); dialog.viewLayout.addWidget(error)
         def validate(text):

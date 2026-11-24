@@ -3,7 +3,7 @@ from ...i18n import tr
 import threading
 from PySide6.QtCore import Qt, QSignalBlocker
 from PySide6.QtWidgets import QFileDialog, QWidget, QVBoxLayout
-from qfluentwidgets import MessageBoxBase, BodyLabel, CheckBox, ScrollArea
+from qfluentwidgets import MessageBoxBase, SubtitleLabel, BodyLabel, CheckBox, ScrollArea
 from ...qt_bridge import call_core, gui_dispatcher
 
 
@@ -48,7 +48,7 @@ def pick_file(page, title, callback, *, save=False, apps=False):
 class ChecklistDialog(MessageBoxBase):
     def __init__(self, preview, importing, parent=None):
         super().__init__(parent)
-        self.viewLayout.addWidget(BodyLabel(tr('Import profiles') if importing else tr('Export profiles'), self))
+        self.viewLayout.addWidget(SubtitleLabel(tr('Import profiles') if importing else tr('Export profiles'), self))
         self.select_all = CheckBox(tr('Select all'), self); self.select_all.setChecked(True)
         self.viewLayout.addWidget(self.select_all)
         area = ScrollArea(self); area.setWidgetResizable(True); area.setMinimumHeight(160)

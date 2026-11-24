@@ -23,7 +23,7 @@ class RumblePage(ServicePage):
         self.timer.setSingleShot(True)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.flush)
-        group = SettingsGroup('Rumble', self.content); self.box.addWidget(group)
+        group = SettingsGroup('Output', self.content); self.box.addWidget(group)
         self.mode = Segments(group)
         group.row('Mode', self.mode)
         self.mode.currentItemChanged.connect(lambda value: apply_change(self, core.settings.set_rumble_mode, value, old_args=(self.view.mode,)))
@@ -39,7 +39,7 @@ class RumblePage(ServicePage):
             slider.setRange(low, high)
             slider.setSingleStep(1)
             slider.setMinimumWidth(180)
-            slider.setAccessibleName(title)
+            slider.setAccessibleName(tr(title))
             label = BodyLabel('', holder); label.setFixedWidth(28)
             layout.addWidget(slider); layout.addWidget(label)
             self.controls[key] = slider
@@ -62,7 +62,7 @@ class RumblePage(ServicePage):
             ('audio_haptics_enabled', 'Audio haptics', self.audio),
             ('adaptive_triggers_enabled', 'Adaptive triggers', self.audio)):
             switch = SwitchButton(owner)
-            switch.setAccessibleName(title)
+            switch.setAccessibleName(tr(title))
             self.controls[key] = switch
             owner.add_body_widget(SettingRow(title, control=switch, parent=owner))
             switch.checkedChanged.connect(lambda value, k=key: apply_change(self, core.settings.set_rumble_setting, k, value, old_args=(k, self.values[k])))

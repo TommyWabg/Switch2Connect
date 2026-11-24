@@ -5,7 +5,7 @@ from .common import FitImage
 from ..resources import resource_path
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy
 from .controls import ComboBox
-from qfluentwidgets import CardWidget, BodyLabel, CaptionLabel, TransparentPushButton, ToolButton, CheckableMenu, FluentIcon, themeColor, qconfig, isDarkTheme
+from qfluentwidgets import SimpleCardWidget, StrongBodyLabel, BodyLabel, CaptionLabel, TransparentPushButton, TransparentToolButton, CheckableMenu, FluentIcon, themeColor, qconfig, isDarkTheme
 
 _ASSETS = resource_path("resources/images")
 CARD_HEIGHT = 250
@@ -36,7 +36,7 @@ class BatteryGlyph(QWidget):
             for bar in range(_BARS.get(level, 0)):
                 painter.fillRect(QRectF(x + 2.5 + bar * 5, 3, 4, 6), fill)
 
-class PlayerCard(CardWidget):
+class PlayerCard(SimpleCardWidget):
     def __init__(self, invoke, parent=None):
         super().__init__(parent)
         self.invoke = invoke
@@ -44,9 +44,9 @@ class PlayerCard(CardWidget):
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.setMinimumWidth(155)
         self.setFixedHeight(CARD_HEIGHT)
-        box = QVBoxLayout(self); box.setContentsMargins(14, 10, 14, 8); box.setSpacing(3)
+        box = QVBoxLayout(self); box.setContentsMargins(12, 12, 12, 8); box.setSpacing(4)
         header = QHBoxLayout()
-        self.title = BodyLabel("", self); header.addWidget(self.title); header.addStretch()
+        self.title = StrongBodyLabel("", self); header.addWidget(self.title); header.addStretch()
         self.leds = CaptionLabel("", self); header.addWidget(self.leds); box.addLayout(header)
         self.illustration = FitImage(_ASSETS / "procontroller2.png", self); self.illustration.setFixedHeight(76); box.addWidget(self.illustration)
         self.model = BodyLabel("", self); self.model.setWordWrap(True); self.model.setAlignment(Qt.AlignCenter)
@@ -56,7 +56,7 @@ class PlayerCard(CardWidget):
         status = QHBoxLayout()
         status.addStretch(); status.addWidget(self.battery); status.addWidget(self.transport); status.addStretch()
         box.addLayout(status)
-        row = QHBoxLayout(); self.ping = ToolButton(FluentIcon.VOLUME, self)
+        row = QHBoxLayout(); self.ping = TransparentToolButton(FluentIcon.VOLUME, self)
         self.ping.setToolTip(tr("Ping")); self.ping.setAccessibleName(tr("Ping"))
         self.merge = TransparentPushButton(tr("Merge"), self)
         self.merge.clicked.connect(lambda: self.action("split" if self.snapshot.split_available else "merge_select"))
@@ -68,10 +68,10 @@ class PlayerCard(CardWidget):
         box.addWidget(self.hold, 0, Qt.AlignHCenter)
         self.hold.activated.connect(lambda index: self.action("set_hold_mode", self.hold.itemData(index)))
         self.merge_hint = CaptionLabel(tr("Choose the other Joy-Con"), self); box.addWidget(self.merge_hint, 0, Qt.AlignHCenter)
-        self.more = ToolButton(FluentIcon.MORE, self)
+        self.more = TransparentToolButton(FluentIcon.MORE, self)
         self.more.setAccessibleName(tr("More"))
         self.more.setToolTip(tr("More"))
-        row.setSpacing(2); row.addWidget(self.ping); row.addWidget(self.merge); row.addStretch(); row.addWidget(self.more); box.addLayout(row)
+        row.setSpacing(4); row.addWidget(self.ping); row.addWidget(self.merge); row.addStretch(); row.addWidget(self.more); box.addLayout(row)
         self.ping.clicked.connect(lambda: self.action("ping"))
         self.more.clicked.connect(self.open_menu)
     def action(self, method, *args):

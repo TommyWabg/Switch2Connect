@@ -125,7 +125,8 @@ def test_compact_cells_search_label_value_and_visibility(mapping, pump, scope):
     page.resize(1000, 760); page.scope_control.setCurrentItem("shift" if scope else "base"); pump()
     row = page.rows[scope, "a"]
     row.choose("Custom[Hold]:VK_CONTROL+VK_SHIFT+VK_A+MB_3"); pump()
-    assert row.width() == 178 and row.value.width() == 150
+    assert row.value.height() >= 32 and row.reset.height() >= 32
+    assert row.value.geometry().right() < row.reset.geometry().left()
     assert row.value.toolTip() != row.value.text()
     page.search.setText("ctrl"); pump()
     assert not row.isHidden() and page.groups[scope]["rail"].isHidden()
@@ -135,8 +136,25 @@ def test_compact_cells_search_label_value_and_visibility(mapping, pump, scope):
     assert not page.rows[scope, "l_joystick"].isHidden() and page.rows[scope, "r_joystick"].isHidden()
     page.search.setText("no matching mapping"); pump()
     assert all(group.isHidden() for group in page.groups[scope].values())
+    assert page.empty_labels[scope].isVisible()
     page.search.clear(); page.changed_only.setChecked(True); pump()
     assert not row.isHidden() and page.rows[scope, "b"].isHidden()
+
+
+def test_filtered_grid_reflows_at_different_widths(mapping, pump):
+    page, _, _ = mapping
+    page.search.setText("right joystick")
+    first = page.rows[None, "r_joystick"]
+    second = page.rows[None, "r_stk"]
+    for width in (760, 1080):
+        page.resize(width, 640)
+        pump()
+        card_layout = first.parentWidget().layout()
+        assert first.x() == card_layout.contentsMargins().left()
+        assert second.x() == first.geometry().right() + 1 + card_layout.horizontalSpacing()
+        assert first.y() == second.y()
+        assert first.value.width() == first.width()
+        assert page.horizontalScrollBar().maximum() == 0
 
 
 def test_recording_restart_empty_stop_mouse_release_and_wheel(mapping, pump):

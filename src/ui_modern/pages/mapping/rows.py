@@ -1,8 +1,8 @@
 from ...i18n import tr
 from ...widgets.changes import apply_change
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
-from qfluentwidgets import DropDownPushButton, TransparentToolButton, TransparentPushButton, FluentIcon, BodyLabel, themeColor
+from PySide6.QtCore import Qt, QEvent
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget, QSizePolicy
+from qfluentwidgets import DropDownPushButton, TransparentToolButton, TransparentPushButton, FluentIcon, BodyLabel, setCustomStyleSheet
 from ...widgets.common import Segments
 from ...widgets.recording import RecordDialog
 from ...widgets.pickers import OptionPicker
@@ -12,25 +12,23 @@ from ...widgets.display import input_display, setting_title
 class MappingRow(QWidget):
     def __init__(self, page, snapshot, scope=None, parent=None, *, writer=None, configure=None):
         super().__init__(parent)
-        self.setFixedWidth(178)
-        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(1)
-        heading = QHBoxLayout(); heading.setContentsMargins(0, 0, 0, 0); heading.setSpacing(3)
+        self.setMaximumWidth(264)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(4)
         self.titleLabel = BodyLabel(snapshot.label.rstrip(":"), self)
-        font = self.titleLabel.font(); font.setPixelSize(12); self.titleLabel.setFont(font)
         controls = QWidget(self)
         box = QHBoxLayout(controls); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(4)
-        self.value = DropDownPushButton(controls); self.value.setFixedWidth(150)
-        self.value.setFixedHeight(28)
-        self.reset = TransparentToolButton(FluentIcon.CANCEL, controls)
-        self.reset.setFixedSize(24, 24)
+        self.value = DropDownPushButton(controls)
+        value_style = "DropDownPushButton { text-align: left; padding-left: 12px; }"
+        setCustomStyleSheet(self.value, value_style, value_style)
+        self.value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.value.setMinimumHeight(32)
+        self.value.installEventFilter(self)
+        self.reset = TransparentToolButton(FluentIcon.ROTATE, controls)
+        self.reset.setFixedSize(32, 32)
         self.reset.setAccessibleName(tr("Reset {title}", title=setting_title(snapshot.label.rstrip(":")))); self.reset.setToolTip(tr("Restore Default"))
-        for widget in (self.value, self.reset):
-            box.addWidget(widget)
-        box.addStretch()
-        self.marker = BodyLabel("●", self)
-        self.marker.setFixedWidth(8)
-        heading.addWidget(self.titleLabel); heading.addStretch(); heading.addWidget(self.marker)
-        outer.addLayout(heading); outer.addWidget(controls)
+        box.addWidget(self.value, 1)
+        box.addWidget(self.reset)
+        outer.addWidget(self.titleLabel); outer.addWidget(controls)
         self.page, self.scope, self.writer, self.configure_callback = page, scope, writer, configure
         self.value.clicked.connect(self.pick)
         self.reset.clicked.connect(self.restore_default)
@@ -38,16 +36,23 @@ class MappingRow(QWidget):
 
     def update_snapshot(self, snapshot):
         self.snapshot = snapshot
-        self.marker.setVisible(not snapshot.is_default)
-        self.marker.setStyleSheet("color: " + themeColor().name() + ";")
         self.titleLabel.setText(setting_title(snapshot.label.rstrip(":")))
         display = input_display(snapshot.display_text)
-        self.value.setText(self.value.fontMetrics().elidedText(display, Qt.ElideRight, 115))
         self.value.setToolTip(display)
+        self._fit_value_text()
         self.value.setAccessibleName(self.titleLabel.text() + " " + display)
         self.can_configure = bool(self.configure_callback) or (not self.writer and snapshot.configurable)
         self.reset.setVisible(not snapshot.is_default)
         self.setVisible(snapshot.visible)
+
+    def _fit_value_text(self):
+        width = max(0, self.value.width() - 40)
+        self.value.setText(self.value.fontMetrics().elidedText(self.value.toolTip(), Qt.ElideRight, width))
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Resize and watched is self.value:
+            self._fit_value_text()
+        return super().eventFilter(watched, event)
 
     def choose(self, value):
         previous = self.snapshot.stored_value
