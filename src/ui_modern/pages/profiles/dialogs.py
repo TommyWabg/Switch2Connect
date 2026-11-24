@@ -1,4 +1,5 @@
 """Profile checklists, asynchronous file pickers and combo capture."""
+from ...i18n import tr
 import threading
 from PySide6.QtWidgets import QFileDialog, QWidget, QVBoxLayout, QScrollArea
 from qfluentwidgets import MessageBoxBase, BodyLabel, CheckBox
@@ -12,8 +13,8 @@ def pick_file(page, title, callback, *, save=False, apps=False):
     page.destroyed.connect(closed.set)
     def show():
         if closed.is_set(): return
-        dialog = QFileDialog(page.window(), title)
-        dialog.setNameFilter('Applications (*.exe)' if apps else 'YAML profiles (*.yaml *.yml)')
+        dialog = QFileDialog(page.window(), tr(title))
+        dialog.setNameFilter(tr('Applications (*.exe)') if apps else tr('YAML profiles (*.yaml *.yml)'))
         dialog.setAcceptMode(QFileDialog.AcceptSave if save else QFileDialog.AcceptOpen)
         dialog.setFileMode(QFileDialog.AnyFile if save else QFileDialog.ExistingFile)
         if save:
@@ -46,8 +47,8 @@ def pick_file(page, title, callback, *, save=False, apps=False):
 class ChecklistDialog(MessageBoxBase):
     def __init__(self, preview, importing, parent=None):
         super().__init__(parent)
-        self.viewLayout.addWidget(BodyLabel('Import profiles' if importing else 'Export profiles', self))
-        self.select_all = CheckBox('Select all', self); self.select_all.setChecked(True)
+        self.viewLayout.addWidget(BodyLabel(tr('Import profiles') if importing else tr('Export profiles'), self))
+        self.select_all = CheckBox(tr('Select all'), self); self.select_all.setChecked(True)
         self.viewLayout.addWidget(self.select_all)
         area = QScrollArea(self); area.setWidgetResizable(True); area.setMinimumHeight(160)
         content = QWidget(area); layout = QVBoxLayout(content); area.setWidget(content)
@@ -57,13 +58,13 @@ class ChecklistDialog(MessageBoxBase):
             self.checks[name] = check; layout.addWidget(check)
             check.stateChanged.connect(self.validate)
         layout.addStretch(); self.viewLayout.addWidget(area)
-        self.keep = CheckBox('Keep current profiles', self); self.keep.setChecked(True)
+        self.keep = CheckBox(tr('Keep current profiles'), self); self.keep.setChecked(True)
         self.keep.setVisible(importing); self.viewLayout.addWidget(self.keep)
-        self.controller = CheckBox(('Import' if importing else 'Export') + ' controller related data', self)
+        self.controller = CheckBox(tr('Import controller related data' if importing else 'Export controller related data'), self)
         self.controller.setVisible(preview.has_controller_data); self.viewLayout.addWidget(self.controller)
         self.controller.stateChanged.connect(self.validate)
         self.select_all.stateChanged.connect(lambda: [c.setChecked(self.select_all.isChecked()) for c in self.checks.values()])
-        self.yesButton.setText('Import' if importing else 'Export'); self.cancelButton.setText('Cancel')
+        self.yesButton.setText(tr('Import') if importing else tr('Export')); self.cancelButton.setText(tr('Cancel'))
         self.error = BodyLabel('', self); self.viewLayout.addWidget(self.error)
         self.widget.setMinimumWidth(440); self.validate()
 
@@ -73,7 +74,7 @@ class ChecklistDialog(MessageBoxBase):
     def validate(self, *_):
         valid = bool(self.selected()) or self.controller.isChecked()
         self.yesButton.setEnabled(valid)
-        self.error.setText('' if valid else 'Select a profile or controller related data.')
+        self.error.setText('' if valid else tr('Select a profile or controller related data.'))
         return valid
 
 

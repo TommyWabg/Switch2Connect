@@ -1,10 +1,11 @@
 """Joy-Con IR configuration rendered from captured-origin read models."""
+from ...i18n import tr
 from ...widgets.support import ThemedDialog
 from ...widgets.changes import apply_change, bind_numeric
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QDialogButtonBox
 from qfluentwidgets import ScrollArea, PushButton, BodyLabel, TitleLabel
 from app_core import events
-from ...widgets.display import input_display
+from ...widgets.display import input_display, setting_title
 from ...qt_bridge import BusBridge, call_core
 from ...widgets.common import SettingsGroup, ExpandSettingRow
 from ...widgets.controls import Choice, Numeric, local_toast
@@ -31,13 +32,13 @@ class IrSensorDialog(ThemedDialog):
         self.context = dict(profile_name=self.profile_name, category=self.category)
         self._closed = False
         self._children = []
-        self.setWindowTitle(f"Joy-Con IR sensor · {side.title()}")
+        self.setWindowTitle(tr("Joy-Con IR sensor") + " · " + tr(side.title()))
         self.resize(780, 680)
         box = QVBoxLayout(self); box.setContentsMargins(20, 16, 20, 16)
-        box.addWidget(TitleLabel(f"{side.title()} IR sensor", self))
+        box.addWidget(TitleLabel(tr(f"{side.title()} IR sensor"), self))
         category_label = {"xbox": "Xbox", "ps4": "PS4", "ps5_winuhid": "PS5 · WinUHid",
             "ps5_usbip": "PS5 · USBIP", "switch1": "Switch", "switch2": "Switch 2"}.get(self.category, self.category)
-        self.origin_label = BodyLabel(f"{self.profile_name} · {category_label} · {'Mode shift' if scope else 'Controller mapping'}", self)
+        self.origin_label = BodyLabel(f"{self.profile_name} · {category_label} · {tr('Mode shift' if scope else 'Controller mapping')}", self)
         self.origin_label.setToolTip(self.origin_label.text()); box.addWidget(self.origin_label)
         scroll = ScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -47,14 +48,14 @@ class IrSensorDialog(ThemedDialog):
         scroll.viewport().setAutoFillBackground(False)
         self.body = QVBoxLayout(content); self.body.setContentsMargins(0, 8, 0, 8); self.body.setSpacing(12)
         self.general = SettingsGroup("Function", content); self.body.addWidget(self.general)
-        self.function = PushButton("Default (IR Mouse)", self); self.function.setFixedWidth(260)
+        self.function = PushButton(tr("Default (IR Mouse)"), self); self.function.setFixedWidth(260)
         self.function.clicked.connect(self.pick_function)
         self.function_row = self.general.row("IR function", self.function)
         self.mode = Choice(self)
         self.mode.sync(("Hold", "Tap"), "Hold")
         self.mode_row = self.general.row("Activation", self.mode)
         self.mode.edited.connect(self.change_mode)
-        reset = PushButton("Reset", self)
+        reset = PushButton(tr("Reset"), self)
         reset.clicked.connect(lambda: self.set_function("Default"))
         self.general.row("Reset function", reset)
         self.reset_button = reset
@@ -113,8 +114,8 @@ class IrSensorDialog(ThemedDialog):
             self.values[c.key] = c.value
             if c.key not in self.controls:
                 group = self.general if c.key == "activate_threshold" else self.mouse_group
-                widget = PushButton("None", self) if c.options else Numeric(c, self)
-                widget.setAccessibleName(c.label.rstrip(":"))
+                widget = PushButton(tr("None"), self) if c.options else Numeric(c, self)
+                widget.setAccessibleName(setting_title(c.label.rstrip(":")))
                 row = group.row(c.label.rstrip(":"), widget)
                 self.controls[c.key], self.rows[c.key] = widget, row
                 if c.options:
@@ -131,7 +132,7 @@ class IrSensorDialog(ThemedDialog):
 
     @staticmethod
     def selection_text(button, value):
-        text = input_display("+".join(map(str, value))) if isinstance(value, (list, tuple)) and value else "None"
+        text = input_display("+".join(map(str, value))) if isinstance(value, (list, tuple)) and value else tr("None")
         button.setText(text); button.setToolTip(text)
 
     def numeric_write(self, key, value):
@@ -202,9 +203,9 @@ class IrSensorDialog(ThemedDialog):
         for c in view.controls:
             self.gyro_values[c.key] = c.value
             if c.key not in self.gyro_controls:
-                widget = PushButton("None", self) if c.options or c.key == "simul" else Numeric(c, self)
+                widget = PushButton(tr("None"), self) if c.options or c.key == "simul" else Numeric(c, self)
                 row = self.gyro_group.row(c.label.rstrip(":"), widget)
-                widget.setAccessibleName(c.label.rstrip(":"))
+                widget.setAccessibleName(setting_title(c.label.rstrip(":")))
                 self.gyro_controls[c.key], self.gyro_rows[c.key] = widget, row
                 if isinstance(widget, Numeric):
                     bind_numeric(self, widget, lambda v, key=c.key: self.core.settings.set_ir_gyro_setting(self.side, key, v, self.scope, **self.context),

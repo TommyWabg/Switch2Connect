@@ -1,4 +1,5 @@
 """Live, asynchronous views over CalibrationService sessions."""
+from ..i18n import tr
 from ..widgets.changes import apply_change
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen
@@ -13,7 +14,7 @@ class StickPlot(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent); self.setFixedSize(150, 150)
         self.raw = (0, 0); self.trace = []
-        self.setAccessibleName("Live stick position and observed envelope")
+        self.setAccessibleName(tr("Live stick position and observed envelope"))
 
     def sample(self, raw):
         self.raw = raw
@@ -40,11 +41,11 @@ class SessionDialog(QDialog):
         super().__init__(parent)
         self.core, self.session_id = core, session_id
         self.session = None; self._closed = False
-        self.setWindowTitle("Calibration"); self.setMinimumWidth(560)
+        self.setWindowTitle(tr("Calibration")); self.setMinimumWidth(560)
         self.setWindowModality(Qt.WindowModal)
         box = QVBoxLayout(self); box.setContentsMargins(24, 24, 24, 24); box.setSpacing(16)
-        self.title = TitleLabel("Starting calibration…", self)
-        self.phase = BodyLabel("Waiting for the controller", self); self.phase.setWordWrap(True)
+        self.title = TitleLabel(tr("Starting calibration…"), self)
+        self.phase = BodyLabel(tr("Waiting for the controller"), self); self.phase.setWordWrap(True)
         self.error = CaptionLabel("", self); self.error.setWordWrap(True)
         for label in (self.title, self.phase, self.error):
             label.installEventFilter(ToolTipFilter(label, showDelay=350))
@@ -52,8 +53,8 @@ class SessionDialog(QDialog):
         self.body = QVBoxLayout(); box.addLayout(self.body)
         box.addWidget(self.error)
         buttons = QHBoxLayout(); buttons.addStretch()
-        self.cancel_button = PushButton("Cancel", self)
-        self.primary = PrimaryPushButton("Done", self); self.primary.setDefault(True)
+        self.cancel_button = PushButton(tr("Cancel"), self)
+        self.primary = PrimaryPushButton(tr("Done"), self); self.primary.setDefault(True)
         buttons.addWidget(self.cancel_button); buttons.addWidget(self.primary); box.addLayout(buttons)
         self.cancel_button.clicked.connect(self.reject)
         self.primary.clicked.connect(self.advance)
@@ -73,7 +74,7 @@ class SessionDialog(QDialog):
                 call_core(self.core.calibration.cancel, session_id)
             return
         if not session_id:
-            self.error.setText("Calibration could not start. Check the connected controller.")
+            self.error.setText(tr("Calibration could not start. Check the connected controller."))
             return
         self.session_id = session_id
         for session in self.core.calibration.state().sessions:
@@ -90,10 +91,10 @@ class SessionDialog(QDialog):
             if session is None:
                 return
         self.session = session
-        title = "Joystick calibration" if self.kind == "joystick" else "GameCube trigger calibration"
+        title = tr("Joystick calibration" if self.kind == "joystick" else "GameCube trigger calibration")
         self.title.setText(title); self.setWindowTitle(title)
         self.title.setToolTip(title)
-        self.phase.setText(session.message); self.phase.setToolTip(session.message)
+        self.phase.setText(tr(session.message)); self.phase.setToolTip(self.phase.text())
         self.render(session)
         self.cancel_button.setEnabled(not session.completed)
         if not session.active:
@@ -153,12 +154,12 @@ class JoystickCalibrationWizard(SessionDialog):
             if stick.rotate_done and stick.release_done:
                 message = "Done"
             elif rotate and not stick.rotate_done:
-                message = f"Keep rotating — {max(0, 10 - int(stick.rotate_elapsed))} s left"
+                message = tr("Keep rotating — {seconds} s left", seconds=max(0, 10 - int(stick.rotate_elapsed)))
             elif stick.phase in ("release", "wait", "waiting", "still"):
                 message = "Release the stick" if stick.release_elapsed == 0 else "Hold still…"
             else:
                 message = "Hold still…"
-            counter.setText(message)
+            counter.setText(tr(message))
             counter.setToolTip(counter.text())
 
 
@@ -166,7 +167,7 @@ class GcTriggerWizard(SessionDialog):
     kind = "gc_trigger"
     def __init__(self, core, session_id=None, parent=None):
         super().__init__(core, session_id, parent)
-        self.primary.setText("Next"); self.primary.setEnabled(False)
+        self.primary.setText(tr("Next")); self.primary.setEnabled(False)
         group = SettingsGroup("Live trigger values", self); self.body.addWidget(group)
         self.bars = []
         for side in ("Left trigger", "Right trigger"):
@@ -177,7 +178,7 @@ class GcTriggerWizard(SessionDialog):
             self.attach(session_id)
 
     def render(self, session):
-        self.primary.setText(session.next_label); self.primary.setEnabled(session.active)
+        self.primary.setText(tr(session.next_label)); self.primary.setEnabled(session.active)
         for bar, value in zip(self.bars, session.trigger_values or (0, 0)):
             bar.setValue(value); bar.setToolTip(str(value))
 

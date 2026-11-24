@@ -1,4 +1,5 @@
 """Shared Windows Settings-style building blocks for modern pages."""
+from ..i18n import tr
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
@@ -48,13 +49,13 @@ class SettingRow(CardWidget):
         self.titleLabel = BodyLabel(setting_title(title), self)
         font = self.titleLabel.font(); font.setPixelSize(14); self.titleLabel.setFont(font)
         text.addWidget(self.titleLabel)
-        self.helper_text = caption or ""
-        self.captionLabel = CaptionLabel(caption or "", self)
+        self.helper_text = tr(caption or "")
+        self.captionLabel = CaptionLabel(self.helper_text, self)
         font = self.captionLabel.font(); font.setPixelSize(12); self.captionLabel.setFont(font)
         self.captionLabel.setTextColor("#606060", "#bfbfbf")
         self.captionLabel.setWordWrap(True); self.captionLabel.setVisible(bool(caption))
         text.addWidget(self.captionLabel)
-        self.titleLabel.setToolTip(title)
+        self.titleLabel.setToolTip(setting_title(title))
         self.titleLabel.installEventFilter(ToolTipFilter(self.titleLabel, showDelay=350))
         self.rowLayout.addLayout(text, 1)
         if control is not None and hasattr(control, "setOnText"):
@@ -70,7 +71,7 @@ class SettingRow(CardWidget):
 class WarningSettingRow(InfoBar):
     """Persistent inline warning with stacked text and a centred right action."""
     def __init__(self, control, parent=None):
-        super().__init__(InfoBarIcon.WARNING, "Driver needs attention", "Virtual output is unavailable.",
+        super().__init__(InfoBarIcon.WARNING, tr("Driver needs attention"), tr("Virtual output is unavailable."),
                          orient=Qt.Vertical, isClosable=False, duration=-1,
                          position=InfoBarPosition.NONE, parent=parent)
         self.setMinimumHeight(64)
@@ -100,7 +101,7 @@ class SettingsGroup(QWidget):
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(8)
         self.box = QVBoxLayout(); self.box.setContentsMargins(0, 0, 0, 0); self.box.setSpacing(4)
         self.heading = QHBoxLayout()
-        self.label = CaptionLabel(title, self)
+        self.label = CaptionLabel(tr(title), self)
         font = self.label.font(); font.setPixelSize(14); font.setWeight(QFont.DemiBold)
         self.label.setFont(font)
         self.label.setTextColor("#606060", "#bfbfbf")
@@ -122,7 +123,7 @@ class ExpandSettingRow(QWidget):
         box = QVBoxLayout(self); box.setContentsMargins(0, 0, 0, 0); box.setSpacing(4)
         self.row = SettingRow(title, caption, control, self)
         self.toggle = ToolButton(FluentIcon.CHEVRON_DOWN_MED, self.row)
-        self.toggle.setAccessibleName(f"Expand {title}")
+        self.toggle.setAccessibleName(tr("Expand {title}", title=self.row.titleLabel.text()))
         self.row.rowLayout.addWidget(self.toggle, 0, Qt.AlignVCenter)
         self.body = QWidget(self); self.viewLayout = QVBoxLayout(self.body)
         self.viewLayout.setContentsMargins(16, 8, 16, 8)
@@ -133,7 +134,7 @@ class ExpandSettingRow(QWidget):
     def setExpand(self, expanded):
         self.isExpand = bool(expanded); self.body.setVisible(self.isExpand)
         self.toggle.setIcon(FluentIcon.UP if self.isExpand else FluentIcon.CHEVRON_DOWN_MED)
-        self.toggle.setAccessibleName(("Collapse " if self.isExpand else "Expand ") + self.row.titleLabel.text())
+        self.toggle.setAccessibleName(tr("Collapse {title}" if self.isExpand else "Expand {title}", title=self.row.titleLabel.text()))
 
     def addWidget(self, widget):
         self.viewLayout.addWidget(widget)

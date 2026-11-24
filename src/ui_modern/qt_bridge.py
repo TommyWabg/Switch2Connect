@@ -3,6 +3,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 import threading
 import logging
+from .i18n import tr
 from PySide6.QtCore import QObject, Signal, Slot, Qt, QThread, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
 from qfluentwidgets import MessageBox, MessageBoxBase, LineEdit, ComboBox, CheckBox, BodyLabel, ProgressBar
@@ -136,7 +137,7 @@ class _ProgressHandle:
     def update(self, message=None, fraction=None):
         def apply():
             if message is not None:
-                self.dialog.label.setText(message)
+                self.dialog.label.setText(tr(message))
             if fraction is not None:
                 self.dialog.bar.setValue(round(fraction * 100))
         self.port.dispatch.requested.emit(apply)
@@ -202,10 +203,11 @@ class QtUiPort(QObject):
                 self.window.showNormal()
             self.window.raise_()
         title, message = r.args[:2]
+        title = tr(title)
         if r.name in ("ask_open_file", "ask_save_file"):
             # Enter/exit may wait for core: keep the suspension on the blocked caller.
             dialog = QFileDialog(self.window, title)
-            dialog.setNameFilters([f"{label} ({pattern})" for label, pattern in message])
+            dialog.setNameFilters([f"{tr(label)} ({pattern})" for label, pattern in message])
             if r.name == "ask_save_file":
                 dialog.setAcceptMode(QFileDialog.AcceptSave)
                 dialog.selectFile(r.kwargs.get("default_name", ""))
@@ -215,6 +217,7 @@ class QtUiPort(QObject):
             dialog.finished.connect(lambda accepted: self._finish(r, dialog.selectedFiles()[0] if accepted and dialog.selectedFiles() else None))
             dialog.open()
             return
+        message = tr(message)
         if r.name == "progress":
             dialog = _ProgressDialog(title, message, r.kwargs.get("cancellable", False), self.window)
             self._progress.add(dialog)
@@ -229,12 +232,14 @@ class QtUiPort(QObject):
                 field = LineEdit(dialog); field.setText(r.kwargs.get("initial", ""))
                 result = lambda accepted: field.text() if accepted else None
             elif r.name == "ask_choice":
-                field = ComboBox(dialog); field.addItems(list(r.args[2]))
+                field = ComboBox(dialog)
+                for choice in r.args[2]:
+                    field.addItem(tr(choice), userData=choice)
                 if r.kwargs.get("default") in r.args[2]:
-                    field.setCurrentText(r.kwargs["default"])
-                result = lambda accepted: field.currentText() if accepted else None
+                    field.setCurrentIndex(field.findData(r.kwargs["default"]))
+                result = lambda accepted: field.currentData() if accepted else None
             else:
-                field = CheckBox(r.kwargs["opt_out_label"], dialog)
+                field = CheckBox(tr(r.kwargs["opt_out_label"]), dialog)
                 result = lambda accepted: (bool(accepted), field.isChecked())
             dialog.viewLayout.addWidget(field)
         else:
@@ -244,8 +249,8 @@ class QtUiPort(QObject):
                 dialog.cancelButton.hide()
         if r.kwargs.get("danger"):
             dialog.yesButton.setStyleSheet("background-color: #c42b1c; color: white;")
-        dialog.yesButton.setText(r.kwargs.get("yes", "Yes" if r.name == "ask_yes_no" else "OK"))
-        dialog.cancelButton.setText(r.kwargs.get("no", "Cancel"))
+        dialog.yesButton.setText(tr(r.kwargs.get("yes", "Yes" if r.name == "ask_yes_no" else "OK")))
+        dialog.cancelButton.setText(tr(r.kwargs.get("no", "Cancel")))
         r.dialog = dialog
         dialog.finished.connect(lambda accepted: self._finish(r, result(accepted)))
         dialog.show()

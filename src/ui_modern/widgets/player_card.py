@@ -1,3 +1,4 @@
+from ..i18n import tr
 from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from .common import FitImage, Segments
@@ -20,7 +21,7 @@ class BatteryGlyph(QWidget):
     def set_levels(self, levels):
         self.levels = tuple(levels)
         self.setFixedWidth(max(1, len(self.levels)) * 28 - 6)
-        self.setToolTip(" / ".join((level or "unknown").capitalize() for level in self.levels))
+        self.setToolTip(" / ".join(tr((level or "unknown").capitalize()) for level in self.levels))
         self.update()
     def paintEvent(self, event):
         painter = QPainter(self); painter.setRenderHint(QPainter.Antialiasing)
@@ -55,13 +56,13 @@ class PlayerCard(CardWidget):
         self.refresh_chip()
         qconfig.themeChangedFinished.connect(self.refresh_chip)
         row = QHBoxLayout(); self.ping = ToolButton(FluentIcon.VOLUME, self)
-        self.ping.setToolTip("Ping"); self.ping.setAccessibleName("Ping")
-        self.merge = TransparentPushButton("Merge", self)
+        self.ping.setToolTip(tr("Ping")); self.ping.setAccessibleName(tr("Ping"))
+        self.merge = TransparentPushButton(tr("Merge"), self)
         self.merge.clicked.connect(lambda: self.action("split" if self.snapshot.split_available else "merge_select"))
         self.hold = Segments(self); self.hold.sync(("Vertical", "Horizontal"), "Vertical", {"Vertical": "V", "Horizontal": "H"})
         self.hold.setFixedWidth(70); transport_row.addWidget(self.hold); transport_row.addStretch()
         self.hold.currentItemChanged.connect(lambda mode: self.action("set_hold_mode", mode))
-        self.merge_hint = CaptionLabel("Choose the other Joy-Con", self); box.addWidget(self.merge_hint, 0, Qt.AlignHCenter)
+        self.merge_hint = CaptionLabel(tr("Choose the other Joy-Con"), self); box.addWidget(self.merge_hint, 0, Qt.AlignHCenter)
         self.more = ToolButton(FluentIcon.MORE, self)
         row.setSpacing(2); row.addWidget(self.ping); row.addWidget(self.merge); row.addStretch(); row.addWidget(self.more); box.addLayout(row)
         self.ping.clicked.connect(lambda: self.action("ping"))
@@ -77,7 +78,7 @@ class PlayerCard(CardWidget):
         if slot == self.snapshot and getattr(self, "first_empty", None) == first_empty:
             return
         self.snapshot, self.first_empty = slot, first_empty
-        self.title.setText(f"Player {slot.player_number}")
+        self.title.setText(tr("Player {number}", number=slot.player_number))
         self.leds.setText(" ".join("■" if led else "□" for led in (slot.leds or (False,)*4)))
         self.leds.setVisible(not slot.is_empty)
         self.leds.setStyleSheet(f"color: {themeColor().name()}")
@@ -87,7 +88,7 @@ class PlayerCard(CardWidget):
         self.illustration.setVisible(not slot.is_empty)
         pending = not slot.is_empty and slot.pending_merge_index == slot.player_number - 1
         self.merge.setVisible(not slot.is_empty and (slot.merge_available or slot.split_available))
-        self.merge.setText("Split" if slot.split_available else "Selecting..." if pending else "Merge")
+        self.merge.setText(tr("Split") if slot.split_available else tr("Selecting...") if pending else tr("Merge"))
         self.merge.setMinimumWidth(95 if pending else 0)
         self.merge_hint.setVisible(pending)
         self.hold.setVisible(not slot.is_empty and slot.hold_mode_available)
@@ -95,12 +96,12 @@ class PlayerCard(CardWidget):
         border = themeColor().name() if pending else "#e88724" if slot.merge_target else None
         self.setStyleSheet(f"PlayerCard {{border: 2px solid {border}; border-radius: 8px;}}" if border else "PlayerCard {border: 1px dashed #888; border-radius: 8px;}" if slot.is_empty else "")
         if slot.is_empty:
-            self.model.setText("Press a button on a paired controller, or hold sync to pair" if first_empty else "")
+            self.model.setText(tr("Press a button on a paired controller, or hold sync to pair") if first_empty else "")
             return
         controllers = slot.controllers
         self.model.setText(" + ".join(c.display_name for c in controllers))
         self.battery.set_levels(c.battery_level for c in controllers)
-        self.transport.setText(" / ".join(dict.fromkeys({"ble": "Bluetooth", "esp32": "ESP32-S3", "wired": "USB", "usbip": "USB"}.get(c.transport, c.transport) for c in controllers)))
+        self.transport.setText(" / ".join(dict.fromkeys({"ble": tr("Bluetooth"), "esp32": "ESP32-S3", "wired": "USB", "usbip": "USB"}.get(c.transport, c.transport) for c in controllers)))
         kind = (slot.kind or controllers[0].kind).lower()
         image = "joycon2leftandright" if slot.is_merged_pair else ("joycon2right" if "right" in kind else "joycon2left") + ("_sideway" if slot.hold_mode == "Horizontal" else "") if "joy" in kind else "nsogamecubecontroller" if "gamecube" in kind else "procontroller2"
         self.illustration.path = _ASSETS / (image + ".png")
@@ -110,17 +111,17 @@ class PlayerCard(CardWidget):
         menu = RoundMenu(parent=self)
         self.menu_actions = {}
         def add(label, fn):
-            action = QAction(label, menu); action.triggered.connect(fn)
+            action = QAction(tr(label), menu); action.triggered.connect(fn)
             menu.addAction(action); self.menu_actions[label] = action
         add("Calibrate sticks", lambda: self.action("calibrate_sticks"))
         for i, controller in enumerate(s.controllers):
             if controller.mag_calibration_available:
                 side = ("Left" if "left" in controller.kind.lower() else "Right") if s.is_merged_pair else None
-                label = ("Stop magnetometer calibration" if controller.is_mag_calibrating else "Calibrate magnetometer") + (f" · {side}" if side else "")
+                label = tr("Stop magnetometer calibration" if controller.is_mag_calibrating else "Calibrate magnetometer") + (f" · {tr(side)}" if side else "")
                 add(label, lambda checked=False, side=side: self.action("toggle_mag_calibration", side))
         if s.gyro_side_available:
             for side in ("Left", "Right"):
-                add(f"Gyro side {side}", lambda checked=False, side=side: self.action("toggle_gyro_side", side))
+                add(tr("Gyro side {side}", side=tr(side)), lambda checked=False, side=side: self.action("toggle_gyro_side", side))
         menu.addSeparator()
         add("Disconnect", lambda: self.action("disconnect"))
         self.menu = menu

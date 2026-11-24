@@ -1,4 +1,5 @@
 """Gyro settings page. No configuration or hardware imports."""
+from ...i18n import tr
 from functools import partial
 from ...widgets.changes import apply_change, bind_numeric
 from PySide6.QtCore import QUrl
@@ -44,17 +45,17 @@ class GyroPage(ScrollArea):
         self.content.setAutoFillBackground(False)
         self.viewport().setAutoFillBackground(False)
         box = QVBoxLayout(self.content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
-        box.addWidget(TitleLabel("Gyro", self.content))
+        box.addWidget(TitleLabel(tr("Gyro"), self.content))
         self.controls = {}; self.rows = {}; self.values = {}; self.keys = {}
         self.groups = {}
         for title in ("Pass-through", "In-app gyro", "Dual Joy-Con gyro"):
             group = SettingsGroup(title, self.content); self.groups[title] = group; box.addWidget(group)
         calibration = SettingsGroup("Calibration", self.content); box.addWidget(calibration)
-        self.calibrate = PushButton("Calibrate", calibration)
+        self.calibrate = PushButton(tr("Calibrate"), calibration)
         self.calibration_row = calibration.addRow(SettingRow("Calibrate gyro",
             "Place controllers on a flat surface and keep them still", self.calibrate, calibration))
         self.calibrate.clicked.connect(lambda: apply_change(self, core.players.start_gyro_calibration))
-        tutorial = PushButton("Watch tutorial", calibration)
+        tutorial = PushButton(tr("Watch tutorial"), calibration)
         tutorial.setToolTip(TUTORIAL_URL)
         tutorial.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(TUTORIAL_URL)))
         calibration.row("Magnetometer calibration", tutorial, "Move the controller in a figure 8 pattern.")
@@ -83,9 +84,9 @@ class GyroPage(ScrollArea):
                 self.values[name] = c.value
                 if name not in self.controls:
                     widget = BooleanChoice(self) if isinstance(c.value, bool) else Choice(self) if c.options else Numeric(c, self)
-                    widget.setAccessibleName(LABELS.get(name, c.label.rstrip(":")))
+                    widget.setAccessibleName(tr(LABELS.get(name, c.label.rstrip(":"))))
                     row = self.groups[title].row(LABELS.get(name, c.label.rstrip(":")), widget, CAPTIONS.get(name))
-                    row.setToolTip(c.label)
+                    row.setToolTip(row.titleLabel.text())
                     self.controls[name], self.rows[name] = widget, row
                     if isinstance(widget, Numeric):
                         bind_numeric(self, widget, lambda val, n=name: self.core.settings.set_gyro_setting(self.keys[n], val),
@@ -125,7 +126,7 @@ class GyroPage(ScrollArea):
                 self.refresh()
         elif topic == events.TASK_STATE and value.task_id == "gyro_calibration":
             self.calibrate.setEnabled(not value.active)
-            self.calibration_row.captionLabel.setText(value.message)
+            self.calibration_row.captionLabel.setText(tr(value.message))
             self.calibration_row.captionLabel.show()
 
     def closeEvent(self, event):

@@ -1,4 +1,6 @@
+from ...i18n import tr
 from ...widgets.changes import apply_change, setting_writer
+from ...widgets.display import setting_title
 import math
 from qfluentwidgets import SwitchButton, LineEdit
 from ...widgets.common import SettingsGroup, ExpandSettingRow, Segments
@@ -72,7 +74,7 @@ class DeadzoneDialog(SettingsDialog):
 
 class JoystickDialog(SettingsDialog):
     def __init__(self, core, key, scope, mode, toast, parent=None):
-        super().__init__(core, ("Left" if key.startswith("l_") else "Right") + " joystick · " + mode, toast, parent)
+        super().__init__(core, tr("Left joystick" if key.startswith("l_") else "Right joystick") + " · " + setting_title(mode), toast, parent)
         self.key, self.scope, self.mode = key, scope, mode
         group = SettingsGroup(mode, self)
         self.box.addWidget(group)
@@ -159,7 +161,7 @@ class ActivationDialog(SettingsDialog):
                 else:
                     field = LineEdit(self)
                     field.setFixedWidth(155)
-                    field.setAccessibleName(control.label)
+                    field.setAccessibleName(setting_title(control.label.rstrip(":")))
                     field.textEdited.connect(lambda text, name=control.key: self.numeric_edit(name, text))
                     field.editingFinished.connect(lambda name=control.key: self.normalize(name))
                 self.fields[control.key] = field
@@ -185,7 +187,7 @@ class ActivationDialog(SettingsDialog):
                 checkbox.blockSignals(True)
                 checkbox.setChecked(token in selected)
                 checkbox.blockSignals(False)
-            self.field_rows[name].row.captionLabel.setText(", ".join(token for token in boxes if token in selected) or "None")
+            self.field_rows[name].row.captionLabel.setText(", ".join(token for token in boxes if token in selected) or tr("None"))
             self.field_rows[name].setToolTip(", ".join(selected) if isinstance(selected, (list, tuple)) else str(selected))
             self.field_rows[name.removesuffix("mode") + "group"].setVisible(bool([token for token in boxes if token in selected]))
         for name, field in self.fields.items():
@@ -210,14 +212,14 @@ class ActivationDialog(SettingsDialog):
             if not math.isfinite(number):
                 raise ValueError
         except ValueError:
-            field.setToolTip("Enter a number; the last saved value is retained.")
+            field.setToolTip(tr("Enter a number; the last saved value is retained."))
             field.setProperty("invalid", True)
-            self.field_rows[name].captionLabel.setText("Enter a number. The last saved value is retained.")
+            self.field_rows[name].captionLabel.setText(tr("Enter a number. The last saved value is retained."))
             self.field_rows[name].captionLabel.setTextColor("#c42b1c", "#ff99a4")
             return
         field.setToolTip("")
         field.setProperty("invalid", False)
-        self.field_rows[name].captionLabel.setText("Enter a non-negative number. Saved as you type.")
+        self.field_rows[name].captionLabel.setText(tr("Enter a non-negative number. Saved as you type."))
         self.field_rows[name].captionLabel.setTextColor("#606060", "#bfbfbf")
         value = max(0., number)
         value = value if name == "deadzone_amount" else int(round(value))
@@ -239,7 +241,7 @@ class ActivationDialog(SettingsDialog):
         self.fields[name].setProperty("normalizeRequested", True)
         self.fields[name].setText(str(self.numeric_pending.get(name, (None, self.values()[name]))[1]))
         self.fields[name].setProperty("invalid", False)
-        self.field_rows[name].captionLabel.setText("Enter a non-negative number. Saved as you type.")
+        self.field_rows[name].captionLabel.setText(tr("Enter a non-negative number. Saved as you type."))
         self.field_rows[name].captionLabel.setTextColor("#606060", "#bfbfbf")
 
     def flush(self, *_):

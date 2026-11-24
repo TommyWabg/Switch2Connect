@@ -1,4 +1,5 @@
 """Shared model-driven choices and throttled numeric controls."""
+from ..i18n import tr
 from PySide6.QtCore import Qt, QTimer, Signal
 import sys
 from PySide6.QtWidgets import QWidget, QHBoxLayout
@@ -15,7 +16,7 @@ def local_toast(parent):
             position=InfoBarPosition.TOP, parent=parent)
         parent._toast = bar
         if undo:
-            button = PushButton("Undo", bar)
+            button = PushButton(tr("Undo"), bar)
             button.clicked.connect(lambda: (bar.close(), undo()))
             bar.addWidget(button)
     return toast

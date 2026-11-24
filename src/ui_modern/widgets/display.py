@@ -1,4 +1,5 @@
 """Presentation over the classic formatter; persisted tokens stay unchanged."""
+from ..i18n import tr
 from app_core.helpers import format_input_display
 
 
@@ -10,7 +11,7 @@ def input_display(value):
     mouse_options = {"m1 Left Click": "Left click", "m2 Middle Click": "Middle click",
         "m3 Right Click": "Right click", "m4 Backward": "Back click", "m5 Forward": "Forward click"}
     if text in mouse_options:
-        return mouse_options[text]
+        return tr(mouse_options[text])
     names = {"CONTROL": "Ctrl", "LCONTROL": "Ctrl", "RCONTROL": "Ctrl",
         "SHIFT": "Shift", "MENU": "Alt", "LWIN": "Win", "RWIN": "Win",
         "RETURN": "Enter", "BACK": "Backspace", "BACKSPACE": "Backspace",
@@ -37,7 +38,7 @@ def input_display(value):
         if part.startswith("KP_") and part[3:].isdigit():
             return "Numpad " + part[3:]
         return names.get(part, part)
-    return setting_title(" + ".join(label(p) for p in text.split("+")))
+    return " + ".join(setting_title(label(p)) for p in text.split("+"))
 
 
 def setting_title(text):
@@ -57,4 +58,4 @@ def setting_title(text):
         "Change Profile": "Change profile", "Mode Shift": "Mode shift", "Gyro Lock": "Gyro lock", "Joystick Calibration": "Joystick calibration", "Wired Controller": "Wired controller"}
     for source, target in replacements.items():
         text = text.replace(source, target)
-    return text
+    return tr(text)

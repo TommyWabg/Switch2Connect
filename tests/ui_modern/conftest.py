@@ -108,6 +108,7 @@ def isolated_preferences(monkeypatch, core_tmp_path):
     qrouter.stackHistories.clear()
     prefs = QSettings(str(core_tmp_path / "ui.ini"), QSettings.IniFormat)
     monkeypatch.setattr(theme, "preferences", lambda: prefs)
+    prefs.setValue("language", "en")
     yield prefs
 
 @pytest.fixture

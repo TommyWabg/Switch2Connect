@@ -1,3 +1,4 @@
+from ...i18n import tr
 from ...widgets.changes import apply_change
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
@@ -22,7 +23,7 @@ class MappingRow(QWidget):
         self.value.setFixedHeight(28)
         self.reset = TransparentToolButton(FluentIcon.CANCEL, controls)
         self.reset.setFixedSize(24, 24)
-        self.reset.setAccessibleName("Reset " + snapshot.label); self.reset.setToolTip("Restore Default")
+        self.reset.setAccessibleName(tr("Reset {title}", title=setting_title(snapshot.label.rstrip(":")))); self.reset.setToolTip(tr("Restore Default"))
         for widget in (self.value, self.reset):
             box.addWidget(widget)
         box.addStretch()
@@ -43,7 +44,7 @@ class MappingRow(QWidget):
         display = input_display(snapshot.display_text)
         self.value.setText(self.value.fontMetrics().elidedText(display, Qt.ElideRight, 115))
         self.value.setToolTip(display)
-        self.value.setAccessibleName(snapshot.label + " " + display)
+        self.value.setAccessibleName(self.titleLabel.text() + " " + display)
         self.can_configure = bool(self.configure_callback) or (not self.writer and snapshot.configurable)
         self.reset.setVisible(not snapshot.is_default)
         self.setVisible(snapshot.visible)
@@ -91,7 +92,7 @@ class MappingRow(QWidget):
             activation.currentItemChanged.connect(self.set_mode); self.picker.box.addWidget(activation)
             self.picker.activation = activation
         if self.can_configure:
-            configure = TransparentPushButton(FluentIcon.SETTING, "Configure…", self.picker)
+            configure = TransparentPushButton(FluentIcon.SETTING, tr("Configure…"), self.picker)
             configure.clicked.connect(lambda: (self.picker.dismiss(), self.configure()))
             self.picker.box.addWidget(configure)
             self.picker.configure_button = configure

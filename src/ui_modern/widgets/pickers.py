@@ -1,3 +1,4 @@
+from ..i18n import tr
 from PySide6.QtCore import Qt, QEvent, QPoint, Signal
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -27,7 +28,7 @@ class OptionPicker(FlyoutViewBase):
         self.content.setContentsMargins(12, 12, 12, 8)
         self.content.setSpacing(5)
         self.search = SearchLineEdit(self)
-        self.search.setPlaceholderText("Search mappings")
+        self.search.setPlaceholderText(tr("Search mappings"))
         self.search.installEventFilter(self)
         self.content.addWidget(self.search)
         self.buttons, self.blocks = {}, {}
@@ -65,7 +66,7 @@ class OptionPicker(FlyoutViewBase):
                     for row, option in enumerate(options):
                         button = TransparentTogglePushButton(input_display(option.label), block)
                         button.setFont(font)
-                        button.setToolTip(str(option.label))
+                        button.setToolTip(input_display(option.label))
                         button.setFixedHeight(28)
                         button.setChecked(option.value == self.selected_option)
                         button.clicked.connect(lambda checked=False, value=option.value: self.select(value))
@@ -87,7 +88,7 @@ class OptionPicker(FlyoutViewBase):
         self.box = QHBoxLayout()
         self.box.setSpacing(8)
         self.content.addLayout(self.box)
-        self.record_button = TransparentPushButton(FluentIcon.EDIT, "Record keys…", self)
+        self.record_button = TransparentPushButton(FluentIcon.EDIT, tr("Record keys…"), self)
         self.record_button.setVisible(not self.joystick)
         self.box.addWidget(self.record_button)
         self.box.addStretch()
@@ -104,7 +105,7 @@ class OptionPicker(FlyoutViewBase):
         query = self.search.text().casefold()
         for header, entries in self._entries:
             for option, button in entries:
-                button.setEnabled(query in (str(option.label) + " " + str(option.value)).casefold())
+                button.setEnabled(query in (button.text() + " " + str(option.label) + " " + str(option.value)).casefold())
             enabled = any(button.isEnabled() for _, button in entries)
             header.setEnabled(enabled)
             header.setTextColor(QColor(0, 0, 0, 255 if enabled else 92),
@@ -198,7 +199,7 @@ class OptionPicker(FlyoutViewBase):
 class InputPicker(QDialog):
     def __init__(self, options, selected=(), parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Switch input")
+        self.setWindowTitle(tr("Switch input"))
         self.resize(360, 440)
         self.setWindowModality(Qt.WindowModal)
         self.setObjectName("switchInputPicker")
@@ -215,7 +216,7 @@ class InputPicker(QDialog):
             item.setToolTip(item.text())
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if value in self.value else Qt.Unchecked)
-        clear = PushButton("Clear", self); box.addWidget(clear)
+        clear = PushButton(tr("Clear"), self); box.addWidget(clear)
         clear.clicked.connect(lambda: [self.listing.item(i).setCheckState(Qt.Unchecked) for i in range(self.listing.count())])
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
         box.addWidget(buttons); buttons.accepted.connect(self.save); buttons.rejected.connect(self.reject)

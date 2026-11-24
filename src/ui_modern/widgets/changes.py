@@ -1,6 +1,7 @@
 """One asynchronous change/Undo path; successful changes render through bus events."""
 from shiboken6 import isValid
 import logging
+from ..i18n import tr
 from ..qt_bridge import call_core
 
 logger = logging.getLogger(__name__)
@@ -8,6 +9,7 @@ logger = logging.getLogger(__name__)
 def show_error(owner, message, row=None):
     if not isValid(owner) or getattr(owner, "_closed", False):
         return
+    message = tr(message)
     if row:
         row.captionLabel.setText(message)
         row.captionLabel.show()
@@ -89,7 +91,7 @@ def apply_change(owner, fn, *args, old_args=None, undo=None, label="Change appli
             on_finished()
         if restore and isValid(owner):
             try:
-                owner.toast(label, "success", undo=restore)
+                owner.toast(tr(label), "success", undo=restore)
             except Exception:
                 logger.warning("Could not display change notification", exc_info=True)
 

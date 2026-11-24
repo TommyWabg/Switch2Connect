@@ -1,4 +1,5 @@
 """Rumble settings rendered exclusively from RumbleView."""
+from ...i18n import tr
 from ...widgets.changes import apply_change
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QWidget, QHBoxLayout
@@ -51,7 +52,7 @@ class RumblePage(ServicePage):
             slider._value_label = label
         holder = QWidget(group); line = QHBoxLayout(holder); line.setContentsMargins(0, 0, 0, 0)
         delay = int_spin(holder); line.addWidget(delay); line.addWidget(BodyLabel('ms', holder))
-        delay.setAccessibleName('Rumble delay in milliseconds')
+        delay.setAccessibleName(tr('Rumble delay in milliseconds'))
         self.controls['rumble_delay_ms'] = delay
         group.row('Delay', holder)
         delay.valueChanged.connect(lambda value: apply_change(self, core.settings.set_rumble_setting, 'rumble_delay_ms', value, old_args=('rumble_delay_ms', self.values['rumble_delay_ms'])))

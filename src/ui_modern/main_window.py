@@ -1,3 +1,4 @@
+from .i18n import tr
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QAction, QIcon, QGuiApplication, QCursor
 from shiboken6 import isValid
@@ -26,10 +27,10 @@ class MainWindow(FluentWindow):
         self._tasks = {}; self.pages = {}; self.lazy_built = set()
         self.bridge = BusBridge(core.bus, self)
         self.bridge.event.connect(self.apply_event)
-        self.status = BodyLabel("Connecting…", self.titleBar)
-        self.profile = PushButton("Profile", self.titleBar)
+        self.status = BodyLabel(tr("Connecting…"), self.titleBar)
+        self.profile = PushButton(tr("Profile"), self.titleBar)
         self.task_indicator = IndeterminateProgressRing(self.titleBar); self.task_indicator.setFixedSize(18, 18); self.task_indicator.hide()
-        self.window_menu = TransparentToolButton(FluentIcon.MORE, self.titleBar); self.window_menu.setAccessibleName("More")
+        self.window_menu = TransparentToolButton(FluentIcon.MORE, self.titleBar); self.window_menu.setAccessibleName(tr("More"))
         for widget in (self.status, self.profile, self.task_indicator, self.window_menu):
             self.titleBar.hBoxLayout.insertWidget(self.titleBar.hBoxLayout.count()-1, widget, 0, Qt.AlignVCenter)
         qconfig.themeChangedFinished.connect(self._refresh_status)
@@ -42,13 +43,13 @@ class MainWindow(FluentWindow):
             page = self.pages.get(name)
             if page is None:
                 page = QWidget(self); page.setObjectName(name); self.pages[name] = page
-            self.addSubInterface(page, icon, name.title(), position=NavigationItemPosition.BOTTOM if name in ("profiles", "settings") else NavigationItemPosition.TOP)
+            self.addSubInterface(page, icon, tr(name.title()), position=NavigationItemPosition.BOTTOM if name in ("profiles", "settings") else NavigationItemPosition.TOP)
         self.stackedWidget.currentChanged.connect(self._build_current)
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip("Switch 2 Connect")
-        menu = QMenu(); show = menu.addAction("Show"); menu.setDefaultAction(show)
+        menu = QMenu(); show = menu.addAction(tr("Show")); menu.setDefaultAction(show)
         show.triggered.connect(self.show_from_tray)
-        menu.addAction("Exit", lambda: self.quit_requested.emit(False)); self.tray.setContextMenu(menu)
+        menu.addAction(tr("Exit"), lambda: self.quit_requested.emit(False)); self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda reason: self.show_from_tray() if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger) else None)
         self.overlays = install_overlays(core, self, route_toast=lambda event:
             self.toast(event.message, event.kind, event.title, event.auto_close_seconds))
@@ -88,14 +89,14 @@ class MainWindow(FluentWindow):
             self._status_state = value
             self._refresh_status()
         elif topic == events.PROFILES_CHANGED:
-            self.profiles_state = value; self.profile.setText(value.active or "Profile")
+            self.profiles_state = value; self.profile.setText(value.active or tr("Profile"))
         elif topic == events.TASK_STATE:
             if value.active:
                 self._tasks[value.task_id] = value
             else:
                 self._tasks.pop(value.task_id, None)
             self.task_indicator.setVisible(bool(self._tasks))
-            self.task_indicator.setToolTip("\n".join(f"{task.title}: {task.message}" for task in self._tasks.values()))
+            self.task_indicator.setToolTip("\n".join(f"{tr(task.title)}: {tr(task.message)}" for task in self._tasks.values()))
             self.devices.task(value)
         elif topic == events.TOAST:
             self.toast(value.message, value.kind, value.title, value.auto_close_seconds)
@@ -107,7 +108,7 @@ class MainWindow(FluentWindow):
         if state is None:
             return
         colors = {"ok": "#6ccb5f", "warn": "#fce100", "error": "#ff99a4"} if isDarkTheme() else {"ok": "#0f7b0f", "warn": "#9d5d00", "error": "#c42b1c"}
-        self.status.setText(f"● {state.text} · {state.connection_route}")
+        self.status.setText(f"● {tr(state.text)} · {tr(state.connection_route)}")
         self.status.setStyleSheet(f"color: {colors.get(state.level, state.color)}; padding: 4px 8px; border-radius: 10px; background-color: rgba(128, 128, 128, 20);")
     def _build_current(self, index):
         page = self.stackedWidget.widget(index); name = page.objectName()
@@ -137,6 +138,7 @@ class MainWindow(FluentWindow):
     def toast(self, message, kind="info", title="", seconds=4, undo=None):
         if self._closing:
             return
+        message, title = tr(message), tr(title)
         if hasattr(self, "overlays") and (not self.isVisible() or not self.isActiveWindow()):
             self.overlays.notification.present(events.Toast(message, kind, title, seconds))
             return
@@ -146,7 +148,7 @@ class MainWindow(FluentWindow):
         self._toast = factory(title, message, duration=-1 if seconds is None else round(seconds * 1000), position=InfoBarPosition.TOP, parent=self)
         if undo:
             bar = self._toast
-            button = PushButton("Undo", bar)
+            button = PushButton(tr("Undo"), bar)
             def restore():
                 if isValid(bar):
                     bar.close()
@@ -160,14 +162,14 @@ class MainWindow(FluentWindow):
             action = QAction(name, menu); action.setCheckable(True); action.setChecked(name == state.active)
             action.triggered.connect(lambda checked=False, name=name: call_core(self.core.profiles.select, name, on_result=self._profile_result, on_error=lambda exc: self.toast(str(exc), "error")))
             menu.addAction(action)
-        menu.addSeparator(); action = QAction("Manage profiles…", menu)
+        menu.addSeparator(); action = QAction(tr("Manage profiles…"), menu)
         action.triggered.connect(lambda: self.navigate("profiles")); menu.addAction(action)
         self._profile_menu = menu; menu.exec(self.profile.mapToGlobal(self.profile.rect().bottomLeft()))
     def _profile_result(self, result):
         if not result.ok:
             self.toast(result.reason or "Could not switch profile.", "warning")
     def show_window_menu(self):
-        menu = RoundMenu(parent=self); action = QAction("Hide to tray", menu)
+        menu = RoundMenu(parent=self); action = QAction(tr("Hide to tray"), menu)
         action.triggered.connect(self.hide_to_tray); menu.addAction(action)
         self._window_menu = menu; menu.exec(self.window_menu.mapToGlobal(self.window_menu.rect().bottomLeft()))
     def save_placement(self):

@@ -1,4 +1,5 @@
 """Mapping page and its public dialog entry points."""
+from ...i18n import tr
 from ...widgets.changes import apply_change
 from ...widgets.support import FluentSurface
 from PySide6.QtCore import Qt
@@ -6,7 +7,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget
 from PySide6.QtGui import QAction
 from qfluentwidgets import ScrollArea, TitleLabel, PushButton, CheckBox, MessageBox, RoundMenu, SearchLineEdit, FlowLayout, CardWidget, BodyLabel, ComboBox
 from app_core import events
-from ...widgets.display import input_display
+from ...widgets.display import input_display, setting_title
 from ...widgets.common import SettingsGroup, Segments
 from ...qt_bridge import BusBridge
 from .rows import MappingRow, OptionPicker
@@ -34,12 +35,12 @@ class MappingPage(ScrollArea):
         self.content = content
         content.setAutoFillBackground(False)
         box = QVBoxLayout(content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
-        box.addWidget(TitleLabel("Mapping", self))
+        box.addWidget(TitleLabel(tr("Mapping"), self))
         header = QHBoxLayout()
         self.scope_control = Segments(self)
         self.scope_control.sync(("base", "shift"), "base", {"base": "Controller mapping", "shift": "Mode shift"})
-        self.changed_only = CheckBox("Show changed only", self)
-        self.search = SearchLineEdit(self); self.search.setPlaceholderText("Search mappings"); self.search.setFixedWidth(210)
+        self.changed_only = CheckBox(tr("Show changed only"), self)
+        self.search = SearchLineEdit(self); self.search.setPlaceholderText(tr("Search mappings")); self.search.setFixedWidth(210)
         header.addWidget(self.scope_control); header.addStretch(); header.addWidget(self.search); header.addWidget(self.changed_only)
         box.addLayout(header)
         self.scope = None; self.rows = {}; self.groups = {}; self.gc_modes = {}; self.ir_buttons = {}
@@ -51,20 +52,20 @@ class MappingPage(ScrollArea):
         self.search.textChanged.connect(self.filter_rows)
         self.cells = {}; self.band_widgets = []
         self.shift_actions = QWidget(self); actions = QHBoxLayout(self.shift_actions); actions.setContentsMargins(0, 0, 0, 0)
-        self.copy = PushButton("Copy from controller mapping", self)
-        self.reset_shift = PushButton("Reset mode shift mapping", self)
+        self.copy = PushButton(tr("Copy from controller mapping"), self)
+        self.reset_shift = PushButton(tr("Reset mode shift mapping"), self)
         self.copy.hide()
         self.reset_shift.hide()
         self.overflow = PushButton("⋯", self.shift_actions); self.overflow.setFixedWidth(36)
-        self.overflow.setAccessibleName("Mode shift actions")
-        self.overflow.setToolTip("Mode shift actions")
+        self.overflow.setAccessibleName(tr("Mode shift actions"))
+        self.overflow.setToolTip(tr("Mode shift actions"))
         actions.addWidget(self.overflow); header.addWidget(self.shift_actions)
         policy = self.shift_actions.sizePolicy()
         policy.setRetainSizeWhenHidden(True)
         self.shift_actions.setSizePolicy(policy)
         self.overflow.clicked.connect(self.show_shift_menu)
-        self.copy.clicked.connect(lambda: self.confirm_shift("Copy controller mapping?", "This replaces the mode shift mappings with controller mappings.", core.settings.copy_controller_mapping_to_mode_shift))
-        self.reset_shift.clicked.connect(lambda: self.confirm_shift("Reset mode shift mapping?", "This clears the mode shift mappings and simultaneous inputs.", core.settings.reset_mode_shift_mapping))
+        self.copy.clicked.connect(lambda: self.confirm_shift(tr("Copy controller mapping?"), tr("This replaces the mode shift mappings with controller mappings."), core.settings.copy_controller_mapping_to_mode_shift))
+        self.reset_shift.clicked.connect(lambda: self.confirm_shift(tr("Reset mode shift mapping?"), tr("This clears the mode shift mappings and simultaneous inputs."), core.settings.reset_mode_shift_mapping))
         for scope in (None, SHIFT_SCOPE):
             panel = QWidget(self); layout = QVBoxLayout(panel); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(8)
             groups = {}
@@ -90,20 +91,20 @@ class MappingPage(ScrollArea):
             def cell(key, title, control, group, band=None):
                 widget = QWidget(panel); widget.setFixedWidth(178)
                 cell_box = QVBoxLayout(widget); cell_box.setContentsMargins(0, 0, 0, 0); cell_box.setSpacing(1)
-                label = BodyLabel(title, widget); font = label.font(); font.setPixelSize(12); label.setFont(font)
+                label = BodyLabel(tr(title), widget); font = label.font(); font.setPixelSize(12); label.setFont(font)
                 cell_box.addWidget(label); cell_box.addWidget(control)
                 control.setFixedHeight(28)
                 control.setFixedWidth(170); flows[group if band is None else band].addWidget(widget)
                 self.cells[scope, key] = (widget, group)
-                widget.search_title = title; widget.control = control
+                widget.search_title = title + ' ' + label.text(); widget.control = control
                 return widget
-            deadzones = PushButton("Deadzones…", self)
+            deadzones = PushButton(tr("Deadzones…"), self)
             cell("deadzones", "Deadzone settings", deadzones, "shared", 2)
             deadzones.clicked.connect(lambda: self.show_dialog(DeadzoneDialog(core, toast, self.window())))
             self.gc_modes[scope] = ComboBox(self)
             cell("gc_mode", "Analog trigger 100%", self.gc_modes[scope], "gamecube")
             self.gc_modes[scope].currentIndexChanged.connect(lambda index, scope=scope: self.set_gc(self.gc_modes[scope].itemData(index), scope))
-            calibrate = PushButton("Calibrate…", self)
+            calibrate = PushButton(tr("Calibrate…"), self)
             cell("gc_calibration", "Trigger calibration", calibrate, "gamecube")
             calibrate.clicked.connect(self.calibrate_gc)
             gc_flow = flows["gamecube"]
@@ -112,7 +113,7 @@ class MappingPage(ScrollArea):
                 if (scope, key) in self.cells:
                     gc_flow.addWidget(self.cells[scope, key][0])
             for side in ("left", "right"):
-                button = PushButton("Configure…", self)
+                button = PushButton(tr("Configure…"), self)
                 self.ir_rows[scope, side] = cell(side + "_ir", side.title() + " IR sensor", button, "ir")
                 button.clicked.connect(lambda _, side=side, scope=scope: self.open_ir(side, scope))
                 self.ir_buttons[scope, side] = button
@@ -133,15 +134,15 @@ class MappingPage(ScrollArea):
 
     def confirm_shift(self, title, text, fn):
         dialog = MessageBox(title, text, self.window())
-        dialog.yesButton.setText("Continue")
-        dialog.cancelButton.setText("Cancel")
+        dialog.yesButton.setText(tr("Continue"))
+        dialog.cancelButton.setText(tr("Cancel"))
         dialog.accepted.connect(lambda: apply_change(self, fn))
         self.show_dialog(dialog)
 
     def show_shift_menu(self):
         self.shift_menu = RoundMenu(parent=self)
         for title, button in (("Copy from controller mapping", self.copy), ("Reset mode shift mapping", self.reset_shift)):
-            action = QAction(title, self.shift_menu)
+            action = QAction(tr(title), self.shift_menu)
             action.triggered.connect(button.click); self.shift_menu.addAction(action)
         self.shift_menu.exec(self.overflow.mapToGlobal(self.overflow.rect().bottomLeft()))
 
@@ -180,7 +181,7 @@ class MappingPage(ScrollArea):
         for view in state.gc_triggers:
             combo = self.gc_modes[view.scope]; combo.blockSignals(True); combo.clear()
             for option in view.options:
-                combo.addItem(option.label, userData=option.value)
+                combo.addItem(setting_title(option.label), userData=option.value)
             combo.setCurrentIndex(next((i for i, o in enumerate(view.options) if o.value == view.mode), 0)); combo.blockSignals(False)
         for view in state.ir_sensors:
             button = self.ir_buttons[view.scope, view.side]

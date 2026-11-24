@@ -1,4 +1,5 @@
 """Profile combo capture retains classic release-to-save and duplicate retry behavior."""
+from ..i18n import tr
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer
 from PySide6.QtWidgets import QApplication, QDialog
 from qfluentwidgets import MessageBoxBase, BodyLabel
@@ -21,11 +22,11 @@ class ComboRecorder(MessageBoxBase):
         self.tokens, self.pressed = [], set()
         self.setProperty("recording_active", True)
         self.saving = False; self.closed = False
-        self.viewLayout.addWidget(BodyLabel('Record profile switching combo', self))
-        self.help = BodyLabel('Press and release keys, mouse buttons, wheel or controller buttons. Escape cancels.', self)
+        self.viewLayout.addWidget(BodyLabel(tr('Record profile switching combo'), self))
+        self.help = BodyLabel(tr('Press and release keys, mouse buttons, wheel or controller buttons. Escape cancels.'), self)
         self.help.setWordWrap(True); self.viewLayout.addWidget(self.help)
-        self.value = BodyLabel('Listening…', self); self.value.setWordWrap(True); self.viewLayout.addWidget(self.value)
-        self.yesButton.setText('Save'); self.cancelButton.setText('Cancel')
+        self.value = BodyLabel(tr('Listening…'), self); self.value.setWordWrap(True); self.viewLayout.addWidget(self.value)
+        self.yesButton.setText(tr('Save')); self.cancelButton.setText(tr('Cancel'))
         self.yesButton.clicked.disconnect(); self.yesButton.clicked.connect(self.submit)
         self.captured.connect(self.controller_tokens, Qt.QueuedConnection)
         QApplication.instance().installEventFilter(self)
@@ -37,7 +38,7 @@ class ComboRecorder(MessageBoxBase):
         for token in tokens:
             if token not in self.tokens:
                 self.tokens.append(token)
-        self.value.setText(input_display('+'.join(self.tokens)) if self.tokens else 'Listening…')
+        self.value.setText(input_display('+'.join(self.tokens)) if self.tokens else tr('Listening…'))
 
     def controller_tokens(self, tokens):
         if not self.closed and not self.saving:
@@ -96,14 +97,14 @@ class ComboRecorder(MessageBoxBase):
             self.saving = False
             self.yesButton.setEnabled(True); self.cancelButton.setEnabled(True)
             if getattr(result, 'restart_recording', False):
-                self.help.setText('This combo is assigned to another profile. Record a different combo.')
-                self.tokens.clear(); self.pressed.clear(); self.value.setText('Listening…')
+                self.help.setText(tr('This combo is assigned to another profile. Record a different combo.'))
+                self.tokens.clear(); self.pressed.clear(); self.value.setText(tr('Listening…'))
                 QTimer.singleShot(100, lambda: call_core(self.core.profiles.begin_controller_combo_capture, self.captured.emit) if not self.closed else None)
             elif getattr(result, 'ok', True):
                 if self.on_saved: self.on_saved('+'.join(self.tokens))
                 self.accept()
             else:
-                self.help.setText(result.reason or 'Could not save combo.')
+                self.help.setText(tr(result.reason or 'Could not save combo.'))
                 call_core(self.core.profiles.begin_controller_combo_capture, self.captured.emit)
         call_core(self.save, '+'.join(self.tokens), on_result=done, on_error=self.capture_error)
 

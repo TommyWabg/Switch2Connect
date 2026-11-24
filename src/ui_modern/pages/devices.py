@@ -1,3 +1,4 @@
+from ..i18n import tr
 from ..widgets.changes import apply_change, apply_setting
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QHBoxLayout, QStackedWidget
 from PySide6.QtCore import Qt
@@ -19,7 +20,7 @@ class DevicesPage(ScrollArea):
         self.enableTransparentBackground()
         self.content = FluentSurface(self); self.setWidget(self.content)
         box = QVBoxLayout(self.content); box.setContentsMargins(24, 20, 24, 24); box.setSpacing(12)
-        box.addWidget(TitleLabel("Devices", self))
+        box.addWidget(TitleLabel(tr("Devices"), self))
         self.controller_stack = QStackedWidget(self.content)
         self.controller_stack.setFixedHeight(EMPTY_HEIGHT)
         self.empty = QWidget(self.controller_stack)
@@ -29,8 +30,8 @@ class DevicesPage(ScrollArea):
         self.pair_image = FitImage(_ASSETS / "pairing_hint.png", self.empty)
         self.pair_image.setFixedHeight(200)
         empty_box.addWidget(self.pair_image)
-        empty_box.addWidget(SubtitleLabel("No controllers connected", self.empty), 0, Qt.AlignCenter)
-        body = BodyLabel("Press a button on a paired controller, or hold the sync button to pair a new one.", self.empty)
+        empty_box.addWidget(SubtitleLabel(tr("No controllers connected"), self.empty), 0, Qt.AlignCenter)
+        body = BodyLabel(tr("Press a button on a paired controller, or hold the sync button to pair a new one."), self.empty)
         body.setWordWrap(True)
         body.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(body)
@@ -44,7 +45,7 @@ class DevicesPage(ScrollArea):
         self._columns = 0
         self._arrange()
         output = SettingsGroup("Output", self.content); self.output_group = output; box.addWidget(output)
-        self.driver_action = PushButton("Install", output)
+        self.driver_action = PushButton(tr("Install"), output)
         self.attention = WarningSettingRow(self.driver_action, output)
         self.attention.hide()
         output.addRow(self.attention)
@@ -70,11 +71,11 @@ class DevicesPage(ScrollArea):
         self.duration_spins = []
         for label in ("days", "hours", "minutes"):
             spin = int_spin(duration)
-            row.addWidget(spin); row.addWidget(BodyLabel(label, duration)); self.duration_spins.append(spin)
+            row.addWidget(spin); row.addWidget(BodyLabel(tr(label), duration)); self.duration_spins.append(spin)
             spin.valueChanged.connect(self.change_duration)
         self.duration_row = auto.row("Duration", duration)
         gyro = SettingsGroup("Calibration", self.content); box.addWidget(gyro)
-        self.gyro_button = PushButton("Calibrate", gyro)
+        self.gyro_button = PushButton(tr("Calibrate"), gyro)
         self.gyro_row = gyro.addRow(SettingRow("Calibrate gyro",
             "Place controllers on a flat surface and keep them still", self.gyro_button, gyro))
         self.gyro_status = self.gyro_row.captionLabel
@@ -122,9 +123,9 @@ class DevicesPage(ScrollArea):
         self.layout_control.sync(("Xbox", "Switch"), state.abxy_mode)
         self.attention.setVisible(state.needs_attention)
         repair = state.action_kind == "repair" or "repair" in state.action_label.lower()
-        self.driver_action.setText("Repair" if repair else "Install")
-        self.attention.setMessage(f"{state.driver_type} needs repair" if repair else f"{state.driver_type} driver isn't installed",
-            "Virtual controller output is unavailable until the driver is " + ("repaired." if repair else "installed."))
+        self.driver_action.setText(tr("Repair") if repair else tr("Install"))
+        self.attention.setMessage(tr("{driver} needs repair" if repair else "{driver} driver isn't installed", driver=state.driver_type),
+            tr("Virtual controller output is unavailable until the driver is repaired." if repair else "Virtual controller output is unavailable until the driver is installed."))
         self.output_progress.setVisible(state.busy)
         self.driver_action.setEnabled(not state.busy)
         self.driver.setEnabled(not state.busy)
@@ -138,8 +139,8 @@ class DevicesPage(ScrollArea):
             spin.blockSignals(True); spin.setValue(value); spin.blockSignals(False)
     def task(self, task):
         if "gyro" in task.task_id:
-            self.gyro_status.setText(task.message if task.active else "Place controllers on a flat surface and keep them still")
+            self.gyro_status.setText(tr(task.message) if task.active else tr("Place controllers on a flat surface and keep them still"))
             self.gyro_button.setEnabled(not task.active)
 
     def apply_status(self, status):
-        self.connection_route.setText(status.connection_route)
+        self.connection_route.setText(tr(status.connection_route))

@@ -1,4 +1,5 @@
 """Non-activating desktop views; no controller or profile mutation."""
+from ..i18n import tr
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QCursor, QGuiApplication
 from PySide6.QtWidgets import QWidget, QVBoxLayout
@@ -49,9 +50,9 @@ class NotificationOverlay(QWidget):
     def present(self, payload):
         self.dismiss_timer.stop(); self.fade.stop(); self._dismissing = False
         self.kind = payload.kind
-        self.title.setText(payload.title or "Switch 2 Connect")
+        self.title.setText(tr(payload.title or "Switch 2 Connect"))
         self.title.setToolTip(self.title.text())
-        self.message.setText(payload.message); self.message.setToolTip(payload.message)
+        self.message.setText(tr(payload.message)); self.message.setToolTip(self.message.text())
         self.refresh_theme(); self.place()
         self.setWindowOpacity(0); self.show()
         self.fade.setStartValue(0.); self.fade.setEndValue(1.); self.fade.start()
@@ -99,7 +100,12 @@ class ProfileSelectionOverlay(NotificationOverlay):
         for label, value in ((self.previous, event.previous), (self.current, event.current), (self.next, event.next)):
             label.setToolTip(value or "")
         confirm, cancel = ("A", "B") if event.layout == "Switch" else ("B", "A")
-        self.hints.setText(f"{event.layout or 'Xbox'} layout · {confirm} Confirm · {cancel} Cancel" if event.manual else f"{event.layout or 'Xbox'} layout · Auto selection")
+        layout = event.layout or "Xbox"
+        if event.manual:
+            hint = tr("{layout} layout · {confirm} Confirm · {cancel} Cancel", layout=layout, confirm=confirm, cancel=cancel)
+        else:
+            hint = tr("{layout} layout · Auto selection", layout=layout)
+        self.hints.setText(hint)
         from app_core.events import Toast
         seconds = event.auto_close_seconds
         if seconds is None and event.auto_close_ms is not None:

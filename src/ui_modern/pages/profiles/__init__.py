@@ -1,3 +1,4 @@
+from ...i18n import tr
 from ...widgets.changes import apply_change
 from PySide6.QtWidgets import QWidget, QHBoxLayout
 from PySide6.QtGui import QAction
@@ -17,16 +18,16 @@ class ProfilesPage(ServicePage):
         self.profile_rows, self.app_rows = {}, {}
         actions = QWidget(self.content); layout = QHBoxLayout(actions); layout.setContentsMargins(0, 0, 0, 0)
         for title, callback in [('New profile', lambda: apply_change(self, core.profiles.add)), ('Import', self.import_profiles), ('Export', self.export_profiles)]:
-            button = PushButton(title, actions); button.clicked.connect(callback); layout.addWidget(button)
+            button = PushButton(tr(title), actions); button.clicked.connect(callback); layout.addWidget(button)
         layout.addStretch(); self.box.addWidget(actions)
         self.list = SettingsGroup('Profiles', self.content); self.box.addWidget(self.list)
         self.apps = SettingsGroup('Assigned apps', self.content); self.box.addWidget(self.apps)
-        self.add_app = PushButton('Add app…', self.apps); self.apps.heading.addWidget(self.add_app)
+        self.add_app = PushButton(tr('Add app…'), self.apps); self.apps.heading.addWidget(self.add_app)
         self.add_app.clicked.connect(lambda: self.choose_app())
         self.switching = SettingsGroup('Profile switching', self.content); self.box.addWidget(self.switching)
         holder = QWidget(self.switching); line = QHBoxLayout(holder); line.setContentsMargins(0, 0, 0, 0)
-        self.trigger = PushButton('None', holder)
-        self.clear_trigger = PushButton('Clear', holder)
+        self.trigger = PushButton(tr('None'), holder)
+        self.clear_trigger = PushButton(tr('Clear'), holder)
         line.addWidget(self.trigger); line.addWidget(self.clear_trigger)
         self.switching.row('Global combo trigger', holder)
         self.trigger.clicked.connect(lambda: self.record())
@@ -50,10 +51,10 @@ class ProfilesPage(ServicePage):
         for name in state.names:
             if name not in self.profile_rows:
                 holder = QWidget(self.list); layout = QHBoxLayout(holder); layout.setContentsMargins(0, 0, 0, 0)
-                include = SwitchButton(holder); include.setOnText(''); include.setOffText(''); include.setFocusPolicy(Qt.StrongFocus); include.setAccessibleName('Include ' + name + ' in change list')
-                include.setToolTip('Include in change list')
-                menu = PushButton('⋯', holder); menu.setAccessibleName('Actions for ' + name)
-                layout.addWidget(BodyLabel("Include in change list", holder))
+                include = SwitchButton(holder); include.setOnText(''); include.setOffText(''); include.setFocusPolicy(Qt.StrongFocus); include.setAccessibleName(tr('Include {name} in change list', name=name))
+                include.setToolTip(tr('Include in change list'))
+                menu = PushButton('⋯', holder); menu.setAccessibleName(tr('Actions for {name}', name=name))
+                layout.addWidget(BodyLabel(tr("Include in change list"), holder))
                 for control in (include, menu): layout.addWidget(control)
                 row = self.list.row(name, holder, 'No switching combo')
                 select = TransparentPushButton(name, row); row.textLayout.insertWidget(0, select)
@@ -68,18 +69,18 @@ class ProfilesPage(ServicePage):
                 ("color: " + (themeColor().name() if name == state.active else "#ffffff" if isDarkTheme() else "#202020") + ";") + " }")
             row.show(); select.setText(('● ' if name == state.active else '') + name); select.setToolTip(name)
             sync(include, 'setChecked', name in state.change_list)
-            row.captionLabel.setText(input_display(combos.get(name)) if combos.get(name) else 'No switching combo')
+            row.captionLabel.setText(input_display(combos.get(name)) if combos.get(name) else tr('No switching combo'))
         for name, controls in self.profile_rows.items():
             controls[0].setVisible(name in state.names)
-        self.trigger.setText(input_display(state.combo_trigger) if state.combo_trigger else 'None'); self.trigger.setToolTip(self.trigger.text())
+        self.trigger.setText(input_display(state.combo_trigger) if state.combo_trigger else tr('None')); self.trigger.setToolTip(self.trigger.text())
         self.clear_trigger.setEnabled(bool(state.combo_trigger))
         self.mode.sync(('Auto', 'Manual'), state.change_profile_mode)
         apps = dict(state.assigned_apps).get(state.active, ())
-        self.apps.label.setText('Assigned apps · ' + state.active)
+        self.apps.label.setText(tr('Assigned apps') + ' · ' + state.active)
         for index, (path, display) in enumerate(apps):
             if index not in self.app_rows:
                 holder = QWidget(self.apps); layout = QHBoxLayout(holder); layout.setContentsMargins(0, 0, 0, 0)
-                choose = PushButton('Choose app…', holder); remove = PushButton('Remove', holder)
+                choose = PushButton(tr('Choose app…'), holder); remove = PushButton(tr('Remove'), holder)
                 layout.addWidget(choose); layout.addWidget(remove)
                 row = self.apps.row('', holder); self.app_rows[index] = row
                 choose.clicked.connect(lambda checked=False, i=index: self.choose_app(i))
@@ -112,7 +113,7 @@ class ProfilesPage(ServicePage):
     def profile_menu(self, name, button):
         menu = RoundMenu(parent=self)
         for label, callback in [('Record combo…', lambda: self.record(name)), ('Clear combo', lambda: self.clear_combo(name)), ('Rename', lambda: self.rename(name)), ('Reset', lambda: self.active_action(name, self.core.profiles.reset)), ('Delete', lambda: self.active_action(name, self.core.profiles.delete))]:
-            action = QAction(label, menu); action.triggered.connect(callback)
+            action = QAction(tr(label), menu); action.triggered.connect(callback)
             if label == 'Clear combo': action.setEnabled(bool(dict(self.state.switching_combos).get(name)))
             if label == 'Delete': action.setEnabled(len(self.state.names) > 1)
             menu.addAction(action)
@@ -125,12 +126,12 @@ class ProfilesPage(ServicePage):
             apply_change(self, self.core.profiles.select, name, after=lambda result: apply_change(self, action) if result.ok else None)
 
     def rename(self, name):
-        dialog = MessageBoxBase(self.window()); dialog.viewLayout.addWidget(BodyLabel('Rename profile', dialog))
+        dialog = MessageBoxBase(self.window()); dialog.viewLayout.addWidget(BodyLabel(tr('Rename profile'), dialog))
         field = LineEdit(dialog); field.setText(name); field.selectAll(); dialog.viewLayout.addWidget(field)
         error = BodyLabel('', dialog); dialog.viewLayout.addWidget(error)
         def validate(text):
             valid = bool(text.strip()) and (text == name or text not in self.state.names)
-            error.setText('' if valid else 'Enter a unique profile name.')
+            error.setText('' if valid else tr('Enter a unique profile name.'))
             dialog.yesButton.setEnabled(valid)
         field.textChanged.connect(validate)
         field.returnPressed.connect(dialog.yesButton.click)
@@ -173,9 +174,9 @@ class ProfilesPage(ServicePage):
             selected, keep, controller = dialog.selected(), dialog.keep.isChecked(), dialog.controller.isChecked()
             def apply(): apply_change(self, self.core.profiles.do_import, preview.path, selected, keep, controller)
             if selected and not keep:
-                confirmation = MessageBox('Replace profiles', 'Replace all current profiles with the selected imported profiles?', self.window())
-                confirmation.yesButton.setText('Replace')
-                confirmation.cancelButton.setText('Cancel')
+                confirmation = MessageBox(tr('Replace profiles'), tr('Replace all current profiles with the selected imported profiles?'), self.window())
+                confirmation.yesButton.setText(tr('Replace'))
+                confirmation.cancelButton.setText(tr('Cancel'))
                 confirmation.finished.connect(lambda accepted: apply() if accepted else None)
                 self.import_confirmation = confirmation
                 confirmation.show()

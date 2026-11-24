@@ -1,4 +1,5 @@
 """Presentation helpers for settings dialogs; all mutations go through core services."""
+from ..i18n import tr
 from .changes import apply_change
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QWidget
@@ -28,13 +29,13 @@ class SettingsDialog(ThemedDialog):
         super().__init__(parent)
         self.core, self.toast = core, toast
         self.setObjectName("mappingDialog")
-        self.setWindowTitle(title)
+        self.setWindowTitle(tr(title))
         self.setMinimumWidth(640)
         self.setModal(True)
         self.resize(820, 640)
         self.outer = QVBoxLayout(self)
         self.outer.setContentsMargins(24, 20, 24, 20); self.outer.setSpacing(12)
-        self.outer.addWidget(TitleLabel(title, self))
+        self.outer.addWidget(TitleLabel(tr(title), self))
         self.scroll = ScrollArea(self)
         self.scroll.setWidgetResizable(True)
         self.scroll.enableTransparentBackground()
@@ -73,10 +74,10 @@ class SettingsDialog(ThemedDialog):
 
     def footer(self, save=None):
         row = QHBoxLayout(); row.addStretch()
-        self.cancel = PushButton("Cancel" if save else "Close", self)
+        self.cancel = PushButton(tr("Cancel") if save else tr("Close"), self)
         self.cancel.clicked.connect(self.reject); row.addWidget(self.cancel)
         if save:
-            self.save = PrimaryPushButton("Save", self)
+            self.save = PrimaryPushButton(tr("Save"), self)
             self.save.setDefault(True); self.save.clicked.connect(save); row.addWidget(self.save)
         self.outer.addLayout(row)
 

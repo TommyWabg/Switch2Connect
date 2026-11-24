@@ -1,4 +1,5 @@
 """Keyboard/mouse/controller input recorder shared by mapping and IR settings."""
+from ..i18n import tr
 from ..widgets.changes import apply_change
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer
 from PySide6.QtGui import QKeySequence
@@ -90,20 +91,20 @@ class RecordDialog(SettingsDialog):
         if initial.startswith("Custom") and ":" in initial:
             self.tokens = canonical_tokens(initial.split(":", 1)[1].split("+"))
         group = SettingsGroup("Custom mapping", self); self.box.addWidget(group)
-        self.capture = PushButton("Click to record", self)
+        self.capture = PushButton(tr("Click to record"), self)
         self.capture.setMinimumHeight(64); self.capture.setFocusPolicy(Qt.StrongFocus)
-        self.capture.setAccessibleName("Recording area")
+        self.capture.setAccessibleName(tr("Recording area"))
         group.row("Capture input", self.capture)
         self.chips = QWidget(self); self.chip_layout = FlowLayout(self.chips, needAni=False)
         self.chip_layout.setContentsMargins(0, 0, 0, 0); self.chip_layout.setHorizontalSpacing(6)
         group.row("Recorded keys", self.chips)
         self.mode = Segments(self); self.mode.sync(("Hold", "Tap"), mode)
         group.row("Activation", self.mode)
-        self.clear = PushButton("Clear", self); group.row("Remove all recorded keys", self.clear)
+        self.clear = PushButton(tr("Clear"), self); group.row("Remove all recorded keys", self.clear)
         self.clear.clicked.connect(self.clear_tokens)
-        self.add_tab = PushButton("Add Tab", self); self.add_tab.clicked.connect(lambda: self.add_tokens(["VK_TAB"]))
+        self.add_tab = PushButton(tr("Add Tab"), self); self.add_tab.clicked.connect(lambda: self.add_tokens(["VK_TAB"]))
         group.row("Record a navigation key", self.add_tab)
-        self.box.addWidget(CaptionLabel("Escape cancels. Tab moves between controls. Empty recordings restore Default.", self))
+        self.box.addWidget(CaptionLabel(tr("Escape cancels. Tab moves between controls. Empty recordings restore Default."), self))
         self.footer(self.save_recording)
         self.render_tokens()
         self.controller_tokens.connect(self.receive_controller, Qt.QueuedConnection)
@@ -114,13 +115,13 @@ class RecordDialog(SettingsDialog):
     def start_recording(self):
         self.tokens.clear(); self.pressed.clear(); self.render_tokens()
         self.recording = True; self.setProperty("recording_active", True)
-        self.capture.setText("Recording... release all inputs to finish")
+        self.capture.setText(tr("Recording... release all inputs to finish"))
         self.start_controller()
 
     def finish_recording(self):
         self.recording = False; self.setProperty("recording_active", False)
         self.generation += 1; self.pressed.clear(); self.wheel_timer.stop()
-        self.capture.setText("Click to record")
+        self.capture.setText(tr("Click to record"))
         call_core(self.core.profiles.end_controller_combo_capture)
 
     def finish_if_released(self):

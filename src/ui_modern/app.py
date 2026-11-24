@@ -58,6 +58,8 @@ def build_session(app, core_factory=None, *, exit_process=os._exit):
     if core_factory is None:
         from app_core import AppCore
         core_factory = AppCore
+    from . import i18n
+    i18n.initialize(app)
     initialize_theme(app)
     from .resources import resource_path
     icon = QIcon(str(resource_path("resources/images/icon.ico")))
