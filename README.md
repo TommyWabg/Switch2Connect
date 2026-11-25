@@ -279,3 +279,13 @@ Happy gaming, and thank you for your generous support!
 * **[JibbSmart/JoyShockLibrary](https://github.com/JibbSmart/JoyShockLibrary):** Reference for Switch 1 Joy-Cons gyro direction.
 * **[RyanCopley/NSO-GameCube-Controller-Pairing-App](https://github.com/RyanCopley/NSO-GameCube-Controller-Pairing-App):** Reference for all NSO GameCube Controller related features. Also a reference for BLE throughput optimized mode.
 * **[DarkEslariate/m12-pro-support](https://github.com/DarkEslariate/Switch2Connect/tree/m12-pro-support):** Mobapad M12 Pro Joy-Con support.
+
+## New interface (beta)
+
+This fork opens the modern interface by default. Select **Settings → Interface** to switch to the classic interface. The **Try the new interface** button switches back. Use `--ui=modern` or `--ui=classic` to override the saved preference for one launch.
+
+The modern interface supports English and Simplified Chinese. It follows the Windows display language by default. Choose **Settings → Interface → Language** to override it, then restart the app.
+
+现代界面支持简体中文。在 **设置 → 界面 → 语言** 中可选择跟随系统、English 或简体中文，重启应用后生效。
+
+To build the Windows executable, install `requirements.txt` in a Python 3.11 environment and run `package.bat`. The build uses the official v3.4 release for driver installers, firmware and package defaults. For an offline build, set `SWITCH2CONNECT_UPSTREAM_EXE` to a local copy of the official `Switch2Connect_v3.4.exe`.
