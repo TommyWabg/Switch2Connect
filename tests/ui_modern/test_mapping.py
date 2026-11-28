@@ -105,7 +105,7 @@ def test_scopes_filters_gc_and_integration(mapping, pump, monkeypatch):
     page.changed_only.setChecked(True); assert page.rows[None, "a"].isHidden()
     page.rows[None, "a"].choose("B"); pump(); assert not page.rows[None, "a"].isHidden()
     page.scope_control.setCurrentItem("shift"); pump()
-    assert page.scope == SHIFT_SCOPE and not page.shift_actions.isHidden()
+    assert page.scope == SHIFT_SCOPE and page.overflow.isEnabled()
     combo = page.gc_modes[SHIFT_SCOPE]
     combo.setCurrentIndex(next(i for i in range(combo.count()) if combo.itemData(i) == "100% at Max")); pump()
     assert page.rows[SHIFT_SCOPE, "gc_l_click"].isHidden()
@@ -155,6 +155,36 @@ def test_filtered_grid_reflows_at_different_widths(mapping, pump):
         assert first.y() == second.y()
         assert first.value.width() == first.width()
         assert page.horizontalScrollBar().maximum() == 0
+
+
+@pytest.mark.parametrize("width", [760, 1080])
+def test_scope_switch_keeps_toolbar_and_mapping_controls_in_place(mapping, pump, width):
+    page, _, _ = mapping
+    page.resize(width, 640); pump()
+    toolbar = (page.scope_control, page.search, page.changed_only, page.overflow)
+    positions = [widget.geometry() for widget in toolbar]
+    for tab, scope in (("base", None), ("shift", SHIFT_SCOPE), ("base", None)):
+        page.scope_control.setCurrentItem(tab); pump()
+        assert all(widget.isVisible() for widget in toolbar)
+        assert [widget.geometry() for widget in toolbar] == positions
+        assert page.overflow.isEnabled() == (scope is not None)
+
+        for key in ("gl", "gr", "sll", "srl", "slr", "srr", "left_ir", "right_ir"):
+            cell = page.cells[scope, key][0]
+            card = cell.parentWidget()
+            assert card.rect().contains(cell.geometry())
+            button = cell.control if key.endswith("_ir") else cell.value
+            page.ensureWidgetVisible(button); pump()
+            center = button.mapTo(page.viewport(), button.rect().center())
+            assert page.viewport().childAt(center) is button
+        page.verticalScrollBar().setValue(0)
+
+        # Qt also measures the inactive panel when negotiating the stack height.
+        other = None if scope else SHIFT_SCOPE
+        inactive = page.rows[other, "gl"]
+        card = inactive.parentWidget()
+        margins = card.layout().contentsMargins()
+        assert card.heightForWidth(width) >= margins.top() + inactive.sizeHint().height() + margins.bottom()
 
 
 def test_recording_restart_empty_stop_mouse_release_and_wheel(mapping, pump):

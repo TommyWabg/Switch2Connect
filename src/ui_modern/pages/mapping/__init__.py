@@ -2,12 +2,12 @@
 from ...i18n import tr
 from ...widgets.changes import apply_change
 from ...widgets.support import FluentSurface
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QRect
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget
 from PySide6.QtGui import QAction
 from ...widgets.controls import ComboBox
 from qfluentwidgets import (ScrollArea, PushButton, TransparentToolButton, FluentIcon, CheckBox,
-                            MessageBox, RoundMenu, SearchLineEdit, AdaptiveFlowLayout, SimpleCardWidget, BodyLabel)
+                            MessageBox, RoundMenu, SearchLineEdit, FlowLayout, SimpleCardWidget, BodyLabel)
 from app_core import events
 from ...widgets.display import input_display, setting_title
 from ...widgets.common import SettingsGroup, Segments
@@ -23,6 +23,34 @@ GROUPS = (("shared", "Shared buttons & joysticks"),
 BANDS = (("zl", "l", "zr", "r"), ("minus", "plus", "capt", "home", "c"),
          ("l_joystick", "l_stk", "r_joystick", "r_stk"),
          ("a", "b", "x", "y"), ("up", "down", "left", "right"))
+
+
+class MappingGrid(FlowLayout):
+    """Measure filtered cells even while the stack is showing the other scope."""
+
+    def _doLayout(self, rect, move):
+        margins = self.contentsMargins()
+        width = max(0, rect.width() - margins.left() - margins.right())
+        gap = self.horizontalSpacing()
+        columns = max(1, (width + gap) // (152 + gap))
+        cell_width = min(264, (width - (columns - 1) * gap) // columns)
+        y = margins.top()
+        column = row_height = 0
+        for index in range(self.count()):
+            item = self.itemAt(index)
+            # isEmpty() respects explicit filtering even if an ancestor is hidden.
+            if item.isEmpty():
+                continue
+            if column == columns:
+                y += row_height + self.verticalSpacing()
+                column = row_height = 0
+            height = item.sizeHint().height()
+            if move:
+                x = margins.left() + column * (cell_width + gap)
+                item.setGeometry(QRect(rect.x() + x, rect.y() + y, cell_width, height))
+            row_height = max(row_height, height)
+            column += 1
+        return y + row_height + margins.bottom()
 
 
 class MappingPage(ScrollArea):
@@ -53,15 +81,15 @@ class MappingPage(ScrollArea):
         self.changed_only.toggled.connect(self.filter_rows)
         self.search.textChanged.connect(self.filter_rows)
         self.cells = {}; self.empty_labels = {}
-        self.shift_actions = QWidget(self); actions = QHBoxLayout(self.shift_actions); actions.setContentsMargins(0, 0, 0, 0)
-        self.overflow = TransparentToolButton(FluentIcon.MORE, self.shift_actions)
+        self.overflow = TransparentToolButton(FluentIcon.MORE, self)
         self.shift_menu = RoundMenu(parent=self.overflow)
         self.copy = QAction(tr("Copy from controller mapping"), self.shift_menu)
         self.reset_shift = QAction(tr("Reset mode shift mapping"), self.shift_menu)
         self.shift_menu.addActions([self.copy, self.reset_shift])
         self.overflow.setAccessibleName(tr("Mode shift actions"))
         self.overflow.setToolTip(tr("Mode shift actions"))
-        actions.addWidget(self.overflow); header.addWidget(self.shift_actions)
+        self.overflow.setEnabled(False)
+        header.addWidget(self.overflow)
         self.overflow.clicked.connect(self.show_shift_menu)
         self.copy.triggered.connect(lambda: self.confirm_shift(tr("Copy controller mapping?"), tr("This replaces the mode shift mappings with controller mappings."), core.settings.copy_controller_mapping_to_mode_shift))
         self.reset_shift.triggered.connect(lambda: self.confirm_shift(tr("Reset mode shift mapping?"), tr("This clears the mode shift mappings and simultaneous inputs."), core.settings.reset_mode_shift_mapping))
@@ -73,12 +101,10 @@ class MappingPage(ScrollArea):
                 group = SettingsGroup(title, panel); groups[key] = group; layout.addWidget(group)
                 card = SimpleCardWidget(group)
                 group.addRow(card)
-                flow = AdaptiveFlowLayout(card, isTight=True)
+                flow = MappingGrid(card)
                 flow.setContentsMargins(16, 12, 16, 16)
                 flow.setHorizontalSpacing(16)
                 flow.setVerticalSpacing(12)
-                flow.setWidgetMinimumWidth(152)
-                flow.setWidgetMaximumWidth(264)
                 flows[key] = flow
             self.groups[scope] = groups
             view = core.settings.mapping(scope)
@@ -124,7 +150,6 @@ class MappingPage(ScrollArea):
             layout.addWidget(empty)
             self.empty_labels[scope] = empty
             layout.addStretch(); self.stack.addWidget(panel)
-        self.shift_actions.hide()
         self.bridge = BusBridge(core.bus, self)
         self.bridge.event.connect(self.apply_event)
         self.destroyed.connect(lambda: self.bridge.close())
@@ -136,7 +161,8 @@ class MappingPage(ScrollArea):
 
     def change_scope(self, value):
         self.scope = SHIFT_SCOPE if value == "shift" else None
-        self.stack.setCurrentIndex(1 if self.scope else 0); self.shift_actions.setVisible(self.scope is not None)
+        self.stack.setCurrentIndex(1 if self.scope else 0)
+        self.overflow.setEnabled(self.scope is not None)
 
     def confirm_shift(self, title, text, fn):
         dialog = MessageBox(title, text, self.window())

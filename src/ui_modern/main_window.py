@@ -4,7 +4,7 @@ from PySide6.QtGui import QAction, QIcon, QGuiApplication, QCursor
 from shiboken6 import isValid
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QSystemTrayIcon, QMenu
 from qfluentwidgets import (FluentWindow, FluentIcon, NavigationItemPosition, CaptionLabel, DotInfoBadge, InfoLevel,
-                           PushButton, TransparentDropDownPushButton, TransparentToolButton, RoundMenu, CheckableMenu, MenuIndicatorType, InfoBar, InfoBarPosition, IndeterminateProgressRing)
+                           PushButton, TransparentDropDownPushButton, TransparentPushButton, CheckableMenu, MenuIndicatorType, InfoBar, InfoBarPosition, IndeterminateProgressRing)
 from app_core import events
 from app_core.models import SettingsState
 from .qt_bridge import BusBridge, call_core
@@ -40,12 +40,13 @@ class MainWindow(FluentWindow):
         self.profile = TransparentDropDownPushButton(tr("Profile"), self.titleBar)
         self.profile.setToolTip(tr("Profile"))
         self.task_indicator = IndeterminateProgressRing(self.titleBar); self.task_indicator.setFixedSize(18, 18); self.task_indicator.hide()
-        self.window_menu = TransparentToolButton(FluentIcon.MORE, self.titleBar); self.window_menu.setAccessibleName(tr("More"))
-        self.window_menu.setToolTip(tr("More"))
+        self.tray_button = TransparentPushButton(FluentIcon.HIDE, tr("Hide to tray"), self.titleBar)
+        self.tray_button.setToolTip(self.tray_button.text())
         # Share the caption buttons' row, which is shorter than the full title bar.
-        for index, widget in enumerate((status_group, self.profile, self.task_indicator, self.window_menu)):
+        for index, widget in enumerate((status_group, self.profile, self.task_indicator, self.tray_button)):
             self.titleBar.buttonLayout.insertWidget(index, widget, 0, Qt.AlignVCenter)
-        self.profile.clicked.connect(self.profile_menu); self.window_menu.clicked.connect(self.show_window_menu)
+        self.profile.clicked.connect(self.profile_menu)
+        self.tray_button.clicked.connect(self.hide_to_tray)
         self.devices = DevicesPage(core, self.toast, self)
         self.settings = SettingsPage(core, self.toast, lambda: self.quit_requested.emit(True), apply_priority, self, hide_to_tray=self.hide_to_tray)
         self.pages["devices"] = self.devices; self.pages["settings"] = self.settings
@@ -184,11 +185,6 @@ class MainWindow(FluentWindow):
     def _profile_result(self, result):
         if not result.ok:
             self.toast(result.reason or "Could not switch profile.", "warning")
-    def show_window_menu(self):
-        menu = RoundMenu(parent=self.window_menu); menu.setAttribute(Qt.WA_DeleteOnClose)
-        action = QAction(tr("Hide to tray"), menu)
-        action.triggered.connect(self.hide_to_tray); menu.addAction(action)
-        self._window_menu = menu; menu.exec(self.window_menu.mapToGlobal(self.window_menu.rect().bottomLeft()))
     def save_placement(self):
         if self.isVisible() and not self.isMinimized():
             if any(self.frameGeometry().intersects(s.availableGeometry()) for s in QGuiApplication.screens()):
