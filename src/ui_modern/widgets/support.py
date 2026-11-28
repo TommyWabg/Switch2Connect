@@ -2,7 +2,7 @@
 from ..i18n import tr
 from .changes import apply_change
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLayout, QVBoxLayout, QWidget
 from qfluentwidgets import TitleLabel, SubtitleLabel, PushButton, PrimaryPushButton, BodyLabel, FluentStyleSheet, ScrollArea, setCustomStyleSheet
 from ..qt_bridge import call_core, BusBridge
 from app_core import events
@@ -26,6 +26,7 @@ class FluentSurface(QWidget):
         setCustomStyleSheet(self, "FluentSurface { background: #f7f7f7; }",
                             "FluentSurface { background: #272727; }")
         self.box = QVBoxLayout(self)
+        self.box.setVerticalSizeConstraint(QLayout.SetMinimumSize)
         self.box.setContentsMargins(24, 24, 24, 24)
         self.box.setSpacing(20)
         self.box.addWidget(TitleLabel(tr(title), self))
@@ -50,6 +51,7 @@ class SettingsDialog(ThemedDialog):
         self.body.setAutoFillBackground(False)
         self.scroll.viewport().setAutoFillBackground(False)
         self.box = QVBoxLayout(self.body); self.box.setContentsMargins(0, 0, 0, 0); self.box.setSpacing(12)
+        self.box.setVerticalSizeConstraint(QLayout.SetMinimumSize)
         self.box.setAlignment(Qt.AlignTop)
         self.outer.addWidget(self.scroll, 1)
         self.bridge = BusBridge(core.bus, self)

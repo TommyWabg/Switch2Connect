@@ -55,6 +55,35 @@ def test_toast_routing_profile_overlay_and_shutdown(window, pump, monkeypatch):
     assert not window.overlays.notification.isVisible()
 
 
+def test_setting_feedback_follows_window_focus(window, pump, monkeypatch):
+    host, core = window
+    monkeypatch.setattr(host, 'isActiveWindow', lambda: True)
+    host.devices.layout_control.setCurrentItem('Switch')
+    pump()
+    assert core.driver_state.abxy_mode == 'Switch'
+    assert host._toast is None
+    assert not host.overlays.notification.isVisible()
+
+    monkeypatch.setattr(host, 'isActiveWindow', lambda: False)
+    host.devices.layout_control.setCurrentItem('Xbox')
+    pump()
+    assert host.overlays.notification.isVisible()
+    assert host.overlays.notification.message.text() == 'Change applied'
+
+    host.overlays.notification.hide()
+    host.hide()
+    host.devices.layout_control.setCurrentItem('Switch')
+    pump()
+    assert host.overlays.notification.isVisible()
+    assert host.overlays.notification.message.text() == 'Change applied'
+
+    core.reject = True
+    host.devices.layout_control.setCurrentItem('Xbox')
+    pump()
+    assert host.overlays.notification.isVisible()
+    assert host.overlays.notification.message.text() == 'rolled_back'
+
+
 def test_calibration_event_opens_wizard_without_starting_again(window, pump):
     window, core = window
     session = CalibrationSession('from-core', 'joystick', (0, 100), 'rotate', 'Joystick calibration', 'Keep rotating')

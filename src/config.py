@@ -374,7 +374,7 @@ def build_in_app_gyro_mapping_defaults(stick_mouse_sensitivity=20.0):
 MAPPING_SCOPE_IN_APP_GYRO_RSTICK = "in_app_gyro_rstick_mode_mappings"
 
 def build_in_app_gyro_rstick_mapping_defaults(gc_trigger_default="Hair Trigger"):
-    defaults = {key: "Default" for key in SHARED_BUTTON_MAPPING_DEFAULTS}
+    defaults = SHARED_BUTTON_MAPPING_DEFAULTS.copy()
     for key in (
         "home_mapping", "capt_mapping", "c_mapping",
         "gl_mapping", "gr_mapping",
@@ -2785,7 +2785,12 @@ class Config:
         full_key = f"{key}_{setting}"
         if default is None:
             default = SHARED_BUTTON_MAPPING_DEFAULTS.get(full_key)
-        return scoped.get(full_key, default)
+        value = scoped.get(full_key, default)
+        # Older right-stick and steering layers stored the mapping sentinel
+        # in both numeric sensitivity fields.
+        if setting == "mouse_sensitivity" and value == "Default":
+            return SHARED_BUTTON_MAPPING_DEFAULTS[full_key]
+        return value
 
     def set_joystick_setting_scoped(self, key, setting, value, scope=None):
         scope = self._resolve_in_app_gyro_scope(scope)

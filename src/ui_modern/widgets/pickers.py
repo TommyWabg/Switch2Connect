@@ -1,5 +1,6 @@
 from ..i18n import tr
 from PySide6.QtCore import Qt, QEvent, QPoint, Signal
+from PySide6.QtGui import QAccessible, QAccessibleTableModelChangeEvent
 from PySide6.QtWidgets import (QDialogButtonBox, QVBoxLayout, QHBoxLayout, QGridLayout, QTreeWidgetItem,
                              QWidget, QListWidgetItem)
 from qfluentwidgets import (PushButton, SearchLineEdit, ListWidget, PrimaryPushButton, SubtitleLabel,
@@ -55,6 +56,8 @@ class OptionPicker(FlyoutViewBase):
                         item.setIcon(0, FluentIcon.ACCEPT.icon())
             group.setExpanded(True)
         self.tree.itemClicked.connect(self.choose_item)
+        self.tree.expanded.connect(self.refresh_accessible_rows)
+        self.tree.collapsed.connect(self.refresh_accessible_rows)
         self.content.addWidget(HorizontalSeparator(self))
         # Callers append activation/configuration actions to this shared footer.
         self.box = QHBoxLayout()
@@ -73,6 +76,14 @@ class OptionPicker(FlyoutViewBase):
         if item is not None and item.parent() is not None and not item.isHidden():
             self.select(item.data(0, Qt.UserRole))
 
+    def refresh_accessible_rows(self):
+        # Qt caches tree accessibility children by visible row number. Hiding
+        # rows can otherwise make Windows UI Automation loop over old siblings.
+        if QAccessible.isActive():
+            event = QAccessibleTableModelChangeEvent(
+                self.tree, QAccessibleTableModelChangeEvent.ModelChangeType.ModelReset)
+            QAccessible.updateAccessibility(event)
+
     def filter(self, *_):
         query = self.search.text().strip().casefold()
         first = None
@@ -89,6 +100,7 @@ class OptionPicker(FlyoutViewBase):
             group.setHidden(not count)
             if count:
                 group.setExpanded(True)
+        self.refresh_accessible_rows()
         self.tree.setVisible(first is not None)
         self.empty.setVisible(first is None)
         selected = self.items.get(self.selected_option)

@@ -1,11 +1,13 @@
 """Shared Windows Settings-style building blocks for modern pages."""
 from ..i18n import tr
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import Property, QEasingCurve, QEvent, QPropertyAnimation, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
+from PySide6.QtWidgets import QApplication, QFrame, QWidget, QVBoxLayout, QHBoxLayout
 from PySide6.QtSvgWidgets import QSvgWidget
 from qfluentwidgets import (SettingCard, StrongBodyLabel, SegmentedWidget, PushButton,
-    FluentIcon, SimpleExpandGroupSettingCard, ToolTipFilter, InfoBar, InfoBarIcon, InfoBarPosition)
+    FluentIcon, FluentStyleSheet, ToolTipFilter, InfoBar, InfoBarIcon, InfoBarPosition)
+from qfluentwidgets.components.settings.expand_setting_card import (
+    ExpandBorderWidget, GroupSeparator, GroupWidget, HeaderSettingCard)
 from .display import setting_title
 from pathlib import Path
 
@@ -107,6 +109,9 @@ class SettingsGroup(QWidget):
         self.label = StrongBodyLabel(tr(title), self)
         self.heading.addWidget(self.label); self.heading.addStretch()
         outer.addLayout(self.heading); outer.addLayout(self.box)
+        # The scroll area can relinquish space a layout pass after a row shrinks.
+        # Put that space below the rows so their geometry stays stable.
+        outer.addStretch()
 
     def addRow(self, row):
         self.box.addWidget(row)
@@ -116,21 +121,90 @@ class SettingsGroup(QWidget):
         return self.addRow(SettingRow(title, helper, control, self))
 
 
-class ExpandSettingRow(SimpleExpandGroupSettingCard):
-    """Fluent disclosure card that follows conditional settings in its body."""
+class ExpandSettingRow(QWidget):
+    """Keep the body at its natural size and reveal it by clipping the card."""
+    animatedHeight = Property(int, QWidget.height, QWidget.setFixedHeight)
+
     def __init__(self, title, caption=None, parent=None, *, icon=FluentIcon.SETTING):
-        super().__init__(icon, setting_title(title), tr(caption or ""), parent)
+        super().__init__(parent)
+        self.isExpand = False
+        self.card = HeaderSettingCard(icon, setting_title(title), tr(caption or ""), self)
         self.card.expandButton.setAccessibleName(self.card.titleLabel.text())
         self.card.expandButton.setFocusPolicy(Qt.StrongFocus)
+        self.card.expandButton.clicked.connect(lambda: self.setExpand(not self.isExpand))
+        self.view = QFrame(self)
+        self.view.setObjectName("view")
+        self.viewLayout = QVBoxLayout(self.view)
+        self.viewLayout.setContentsMargins(0, 0, 0, 0)
+        self.viewLayout.setSpacing(0)
+        self.view.hide()
+        self.border = ExpandBorderWidget(self)
+        FluentStyleSheet.EXPAND_SETTING_CARD.apply(self)
+        self.setFixedHeight(self.card.height())
+        self._animation = QPropertyAnimation(self, b"animatedHeight", self)
+        self._animation.setDuration(200)
+        self._animation.setEasingCurve(QEasingCurve.OutQuad)
+        self._animation.finished.connect(lambda: self.view.setVisible(self.isExpand))
         self.view.installEventFilter(self)
 
     def add_body_widget(self, widget):
         self.viewLayout.addWidget(widget)
 
+    def add_setting(self, title, control):
+        """Return a single visibility handle for a setting and its divider."""
+        row = QWidget(self.view)
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        if self.viewLayout.count():
+            layout.addWidget(GroupSeparator(row))
+        layout.addWidget(GroupWidget(QIcon(), tr(title), "", control, parent=row))
+        self.add_body_widget(row)
+        return row
+
+    def setTitle(self, title):
+        self.card.setTitle(title)
+        self.card.expandButton.setAccessibleName(title)
+
+    def setExpand(self, expanded):
+        if self.isExpand == expanded:
+            return
+        self.isExpand = expanded
+        if expanded:
+            self.view.show()
+        elif self.view.isAncestorOf(QApplication.focusWidget()):
+            self.card.expandButton.setFocus()
+        self.card.expandButton.setExpand(expanded)
+        self.card.update()
+        self._sync_height(animate=True)
+
+    def _sync_height(self, animate):
+        header = self.card.height()
+        height = (self.viewLayout.totalHeightForWidth(self.width()) if self.viewLayout.hasHeightForWidth()
+                  else self.viewLayout.sizeHint().height())
+        self.view.setGeometry(0, header, self.width(), height)
+        target = header + height if self.isExpand else header
+        running = self._animation.state() == QPropertyAnimation.Running
+        if running and target == self._animation.endValue():
+            return
+        self._animation.stop()
+        if (animate or running) and self.height() != target:
+            self._animation.setStartValue(self.height())
+            self._animation.setEndValue(target)
+            self._animation.start()
+        else:
+            self.setFixedHeight(target)
+            self.view.setVisible(self.isExpand)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.card.resize(self.width(), self.card.height())
+            self._sync_height(animate=False)
+
     def eventFilter(self, watched, event):
-        if (event.type() == QEvent.LayoutRequest and watched is getattr(self, "view", None)
-                and self.isExpand and self.expandAni.state() != self.expandAni.State.Running):
-            self._adjustViewSize()
+        if event.type() == QEvent.LayoutRequest and watched is self.view:
+            self._sync_height(animate=False)
         return super().eventFilter(watched, event)
 
 

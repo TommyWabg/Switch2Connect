@@ -7,6 +7,7 @@ from PyInstaller.archive.readers import CArchiveReader
 import sys
 import pkgutil
 import PySide6
+import yaml
 sys.path.insert(0, os.path.join(SPECPATH, "src"))
 from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
@@ -36,6 +37,13 @@ for name in archive.toc:
         local = payload / rel
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(archive.extract(name))
+    if rel == Path("resources/config.yaml"):
+        # Extend the official clean seed without reading a user's working config.
+        seed = yaml.safe_load(local.read_bytes())
+        preset = yaml.safe_load((root / "resources/profiles/Pro2-GL-Desktop.yaml").read_bytes())
+        seed["profiles"].update(preset["profiles"])
+        local = payload / rel
+        local.write_text(yaml.safe_dump(seed, allow_unicode=True, sort_keys=False), encoding="utf-8")
     resources[rel] = local
 
 native = {"WinUHid.dll", "WinUHidDevs.dll", "dualsense_haptic_native.dll"}

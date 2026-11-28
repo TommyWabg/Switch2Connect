@@ -8,7 +8,9 @@ from .display import setting_title
 
 
 def local_toast(parent):
-    def toast(message, kind="info", title="", seconds=4, undo=None):
+    def toast(message, kind="info", title="", seconds=4, undo=None, *, background_only=False):
+        if background_only:
+            return
         old = getattr(parent, "_toast", None)
         if old:
             old.close()

@@ -226,7 +226,11 @@ def test_switch_rollback_and_remembered_hold(rig):
 
 @pytest.mark.parametrize("driver", ["WinUHid", "ViGEmBus", "USBIP"])
 @pytest.mark.parametrize("health", ["absent", "partial", "unknown"])
-def test_switch_declined_unavailable(rig, driver, health):
+def test_switch_declined_unavailable(rig, driver, health, monkeypatch):
+    from app_core import driver_transitions
+
+    # The USBIP fallback also checks for the user's installed usbip.exe.
+    monkeypatch.setattr(driver_transitions, "os", NS(path=NS(exists=lambda _: False)))
     r = rig
     r.config.driver_type = "ViGEmBus" if driver == "WinUHid" else "WinUHid"
     r.health[driver] = Status(health)

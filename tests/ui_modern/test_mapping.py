@@ -444,6 +444,36 @@ def test_picker_filtered_categories_highlight_and_screen(mapping, pump, theme):
         setTheme(Theme.LIGHT)
 
 
+def test_picker_accessible_children_follow_visible_rows(mapping, pump):
+    from PySide6.QtGui import QAccessible
+    page, _, _ = mapping
+    row = page.rows[None, "a"]
+    was_active = QAccessible.isActive()
+    QAccessible.setActive(True)
+    try:
+        row.open_picker()
+        picker = row.picker
+        tree = QAccessible.queryAccessibleInterface(picker.tree)
+
+        def check_children():
+            pump()
+            for index in range(tree.childCount()):
+                child = tree.child(index)
+                assert child is not None and tree.indexOfChild(child) == index
+
+        check_children()
+        for expanded in (False, True):
+            picker.tree.topLevelItem(0).setExpanded(expanded)
+            check_children()
+        picker.search.setText("vol")
+        check_children()
+        picker.search.clear()
+        check_children()
+        picker.flyout.close()
+    finally:
+        QAccessible.setActive(was_active)
+
+
 def test_picker_list_navigation_search_enter_and_escape(mapping, pump):
     page, core, _ = mapping
     row = page.rows[None, "a"]

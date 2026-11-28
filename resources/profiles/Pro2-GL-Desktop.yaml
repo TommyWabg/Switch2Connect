@@ -1,0 +1,48 @@
+# Pro Controller 2 · Hold GL for desktop controls, release to return to the game.
+profiles:
+  Pro 2 GL Desktop:
+    driver_type: ViGEmBus
+    simulation_mode: Xbox360
+    keyboard_output_mode: Standard
+    mouse_output_mode: Standard
+    gyro_control_mode: R Joystick
+    gyro_activation_mode: Hold
+    gyro_always_active: false
+    stabilized_gyro: true
+    gyro_mode: World
+    gyro_sensitivity: 2.0
+    r_joystick_gyro_sensitivity: 5.0
+    stick_mouse_sensitivity: 5.0
+    mode_shift_enabled: {Mouse: false, R Joystick: false, Steering: false}
+    _mode_shift_enabled_migration_v1: true
+    xbox:
+      abxy_mode: Switch
+      c_mapping: Default
+      srr_mapping: Default
+      capt_mapping: Custom[Tap]:VK_F12
+      gl_mapping: Custom[Hold]:MODE_SHIFT
+      gr_mapping: Custom[Hold]:INAPPGYRO
+      in_app_gyro_rstick_mode_mappings:
+        gl_mapping: Custom[Hold]:MODE_SHIFT
+        gr_mapping: Custom[Hold]:INAPPGYRO
+        l_joystick_mapping: Mouse
+        l_joystick_mouse_sensitivity: 5.0
+        r_joystick_mapping: Scroll Wheel
+        r_joystick_scroll_mode: Up/Down
+        r_joystick_scroll_activation: Hold
+        zl_mapping: Custom[Hold]:MB_1
+        zr_mapping: Custom[Hold]:MB_3
+        r_stk_mapping: Custom[Hold]:MB_2
+        l_mapping: Custom[Hold]:MB_4
+        r_mapping: Custom[Hold]:MB_5
+        a_mapping: Custom[Tap]:VK_RETURN
+        b_mapping: Custom[Tap]:VK_ESCAPE
+        x_mapping: Custom[Tap]:VK_CONTROL+VK_C
+        y_mapping: Custom[Tap]:VK_CONTROL+VK_V
+        up_mapping: Custom[Hold]:VK_UP
+        down_mapping: Custom[Hold]:VK_DOWN
+        left_mapping: Custom[Hold]:VK_LEFT
+        right_mapping: Custom[Hold]:VK_RIGHT
+        plus_mapping: Custom[Tap]:VK_MENU+VK_TAB
+        minus_mapping: On-Screen Keyboard
+        capt_mapping: PrtSc

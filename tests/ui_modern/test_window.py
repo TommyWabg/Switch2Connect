@@ -89,10 +89,10 @@ def test_initial_event_buffer(window, pump):
 def test_undo_and_player_menu_routes(window, pump):
     from qfluentwidgets import PushButton
     w, core = window
-    w.devices.layout_control.setCurrentItem("Switch"); pump()
+    w.settings.theme.setCurrentText("Dark"); pump()
     undo=next(b for b in w._toast.findChildren(PushButton) if b.text()=="Undo")
     undo.click(); pump()
-    assert core.driver_state.abxy_mode=="Xbox"
+    assert w.settings.theme.currentText() == "System"
     card=w.devices.cards[1]
     card.open_menu(); pump()
     card.menu_actions["Calibrate magnetometer · Left"].trigger()

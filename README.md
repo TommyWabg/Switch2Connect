@@ -21,6 +21,12 @@
   </a>
 </p>
 
+## Pro Controller 2 desktop controls (Modern UI fork)
+
+Select **Pro 2 GL Desktop** in the profile selector to use ViGEmBus with Xbox 360 output. If you already have a configuration from an earlier version, open **Profiles → Import**, import [Pro2-GL-Desktop.yaml](resources/profiles/Pro2-GL-Desktop.yaml), and choose to keep your existing profiles.
+
+Hold **GL** for desktop controls and release it to resume the game. The left stick moves the pointer, the right stick scrolls, ZL clicks or drags, ZR right-clicks, and pressing the right stick middle-clicks. A/B send Enter/Escape, X/Y copy/paste, and L/R go back/forward. The D-pad sends arrow keys, + switches windows, and − opens the on-screen keyboard. The capture button sends F12 in the game layer and Print Screen while GL is held. Hold **GR** to aim with right-stick gyro output.
+
 ## Choose a Version And Get Started
 
 ### Microsoft Store Version

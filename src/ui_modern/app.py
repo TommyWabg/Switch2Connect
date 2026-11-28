@@ -1,17 +1,34 @@
 """Modern application lifecycle. Importing this module does not start hardware."""
 import os
 import sys
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QGuiApplication, QIcon
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QAbstractScrollArea, QApplication
+from qfluentwidgets import SmoothScrollDelegate
 from .qt_bridge import QtUiPort, call_core, gui_dispatcher
 from .main_window import MainWindow
 from .theme import initialize_theme, current_ui_priority, set_ui_priority
 from .restart import schedule_relaunch
 
+
+class NativeWheelScrolling(QObject):
+    """Let Qt scroll pages and item views directly, including lazy Fluent popups."""
+
+    def eventFilter(self, widget, event):
+        if event.type() == QEvent.Type.Show and isinstance(widget, QAbstractScrollArea):
+            delegate = widget.findChild(SmoothScrollDelegate, options=Qt.FindDirectChildrenOnly)
+            if delegate is not None:
+                # The delegate intercepts viewport wheel input to queue animation frames.
+                # Its overlay scrollbars still track the native bars via signals.
+                widget.viewport().removeEventFilter(delegate)
+        return False
+
+
 class ApplicationSession:
     def __init__(self, app, core_factory, *, exit_process=os._exit):
         self.app, self.exit_process = app, exit_process
+        self.wheel_scrolling = NativeWheelScrolling(self.app)
+        self.app.installEventFilter(self.wheel_scrolling)
         self.quitting = False; self.restart = False
         self.dispatch = gui_dispatcher()
         self.ui_port = QtUiPort()

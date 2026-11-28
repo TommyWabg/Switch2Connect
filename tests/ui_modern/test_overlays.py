@@ -67,6 +67,13 @@ def test_notification_replacement_and_monitor(app, pump):
     assert overlay.testAttribute(Qt.WA_ShowWithoutActivating)
     assert overlay.windowFlags() & Qt.WindowDoesNotAcceptFocus
     assert overlay.screen().availableGeometry().contains(overlay.geometry())
+    compact = overlay.size()
+    assert compact.width() < 300 and compact.height() < 100
+    overlay.present(events.Toast("A longer notification with more detail. " * 5))
+    assert overlay.height() > compact.height()
+    assert overlay.message.height() >= overlay.message.heightForWidth(overlay.message.width())
+    overlay.present(events.Toast("Second", "error", "Disconnected", None))
+    assert overlay.size() == compact
     overlay.present(events.Toast("Done", auto_close_seconds=.01)); pump(timeout=.25)
     assert not overlay.isVisible()
     overlay.close(); sentinel.close()

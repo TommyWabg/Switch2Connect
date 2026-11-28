@@ -41,7 +41,7 @@ def apply_toggle(owner, fn, read):
     apply_change(owner, fn, undo=restore)
 
 
-def apply_change(owner, fn, *args, old_args=None, undo=None, label="Change applied",
+def apply_change(owner, fn, *args, old_args=None, undo=None, label=None,
                  row=None, after=None, restart=False, rollback=None, on_finished=None, **kwargs):
     if rollback is None:
         saved = [(state, getattr(owner, render))
@@ -91,7 +91,8 @@ def apply_change(owner, fn, *args, old_args=None, undo=None, label="Change appli
             on_finished()
         if restore and isValid(owner):
             try:
-                owner.toast(tr(label), "success", undo=restore)
+                owner.toast(tr(label or "Change applied"), "success", undo=restore,
+                           background_only=label is None)
             except Exception:
                 logger.warning("Could not display change notification", exc_info=True)
 

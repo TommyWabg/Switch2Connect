@@ -1,5 +1,4 @@
 from ...widgets.changes import apply_change, apply_setting, apply_toggle
-from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QHBoxLayout
 from ...widgets.controls import ComboBox
@@ -18,7 +17,7 @@ from .firmware import FirmwareManagerDialog
 
 class SettingsPage(ServicePage):
     def __init__(self, core, toast, request_restart=lambda: None, apply_priority=lambda policy: None,
-                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.7'):
+                 parent=None, *, hide_to_tray=None, version='v3.4-modern-preview.8'):
         super().__init__('Settings', core, toast, parent)
         self.request_restart, self.apply_priority, self.hide_to_tray = request_restart, apply_priority, hide_to_tray
         self.driver_rows = {}
@@ -48,13 +47,12 @@ class SettingsPage(ServicePage):
             switch.setOnText('')
             switch.setOffText('')
             switch.setFocusPolicy(Qt.StrongFocus)
-        self.hidhide_widgets = []
+        self.hidhide_rows = []
         for title, control in [('Auto scan', self.auto_scan), ('Manual scan', self.manual_scan), ('HidHide active', self.hidhide), ('HidHide driver', self.hidhide_uninstall)]:
             control.setAccessibleName(tr(title))
-            row = self.wired.addGroup(QIcon(), tr(title), '', control)
+            row = self.wired.add_setting(title, control)
             if control in (self.hidhide, self.hidhide_uninstall):
-                separator = self.wired.viewLayout.itemAt(self.wired.viewLayout.indexOf(row) - 1).widget()
-                self.hidhide_widgets.extend((separator, row))
+                self.hidhide_rows.append(row)
         self.auto_scan.checkedChanged.connect(lambda _: apply_toggle(self, core.drivers.toggle_wired_auto_scan, lambda: self.driver_state.wired_auto_scan_enabled))
         self.manual_scan.clicked.connect(lambda: apply_change(self, core.drivers.manual_wired_scan))
         self.hidhide.checkedChanged.connect(lambda _: apply_toggle(self, core.drivers.toggle_hidhide_active, lambda: self.driver_state.hidhide_active))
@@ -152,13 +150,11 @@ class SettingsPage(ServicePage):
         self.keyboard_row.setVisible(state.keyboard_available); self.mouse_row.setVisible(state.mouse_available)
         self.keyboard.setEnabled(not state.busy); self.mouse.setEnabled(not state.busy)
         title = setting_title(state.wired_settings_label)
-        self.wired.card.setTitle(title)
-        self.wired.card.expandButton.setAccessibleName(title)
+        self.wired.setTitle(title)
         sync(self.auto_scan, 'setChecked', state.wired_auto_scan_enabled)
         sync(self.hidhide, 'setChecked', state.hidhide_active)
-        for widget in self.hidhide_widgets:
-            widget.setVisible(state.hidhide_service_state is True)
-        self.wired._adjustViewSize()
+        for row in self.hidhide_rows:
+            row.setVisible(state.hidhide_service_state is True)
         for control in (self.auto_scan, self.manual_scan, self.hidhide, self.hidhide_uninstall): control.setEnabled(not state.busy)
 
     def output_selector(self, group, title, state_field, setter):

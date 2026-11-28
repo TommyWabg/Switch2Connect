@@ -13,12 +13,12 @@ class NotificationOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setFocusPolicy(Qt.NoFocus)
-        self.setFixedSize(420, 160)
+        self.setMaximumWidth(340)
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
         self.surface = QWidget(self); self.surface.setObjectName(f"overlaySurface_{id(self)}")
         outer.addWidget(self.surface)
-        self.content = QVBoxLayout(self.surface); self.content.setContentsMargins(20, 16, 20, 16)
-        self.content.setSpacing(8)
+        self.content = QVBoxLayout(self.surface); self.content.setContentsMargins(14, 9, 14, 9)
+        self.content.setSpacing(3)
         self.content.setAlignment(Qt.AlignVCenter)
         self.title = SubtitleLabel("", self.surface)
         self.title.setWordWrap(True)
@@ -51,7 +51,9 @@ class NotificationOverlay(QWidget):
     def place(self):
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         area = screen.availableGeometry()
-        self.adjustSize()
+        width = min(self.sizeHint().width(), self.maximumWidth(), area.width() - 40)
+        height = self.layout().totalHeightForWidth(width)
+        self.resize(width, min(height, area.height() - 40))
         self.move(area.right() - self.width() - 19, area.bottom() - self.height() - 19)
 
     def present(self, payload):
@@ -83,7 +85,9 @@ class NotificationOverlay(QWidget):
 class ProfileSelectionOverlay(NotificationOverlay):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(290)
+        self.setFixedSize(420, 290)
+        self.content.setContentsMargins(20, 16, 20, 16)
+        self.content.setSpacing(8)
         self.previous = CaptionLabel("", self.surface)
         self.current = SubtitleLabel("", self.surface)
         self.next = CaptionLabel("", self.surface)

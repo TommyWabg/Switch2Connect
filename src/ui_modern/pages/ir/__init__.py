@@ -2,7 +2,7 @@
 from ...i18n import tr
 from ...widgets.support import ThemedDialog
 from ...widgets.changes import apply_change, bind_numeric
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget, QHBoxLayout
+from PySide6.QtWidgets import QDialog, QLayout, QVBoxLayout, QWidget, QHBoxLayout
 from qfluentwidgets import ScrollArea, DropDownPushButton, PushButton, BodyLabel, SubtitleLabel
 from app_core import events
 from ...widgets.display import input_display, setting_title
@@ -47,6 +47,7 @@ class IrSensorDialog(ThemedDialog):
         content.setAutoFillBackground(False)
         scroll.viewport().setAutoFillBackground(False)
         self.body = QVBoxLayout(content); self.body.setContentsMargins(0, 8, 0, 8); self.body.setSpacing(12)
+        self.body.setVerticalSizeConstraint(QLayout.SetMinimumSize)
         self.general = SettingsGroup("Function", content); self.body.addWidget(self.general)
         self.function = DropDownPushButton(tr("Default (IR Mouse)"), self); self.function.setFixedWidth(260)
         self.function.clicked.connect(self.pick_function)

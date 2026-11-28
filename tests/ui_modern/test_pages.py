@@ -1,7 +1,7 @@
 from ui_modern.widgets.changes import apply_change
 from dataclasses import replace
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt
 from PySide6.QtTest import QTest
 from app_core import events
 from app_core.models import Option, Esp32State, FirmwareSession, PortMode, PortChoice, ImportPreview, ExportPreview, ProfileResult
@@ -254,6 +254,60 @@ def test_wired_group_opens_from_header_and_resizes_for_driver_state(setup_page, 
     QTest.keyClick(group.card.expandButton, Qt.Key_Space)
     pump(timeout=.3)
     assert not group.isExpand and group.height() == group.card.height()
+    assert not page.manual_scan.isVisibleTo(group)
+
+
+def test_wired_animation_keeps_preceding_card_still(setup_page, pump):
+    page, core, _ = setup_page(SettingsPage)
+    page.apply_driver(replace(core.driver_state, hidhide_service_state=False))
+    page.verticalScrollBar().setValue(150)
+    pump()
+    row = page.esp_row
+    group = page.wired
+
+    def geometry():
+        return row.mapTo(page.viewport(), QPoint()), row.size()
+
+    baseline = geometry()
+    samples = []
+
+    class ObserveLayout(QObject):
+        def eventFilter(self, watched, event):
+            if event.type() in (QEvent.Move, QEvent.Resize):
+                samples.append(geometry())
+            return False
+
+    observer = ObserveLayout()
+    for widget in (row, row.parentWidget(), page.content):
+        widget.installEventFilter(observer)
+    for expanded in (True, False):
+        QTest.mouseClick(group.card.expandButton, Qt.LeftButton)
+        pump(timeout=.3)
+        assert group.isExpand == expanded
+        assert samples and all(sample == baseline for sample in samples)
+        samples.clear()
+
+
+def test_wired_animation_reverses_and_accepts_driver_updates(setup_page, pump):
+    page, core, _ = setup_page(SettingsPage)
+    group = page.wired
+    header = group.card.height()
+    group.setExpand(True)
+    pump(lambda: group.height() > header, timeout=.3)
+    partial = group.height()
+    assert header < partial < header + group.view.height()
+    page.apply_driver(replace(core.driver_state, busy=True))
+    assert group.height() == partial
+    group.setExpand(False)
+    assert group.height() == partial
+    pump(timeout=.3)
+    assert group.height() == header
+
+    group.setExpand(True)
+    pump(lambda: group.height() > header, timeout=.3)
+    page.apply_driver(replace(core.driver_state, hidhide_service_state=False))
+    pump(timeout=.3)
+    assert group.height() == header + group.viewLayout.sizeHint().height()
 
 
 def test_firmware_port_actions_close_and_replug(setup_page, pump):

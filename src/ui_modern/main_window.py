@@ -151,11 +151,17 @@ class MainWindow(FluentWindow):
             if hasattr(content, "bridge"):
                 content.bridge.close()
 
-    def toast(self, message, kind="info", title="", seconds=4, undo=None):
+    def toast(self, message, kind="info", title="", seconds=4, undo=None, *, background_only=False):
         if self._closing:
             return
         message, title = tr(message), tr(title)
-        if hasattr(self, "overlays") and (not self.isVisible() or not self.isActiveWindow()):
+        active = QApplication.activeWindow()
+        foreground = self.isVisible() and not self.isMinimized() and (
+            self.isActiveWindow() or (isinstance(active, QDialog) and self.isAncestorOf(active))
+        )
+        if background_only and foreground:
+            return
+        if hasattr(self, "overlays") and not foreground:
             self.overlays.notification.present(events.Toast(message, kind, title, seconds))
             return
         if self._toast is not None and isValid(self._toast):
